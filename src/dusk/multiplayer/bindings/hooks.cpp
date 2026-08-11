@@ -12,6 +12,10 @@
 
 namespace dusk::mp {
 
+void apply_startup_options(const StartupOptions& options) {
+    network_manager().set_startup_options(options);
+}
+
 void pre_actor_tick() {
     network_manager().pre_actor_tick();
 }

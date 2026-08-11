@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../net/transport.hpp"
+#include "dusk/multiplayer.hpp"
 
 namespace dusk::mp {
 
@@ -42,8 +43,11 @@ struct PeerSession {
  */
 class NetworkManager {
 public:
-    /// Reads DUSK_MP_* environment variables and opens a session if they ask for one.
-    /// Idempotent; called lazily from the first tick.
+    /// Copy in what the command line asked for. Must happen before the first tick.
+    void set_startup_options(const StartupOptions& options);
+
+    /// Opens a session if the command line or the DUSK_MP_* environment variables ask for one,
+    /// with the command line winning. Idempotent; called lazily from the first tick.
     void ensure_initialized();
 
     void shutdown();
@@ -84,9 +88,19 @@ private:
 
     void report_interpolation();
 
+    /// What --mp-* asked for, owned as strings so the caller's argv can go away.
+    struct StartupRequest {
+        bool host = false;
+        std::string connect;
+        std::uint16_t port = 0;
+        std::string nickname;
+        std::string color;
+    };
+
     std::unique_ptr<ITransport> mTransport;
     Role mRole = Role::Inactive;
     bool mInitialized = false;
+    StartupRequest mStartup;
 
     std::string mLocalNickname;
     std::uint32_t mLocalColor = 0xFFFFFF;

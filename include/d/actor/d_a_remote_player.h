@@ -52,6 +52,8 @@ private:
     bool mReportedArcConflict;
     /* Guards the one-time archive switch in create(), so a wrong guess can't loop forever. */
     bool mSwitchedArc;
+    /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
+    bool mLoggedFirstCalc;
 
     request_of_phase_process_class mPhaseReq;
     mDoExt_McaMorfSO* mpModelMorf;

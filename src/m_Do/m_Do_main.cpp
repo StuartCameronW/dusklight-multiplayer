@@ -90,6 +90,7 @@
 #include "dusk/io.hpp"
 #include "dusk/version.hpp"
 #include "dusk/discord_presence.hpp"
+#include "dusk/multiplayer.hpp"
 #include "tracy/Tracy.hpp"
 #include "f_pc/f_pc_draw.h"
 #include "tracy/Tracy.hpp"
@@ -434,6 +435,38 @@ static void ApplyCVarOverrides(const cxxopts::OptionValue& option) {
     }
 }
 
+/**
+ * Hand the --mp-* flags to the multiplayer layer. The session itself is not opened here: it is
+ * opened lazily on the first sim tick, once the game's subsystems are up.
+ */
+static void ApplyMultiplayerOptions(const cxxopts::ParseResult& parsed) {
+    // These locals must outlive the call — apply_startup_options copies out of them.
+    std::string connect;
+    std::string nickname;
+    std::string color;
+
+    dusk::mp::StartupOptions options;
+    options.host = parsed["mp-host"].as<bool>();
+
+    if (parsed.count("mp-connect") != 0) {
+        connect = parsed["mp-connect"].as<std::string>();
+        options.connect = connect.c_str();
+    }
+    if (parsed.count("mp-port") != 0) {
+        options.port = parsed["mp-port"].as<uint16_t>();
+    }
+    if (parsed.count("mp-name") != 0) {
+        nickname = parsed["mp-name"].as<std::string>();
+        options.nickname = nickname.c_str();
+    }
+    if (parsed.count("mp-color") != 0) {
+        color = parsed["mp-color"].as<std::string>();
+        options.color = color.c_str();
+    }
+
+    dusk::mp::apply_startup_options(options);
+}
+
 static constexpr PADDefaultMapping defaultPadMapping = {
     .buttons = {
         {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
@@ -513,7 +546,12 @@ int game_main(int argc, char* argv[]) {
             ("console", "Show the Windows console window for logs", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
             ("dvd", "Path to DVD image file", cxxopts::value<std::string>())
             ("backend", "Graphics API backend to use (auto, d3d12, d3d11, metal, vulkan, null)", cxxopts::value<std::string>())
-            ("cvar", "Override configuration variables without modifying config", cxxopts::value<std::vector<std::string>>());
+            ("cvar", "Override configuration variables without modifying config", cxxopts::value<std::vector<std::string>>())
+            ("mp-host", "Multiplayer: host a co-op session", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+            ("mp-connect", "Multiplayer: join a session at <address> or <address:port>", cxxopts::value<std::string>())
+            ("mp-port", "Multiplayer: UDP port to host on or join (default 7777)", cxxopts::value<uint16_t>())
+            ("mp-name", "Multiplayer: nickname shown to the other players", cxxopts::value<std::string>())
+            ("mp-color", "Multiplayer: player tint as RRGGBB hex", cxxopts::value<std::string>());
 
         arg_options.parse_positional({"dvd"});
         arg_options.positional_help("<dvd-image>");
@@ -543,6 +581,7 @@ int game_main(int argc, char* argv[]) {
 
     dusk::config::load_from_user_preferences();
     ApplyCVarOverrides(parsed_arg_options["cvar"]);
+    ApplyMultiplayerOptions(parsed_arg_options);
     dusk::android::update_surface_frame_rate();
     dusk::crash_reporting::initialize();
     dusk::crash_handler::install();

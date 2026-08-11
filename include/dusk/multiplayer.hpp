@@ -13,6 +13,35 @@
 
 namespace dusk::mp {
 
+/**
+ * A session asked for on the command line.
+ *
+ * Plain C types on purpose: this header is included by decomp translation units, so it must not
+ * pull in <string>. The strings are copied when the options are applied, so the caller keeps
+ * ownership of them.
+ */
+struct StartupOptions {
+    /// --mp-host: open a session and wait for players.
+    bool host = false;
+    /// --mp-connect: "address" or "address:port". Null or empty means no join was requested.
+    const char* connect = nullptr;
+    /// --mp-port: 0 leaves the port at its default.
+    unsigned short port = 0;
+    /// --mp-name: nickname shown to the other players.
+    const char* nickname = nullptr;
+    /// --mp-color: "RRGGBB" hex. Null or empty leaves the colour to the automatic palette.
+    const char* color = nullptr;
+};
+
+/**
+ * Record what the command line asked for. Must be called before the first tick; the session is
+ * actually opened lazily on that tick, once the game's own subsystems are up.
+ *
+ * These win over the DUSK_MP_* environment variables, which stay supported because they survive
+ * a process restart and because the two-instance test script uses them.
+ */
+void apply_startup_options(const StartupOptions& options);
+
 /// Called from fapGm_Before, immediately BEFORE the actor pass runs.
 /// Drains the transport and applies inbound state so actors execute against fresh data.
 /// Cheap and safe to call when multiplayer is inactive.

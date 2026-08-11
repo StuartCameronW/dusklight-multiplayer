@@ -77,23 +77,43 @@ NetworkManager& network_manager() {
     return sInstance;
 }
 
+void NetworkManager::set_startup_options(const StartupOptions& options) {
+    if (mInitialized) {
+        // The session is opened on the first tick, so anything arriving later is a wiring mistake
+        // rather than a user error. Say so instead of silently doing nothing.
+        Log.warn("Startup options arrived after the session was already initialized; ignoring");
+        return;
+    }
+    mStartup.host = options.host;
+    mStartup.connect = options.connect != nullptr ? options.connect : "";
+    mStartup.port = options.port;
+    mStartup.nickname = options.nickname != nullptr ? options.nickname : "";
+    mStartup.color = options.color != nullptr ? options.color : "";
+}
+
 void NetworkManager::ensure_initialized() {
     if (mInitialized) {
         return;
     }
     mInitialized = true;
 
-    // Milestone 0 activation is environment-driven so that no UI or CLI plumbing is needed yet.
-    // The real Host/Join lobby replaces this at M2 (see 05-ui-integration.md).
-    const std::uint16_t port = env_port("DUSK_MP_PORT", kDefaultPort);
+    // Command line first, environment second. The real Host/Join lobby replaces both at M2
+    // (see 05-ui-integration.md); until then these are how a session gets opened.
+    const std::uint16_t port =
+        mStartup.port != 0 ? mStartup.port : env_port("DUSK_MP_PORT", kDefaultPort);
 
-    if (const char* name = env_or_null("DUSK_MP_NAME")) {
+    if (!mStartup.nickname.empty()) {
+        mLocalNickname = mStartup.nickname;
+    } else if (const char* name = env_or_null("DUSK_MP_NAME")) {
         mLocalNickname = name;
     }
     if (mLocalNickname.empty()) {
         mLocalNickname = "Player";
     }
-    if (const char* color = env_or_null("DUSK_MP_COLOR")) {
+
+    const char* envColor = env_or_null("DUSK_MP_COLOR");
+    const char* color = !mStartup.color.empty() ? mStartup.color.c_str() : envColor;
+    if (color != nullptr) {
         mLocalColor = static_cast<std::uint32_t>(std::strtoul(color, nullptr, 16)) & 0xFFFFFFu;
         mColorExplicit = true;
     } else {
@@ -102,7 +122,18 @@ void NetworkManager::ensure_initialized() {
         mLocalColor = kPlayerColors[0];
     }
 
-    if (const char* target = env_or_null("DUSK_MP_CONNECT")) {
+    const char* envTarget = env_or_null("DUSK_MP_CONNECT");
+    const char* target = !mStartup.connect.empty() ? mStartup.connect.c_str() : envTarget;
+    const bool wantsHost = mStartup.host || env_or_null("DUSK_MP_HOST") != nullptr;
+
+    if (target != nullptr && wantsHost) {
+        // Both were asked for. Hosting and joining are mutually exclusive, and guessing which one
+        // was meant is worse than refusing: pick neither and say why.
+        Log.warn("Both a host and a join were requested ('{}'); not starting a session", target);
+        return;
+    }
+
+    if (target != nullptr) {
         std::string address;
         std::uint16_t targetPort = port;
         split_address(target, address, targetPort);
@@ -110,7 +141,7 @@ void NetworkManager::ensure_initialized() {
         return;
     }
 
-    if (env_or_null("DUSK_MP_HOST") != nullptr) {
+    if (wantsHost) {
         host(port);
     }
 }

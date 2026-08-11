@@ -88,13 +88,21 @@ bool model_data_claimed(J3DModelData* i_modelData) {
 }
 
 /**
- * Load one animation out of the ARAM archive, sizing the staging buffer from the archive itself.
+ * Load one animation out of the ARAM archive.
  *
- * The size MUST come from the entry, not a constant. `readIdxResource` clamps to the buffer it is
- * given and reports the real size, so an undersized buffer silently yields a TRUNCATED animation
- * that `J3DAnmLoaderDataBase::load` then parses as garbage. daAlink_c gets away with literals only
- * because it hardcodes a different one per resource (0x400 to 0x6000 across d_a_alink*); a single
- * guess covering several animations is exactly how that goes wrong.
+ * Sizing the staging buffer is the whole job here, and getting it wrong is not loud. `data_size` is
+ * the size of the entry AS STORED, which for these animations is Yaz0-compressed — the expanded
+ * animation is several times larger. Both archive backends clamp the read to the buffer they are
+ * handed (JKRAramArchive rounds the destination DOWN to 0x20 and truncates the DMA; JKRMemArchive
+ * clamps the Yaz0 expand size) and then report the clamped figure as the size read, so a small
+ * buffer produces a silently truncated animation. J3DAnmLoaderDataBase::load parses that into an
+ * object whose internals point at nothing, and the failure finally surfaces as an access violation
+ * inside J3DJoint::recursiveCalc on the first calc() — a long way from the mistake.
+ *
+ * So: start from the stored size (exact when the entry is uncompressed), give compressed entries
+ * room to expand, and treat "the read exactly filled the buffer" as the signature of a clamp
+ * rather than of a lucky fit. daAlink_c avoids all of this by hardcoding a generous literal per
+ * resource (0x400 to 0x6000 across d_a_alink*), which works only because someone checked each one.
  */
 J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
     JKRArchive* archive = dComIfGp_getAnmArchive();
@@ -108,25 +116,57 @@ J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
         return NULL;
     }
 
-    const u32 size = static_cast<u32>(entry->data_size);
-    if (size == 0) {
+    const u32 storedSize = static_cast<u32>(entry->data_size);
+    if (storedSize == 0) {
         return NULL;
     }
 
-    u8* buffer = JKR_NEW_ARRAY_ARGS(u8, size, 0x20);
-    if (buffer == NULL) {
-        Log.warn("Out of heap for animation {} ({} bytes)", i_resIdx, size);
-        return NULL;
+    const JKRCompression compression =
+        JKRConvertAttrToCompressionType(entry->type_flags_and_name_offset >> 24);
+    /* Typical Yaz0 ratio on animation data is 2-3x; 4x means the first attempt almost always fits
+     * and the loop below is only a backstop. */
+    const u32 headroom = compression == COMPRESSION_NONE ? 1 : 4;
+    u32 size = ALIGN_NEXT(storedSize * headroom, 0x20);
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+        u8* buffer = JKR_NEW_ARRAY_ARGS(u8, size, 0x20);
+        if (buffer == NULL) {
+            Log.warn("Out of heap for animation {} ({} bytes)", i_resIdx, size);
+            return NULL;
+        }
+
+        const u32 read = JKRReadIdxResource(buffer, size, i_resIdx, archive);
+        if (read == 0) {
+            Log.warn("Animation {} read nothing into a {}-byte buffer", i_resIdx, size);
+            return NULL;
+        }
+
+        if (read >= size) {
+            // Exactly filled: assume it was clamped and there is more animation we did not get.
+            size *= 2;
+            continue;
+        }
+
+        // Compared byte-wise rather than as a u32 so this does not depend on which way round the
+        // header is on this platform.
+        if (buffer[0] != 'J' || buffer[1] != '3' || buffer[2] != 'D' || buffer[3] != '1') {
+            Log.warn("Animation {} is not a J3D binary after reading {} bytes", i_resIdx, read);
+            return NULL;
+        }
+
+        J3DAnmTransform* anm = static_cast<J3DAnmTransform*>(J3DAnmLoaderDataBase::load(buffer));
+        if (anm == NULL) {
+            Log.warn("J3D loader rejected animation {} ({} bytes)", i_resIdx, read);
+            return NULL;
+        }
+
+        Log.info("Loaded animation {}: {} stored -> {} expanded, {}-byte buffer", i_resIdx,
+            storedSize, read, size);
+        return anm;
     }
 
-    const u32 read = JKRReadIdxResource(buffer, size, i_resIdx, archive);
-    if (read == 0 || read > size) {
-        Log.warn("Animation {} read {} bytes into a {}-byte buffer", i_resIdx, read, size);
-        return NULL;
-    }
-
-    Log.info("Loaded animation {} ({} bytes)", i_resIdx, size);
-    return static_cast<J3DAnmTransform*>(J3DAnmLoaderDataBase::load(buffer));
+    Log.warn("Animation {} kept filling the buffer up to {} bytes; giving up", i_resIdx, size);
+    return NULL;
 }
 
 }  // namespace
@@ -271,6 +311,21 @@ int daRemotePlayer_c::execute() {
     if (!mHasPose) {
         // No network pose yet. Skipping calc keeps the puppet from flashing at its spawn point.
         return 1;
+    }
+
+    if (!mLoggedFirstCalc) {
+        mLoggedFirstCalc = true;
+        // A bad animation object does not announce itself here — it surfaces as an access violation
+        // on mpAnm's vtable several frames deep inside J3DJoint::recursiveCalc, with no hint of
+        // which pointer was wrong. One line before the first calc() makes that diagnosable from a
+        // log alone. The two animations are both J3DAnmTransformKey, so their vtable pointers must
+        // match each other and must look like an address in the executable.
+        Log.debug("Puppet {} first calc: morf={:#x} model={:#x} idle={:#x}/{:#x} walk={:#x}/{:#x}",
+            mPlayerId, reinterpret_cast<uintptr_t>(mpModelMorf), reinterpret_cast<uintptr_t>(model),
+            reinterpret_cast<uintptr_t>(mpIdleAnm),
+            mpIdleAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpIdleAnm) : 0,
+            reinterpret_cast<uintptr_t>(mpWalkAnm),
+            mpWalkAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpWalkAnm) : 0);
     }
 
     if (modelDataOwnedByPlayer()) {
