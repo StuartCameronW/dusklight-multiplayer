@@ -7,6 +7,7 @@
 
 #include <cstring>
 
+#include "JSystem/J3DGraphAnimator/J3DJoint.h"
 #include "JSystem/J3DGraphLoader/J3DAnmLoader.h"
 #include "JSystem/JKernel/JKRArchive.h"
 #include "d/actor/d_a_alink.h"
@@ -96,6 +97,13 @@ J3DModelData* body_model_data(const char* i_arcName) {
  * True when daAlink_c has installed its joint callbacks on this model data, i.e. the local player
  * is wearing this outfit. Those callbacks read J3DModel::getUserArea(), which is zero for any
  * model we create, so calling calc() on it is an immediate null dereference.
+ *
+ * ★ Only valid while Link is in the world. daAlink_c::initStatusWindow sets FLG2_STATUS_WINDOW_DRAW
+ * and then calls changeModelDataDirect(0), which takes the branch that sets all 35 body callbacks
+ * to NULL (d_a_alink_swindow.inc:195-197); resetStatusWindow puts them back (:368-375). So for as
+ * long as the pause menu is open this reports "unclaimed" for the outfit the local player is
+ * standing in. Do not use it as the ONLY guard against sharing — see ScopedJointIsolation below,
+ * which does not care what state the callbacks are in.
  */
 bool model_data_claimed(J3DModelData* i_modelData) {
     if (i_modelData == NULL || i_modelData->getJointNum() == 0) {
@@ -103,6 +111,75 @@ bool model_data_claimed(J3DModelData* i_modelData) {
     }
     return i_modelData->getJointNodePointer(0)->getCallBack() != NULL;
 }
+
+/**
+ * Borrow a J3DModelData that another actor may also be using, for exactly one calc().
+ *
+ * A J3DModelData loaded from an archive is shared by every J3DModel built from it, and the joint
+ * tree — which is where per-actor hooks get stored — belongs to the DATA, not to the model
+ * (J3DModel has no joint array at all). daAlink_c parks two kinds of pointer-to-itself there:
+ *
+ *   - joint callbacks on joints 0..34 (d_a_alink_swindow.inc:171-173). J3DJoint::recursiveCalc
+ *     fires these unconditionally (J3DJoint.cpp:218-221) — there is no per-model gate — and
+ *     daAlink_modelCallBack immediately does `(daAlink_c*)j3dSys.getModel()->getUserArea()` with no
+ *     null check (d_a_alink.cpp:2449), so it faults on any model that is not Link's.
+ *   - mtx calculators on joints 0, 1 and 16 (swindow.inc:167-169), which are the local player's own
+ *     animation blend tables. Those do not crash us; they would quietly drive OUR root and spine
+ *     from the local player's animation.
+ *
+ * There is traffic in the other direction too, and it is the one that would be easy to miss:
+ * mDoExt_McaMorfSO::modelCalc writes ITSELF onto joint 0 as the mtx calc every single frame
+ * (m_Do_ext.cpp:1804). Sharing without restoring would therefore leave the local player's root
+ * joint driven by a puppet's animation.
+ *
+ * So: save every joint hook, clear it, calc, put it back exactly as it was. The engine's own idiom
+ * (mDoExt_bckAnm::entry, m_Do_ext.cpp:239-242) is already "write your state onto the shared joint
+ * immediately before your calc"; this is that, with the restore that a second Link makes necessary.
+ * d_a_e_bg.cpp:1177-1187 and d_a_e_oct_bg.cpp:212-219 do the same install/calc/uninstall bracket.
+ *
+ * Why not give the puppet its own J3DModelData instead? Because on PC the model loader byte-swaps
+ * the archive buffer IN PLACE (J3DModelLoader.cpp:342-350 and :555, J3DShapeFactory.cpp:32-39, all
+ * under TARGET_LITTLE_ENDIAN). J3DModelData::getRawData() hands back those already-swapped bytes,
+ * so a second J3DModelLoaderDataBase::load on them would double-swap and destroy the original model
+ * as well. A private copy means mounting a second archive, or making the endian fixups idempotent
+ * inside libs/JSystem — a lot of blast radius, and neither buys anything this does not.
+ *
+ * RAII rather than a begin/end pair on purpose: leaving the local player's callbacks cleared
+ * because something returned early would break LINK, several frames later and nowhere near here.
+ */
+class ScopedJointIsolation {
+public:
+    ScopedJointIsolation(J3DModelData* i_modelData, J3DJointCallBack* i_callBacks,
+        J3DMtxCalc** i_mtxCalcs, u16 i_jointNum)
+        : mpModelData(i_modelData), mpCallBacks(i_callBacks), mpMtxCalcs(i_mtxCalcs),
+          mJointNum(i_jointNum) {
+        if (mpModelData == NULL || mpCallBacks == NULL || mpMtxCalcs == NULL) {
+            mJointNum = 0;
+            return;
+        }
+        for (u16 i = 0; i < mJointNum; i++) {
+            J3DJoint* joint = mpModelData->getJointNodePointer(i);
+            mpCallBacks[i] = joint->getCallBack();
+            mpMtxCalcs[i] = joint->getMtxCalc();
+            joint->setCallBack(NULL);
+            joint->setMtxCalc(NULL);
+        }
+    }
+
+    ~ScopedJointIsolation() {
+        for (u16 i = 0; i < mJointNum; i++) {
+            J3DJoint* joint = mpModelData->getJointNodePointer(i);
+            joint->setCallBack(mpCallBacks[i]);
+            joint->setMtxCalc(mpMtxCalcs[i]);
+        }
+    }
+
+private:
+    J3DModelData* mpModelData;
+    J3DJointCallBack* mpCallBacks;
+    J3DMtxCalc** mpMtxCalcs;
+    u16 mJointNum;
+};
 
 /**
  * Load one animation out of the ARAM archive.
@@ -205,6 +282,18 @@ int daRemotePlayer_c::createHeap() {
         modelData, NULL, NULL, mpIdleAnm, J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0, 0);
     if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
         return 0;
+    }
+
+    // Sized from the model rather than from daAlink_c's hardcoded 35 (d_a_alink_swindow.inc:171):
+    // the wolf skeleton runs to 40, and a bound that is right for one outfit and short for another
+    // would leave joints un-isolated, which is precisely the crash this exists to prevent.
+    mJointNum = modelData->getJointNum();
+    if (mJointNum != 0) {
+        mpSavedCallBacks = JKR_NEW_ARRAY(J3DJointCallBack, mJointNum);
+        mpSavedMtxCalcs = JKR_NEW_ARRAY(J3DMtxCalc*, mJointNum);
+        if (mpSavedCallBacks == NULL || mpSavedMtxCalcs == NULL) {
+            return 0;
+        }
     }
 
     // What is LEFT, not what was asked for. Adding the run animation grew the animation footprint
@@ -404,7 +493,14 @@ int daRemotePlayer_c::execute() {
 
     selectAnimation();
     mpModelMorf->play(0, 0);
-    setMatrix();
+    {
+        // Only setMatrix() needs the bracket: it is the one that reaches modelCalc(), and neither
+        // selectAnimation() nor play() writes to the model data (mDoExt_McaMorfSO::setAnm and
+        // ::play touch only their own frame controller, m_Do_ext.cpp:1721 and :1765).
+        ScopedJointIsolation isolation(
+            model->getModelData(), mpSavedCallBacks, mpSavedMtxCalcs, mJointNum);
+        setMatrix();
+    }
     return 1;
 }
 

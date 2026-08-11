@@ -1,6 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
+#include "JSystem/J3DGraphAnimator/J3DJoint.h"
 #include "f_op/f_op_actor.h"
 #include "m_Do/m_Do_ext.h"
 
@@ -68,6 +69,14 @@ private:
     J3DAnmTransform* mpIdleAnm;
     J3DAnmTransform* mpWalkAnm;
     J3DAnmTransform* mpRunAnm;
+
+    /* Scratch space for ScopedJointIsolation, which has to put back every joint hook it clears.
+     * Held per puppet rather than on the stack so the size follows the model's real joint count
+     * instead of a cap that a future outfit could quietly exceed. Allocated in createHeap, so they
+     * live and die with the actor's solid heap. */
+    u16 mJointNum;
+    J3DJointCallBack* mpSavedCallBacks;
+    J3DMtxCalc** mpSavedMtxCalcs;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */
