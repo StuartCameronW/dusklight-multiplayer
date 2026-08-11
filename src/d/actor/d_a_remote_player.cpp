@@ -36,13 +36,21 @@ const char l_kBodyResName[] = "al.bmd";
  */
 const u16 l_idleAnmIdx = dRes_ID_ALANM_BCK_WAITS_e;
 const u16 l_walkAnmIdx = dRes_ID_ALANM_BCK_WALKS_e;
+/* Pairs with WALKS in daAlink_c::m_anmDataTable (ANM_WALK / ANM_RUN, d_a_alink.cpp:301-302), so
+ * this is the cycle the local player runs on — not a faster playback of the walk.
+ */
+const u16 l_runAnmIdx = dRes_ID_ALANM_BCK_DASHS_e;
 
-/* Below this the puppet is standing still. Link's speedF is in units per tick. */
+/* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
+ * HIO rates below: this one is about network noise, not about gait.
+ */
 const f32 l_idleSpeedThreshold = 0.5f;
-/* speedF at which the walk cycle plays at its authored rate; faster input speeds it up. */
-const f32 l_walkReferenceSpeed = 6.0f;
-const f32 l_minAnmRate = 0.5f;
-const f32 l_maxAnmRate = 2.5f;
+
+/* Widens the walk/run crossover into a dead band. daAlink_c does not need this because it blends
+ * the two cycles continuously; we switch outright, and mNetSpeed is an interpolated value that
+ * jitters, so without hysteresis a puppet held near the crossover flips gait every tick.
+ */
+const f32 l_gaitHysteresis = 0.05f;
 
 /**
  * Pick a body archive the LOCAL player is not currently wearing.
@@ -188,7 +196,8 @@ int daRemotePlayer_c::createHeap() {
 
     mpIdleAnm = load_aram_anm(l_idleAnmIdx);
     mpWalkAnm = load_aram_anm(l_walkAnmIdx);
-    if (mpIdleAnm == NULL || mpWalkAnm == NULL) {
+    mpRunAnm = load_aram_anm(l_runAnmIdx);
+    if (mpIdleAnm == NULL || mpWalkAnm == NULL || mpRunAnm == NULL) {
         return 0;
     }
 
@@ -283,26 +292,57 @@ bool daRemotePlayer_c::modelDataOwnedByPlayer() const {
     return model_data_claimed(mpModelMorf->getModel()->getModelData());
 }
 
+/**
+ * Choose the gait from the replicated speed, the way the local player chooses it.
+ *
+ * daAlink_c normalises speedF against its top ground speed and crosses over at two fixed fractions
+ * (d_a_alink.cpp:7653/7784): wait blends into walk below mWalkChangeRate, walk into run below
+ * mRunChangeRate, run alone above it. Each cycle plays at its own authored rate — the game never
+ * speeds a walk up to stand in for a run.
+ *
+ * Those numbers are read from daAlinkHIO_move_c0::m rather than copied, so the puppet cannot drift
+ * out of step with the player if the table is ever corrected.
+ *
+ * ★ What we do NOT reproduce is the blend. daAlink_c drives two animations at once through
+ * daPy_frameCtrl_c pairs (commonDoubleAnime, m_Do_ext.cpp has the same idea in mDoExt_McaMorf2) and
+ * cross-fades by weight; mDoExt_McaMorfSO holds a single animation, so we quantise to whichever
+ * side of the blend is dominant and morf across the switch. Visible difference is confined to the
+ * walk/run transition; the endpoints match the player exactly. Proper blending is M3, alongside
+ * real action states.
+ */
 void daRemotePlayer_c::selectAnimation() {
-    const bool moving = mNetSpeed > l_idleSpeedThreshold;
-    const u16 wanted = moving ? l_walkAnmIdx : l_idleAnmIdx;
+    const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
 
-    f32 rate = 1.0f;
-    if (moving) {
-        // Rate-scale the walk cycle by the replicated speed so the feet roughly match the ground
-        // the puppet is covering. Coarse by design — real action states are M3.
-        rate = mNetSpeed / l_walkReferenceSpeed;
-        if (rate < l_minAnmRate) {
-            rate = l_minAnmRate;
-        } else if (rate > l_maxAnmRate) {
-            rate = l_maxAnmRate;
-        }
+    // Midpoint of the band daAlink_c cross-fades over, i.e. where its blend weight passes 0.5.
+    const f32 runFraction = 0.5f * (hio.mWalkChangeRate + hio.mRunChangeRate);
+    const f32 fraction = mNetSpeed / hio.mMaxSpeed;
+
+    u16 wanted;
+    if (mNetSpeed <= l_idleSpeedThreshold) {
+        wanted = l_idleAnmIdx;
+    } else if (mCurrentAnm == l_runAnmIdx) {
+        wanted = fraction < runFraction - l_gaitHysteresis ? l_walkAnmIdx : l_runAnmIdx;
+    } else {
+        wanted = fraction > runFraction + l_gaitHysteresis ? l_runAnmIdx : l_walkAnmIdx;
+    }
+
+    J3DAnmTransform* anm;
+    f32 rate;
+    if (wanted == l_runAnmIdx) {
+        anm = mpRunAnm;
+        rate = hio.mRunAnmSpeed;
+    } else if (wanted == l_walkAnmIdx) {
+        anm = mpWalkAnm;
+        rate = hio.mWalkAnmSpeed;
+    } else {
+        anm = mpIdleAnm;
+        rate = hio.mWaitAnmSpeed;
     }
 
     if (wanted != mCurrentAnm) {
-        // A short blend, so switching between idle and walk doesn't pop.
-        mpModelMorf->setAnm(
-            moving ? mpWalkAnm : mpIdleAnm, J3DFrameCtrl::EMode_LOOP, 5.0f, rate, 0.0f, -1.0f);
+        // A short morf, so changing gait doesn't pop. This is the one place we are standing in for
+        // the player's cross-fade, so it is doing more work here than a plain animation change.
+        mpModelMorf->setAnm(anm, J3DFrameCtrl::EMode_LOOP, 5.0f, rate, 0.0f, -1.0f);
         mCurrentAnm = wanted;
     } else {
         mpModelMorf->setPlaySpeed(rate);

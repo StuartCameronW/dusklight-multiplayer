@@ -13,11 +13,15 @@
  *
  * Rows are long-format (one row per subject per tick) because the number of players varies:
  *
- *   tick,ms,role,kind,playerId,x,y,z,angleY,speed,delayTicks,starvations,snaps,buffered
+ *   tick,ms,role,kind,playerId,x,y,z,angleY,speed,delayTicks,starvations,snaps,buffered,anm
  *
  * `kind` is `local` for this instance's own Link, `applied` for the pose pushed onto a puppet, and
  * `actor` for the pose read back off the puppet actor afterwards. `applied` and `actor` disagreeing
  * means the puppet is not honouring what it was given, which is a different bug from a bad pose.
+ *
+ * `anm` is set on `actor` rows only: the AlAnm resource index of the gait the puppet chose. It is
+ * here because a wrong gait is otherwise only visible on the OTHER player's screen, which makes it
+ * the one class of bug the harness could not catch on its own.
  */
 
 namespace dusk::mp::trace {

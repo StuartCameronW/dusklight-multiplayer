@@ -34,6 +34,9 @@ public:
      * inherited field would read as a permanent zero and misreport the puppet as standing still. */
     f32 getNetSpeed() const { return mNetSpeed; }
     bool hasPose() const { return mHasPose; }
+    /* Resource index of the gait currently playing. Exposed for --mp-trace: which animation a
+     * puppet picked is otherwise only checkable by looking at the other player's screen. */
+    u16 getCurrentAnm() const { return mCurrentAnm; }
 
 private:
     void setMatrix();
@@ -46,7 +49,8 @@ private:
     u32 mPlayerId;
     /* Body archive we loaded. Deliberately NOT the one the local player is wearing. */
     const char* mArcName;
-    /* Horizontal speed from the network, used to pick and rate-scale the animation. */
+    /* Horizontal speed from the network. Picks the gait, against the same thresholds daAlink_c
+     * uses; it does NOT rate-scale a single cycle. */
     f32 mNetSpeed;
     /* Resource index of the animation currently playing, so setAnm only fires on a real change. */
     u16 mCurrentAnm;
@@ -63,6 +67,7 @@ private:
     mDoExt_McaMorfSO* mpModelMorf;
     J3DAnmTransform* mpIdleAnm;
     J3DAnmTransform* mpWalkAnm;
+    J3DAnmTransform* mpRunAnm;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */

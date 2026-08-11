@@ -174,6 +174,15 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     return true;
 }
 
+bool read_puppet_anim(std::uint32_t playerId, std::uint16_t& out) {
+    daRemotePlayer_c* puppet = resolve_puppet(playerId);
+    if (puppet == nullptr) {
+        return false;
+    }
+    out = puppet->getCurrentAnm();
+    return true;
+}
+
 void destroy_puppet(std::uint32_t playerId) {
     const auto it = s_puppets.find(playerId);
     if (it == s_puppets.end()) {

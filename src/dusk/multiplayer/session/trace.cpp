@@ -27,11 +27,11 @@ long long elapsed_ms() {
 
 void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     const PlayerState& state, double delayTicks, std::uint32_t starvations, std::uint32_t snaps,
-    std::size_t buffered) {
+    std::size_t buffered, unsigned anm = 0) {
     sFile << tick << ',' << elapsed_ms() << ',' << sRole << ',' << kind << ',' << playerId << ','
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
           << state.speed << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
-          << buffered << '\n';
+          << buffered << ',' << anm << '\n';
 }
 
 }  // namespace
@@ -46,8 +46,8 @@ void open(const std::string& path, const char* role) {
     sRole = role;
     sStart = std::chrono::steady_clock::now();
     sEnabled = true;
-    sFile
-        << "tick,ms,role,kind,playerId,x,y,z,angleY,speed,delayTicks,starvations,snaps,buffered\n";
+    sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,speed,delayTicks,starvations,snaps,buffered,"
+             "anm\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
@@ -77,7 +77,9 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
 
         PlayerState actual;
         if (read_puppet_pose(player.playerId, actual)) {
-            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0);
+            std::uint16_t anm = 0;
+            read_puppet_anim(player.playerId, anm);
+            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm);
         }
     }
 

@@ -39,6 +39,10 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state);
 /// pose we last pushed: if the two disagree, the puppet is not honouring what it was given.
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out);
 
+/// Read back which gait animation the puppet chose, as an AlAnm resource index. Kept out of
+/// PlayerState, which is a wire type: this is local presentation, not replicated state.
+bool read_puppet_anim(std::uint32_t playerId, std::uint16_t& out);
+
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 
