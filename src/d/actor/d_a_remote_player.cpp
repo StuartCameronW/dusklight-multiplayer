@@ -207,6 +207,16 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
+    // What is LEFT, not what was asked for. Adding the run animation grew the animation footprint
+    // from ~20 KB to ~35 KB inside a fixed 0x20000 solid heap, and a heap that is merely nearly
+    // full does not announce itself: every allocation here still succeeds and the damage, if any,
+    // shows up later and somewhere else. One line makes the margin a number instead of a guess.
+    JKRHeap* heap = JKRGetCurrentHeap();
+    if (heap != NULL) {
+        Log.info("Puppet heap after setup: {} bytes free, largest block {}", heap->getFreeSize(),
+            heap->getMaxAllocatableSize(0x20));
+    }
+
     return 1;
 }
 
@@ -369,12 +379,15 @@ int daRemotePlayer_c::execute() {
         // which pointer was wrong. One line before the first calc() makes that diagnosable from a
         // log alone. The two animations are both J3DAnmTransformKey, so their vtable pointers must
         // match each other and must look like an address in the executable.
-        Log.debug("Puppet {} first calc: morf={:#x} model={:#x} idle={:#x}/{:#x} walk={:#x}/{:#x}",
+        Log.debug("Puppet {} first calc: morf={:#x} model={:#x} idle={:#x}/{:#x} walk={:#x}/{:#x} "
+                  "run={:#x}/{:#x}",
             mPlayerId, reinterpret_cast<uintptr_t>(mpModelMorf), reinterpret_cast<uintptr_t>(model),
             reinterpret_cast<uintptr_t>(mpIdleAnm),
             mpIdleAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpIdleAnm) : 0,
             reinterpret_cast<uintptr_t>(mpWalkAnm),
-            mpWalkAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpWalkAnm) : 0);
+            mpWalkAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpWalkAnm) : 0,
+            reinterpret_cast<uintptr_t>(mpRunAnm),
+            mpRunAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpRunAnm) : 0);
     }
 
     if (modelDataOwnedByPlayer()) {

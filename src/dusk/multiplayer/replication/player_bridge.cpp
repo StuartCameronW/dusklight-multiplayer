@@ -24,6 +24,20 @@ aurora::Module Log{"dusk::mp"};
 /// loading. Creation is multi-phase and hits the DVD, so this has to be generous; ~4 s at 30 Hz.
 constexpr int kCreateGraceTicks = 120;
 
+/*
+ * ★ Do NOT add a "wait N settled ticks before creating the puppet" gate here.
+ *
+ * That was tried on 2026-08-12 as a mitigation for a hang, on the theory that creating a puppet on
+ * the first playable tick after an event ends was too early. It is a reasonable-sounding theory and
+ * it is wrong: with a 15-tick delay the joining instance hung on the puppet's first calc() in two
+ * runs out of two, and with the delay removed it completed 1,076 in-world ticks. Delaying creation
+ * did not avoid a bad moment, it moved creation INTO one.
+ *
+ * The useful part of that result is the clue: puppet creation is sensitive to where in the room's
+ * lifecycle it lands, which is worth knowing when the real hang is finally chased. Whatever the
+ * eventual fix is, it will not be a timer.
+ */
+
 struct PuppetRef {
     fpc_ProcID id = 0;
     /// True once the actor has resolved at least once. Before that, a NULL resolve means "still
@@ -47,8 +61,14 @@ daRemotePlayer_c* resolve_puppet(std::uint32_t playerId) {
     // The two-argument form reports NULL while the actor is still mid-create, where the inline
     // one-argument overload would hand back a half-constructed process.
     fopAcM_SearchByID(it->second.id, &actor);
-    if (actor != nullptr) {
+    if (actor != nullptr && !it->second.everResolved) {
         it->second.everResolved = true;
+        // One line, once, on the tick the actor first becomes resolvable. The hang on 2026-08-11
+        // left a log ending at "using body archive" with the actor's own first-calc dump absent,
+        // which narrowed it to "after create() returned, before the first execute() did any work"
+        // and no further — because nothing was logged in between. This is that missing line.
+        Log.debug("Puppet for player {} resolved after {} tick(s); entering the actor pass",
+            playerId, it->second.ticksSinceRequest);
     }
     return static_cast<daRemotePlayer_c*>(actor);
 }
