@@ -44,6 +44,8 @@ private:
     void selectAnimation();
     /// Drive the private archive mount forward; returns a cPhs_* step for create() to hand back.
     int mountOwnArchive();
+    /// Draw one sub-model, lit like the body. Null-tolerant, so a missing part costs a part.
+    void drawModel(J3DModel* i_model);
 
     /* Which replicated player this puppet represents; arrives as the create parameter. */
     u32 mPlayerId;
@@ -76,6 +78,13 @@ private:
     J3DAnmTransform* mpIdleAnm;
     J3DAnmTransform* mpWalkAnm;
     J3DAnmTransform* mpRunAnm;
+
+    /* Link is four models. The body is the one the animation drives; these three are posed off its
+     * joints every frame in setMatrix(). Any of them may be NULL — a puppet missing a head is a
+     * better failure than no puppet at all. */
+    J3DModel* mpHeadModel;
+    J3DModel* mpHandModel;
+    J3DModel* mpFaceModel;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */

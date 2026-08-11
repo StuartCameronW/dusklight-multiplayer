@@ -35,13 +35,21 @@ aurora::Module Log{"dusk::mp"};
 struct OutfitArc {
     const char* arcName;
     const char* bodyResName;
+    const char* headResName;
+    const char* handsResName;
+    const char* faceResName;
 };
 
+/* Link is four models, not one — body, head, hands and face — and the outfits do not name them
+ * consistently (Zora and magic armour reuse al_hands.bmd; only Zora has its own face). Taken from
+ * the outfit branches of daAlink_c::setLinkModel, d_a_alink_wolf.inc:328-377.
+ */
 const OutfitArc l_outfits[] = {
-    {"Bmdl", "bl.bmd"},  // Ordon / casual clothes
-    {"Kmdl", "al.bmd"},  // hero's clothes
-    {"Zmdl", "zl.bmd"},  // Zora armour
-    {"Mmdl", "ml.bmd"},  // magic armour
+    // arc      body       head            hands            face
+    {"Bmdl", "bl.bmd", "bl_head.bmd", "bl_hands.bmd", "al_face.bmd"},  // Ordon / casual clothes
+    {"Kmdl", "al.bmd", "al_head.bmd", "al_hands.bmd", "al_face.bmd"},  // hero's clothes
+    {"Zmdl", "zl.bmd", "zl_head.bmd", "al_hands.bmd", "zl_face.bmd"},  // Zora armour
+    {"Mmdl", "ml.bmd", "ml_head.bmd", "al_hands.bmd", "al_face.bmd"},  // magic armour
 };
 
 const int l_outfitNum = sizeof(l_outfits) / sizeof(l_outfits[0]);
@@ -54,6 +62,35 @@ const int l_defaultOutfit = 1;
  * (d_resorce.h:96).
  */
 const char l_objectPath[] = "/res/Object/";
+
+/* Body joints the sub-models hang off. daAlink_c uses these same three literals: the head and face
+ * both ride joint 4 (d_a_alink.cpp:5968-5970) and the hands model's own joints 1 and 2 are
+ * overwritten with the body's hand joints after its calc (d_a_alink.cpp:19013-19014).
+ */
+const u16 l_headJointNo = 4;
+const u16 l_leftHandJointNo = 9;
+const u16 l_rightHandJointNo = 0xE;
+
+/* The hands model holds ELEVEN alternative hand poses as separate shapes and shows exactly one per
+ * hand (daAlink_c::setDrawHand, d_a_alink.cpp:18928-19057); draw them all and Link sprouts a
+ * bouquet of hands. daAlink_c picks per frame from what he is holding. A puppet has no replicated
+ * equipment yet, so it takes the pair the pause menu uses as its neutral
+ * (d_a_alink.cpp:18936-18946) and holds them. Item-dependent hands arrive with equipment
+ * replication.
+ */
+const u16 l_handShapeNum = 11;
+const u16 l_leftHandShape = 0;
+const u16 l_rightHandShape = 6;
+
+/* Matches daAlink_c::initModel (d_a_alink.h:3732 -> d_a_alink.cpp:4131), minus the warp-material
+ * branch, which only fires for the midna-warp texture and cannot apply to these.
+ */
+J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
+    if (i_modelData == NULL) {
+        return NULL;
+    }
+    return mDoExt_J3DModel__create(i_modelData, 0x80000, i_diffFlags | 0x11000084);
+}
 
 /* Link's animations do not live in the body archive — they are in AlAnm, mounted in ARAM at boot
  * and streamed by index.
@@ -225,6 +262,60 @@ int daRemotePlayer_c::createHeap() {
         modelData, NULL, NULL, mpIdleAnm, J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0, 0);
     if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
         return 0;
+    }
+
+    /* Head, hands and face. Without these the puppet is a headless, handless body — which is
+     * exactly what Stuart saw ("only ears") before this, because the archive carries them but
+     * nothing attached them. They are separate models posed off the body's joints every frame in
+     * setMatrix(), not extra geometry on the body skeleton.
+     *
+     * A missing sub-model is deliberately NOT fatal: an outfit whose head resource is named
+     * differently should cost a head, not the whole puppet. own_archive_res() already logs which
+     * name was missing. */
+    const OutfitArc& outfit = l_outfits[mOutfit];
+    mpHeadModel =
+        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0);
+    mpHandModel =
+        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0);
+    mpFaceModel = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)), 0x20200);
+
+    /* Dusk already fixes Link's eyes vanishing on PC by clamping maxLOD on three face textures
+     * (d_a_alink_wolf.inc:379-395). That fix is applied to the local player's face model data, and
+     * our private mount is a different copy, so it has to be applied again here or puppets get the
+     * bug the local player no longer has. Safe to write: nothing else shares these textures.
+     */
+    if (mpFaceModel != NULL) {
+        J3DModelData* faceData = mpFaceModel->getModelData();
+        J3DTexture* tex = faceData->getTexture();
+        JUTNameTab* nameTab = faceData->getTextureName();
+        if (tex != NULL && nameTab != NULL) {
+            for (u16 i = 0; i < tex->getNum(); i++) {
+                const char* texName = nameTab->getName(i);
+                if (texName != NULL && (std::strcmp(texName, "al_eyeball") == 0 ||
+                                           std::strcmp(texName, "highlight02") == 0 ||
+                                           std::strcmp(texName, "eye_kage01") == 0))
+                {
+                    tex->getResTIMG(i)->maxLOD = 0;
+                }
+            }
+        }
+    }
+
+    if (mpHandModel != NULL) {
+        J3DModelData* handData = mpHandModel->getModelData();
+        const u16 shapeNum = handData->getMaterialNum() < l_handShapeNum ?
+                                 handData->getMaterialNum() :
+                                 l_handShapeNum;
+        for (u16 i = 0; i < shapeNum; i++) {
+            handData->getMaterialNodePointer(i)->getShape()->hide();
+        }
+        if (l_leftHandShape < shapeNum) {
+            handData->getMaterialNodePointer(l_leftHandShape)->getShape()->show();
+        }
+        if (l_rightHandShape < shapeNum) {
+            handData->getMaterialNodePointer(l_rightHandShape)->getShape()->show();
+        }
     }
 
     // What is LEFT, not what was asked for. Adding the run animation grew the animation footprint
@@ -413,6 +504,29 @@ void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::YrotM(shape_angle.y);
     model->setBaseTRMtx(mDoMtx_stack_c::get());
     mpModelMorf->modelCalc();
+
+    /* Sub-models ride the body's joints, so they must be posed AFTER the body's calc. The head and
+     * face take the head joint's matrix as their whole base transform; the hands take the body's
+     * base transform and then have their own two joints overwritten with the body's hand joints
+     * (daAlink_c does the same three things, d_a_alink.cpp:5968-5980 and :19007-19014). Note the
+     * hand fix-up has to come after the hand model's own calc(), not before, or calc overwrites it.
+     */
+    if (mpHeadModel != NULL) {
+        mpHeadModel->setBaseTRMtx(model->getAnmMtx(l_headJointNo));
+        mpHeadModel->calc();
+    }
+
+    if (mpFaceModel != NULL) {
+        mpFaceModel->setBaseTRMtx(model->getAnmMtx(l_headJointNo));
+        mpFaceModel->calc();
+    }
+
+    if (mpHandModel != NULL) {
+        mpHandModel->setBaseTRMtx(model->getBaseTRMtx());
+        mpHandModel->calc();
+        mpHandModel->setAnmMtx(1, model->getAnmMtx(l_leftHandJointNo));
+        mpHandModel->setAnmMtx(2, model->getAnmMtx(l_rightHandJointNo));
+    }
 }
 
 int daRemotePlayer_c::execute() {
@@ -452,6 +566,15 @@ static int daRemotePlayer_Execute(daRemotePlayer_c* i_this) {
     return i_this->execute();
 }
 
+/// One sub-model, lit like the body. Mirrors daAlink_c::basicModelDraw (d_a_alink.cpp:19370).
+void daRemotePlayer_c::drawModel(J3DModel* i_model) {
+    if (i_model == NULL) {
+        return;
+    }
+    g_env_light.setLightTevColorType_MAJI(i_model, &tevStr);
+    mDoExt_modelEntryDL(i_model);
+}
+
 int daRemotePlayer_c::draw() {
     if (!mHasPose) {
         return 1;
@@ -460,8 +583,12 @@ int daRemotePlayer_c::draw() {
     // 10 is the light type daAlink_c uses for human Link (d_a_alink.cpp:19468), so the puppet is
     // lit consistently with the local player rather than as scenery.
     g_env_light.settingTevStruct(10, &current.pos, &tevStr);
-    g_env_light.setLightTevColorType_MAJI(model, &tevStr);
-    mDoExt_modelEntryDL(model);
+    drawModel(model);
+    // Same order daAlink_c draws them in, which matters for the face: it is drawn after the head so
+    // it wins the depth fight at the eyes rather than being buried inside it.
+    drawModel(mpHeadModel);
+    drawModel(mpFaceModel);
+    drawModel(mpHandModel);
     return 1;
 }
 
