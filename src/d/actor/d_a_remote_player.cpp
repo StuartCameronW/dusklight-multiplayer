@@ -23,14 +23,37 @@ namespace {
 
 aurora::Module Log{"dusk::mp"};
 
-/* Two interchangeable body archives. Their skeletons are joint-for-joint identical (compare AL_JNT
- * in Kmdl.h with BL_JNT in Bmdl.h), so every AlAnm animation drives either one.
+/* Every human outfit daAlink_c::setArcName can select (d_a_alink_swindow.inc:14-26), with the body
+ * model inside each. The skeletons are joint-for-joint identical across all of them (compare AL_JNT
+ * in Kmdl.h with BL_JNT in Bmdl.h), so every AlAnm animation drives any of them.
+ *
+ * Wmdl — wolf — is deliberately absent. It has a different skeleton and a different animation set,
+ * and transform is per-player by policy (mp_policy.hpp), so a puppet whose owner is a wolf needs a
+ * genuinely different model rather than a different entry here. Until that exists we fall back to
+ * the hero's clothes; see outfit_arc_name().
  */
-const char l_bArcName[] = "Bmdl";  // Ordon / casual clothes
-const char l_kArcName[] = "Kmdl";  // hero's clothes
+struct OutfitArc {
+    const char* arcName;
+    const char* bodyResName;
+};
 
-const char l_bBodyResName[] = "bl.bmd";
-const char l_kBodyResName[] = "al.bmd";
+const OutfitArc l_outfits[] = {
+    {"Bmdl", "bl.bmd"},  // Ordon / casual clothes
+    {"Kmdl", "al.bmd"},  // hero's clothes
+    {"Zmdl", "zl.bmd"},  // Zora armour
+    {"Mmdl", "ml.bmd"},  // magic armour
+};
+
+const int l_outfitNum = sizeof(l_outfits) / sizeof(l_outfits[0]);
+
+/* Index into l_outfits used when we have nothing better — the hero's clothes. */
+const int l_defaultOutfit = 1;
+
+/* Where object archives live on disc. dRes_info_c::set builds "<path><name>.arc" from these
+ * (d_resorce.cpp:58-62); it is the same string dRes_control_c::setObjectRes passes
+ * (d_resorce.h:96).
+ */
+const char l_objectPath[] = "/res/Object/";
 
 /* Link's animations do not live in the body archive — they are in AlAnm, mounted in ARAM at boot
  * and streamed by index.
@@ -54,132 +77,51 @@ const f32 l_idleSpeedThreshold = 0.5f;
 const f32 l_gaitHysteresis = 0.05f;
 
 /**
- * Pick a body archive the LOCAL player is not currently wearing.
+ * Which outfit archive a puppet should wear.
  *
- * This is not cosmetic. daAlink_c installs joint callbacks on the shared J3DModelData
- * (d_a_alink_swindow.inc:171-173), and daAlink_modelCallBack dereferences
- * J3DModel::getUserArea() (d_a_alink.cpp:2449) — which is zero on any model we create. Calling
- * calc() on a model built from the archive Link is wearing is therefore an immediate null
- * dereference. Taking the other outfit sidesteps the whole problem.
+ * ★ Placeholder: this currently mirrors the LOCAL player. Stuart's rule (2026-08-12) is that
+ * appearance is owned by the wearer — whatever P2 is wearing on their own screen is what P1 should
+ * see — so this becomes a replicated property of the sender. It is not one yet; PlayerState does
+ * not carry the outfit. Matching the local player is the right placeholder because it is correct in
+ * the common case (both players in the same clothes) and, unlike the arrangement it replaces, it no
+ * longer deliberately shows the WRONG clothes.
  *
- * ★ This is a WORKAROUND, not a design, and it has a visible cost: the puppet can never wear the
- * same clothes as the local player, so on a save where both players would be in the hero's tunic
- * the remote one shows up in Ordon clothes. Confirmed on screen 2026-08-11. It reads as an
- * at-a-glance cue for which Link is you, but that is a consolation, not the reason — do not treat
- * the mismatch as intended behaviour.
- *
- * Proper fix (M3): give the puppet its OWN copy of the J3DModelData rather than sharing Link's, so
- * daAlink_c's joint callbacks and getUserArea() never apply to it. Outfit then becomes a
- * replicated property of the wearer instead of a collision-avoidance choice.
+ * Wolf is not an outfit swap. Wmdl has its own skeleton and animation set, so a wolf owner falls
+ * back to the hero's clothes and looks like a human Link until transform replication exists.
  */
-const char* select_arc_name() {
+int outfit_index_for_local_player() {
     const daAlink_c* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (link != NULL && link->mArcName != NULL && std::strcmp(link->mArcName, l_bArcName) == 0) {
-        return l_kArcName;
+    if (link != NULL && link->mArcName != NULL) {
+        for (int i = 0; i < l_outfitNum; i++) {
+            if (std::strcmp(link->mArcName, l_outfits[i].arcName) == 0) {
+                return i;
+            }
+        }
     }
-    return l_bArcName;
+    return l_defaultOutfit;
 }
 
-const char* other_arc_name(const char* i_arcName) {
-    return i_arcName == l_bArcName ? l_kArcName : l_bArcName;
-}
-
-J3DModelData* body_model_data(const char* i_arcName) {
-    const char* resName = i_arcName == l_kArcName ? l_kBodyResName : l_bBodyResName;
-    const int idx = dComIfG_getObjctResName2Index(i_arcName, resName);
-    if (idx < 0) {
+/**
+ * Fetch a resource out of a PRIVATELY mounted archive.
+ *
+ * dComIfG_getObjectRes cannot be used here: it looks the name up in the global 128-slot resource
+ * table, which is exactly the shared entry we are avoiding. This is the same two steps
+ * dRes_control_c::getRes performs once it has the dRes_info_c in hand (d_resorce.cpp:928-940).
+ */
+void* own_archive_res(dRes_info_c& i_res, const char* i_resName) {
+    JKRArchive* archive = i_res.getArchive();
+    if (archive == NULL) {
         return NULL;
     }
-    return static_cast<J3DModelData*>(dComIfG_getObjectRes(i_arcName, static_cast<u16>(idx)));
+
+    JKRArchive::SDIFileEntry* entry = archive->findNameResource(i_resName);
+    if (entry == NULL) {
+        Log.warn("Resource '{}' is not in the puppet's private archive", i_resName);
+        return NULL;
+    }
+
+    return i_res.getRes(entry - archive->mFiles);
 }
-
-/**
- * True when daAlink_c has installed its joint callbacks on this model data, i.e. the local player
- * is wearing this outfit. Those callbacks read J3DModel::getUserArea(), which is zero for any
- * model we create, so calling calc() on it is an immediate null dereference.
- *
- * ★ Only valid while Link is in the world. daAlink_c::initStatusWindow sets FLG2_STATUS_WINDOW_DRAW
- * and then calls changeModelDataDirect(0), which takes the branch that sets all 35 body callbacks
- * to NULL (d_a_alink_swindow.inc:195-197); resetStatusWindow puts them back (:368-375). So for as
- * long as the pause menu is open this reports "unclaimed" for the outfit the local player is
- * standing in. Do not use it as the ONLY guard against sharing — see ScopedJointIsolation below,
- * which does not care what state the callbacks are in.
- */
-bool model_data_claimed(J3DModelData* i_modelData) {
-    if (i_modelData == NULL || i_modelData->getJointNum() == 0) {
-        return false;
-    }
-    return i_modelData->getJointNodePointer(0)->getCallBack() != NULL;
-}
-
-/**
- * Borrow a J3DModelData that another actor may also be using, for exactly one calc().
- *
- * A J3DModelData loaded from an archive is shared by every J3DModel built from it, and the joint
- * tree — which is where per-actor hooks get stored — belongs to the DATA, not to the model
- * (J3DModel has no joint array at all). daAlink_c parks two kinds of pointer-to-itself there:
- *
- *   - joint callbacks on joints 0..34 (d_a_alink_swindow.inc:171-173). J3DJoint::recursiveCalc
- *     fires these unconditionally (J3DJoint.cpp:218-221) — there is no per-model gate — and
- *     daAlink_modelCallBack immediately does `(daAlink_c*)j3dSys.getModel()->getUserArea()` with no
- *     null check (d_a_alink.cpp:2449), so it faults on any model that is not Link's.
- *   - mtx calculators on joints 0, 1 and 16 (swindow.inc:167-169), which are the local player's own
- *     animation blend tables. Those do not crash us; they would quietly drive OUR root and spine
- *     from the local player's animation.
- *
- * There is traffic in the other direction too, and it is the one that would be easy to miss:
- * mDoExt_McaMorfSO::modelCalc writes ITSELF onto joint 0 as the mtx calc every single frame
- * (m_Do_ext.cpp:1804). Sharing without restoring would therefore leave the local player's root
- * joint driven by a puppet's animation.
- *
- * So: save every joint hook, clear it, calc, put it back exactly as it was. The engine's own idiom
- * (mDoExt_bckAnm::entry, m_Do_ext.cpp:239-242) is already "write your state onto the shared joint
- * immediately before your calc"; this is that, with the restore that a second Link makes necessary.
- * d_a_e_bg.cpp:1177-1187 and d_a_e_oct_bg.cpp:212-219 do the same install/calc/uninstall bracket.
- *
- * Why not give the puppet its own J3DModelData instead? Because on PC the model loader byte-swaps
- * the archive buffer IN PLACE (J3DModelLoader.cpp:342-350 and :555, J3DShapeFactory.cpp:32-39, all
- * under TARGET_LITTLE_ENDIAN). J3DModelData::getRawData() hands back those already-swapped bytes,
- * so a second J3DModelLoaderDataBase::load on them would double-swap and destroy the original model
- * as well. A private copy means mounting a second archive, or making the endian fixups idempotent
- * inside libs/JSystem — a lot of blast radius, and neither buys anything this does not.
- *
- * RAII rather than a begin/end pair on purpose: leaving the local player's callbacks cleared
- * because something returned early would break LINK, several frames later and nowhere near here.
- */
-class ScopedJointIsolation {
-public:
-    ScopedJointIsolation(J3DModelData* i_modelData, J3DJointCallBack* i_callBacks,
-        J3DMtxCalc** i_mtxCalcs, u16 i_jointNum)
-        : mpModelData(i_modelData), mpCallBacks(i_callBacks), mpMtxCalcs(i_mtxCalcs),
-          mJointNum(i_jointNum) {
-        if (mpModelData == NULL || mpCallBacks == NULL || mpMtxCalcs == NULL) {
-            mJointNum = 0;
-            return;
-        }
-        for (u16 i = 0; i < mJointNum; i++) {
-            J3DJoint* joint = mpModelData->getJointNodePointer(i);
-            mpCallBacks[i] = joint->getCallBack();
-            mpMtxCalcs[i] = joint->getMtxCalc();
-            joint->setCallBack(NULL);
-            joint->setMtxCalc(NULL);
-        }
-    }
-
-    ~ScopedJointIsolation() {
-        for (u16 i = 0; i < mJointNum; i++) {
-            J3DJoint* joint = mpModelData->getJointNodePointer(i);
-            joint->setCallBack(mpCallBacks[i]);
-            joint->setMtxCalc(mpMtxCalcs[i]);
-        }
-    }
-
-private:
-    J3DModelData* mpModelData;
-    J3DJointCallBack* mpCallBacks;
-    J3DMtxCalc** mpMtxCalcs;
-    u16 mJointNum;
-};
 
 /**
  * Load one animation out of the ARAM archive.
@@ -266,7 +208,8 @@ J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
 }  // namespace
 
 int daRemotePlayer_c::createHeap() {
-    J3DModelData* modelData = body_model_data(mArcName);
+    J3DModelData* modelData =
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_outfits[mOutfit].bodyResName));
     if (modelData == NULL) {
         return 0;
     }
@@ -282,18 +225,6 @@ int daRemotePlayer_c::createHeap() {
         modelData, NULL, NULL, mpIdleAnm, J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0, 0);
     if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
         return 0;
-    }
-
-    // Sized from the model rather than from daAlink_c's hardcoded 35 (d_a_alink_swindow.inc:171):
-    // the wolf skeleton runs to 40, and a bound that is right for one outfit and short for another
-    // would leave joints un-isolated, which is precisely the crash this exists to prevent.
-    mJointNum = modelData->getJointNum();
-    if (mJointNum != 0) {
-        mpSavedCallBacks = JKR_NEW_ARRAY(J3DJointCallBack, mJointNum);
-        mpSavedMtxCalcs = JKR_NEW_ARRAY(J3DMtxCalc*, mJointNum);
-        if (mpSavedCallBacks == NULL || mpSavedMtxCalcs == NULL) {
-            return 0;
-        }
     }
 
     // What is LEFT, not what was asked for. Adding the run animation grew the animation footprint
@@ -313,32 +244,67 @@ static int daRemotePlayer_createHeap(fopAc_ac_c* i_this) {
     return static_cast<daRemotePlayer_c*>(i_this)->createHeap();
 }
 
+/**
+ * Mount this puppet's OWN copy of the outfit archive.
+ *
+ * ★ Deliberately NOT dComIfG_resLoad. That registers against a global, name-keyed,
+ * reference-counted table (dRes_control_c::setRes, d_resorce.cpp:793-816), so a puppet asking for
+ * the outfit the local player is wearing gets a second reference to Link's ONE archive. Two things
+ * then go wrong, and both are fatal rather than cosmetic:
+ *
+ *   - The joint tree is shared, so daAlink_c's per-actor callbacks and mtx calculators apply to our
+ *     model too (see the note on the M3 fix in 00-status.md).
+ *   - Worse, the lifetime is not actually shared. Link loads his outfit into his own heap
+ *     (d_a_alink.cpp:4971), and on a clothes change he calls dComIfG_resDelete and then
+ *     mpArcHeap->freeAll() two lines later (d_a_alink_swindow.inc:80-87). freeAll knows nothing
+ *     about the reference count — it wipes the heap regardless — so changing clothes would free the
+ *     archive out from under any puppet still pointing into it. Note that setRes only honours the
+ *     caller's heap for the FIRST loader (d_resorce.cpp:807 sits inside the `resInfo == NULL`
+ *     branch), so a puppet cannot opt out by passing its own heap either.
+ *
+ * A private dRes_info_c sidesteps all of it: our own mount, our own J3DModelData with a clean joint
+ * tree, our own lifetime, destroyed with the actor. It is the same machinery the global table uses
+ * per entry — set() starts the async mount, setRes() polls it and then runs loadResource() — just
+ * not registered anywhere, so nothing else can find it, share it, or free it.
+ *
+ * Cost is one extra archive per remote player (Link budgets 0xA2800 for his, d_a_alink.cpp:4969).
+ * Passing NULL for the heap puts it where the puppet's archive already went before this change: the
+ * global archive heap, which nothing ever calls freeAll on.
+ */
+int daRemotePlayer_c::mountOwnArchive() {
+    if (!mResRequested) {
+        if (!mOwnRes.set(
+                l_outfits[mOutfit].arcName, l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL))
+        {
+            Log.warn("Puppet could not start a private mount of '{}'", l_outfits[mOutfit].arcName);
+            return cPhs_ERROR_e;
+        }
+        mResRequested = true;
+    }
+
+    const int resState = mOwnRes.setRes();
+    if (resState > 0) {
+        return cPhs_LOADING_e;
+    }
+    if (resState < 0) {
+        Log.warn("Puppet's private mount of '{}' failed", l_outfits[mOutfit].arcName);
+        return cPhs_ERROR_e;
+    }
+
+    return cPhs_COMPLEATE_e;
+}
+
 int daRemotePlayer_c::create() {
     fopAcM_ct(this, daRemotePlayer_c);
 
-    if (mArcName == NULL) {
-        mArcName = select_arc_name();
+    if (!mOutfitChosen) {
+        mOutfit = outfit_index_for_local_player();
+        mOutfitChosen = true;
     }
 
-    int phase = dComIfG_resLoad(&mPhaseReq, mArcName);
-    if (phase != cPhs_COMPLEATE_e) {
-        return phase;
-    }
-
-    // VERIFY the archive choice rather than trusting it. select_arc_name() reads the local Link's
-    // mArcName, which is only a hint — during the intro demo it can be unset or stale while Link is
-    // in fact wearing that outfit. Confirm against the model data itself, and switch once if we
-    // guessed wrong. Getting this wrong is not cosmetic: it is an access violation on the first
-    // calc().
-    if (!mSwitchedArc && model_data_claimed(body_model_data(mArcName))) {
-        const char* rejected = mArcName;
-        mArcName = other_arc_name(rejected);
-        mSwitchedArc = true;
-        dComIfG_resDelete(&mPhaseReq, rejected);
-        cPhs_Reset(&mPhaseReq);
-        Log.info("Archive '{}' belongs to the local player; puppet switching to '{}'", rejected,
-            mArcName);
-        return cPhs_INIT_e;
+    const int mountPhase = mountOwnArchive();
+    if (mountPhase != cPhs_COMPLEATE_e) {
+        return mountPhase;
     }
 
     if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x20000)) {
@@ -355,7 +321,8 @@ int daRemotePlayer_c::create() {
     // Deliberately NOT calling setMatrix() here. It ends in modelCalc(), and calc'ing before the
     // first network pose has arrived is both pointless (we'd be posing at the spawn point) and the
     // exact place the original crash happened.
-    Log.info("Puppet for player {} using body archive '{}'", mPlayerId, mArcName);
+    Log.info("Puppet for player {} wearing '{}' from its own archive copy", mPlayerId,
+        l_outfits[mOutfit].arcName);
     return cPhs_COMPLEATE_e;
 }
 
@@ -364,9 +331,9 @@ static int daRemotePlayer_Create(fopAc_ac_c* i_this) {
 }
 
 daRemotePlayer_c::~daRemotePlayer_c() {
-    if (mArcName != NULL) {
-        dComIfG_resDelete(&mPhaseReq, mArcName);
-    }
+    // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
+    // unmounts the archive and frees its resources — the whole reason the private mount is a member
+    // rather than a registration in the global table.
 }
 
 static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
@@ -382,13 +349,6 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_spe
     current.angle.y = i_angleY;
     mNetSpeed = i_speed;
     mHasPose = true;
-}
-
-bool daRemotePlayer_c::modelDataOwnedByPlayer() const {
-    if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
-        return true;
-    }
-    return model_data_claimed(mpModelMorf->getModel()->getModelData());
 }
 
 /**
@@ -479,28 +439,12 @@ int daRemotePlayer_c::execute() {
             mpRunAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpRunAnm) : 0);
     }
 
-    if (modelDataOwnedByPlayer()) {
-        // The local player changed clothes into our archive. Calling calc() now would dereference
-        // a null user area, so stand down until they change back rather than take the crash.
-        if (!mReportedArcConflict) {
-            Log.warn(
-                "Player {} puppet hidden: local Link took over archive '{}'", mPlayerId, mArcName);
-            mReportedArcConflict = true;
-        }
-        return 1;
-    }
-    mReportedArcConflict = false;
-
+    // No guard against the local player owning this model data, and none needed: the puppet's
+    // J3DModelData came out of its own private archive mount, so daAlink_c's joint callbacks and
+    // mtx calculators are not on it and cannot be.
     selectAnimation();
     mpModelMorf->play(0, 0);
-    {
-        // Only setMatrix() needs the bracket: it is the one that reaches modelCalc(), and neither
-        // selectAnimation() nor play() writes to the model data (mDoExt_McaMorfSO::setAnm and
-        // ::play touch only their own frame controller, m_Do_ext.cpp:1721 and :1765).
-        ScopedJointIsolation isolation(
-            model->getModelData(), mpSavedCallBacks, mpSavedMtxCalcs, mJointNum);
-        setMatrix();
-    }
+    setMatrix();
     return 1;
 }
 
@@ -509,7 +453,7 @@ static int daRemotePlayer_Execute(daRemotePlayer_c* i_this) {
 }
 
 int daRemotePlayer_c::draw() {
-    if (!mHasPose || modelDataOwnedByPlayer()) {
+    if (!mHasPose) {
         return 1;
     }
 

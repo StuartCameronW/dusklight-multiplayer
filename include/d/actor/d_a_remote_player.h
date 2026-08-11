@@ -1,7 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
-#include "JSystem/J3DGraphAnimator/J3DJoint.h"
+#include "d/d_resorce.h"
 #include "f_op/f_op_actor.h"
 #include "m_Do/m_Do_ext.h"
 
@@ -42,14 +42,14 @@ public:
 private:
     void setMatrix();
     void selectAnimation();
-    /// True when the local player has taken over our body archive, which makes calling calc() on
-    /// our model a null dereference. See the comment in selectArcName().
-    bool modelDataOwnedByPlayer() const;
+    /// Drive the private archive mount forward; returns a cPhs_* step for create() to hand back.
+    int mountOwnArchive();
 
     /* Which replicated player this puppet represents; arrives as the create parameter. */
     u32 mPlayerId;
-    /* Body archive we loaded. Deliberately NOT the one the local player is wearing. */
-    const char* mArcName;
+    /* Index into the outfit table in the .cpp. Latched once, so a clothes change on the local
+     * player cannot make create() and createHeap() disagree about which body to load. */
+    int mOutfit;
     /* Horizontal speed from the network. Picks the gait, against the same thresholds daAlink_c
      * uses; it does NOT rate-scale a single cycle. */
     f32 mNetSpeed;
@@ -57,26 +57,25 @@ private:
     u16 mCurrentAnm;
     /* False until the first network pose lands, so the puppet is never drawn at its spawn pose. */
     bool mHasPose;
-    /* Latches the "archive stolen by the local player" warning to one log line. */
-    bool mReportedArcConflict;
-    /* Guards the one-time archive switch in create(), so a wrong guess can't loop forever. */
-    bool mSwitchedArc;
+    /* Latches the outfit choice, so create() being re-entered while the mount completes cannot
+     * change which body we are loading half way through. */
+    bool mOutfitChosen;
+    /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
+    bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
     bool mLoggedFirstCalc;
 
-    request_of_phase_process_class mPhaseReq;
+    /* ★ This puppet's PRIVATE copy of the outfit archive - not a reference into the global,
+     * name-keyed table that dComIfG_resLoad uses. It has to be private because the local player
+     * frees his own outfit archive's heap wholesale on a clothes change, without consulting the
+     * reference count (d_a_alink_swindow.inc:80-87). Being a plain member is the point:
+     * ~dRes_info_c unmounts and frees everything when the actor dies, with no teardown ordering to
+     * get wrong. */
+    dRes_info_c mOwnRes;
     mDoExt_McaMorfSO* mpModelMorf;
     J3DAnmTransform* mpIdleAnm;
     J3DAnmTransform* mpWalkAnm;
     J3DAnmTransform* mpRunAnm;
-
-    /* Scratch space for ScopedJointIsolation, which has to put back every joint hook it clears.
-     * Held per puppet rather than on the stack so the size follows the model's real joint count
-     * instead of a cap that a future outfit could quietly exceed. Allocated in createHeap, so they
-     * live and die with the actor's solid heap. */
-    u16 mJointNum;
-    J3DJointCallBack* mpSavedCallBacks;
-    J3DMtxCalc** mpSavedMtxCalcs;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */
