@@ -32,9 +32,8 @@ const char l_bBodyResName[] = "bl.bmd";
 const char l_kBodyResName[] = "al.bmd";
 
 /* Link's animations do not live in the body archive — they are in AlAnm, mounted in ARAM at boot
- * and streamed by index. 0x1400 is the staging size the game itself uses for these.
+ * and streamed by index.
  */
-const u32 l_anmBufferSize = 0x1400;
 const u16 l_idleAnmIdx = dRes_ID_ALANM_BCK_WAITS_e;
 const u16 l_walkAnmIdx = dRes_ID_ALANM_BCK_WALKS_e;
 
@@ -63,26 +62,77 @@ const char* select_arc_name() {
     return l_bArcName;
 }
 
-J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
-    u8* buffer = JKR_NEW_ARRAY_ARGS(u8, l_anmBufferSize, 0x20);
-    if (buffer == NULL) {
+const char* other_arc_name(const char* i_arcName) {
+    return i_arcName == l_bArcName ? l_kArcName : l_bArcName;
+}
+
+J3DModelData* body_model_data(const char* i_arcName) {
+    const char* resName = i_arcName == l_kArcName ? l_kBodyResName : l_bBodyResName;
+    const int idx = dComIfG_getObjctResName2Index(i_arcName, resName);
+    if (idx < 0) {
         return NULL;
     }
-    JKRReadIdxResource(buffer, l_anmBufferSize, i_resIdx, dComIfGp_getAnmArchive());
+    return static_cast<J3DModelData*>(dComIfG_getObjectRes(i_arcName, static_cast<u16>(idx)));
+}
+
+/**
+ * True when daAlink_c has installed its joint callbacks on this model data, i.e. the local player
+ * is wearing this outfit. Those callbacks read J3DModel::getUserArea(), which is zero for any
+ * model we create, so calling calc() on it is an immediate null dereference.
+ */
+bool model_data_claimed(J3DModelData* i_modelData) {
+    if (i_modelData == NULL || i_modelData->getJointNum() == 0) {
+        return false;
+    }
+    return i_modelData->getJointNodePointer(0)->getCallBack() != NULL;
+}
+
+/**
+ * Load one animation out of the ARAM archive, sizing the staging buffer from the archive itself.
+ *
+ * The size MUST come from the entry, not a constant. `readIdxResource` clamps to the buffer it is
+ * given and reports the real size, so an undersized buffer silently yields a TRUNCATED animation
+ * that `J3DAnmLoaderDataBase::load` then parses as garbage. daAlink_c gets away with literals only
+ * because it hardcodes a different one per resource (0x400 to 0x6000 across d_a_alink*); a single
+ * guess covering several animations is exactly how that goes wrong.
+ */
+J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
+    JKRArchive* archive = dComIfGp_getAnmArchive();
+    if (archive == NULL) {
+        return NULL;
+    }
+
+    JKRArchive::SDIFileEntry* entry = archive->findIdxResource(i_resIdx);
+    if (entry == NULL) {
+        Log.warn("Animation resource {} not present in the ARAM archive", i_resIdx);
+        return NULL;
+    }
+
+    const u32 size = static_cast<u32>(entry->data_size);
+    if (size == 0) {
+        return NULL;
+    }
+
+    u8* buffer = JKR_NEW_ARRAY_ARGS(u8, size, 0x20);
+    if (buffer == NULL) {
+        Log.warn("Out of heap for animation {} ({} bytes)", i_resIdx, size);
+        return NULL;
+    }
+
+    const u32 read = JKRReadIdxResource(buffer, size, i_resIdx, archive);
+    if (read == 0 || read > size) {
+        Log.warn("Animation {} read {} bytes into a {}-byte buffer", i_resIdx, read, size);
+        return NULL;
+    }
+
+    Log.info("Loaded animation {} ({} bytes)", i_resIdx, size);
     return static_cast<J3DAnmTransform*>(J3DAnmLoaderDataBase::load(buffer));
 }
 
 }  // namespace
 
 int daRemotePlayer_c::createHeap() {
-    const char* bodyResName = mArcName == l_kArcName ? l_kBodyResName : l_bBodyResName;
-    const int bodyIdx = dComIfG_getObjctResName2Index(mArcName, bodyResName);
-    if (bodyIdx < 0) {
-        return 0;
-    }
-
-    J3DModelData* modelData =
-        static_cast<J3DModelData*>(dComIfG_getObjectRes(mArcName, static_cast<u16>(bodyIdx)));
+    J3DModelData* modelData = body_model_data(mArcName);
     if (modelData == NULL) {
         return 0;
     }
@@ -114,20 +164,42 @@ int daRemotePlayer_c::create() {
     }
 
     int phase = dComIfG_resLoad(&mPhaseReq, mArcName);
-    if (phase == cPhs_COMPLEATE_e) {
-        if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x20000)) {
-            return cPhs_ERROR_e;
-        }
-
-        mPlayerId = fopAcM_GetParam(this);
-        mCurrentAnm = l_idleAnmIdx;
-        model = mpModelMorf->getModel();
-        setMatrix();
-
-        Log.info("Puppet for player {} using body archive '{}'", mPlayerId, mArcName);
+    if (phase != cPhs_COMPLEATE_e) {
+        return phase;
     }
 
-    return phase;
+    // VERIFY the archive choice rather than trusting it. select_arc_name() reads the local Link's
+    // mArcName, which is only a hint — during the intro demo it can be unset or stale while Link is
+    // in fact wearing that outfit. Confirm against the model data itself, and switch once if we
+    // guessed wrong. Getting this wrong is not cosmetic: it is an access violation on the first
+    // calc().
+    if (!mSwitchedArc && model_data_claimed(body_model_data(mArcName))) {
+        const char* rejected = mArcName;
+        mArcName = other_arc_name(rejected);
+        mSwitchedArc = true;
+        dComIfG_resDelete(&mPhaseReq, rejected);
+        cPhs_Reset(&mPhaseReq);
+        Log.info("Archive '{}' belongs to the local player; puppet switching to '{}'", rejected,
+            mArcName);
+        return cPhs_INIT_e;
+    }
+
+    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x20000)) {
+        // Either the heap estimate was too small or a resource was missing. Say so: a silent
+        // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
+        Log.warn("Puppet heap/model setup failed for the remote player actor");
+        return cPhs_ERROR_e;
+    }
+
+    mPlayerId = fopAcM_GetParam(this);
+    mCurrentAnm = l_idleAnmIdx;
+    model = mpModelMorf->getModel();
+
+    // Deliberately NOT calling setMatrix() here. It ends in modelCalc(), and calc'ing before the
+    // first network pose has arrived is both pointless (we'd be posing at the spawn point) and the
+    // exact place the original crash happened.
+    Log.info("Puppet for player {} using body archive '{}'", mPlayerId, mArcName);
+    return cPhs_COMPLEATE_e;
 }
 
 static int daRemotePlayer_Create(fopAc_ac_c* i_this) {
@@ -156,12 +228,10 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_spe
 }
 
 bool daRemotePlayer_c::modelDataOwnedByPlayer() const {
-    const J3DModelData* modelData = mpModelMorf->getModel()->getModelData();
-    if (modelData == NULL || modelData->getJointNum() == 0) {
-        return false;
+    if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
+        return true;
     }
-    // A non-NULL callback means daAlink_c has claimed this modelData — see select_arc_name().
-    return const_cast<J3DModelData*>(modelData)->getJointNodePointer(0)->getCallBack() != NULL;
+    return model_data_claimed(mpModelMorf->getModel()->getModelData());
 }
 
 void daRemotePlayer_c::selectAnimation() {

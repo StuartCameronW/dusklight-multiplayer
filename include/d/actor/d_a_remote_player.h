@@ -50,6 +50,8 @@ private:
     bool mHasPose;
     /* Latches the "archive stolen by the local player" warning to one log line. */
     bool mReportedArcConflict;
+    /* Guards the one-time archive switch in create(), so a wrong guess can't loop forever. */
+    bool mSwitchedArc;
 
     request_of_phase_process_class mPhaseReq;
     mDoExt_McaMorfSO* mpModelMorf;
