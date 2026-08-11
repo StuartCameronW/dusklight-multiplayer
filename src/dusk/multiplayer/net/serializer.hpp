@@ -41,6 +41,8 @@ public:
         write_u32(static_cast<std::uint32_t>(v));
     }
 
+    void write_s16(std::int16_t v) { write_u16(static_cast<std::uint16_t>(v)); }
+
     void write_s32(std::int32_t v) { write_u32(static_cast<std::uint32_t>(v)); }
 
     void write_f32(float v) {
@@ -104,6 +106,15 @@ public:
             return false;
         }
         out = static_cast<std::uint64_t>(hi) << 32 | lo;
+        return true;
+    }
+
+    bool read_s16(std::int16_t& out) {
+        std::uint16_t v = 0;
+        if (!read_u16(v)) {
+            return false;
+        }
+        out = static_cast<std::int16_t>(v);
         return true;
     }
 

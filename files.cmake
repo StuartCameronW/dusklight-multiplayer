@@ -1418,6 +1418,8 @@ set(DUSK_FILES
         include/dusk/scope_guard.hpp
         src/dusk/dvd_asset.cpp
         src/d/actor/d_a_alink_dusk.cpp
+        include/d/actor/d_a_remote_player.h
+        src/d/actor/d_a_remote_player.cpp
         src/dusk/android_frame_rate.hpp
         src/dusk/android_frame_rate.cpp
         src/dusk/asserts.cpp
@@ -1553,6 +1555,13 @@ set(DUSK_FILES
         src/dusk/multiplayer/net/transport.hpp
         src/dusk/multiplayer/net/enet_transport.cpp
         src/dusk/multiplayer/net/enet_transport.hpp
+        src/dusk/multiplayer/replication/player_state.hpp
+        src/dusk/multiplayer/replication/state_buffer.cpp
+        src/dusk/multiplayer/replication/state_buffer.hpp
+        src/dusk/multiplayer/replication/player_bridge.cpp
+        src/dusk/multiplayer/replication/player_bridge.hpp
+        src/dusk/multiplayer/replication/replication_manager.cpp
+        src/dusk/multiplayer/replication/replication_manager.hpp
         src/dusk/multiplayer/session/network_manager.cpp
         src/dusk/multiplayer/session/network_manager.hpp
         src/dusk/multiplayer/bindings/hooks.cpp

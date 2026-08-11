@@ -11,6 +11,18 @@
 #define PROCS_NOT_WII
 #endif
 
+#if TARGET_PC
+/* Dusk-only process names. Appended at the END of the table so every original id keeps its value
+ * — the ids are matched by tools and by the profile-list array index (see f_pc_profile_lst.cpp).
+ * A preprocessor conditional cannot live inside the ALL_PROCS macro body, hence this helper,
+ * mirroring PROCS_NOT_WII above.
+ */
+#define PROCS_DUSK \
+/* 0x318 */ X(fpcNm_REMOTE_PLAYER_e)
+#else
+#define PROCS_DUSK
+#endif
+
 #define ALL_PROCS \
 /* 0x000 */ X(fpcNm_OVERLAP0_e) \
 /* 0x001 */ X(fpcNm_OVERLAP1_e) \
@@ -803,6 +815,7 @@ PROCS_NOT_WII \
 /* 0x315 */ X(fpcNm_TIMER_e) \
 /* 0x316 */ X(fpcNm_METER2_e) \
 /* 0x317 */ X(fpcNm_GAMEOVER_e) \
+PROCS_DUSK
 
 #define X(name) name,
 enum {

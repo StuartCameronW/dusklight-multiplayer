@@ -20,6 +20,10 @@ enum class Role {
 /// Per-peer session state. Grows into the full peer record (puppet ProcID, ...) at M1/M2.
 struct PeerSession {
     PeerId id = kInvalidPeer;
+    /// World identity, assigned by the host from its own counter. Deliberately NOT the transport's
+    /// PeerId: ENet's id space is per-host and starts at 0, which is reserved for the host itself,
+    /// so reusing it would let a client collide with kHostPlayerId.
+    std::uint32_t playerId = 0;
     std::string nickname;
     /// 0xRRGGBB tint used to tell players apart, borrowed from tpmp's name+colour idea (08).
     std::uint32_t color = 0xFFFFFF;
@@ -59,6 +63,7 @@ public:
     const std::unordered_map<PeerId, PeerSession>& peers() const { return mPeers; }
     const std::string& local_nickname() const { return mLocalNickname; }
     std::uint32_t local_color() const { return mLocalColor; }
+    std::uint32_t local_player_id() const { return mLocalPlayerId; }
 
 private:
     void handle_event(const TransportEvent& event);
@@ -66,6 +71,18 @@ private:
     void send_hello(PeerId peer);
     void send_heartbeats();
     void report_tick_rate();
+
+    /// Host: tell a freshly-admitted peer about everyone already in the session, and tell everyone
+    /// else about it. Reliable, because a missed roster update leaves a permanently invisible peer.
+    void send_peer_list(PeerId peer);
+    void broadcast_peer_joined(const PeerSession& joined);
+    void broadcast_peer_left(std::uint32_t playerId);
+
+    /// Client: our own pose, up to the host. Host: everyone's pose, down to every client.
+    void send_local_state();
+    void broadcast_snapshot();
+
+    void report_interpolation();
 
     std::unique_ptr<ITransport> mTransport;
     Role mRole = Role::Inactive;
@@ -75,6 +92,10 @@ private:
     std::uint32_t mLocalColor = 0xFFFFFF;
     /// True if the player chose a colour explicitly, so the host must not reassign it.
     bool mColorExplicit = false;
+    /// 0 while hosting (the host reserves kHostPlayerId); set from HelloAck when joining.
+    std::uint32_t mLocalPlayerId = 0;
+    /// Host-side allocator for world identities. Starts at 1 so it can never hand out the host's.
+    std::uint32_t mNextPlayerId = 1;
 
     std::unordered_map<PeerId, PeerSession> mPeers;
     std::vector<TransportEvent> mEventScratch;

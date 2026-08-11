@@ -7,6 +7,8 @@
 #include "../net/enet_transport.hpp"
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
+#include "../replication/player_state.hpp"
+#include "../replication/replication_manager.hpp"
 #include "dusk/logging.h"
 
 namespace dusk::mp {
@@ -19,6 +21,9 @@ constexpr std::uint64_t kHeartbeatIntervalTicks = 30;
 
 /// How often to log the measured tick rate while a session is live.
 constexpr std::uint64_t kRateReportIntervalTicks = 150;
+
+/// How often to log interpolation health (buffer depth, starvations). ~10 s at 30 Hz.
+constexpr std::uint64_t kInterpReportIntervalTicks = 300;
 
 const char* env_or_null(const char* name) {
     const char* value = std::getenv(name);
@@ -117,7 +122,9 @@ bool NetworkManager::host(std::uint16_t port) {
     }
 
     auto transport = std::make_unique<EnetTransport>();
-    if (!transport->listen(port, 8)) {
+    // Peers, not players: the host occupies one of the kMaxPlayers slots itself, and the snapshot
+    // packet is sized so that all of them fit in one unfragmented datagram.
+    if (!transport->listen(port, kMaxPlayers - 1)) {
         return false;
     }
 
@@ -153,6 +160,7 @@ void NetworkManager::shutdown() {
         mTransport->disconnect_all();
         mTransport.reset();
     }
+    replication_manager().clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
     mRole = Role::Inactive;
@@ -173,8 +181,10 @@ void NetworkManager::pre_actor_tick() {
         handle_event(event);
     }
 
-    // M1 applies inbound player state to the puppet actors here, so that actors execute this
-    // tick against fresh remote positions.
+    // Apply inbound state BEFORE actors run, so this tick's actors see fresh remote positions.
+    // Advancing the interpolation cursor here (once per sim tick, never per rendered frame) is
+    // what keeps playback locked to the same clock the poses were captured on.
+    replication_manager().drive_puppets();
 }
 
 void NetworkManager::post_actor_tick() {
@@ -182,9 +192,16 @@ void NetworkManager::post_actor_tick() {
         return;
     }
 
-    // M1 captures the local Link's pos/rot/anim here and sends it.
+    // Captured after the actor pass, so the pose sent is the one this tick actually ended at.
+    if (mRole == Role::Client) {
+        send_local_state();
+    } else if (mRole == Role::Host) {
+        broadcast_snapshot();
+    }
+
     send_heartbeats();
     report_tick_rate();
+    report_interpolation();
     mTransport->flush();
 }
 
@@ -201,10 +218,24 @@ void NetworkManager::handle_event(const TransportEvent& event) {
         }
         break;
     }
-    case TransportEventType::Disconnected:
+    case TransportEventType::Disconnected: {
+        const auto it = mPeers.find(event.peer);
+        if (it != mPeers.end()) {
+            const std::uint32_t playerId = it->second.playerId;
+            mPeers.erase(it);
+            if (mRole == Role::Host && playerId != 0) {
+                // Despawn locally and tell the remaining clients, otherwise a puppet stands frozen
+                // in the world forever — one of the ways tpmp sessions visibly rot.
+                replication_manager().remove_player(playerId);
+                broadcast_peer_left(playerId);
+            } else if (mRole == Role::Client) {
+                // Lost the host: every puppet's authority is gone, so clear the whole world view.
+                replication_manager().clear();
+            }
+        }
         Log.info("Peer {} disconnected", event.peer);
-        mPeers.erase(event.peer);
         break;
+    }
     case TransportEventType::Data:
         handle_packet(event.peer, event.data.data(), event.data.size());
         break;
@@ -246,28 +277,46 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             Log.warn("Rejecting peer {}: protocol v{} != our v{}", peer, version, kProtocolVersion);
         }
 
+        const auto peerIt = mPeers.find(peer);
+        if (peerIt == mPeers.end()) {
+            return;
+        }
+
+        // World identity comes from our own counter, never from the transport's peer id — see
+        // PeerSession::playerId for why reusing ENet's id space would collide with the host.
+        const std::uint32_t playerId = accepted ? mNextPlayerId++ : 0;
+
         // The host owns colour assignment — otherwise its record of a peer goes stale the moment
         // the peer picks a different one, and the puppet would be tinted wrong at M1.
-        const std::uint32_t assignedColor =
-            colorExplicit != 0 ? preferredColor : kPlayerColors[peer % std::size(kPlayerColors)];
+        const std::uint32_t assignedColor = colorExplicit != 0 ?
+                                                preferredColor :
+                                                kPlayerColors[playerId % std::size(kPlayerColors)];
 
         Writer w;
         w.write_u8(static_cast<std::uint8_t>(PacketId::HelloAck));
         w.write_u8(accepted ? 1 : 0);
         w.write_u32(kProtocolVersion);
-        w.write_u32(peer);
+        w.write_u32(playerId);
         w.write_u32(assignedColor);
         w.write_string(mLocalNickname);
         w.write_u32(mLocalColor);
         mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
 
         if (accepted) {
-            if (auto it = mPeers.find(peer); it != mPeers.end()) {
-                it->second.nickname = nickname;
-                it->second.color = assignedColor;
-                it->second.handshakeComplete = true;
-            }
-            Log.info("Peer {} ('{}', #{:06X}) completed handshake", peer, nickname, assignedColor);
+            peerIt->second.playerId = playerId;
+            peerIt->second.nickname = nickname;
+            peerIt->second.color = assignedColor;
+            peerIt->second.handshakeComplete = true;
+
+            // Order matters: the newcomer must learn the existing roster before anyone is told
+            // about the newcomer, so no client can receive a PeerJoined for a session it has an
+            // incomplete view of.
+            send_peer_list(peer);
+            broadcast_peer_joined(peerIt->second);
+
+            replication_manager().add_player(playerId, nickname, assignedColor);
+            Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
+                assignedColor);
         }
         break;
     }
@@ -291,17 +340,23 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             return;
         }
 
-        // The host is authoritative on colour, so take what it assigns rather than deriving it
-        // locally — that keeps both ends agreeing on what this player looks like.
+        // The host is authoritative on colour and identity, so take what it assigns rather than
+        // deriving either locally — that keeps both ends agreeing on what this player is.
         mLocalColor = assignedColor;
+        mLocalPlayerId = assignedId;
 
         if (auto it = mPeers.find(peer); it != mPeers.end()) {
+            it->second.playerId = kHostPlayerId;
             it->second.nickname = hostNickname;
             it->second.color = hostColor;
             it->second.handshakeComplete = true;
         }
-        Log.info("Handshake complete — we are player {} ('{}', #{:06X}), host is '{}'", assignedId,
-            mLocalNickname, mLocalColor, hostNickname);
+
+        // The host is a player too, and it is the one player never announced by PeerJoined.
+        replication_manager().add_player(kHostPlayerId, hostNickname, hostColor);
+
+        Log.info("Handshake complete — we are player {} ('{}', #{:06X}), host is '{}' (#{:06X})",
+            assignedId, mLocalNickname, mLocalColor, hostNickname, hostColor);
         break;
     }
     case PacketId::Heartbeat: {
@@ -342,10 +397,229 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             rttMs, mTransport->rtt_ms(peer));
         break;
     }
+    case PacketId::PlayerStateUpdate: {
+        std::uint64_t senderTick = 0;
+        PlayerState state;
+        if (!r.read_u64(senderTick) || !state.read(r) || !r.ok()) {
+            return;
+        }
+        const auto it = mPeers.find(peer);
+        if (it == mPeers.end() || !it->second.handshakeComplete) {
+            // Unauthenticated pose. Dropping it is the whole point of gating on the handshake.
+            return;
+        }
+        // Stamped with our own tick, not the sender's: the host is the clock everyone plays back
+        // against, and mixing two unsynchronised tick origins in one buffer would be meaningless.
+        replication_manager().record_remote(it->second.playerId, mSimTick, state);
+        break;
+    }
+    case PacketId::WorldSnapshot: {
+        std::uint64_t hostTick = 0;
+        std::uint8_t count = 0;
+        if (!r.read_u64(hostTick) || !r.read_u8(count)) {
+            return;
+        }
+        if (count > kMaxPlayers) {
+            Log.warn("Snapshot claims {} players (max {}) — dropping", count, kMaxPlayers);
+            return;
+        }
+        for (std::uint8_t i = 0; i < count; ++i) {
+            std::uint32_t playerId = 0;
+            PlayerState state;
+            if (!r.read_u32(playerId) || !state.read(r)) {
+                return;
+            }
+            if (playerId == mLocalPlayerId) {
+                // Our own pose echoed back. We are authoritative over ourselves at M1, so
+                // applying it would fight local input.
+                continue;
+            }
+            replication_manager().record_remote(playerId, hostTick, state);
+        }
+        if (!r.ok()) {
+            Log.warn("Truncated snapshot from peer {}", peer);
+        }
+        break;
+    }
+    case PacketId::PeerList: {
+        std::uint8_t count = 0;
+        if (!r.read_u8(count) || count > kMaxPlayers) {
+            return;
+        }
+        for (std::uint8_t i = 0; i < count; ++i) {
+            std::uint32_t playerId = 0;
+            std::string nickname;
+            std::uint32_t color = 0;
+            if (!r.read_u32(playerId) || !r.read_string(nickname) || !r.read_u32(color)) {
+                return;
+            }
+            if (playerId == mLocalPlayerId) {
+                continue;
+            }
+            replication_manager().add_player(playerId, nickname, color);
+            Log.info("Roster: player {} ('{}', #{:06X})", playerId, nickname, color);
+        }
+        break;
+    }
+    case PacketId::PeerJoined: {
+        std::uint32_t playerId = 0;
+        std::string nickname;
+        std::uint32_t color = 0;
+        if (!r.read_u32(playerId) || !r.read_string(nickname) || !r.read_u32(color) || !r.ok()) {
+            return;
+        }
+        if (playerId == mLocalPlayerId) {
+            return;
+        }
+        replication_manager().add_player(playerId, nickname, color);
+        Log.info("Player {} ('{}', #{:06X}) joined", playerId, nickname, color);
+        break;
+    }
+    case PacketId::PeerLeft: {
+        std::uint32_t playerId = 0;
+        if (!r.read_u32(playerId) || !r.ok()) {
+            return;
+        }
+        replication_manager().remove_player(playerId);
+        Log.info("Player {} left", playerId);
+        break;
+    }
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);
         break;
     }
+}
+
+void NetworkManager::send_peer_list(PeerId peer) {
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::PeerList));
+
+    // The host is always in the roster, and is always first.
+    std::uint8_t count = 1;
+    for (const auto& entry : mPeers) {
+        if (entry.second.handshakeComplete && entry.first != peer) {
+            ++count;
+        }
+    }
+    w.write_u8(count);
+    w.write_u32(kHostPlayerId);
+    w.write_string(mLocalNickname);
+    w.write_u32(mLocalColor);
+
+    for (const auto& entry : mPeers) {
+        if (!entry.second.handshakeComplete || entry.first == peer) {
+            continue;
+        }
+        w.write_u32(entry.second.playerId);
+        w.write_string(entry.second.nickname);
+        w.write_u32(entry.second.color);
+    }
+
+    mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
+}
+
+void NetworkManager::broadcast_peer_joined(const PeerSession& joined) {
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::PeerJoined));
+    w.write_u32(joined.playerId);
+    w.write_string(joined.nickname);
+    w.write_u32(joined.color);
+
+    for (const auto& entry : mPeers) {
+        if (!entry.second.handshakeComplete || entry.first == joined.id) {
+            continue;
+        }
+        mTransport->send(entry.first, w.data().data(), w.size(), kChannelControl, true);
+    }
+}
+
+void NetworkManager::broadcast_peer_left(std::uint32_t playerId) {
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::PeerLeft));
+    w.write_u32(playerId);
+    mTransport->broadcast(w.data().data(), w.size(), kChannelControl, true);
+}
+
+void NetworkManager::send_local_state() {
+    PlayerState state;
+    if (!replication_manager().capture_local(state)) {
+        // No Link in the world (loading, title screen). Sending a stale pose would park our
+        // puppet at wherever we last were instead of hiding it.
+        return;
+    }
+
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::PlayerStateUpdate));
+    w.write_u64(mSimTick);
+    state.write(w);
+    // Unreliable and unsequenced: a lost pose is always superseded by the next tick's, so
+    // retransmitting it would only add latency to data that is already obsolete.
+    mTransport->broadcast(w.data().data(), w.size(), kChannelState, false);
+}
+
+void NetworkManager::broadcast_snapshot() {
+    if (mPeers.empty()) {
+        return;
+    }
+
+    PlayerState localState;
+    const bool haveLocal = replication_manager().capture_local(localState);
+
+    // Serialize once and send the same bytes to everyone — clients skip their own entry. Building
+    // a per-recipient packet would cost N serializations for no benefit at this size.
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::WorldSnapshot));
+    w.write_u64(mSimTick);
+
+    std::uint8_t count = haveLocal ? 1 : 0;
+    for (const auto& entry : replication_manager().players()) {
+        if (entry.second.hasLatest) {
+            ++count;
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    if (count > kMaxPlayers) {
+        count = static_cast<std::uint8_t>(kMaxPlayers);
+    }
+    w.write_u8(count);
+
+    std::uint8_t written = 0;
+    if (haveLocal) {
+        w.write_u32(kHostPlayerId);
+        localState.write(w);
+        ++written;
+    }
+    for (const auto& entry : replication_manager().players()) {
+        if (written >= count) {
+            break;
+        }
+        if (!entry.second.hasLatest) {
+            continue;
+        }
+        w.write_u32(entry.second.playerId);
+        entry.second.latest.write(w);
+        ++written;
+    }
+
+    mTransport->broadcast(w.data().data(), w.size(), kChannelState, false);
+}
+
+void NetworkManager::report_interpolation() {
+    if (mSimTick % kInterpReportIntervalTicks != 0) {
+        return;
+    }
+    const ReplicationManager& replication = replication_manager();
+    if (replication.empty()) {
+        return;
+    }
+    const ReplicationManager::Diagnostics diag = replication.diagnostics();
+    Log.info("Interp: {} remote player(s), buffer {:.1f} ticks, {} starvation(s), {} snap(s); "
+             "pose ({:.0f}, {:.0f}, {:.0f}) angleY {} speed {:.2f}",
+        replication.players().size(), diag.worstDelayTicks, diag.totalStarvations, diag.totalSnaps,
+        diag.samplePose.posX, diag.samplePose.posY, diag.samplePose.posZ, diag.samplePose.angleY,
+        diag.samplePose.speed);
 }
 
 void NetworkManager::send_heartbeats() {

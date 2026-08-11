@@ -1604,6 +1604,11 @@ process_profile_definition DUSK_CONST* DUSK_CONST g_fpcPfLst_ProfileList[] = {
     &g_profile_TIMER.base.base,
     &g_profile_METER2.base.base,
     &g_profile_GAMEOVER.base.base,
+#if TARGET_PC
+    // Dusk-only, appended last so every original profile keeps its index. fpcPf_Get() indexes this
+    // array directly by proc name, so this entry must stay aligned with PROCS_DUSK in f_pc_name.h.
+    &g_profile_REMOTE_PLAYER.base.base,
+#endif
     NULL,
 };
 #endif
