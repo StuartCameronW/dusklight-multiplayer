@@ -42,8 +42,12 @@ struct MultiplayerPolicy {
     /// The one v1 exception — each client keeps its own mLife/mMaxLife.
     Ownership health = Ownership::Individual;
 
-    /// Wolf/human. tpmp made this Individual and that is probably better; one flag to change.
-    Ownership transform = Ownership::Shared;
+    /// Wolf/human. Decided by Stuart 2026-08-12: players may be in different forms at once, and
+    /// that is intended rather than tolerated. Note this is a GAMEPLAY decision, not the same one
+    /// as `equipment` above — a costume propagates from its wearer, but being a wolf changes what
+    /// a player can do (doors, items, Midna), so M3 has to cope with the two forms diverging
+    /// rather than assume a single world state. tpmp reached the same answer.
+    Ownership transform = Ownership::Individual;
 
     DeathRule onDeath = DeathRule::ReloadRoom;
 
