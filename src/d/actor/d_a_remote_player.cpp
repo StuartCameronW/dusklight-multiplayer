@@ -51,8 +51,17 @@ const f32 l_maxAnmRate = 2.5f;
  * (d_a_alink_swindow.inc:171-173), and daAlink_modelCallBack dereferences
  * J3DModel::getUserArea() (d_a_alink.cpp:2449) — which is zero on any model we create. Calling
  * calc() on a model built from the archive Link is wearing is therefore an immediate null
- * dereference. Taking the other outfit sidesteps the whole problem, and doubles as an at-a-glance
- * cue for which Link is you.
+ * dereference. Taking the other outfit sidesteps the whole problem.
+ *
+ * ★ This is a WORKAROUND, not a design, and it has a visible cost: the puppet can never wear the
+ * same clothes as the local player, so on a save where both players would be in the hero's tunic
+ * the remote one shows up in Ordon clothes. Confirmed on screen 2026-08-11. It reads as an
+ * at-a-glance cue for which Link is you, but that is a consolation, not the reason — do not treat
+ * the mismatch as intended behaviour.
+ *
+ * Proper fix (M3): give the puppet its OWN copy of the J3DModelData rather than sharing Link's, so
+ * daAlink_c's joint callbacks and getUserArea() never apply to it. Outfit then becomes a
+ * replicated property of the wearer instead of a collision-avoidance choice.
  */
 const char* select_arc_name() {
     const daAlink_c* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
