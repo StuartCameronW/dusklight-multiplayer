@@ -1546,6 +1546,16 @@ set(DUSK_FILES
         src/dusk/discord_presence.cpp
         src/dusk/version.cpp
         src/dusk/action_bindings.cpp
+        include/dusk/multiplayer.hpp
+        src/dusk/multiplayer/policy/mp_policy.hpp
+        src/dusk/multiplayer/net/packet.hpp
+        src/dusk/multiplayer/net/serializer.hpp
+        src/dusk/multiplayer/net/transport.hpp
+        src/dusk/multiplayer/net/enet_transport.cpp
+        src/dusk/multiplayer/net/enet_transport.hpp
+        src/dusk/multiplayer/session/network_manager.cpp
+        src/dusk/multiplayer/session/network_manager.hpp
+        src/dusk/multiplayer/bindings/hooks.cpp
 )
 
 set(DUSK_HTTP_BACKEND_FILES

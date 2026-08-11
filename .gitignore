@@ -2,6 +2,9 @@
 .idea/
 .vs/
 
+# Local AI-assistant tooling (kept out of PRs — project rejects AI-generated contributions)
+.claude/
+
 # Caches
 __pycache__
 .mypy_cache

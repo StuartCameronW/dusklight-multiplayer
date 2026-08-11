@@ -299,7 +299,23 @@ FetchContent_Declare(json
     URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
-FetchContent_MakeAvailable(cxxopts json)
+# Multiplayer transport. Kept behind ITransport so it can be swapped for GameNetworkingSockets
+# when NAT traversal and encryption are needed.
+message(STATUS "dusklight: Fetching ENet")
+set(ENET_NO_INSTALL ON CACHE BOOL "" FORCE)
+FetchContent_Declare(enet
+    URL https://github.com/lsalzman/enet/archive/refs/tags/v1.3.18.tar.gz
+    URL_HASH SHA256=28603c895f9ed24a846478180ee72c7376b39b4bb1287b73877e5eae7d96b0dd
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+)
+FetchContent_MakeAvailable(cxxopts json enet)
+# ENet declares its includes relative to its own source dir rather than exporting them.
+target_include_directories(enet PUBLIC ${enet_SOURCE_DIR}/include)
+if (WIN32)
+    # win32.c uses timeGetTime/timeBeginPeriod/timeEndPeriod but ENet doesn't declare the
+    # dependency, so consumers fail to link without these.
+    target_link_libraries(enet PUBLIC winmm ws2_32)
+endif ()
 
 if (DUSK_ENABLE_SENTRY_NATIVE)
     message(STATUS "dusklight: Fetching sentry-native")
@@ -379,7 +395,7 @@ set(GAME_INCLUDE_DIRS
 find_package(Threads REQUIRED)
 set(GAME_LIBS aurora::core aurora::gx aurora::gd aurora::si aurora::vi aurora::pad aurora::mtx aurora::os aurora::dvd
     aurora::card freeverb cxxopts::cxxopts absl::flat_hash_map nlohmann_json::nlohmann_json TracyClient fmt::fmt
-    Threads::Threads zstd::libzstd)
+    Threads::Threads zstd::libzstd enet)
 
 if (DUSK_ENABLE_SENTRY_NATIVE)
     list(APPEND GAME_LIBS sentry)

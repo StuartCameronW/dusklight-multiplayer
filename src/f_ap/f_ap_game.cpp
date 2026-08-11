@@ -30,6 +30,7 @@
 #include <dusk/gamepad_color.h>
 #include <dusk/autosave.h>
 #include "dusk/menu_pointer.h"
+#include "dusk/multiplayer.hpp"
 #endif
 
 fapGm_HIO_c::fapGm_HIO_c() {
@@ -734,11 +735,16 @@ void fapGm_After() {
 #ifdef TARGET_PC
 static void fapGm_Before() {
     dusk::frame_interp::begin_record();
+    // Drain the network and apply inbound state BEFORE actors execute, so this tick's actors
+    // run against fresh remote data. Fires per 30 Hz sim tick, not per rendered frame.
+    dusk::mp::pre_actor_tick();
 }
 
 static void fapGm_AfterRecord() {
     dusk::frame_interp::end_record();
     fapGm_After();
+    // Capture and send local state AFTER actors have executed.
+    dusk::mp::post_actor_tick();
 }
 
 BOOL isRecording = false;
