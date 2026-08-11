@@ -1423,6 +1423,8 @@ set(DUSK_FILES
         src/dusk/android_frame_rate.hpp
         src/dusk/android_frame_rate.cpp
         src/dusk/asserts.cpp
+        src/dusk/autopilot.cpp
+        src/dusk/autopilot.hpp
         src/dusk/batch.cpp
         src/dusk/batch.hpp
         src/dusk/config.cpp
@@ -1564,6 +1566,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/replication_manager.hpp
         src/dusk/multiplayer/session/network_manager.cpp
         src/dusk/multiplayer/session/network_manager.hpp
+        src/dusk/multiplayer/session/trace.cpp
+        src/dusk/multiplayer/session/trace.hpp
         src/dusk/multiplayer/bindings/hooks.cpp
 )
 

@@ -30,6 +30,10 @@ public:
     void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed);
 
     u32 getPlayerId() const { return mPlayerId; }
+    /* Networked speed, which is NOT mirrored into speedF: nothing moves this actor locally, so the
+     * inherited field would read as a permanent zero and misreport the puppet as standing still. */
+    f32 getNetSpeed() const { return mNetSpeed; }
+    bool hasPose() const { return mHasPose; }
 
 private:
     void setMatrix();

@@ -79,13 +79,14 @@ void ReplicationManager::drive_puppets() {
             continue;
         }
 
-        if (!player.puppetAlive) {
-            if (!ensure_puppet(player.playerId, player.color)) {
-                // No scene yet, or allocation refused. Retry next tick.
-                continue;
-            }
-            player.puppetAlive = true;
+        // Asked every tick rather than cached in puppetAlive: the actor can be destroyed under us
+        // by a room unload, and a cached "alive" would leave us applying poses to nothing forever.
+        // ensure_puppet() owns the whole question, including respawning after a scene change.
+        if (!ensure_puppet(player.playerId, player.color)) {
+            player.puppetAlive = false;
+            continue;
         }
+        player.puppetAlive = true;
 
         apply_puppet_state(player.playerId, pose);
         player.lastApplied = pose;

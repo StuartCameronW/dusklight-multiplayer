@@ -10,6 +10,7 @@
 #include "../replication/player_state.hpp"
 #include "../replication/replication_manager.hpp"
 #include "dusk/logging.h"
+#include "trace.hpp"
 
 namespace dusk::mp {
 namespace {
@@ -89,6 +90,7 @@ void NetworkManager::set_startup_options(const StartupOptions& options) {
     mStartup.port = options.port;
     mStartup.nickname = options.nickname != nullptr ? options.nickname : "";
     mStartup.color = options.color != nullptr ? options.color : "";
+    mStartup.trace = options.trace != nullptr ? options.trace : "";
 }
 
 void NetworkManager::ensure_initialized() {
@@ -131,6 +133,11 @@ void NetworkManager::ensure_initialized() {
         // was meant is worse than refusing: pick neither and say why.
         Log.warn("Both a host and a join were requested ('{}'); not starting a session", target);
         return;
+    }
+
+    // Opened before the session so the trace covers the handshake as well as the play.
+    if (!mStartup.trace.empty()) {
+        trace::open(mStartup.trace, wantsHost ? "host" : "client");
     }
 
     if (target != nullptr) {
@@ -195,6 +202,7 @@ void NetworkManager::shutdown() {
     mPeers.clear();
     mPendingHeartbeats.clear();
     mRole = Role::Inactive;
+    trace::close();
     Log.info("Session ended");
 }
 
@@ -233,6 +241,9 @@ void NetworkManager::post_actor_tick() {
     send_heartbeats();
     report_tick_rate();
     report_interpolation();
+    // Sampled here rather than in pre_actor_tick: the puppets have executed by now, so what gets
+    // recorded is where they ended the tick, not where they were asked to go.
+    trace::write_tick(mSimTick, mLocalPlayerId);
     mTransport->flush();
 }
 

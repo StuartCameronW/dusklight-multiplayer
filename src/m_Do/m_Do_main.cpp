@@ -49,6 +49,7 @@
 #include "SSystem/SComponent/c_API.h"
 #include "dusk/android_frame_rate.hpp"
 #include "dusk/app_info.hpp"
+#include "dusk/autopilot.hpp"
 #include "dusk/crash_handler.h"
 #include "dusk/crash_reporting.h"
 #include "dusk/data.hpp"
@@ -444,6 +445,7 @@ static void ApplyMultiplayerOptions(const cxxopts::ParseResult& parsed) {
     std::string connect;
     std::string nickname;
     std::string color;
+    std::string trace;
 
     dusk::mp::StartupOptions options;
     options.host = parsed["mp-host"].as<bool>();
@@ -462,6 +464,10 @@ static void ApplyMultiplayerOptions(const cxxopts::ParseResult& parsed) {
     if (parsed.count("mp-color") != 0) {
         color = parsed["mp-color"].as<std::string>();
         options.color = color.c_str();
+    }
+    if (parsed.count("mp-trace") != 0) {
+        trace = parsed["mp-trace"].as<std::string>();
+        options.trace = trace.c_str();
     }
 
     dusk::mp::apply_startup_options(options);
@@ -551,7 +557,10 @@ int game_main(int argc, char* argv[]) {
             ("mp-connect", "Multiplayer: join a session at <address> or <address:port>", cxxopts::value<std::string>())
             ("mp-port", "Multiplayer: UDP port to host on or join (default 7777)", cxxopts::value<uint16_t>())
             ("mp-name", "Multiplayer: nickname shown to the other players", cxxopts::value<std::string>())
-            ("mp-color", "Multiplayer: player tint as RRGGBB hex", cxxopts::value<std::string>());
+            ("mp-color", "Multiplayer: player tint as RRGGBB hex", cxxopts::value<std::string>())
+            ("mp-trace", "Multiplayer: append a per-tick pose trace to <file> (CSV)", cxxopts::value<std::string>())
+            ("data-dir", "Use <path> for saves, config and logs instead of the installed data folder", cxxopts::value<std::string>())
+            ("autopilot", "Development: run the controller script at <path>", cxxopts::value<std::string>());
 
         arg_options.parse_positional({"dvd"});
         arg_options.positional_help("<dvd-image>");
@@ -572,6 +581,11 @@ int game_main(int argc, char* argv[]) {
 
     const auto startupLogLevel =
         static_cast<AuroraLogLevel>(parsed_arg_options["log-level"].as<uint8_t>());
+    // Before initialize_data(), which is what resolves the descriptor this deliberately bypasses.
+    if (parsed_arg_options.count("data-dir") != 0) {
+        dusk::data::set_data_path_override(
+            std::filesystem::path(parsed_arg_options["data-dir"].as<std::string>()));
+    }
     const auto dataPaths = dusk::data::initialize_data();
     dusk::ConfigPath = dataPaths.userPath;
     dusk::CachePath = dataPaths.cachePath;
@@ -582,6 +596,11 @@ int game_main(int argc, char* argv[]) {
     dusk::config::load_from_user_preferences();
     ApplyCVarOverrides(parsed_arg_options["cvar"]);
     ApplyMultiplayerOptions(parsed_arg_options);
+    // After file logging is up, so a bad script reports itself in the log rather than only stderr.
+    if (parsed_arg_options.count("autopilot") != 0) {
+        dusk::autopilot::load_script(
+            std::filesystem::path(parsed_arg_options["autopilot"].as<std::string>()));
+    }
     dusk::android::update_surface_frame_rate();
     dusk::crash_reporting::initialize();
     dusk::crash_handler::install();

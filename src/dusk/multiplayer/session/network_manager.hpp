@@ -95,6 +95,7 @@ private:
         std::uint16_t port = 0;
         std::string nickname;
         std::string color;
+        std::string trace;
     };
 
     std::unique_ptr<ITransport> mTransport;

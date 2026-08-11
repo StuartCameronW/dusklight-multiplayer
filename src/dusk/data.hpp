@@ -28,6 +28,11 @@ struct Paths {
     std::filesystem::path cachePath;
 };
 
+/// Point this process at its own data directory, ignoring the installed one entirely. Must be
+/// called before initialize_data(). Exists so two instances can run side by side without sharing a
+/// memory card, a config file or a log.
+void set_data_path_override(const std::filesystem::path& path);
+
 Paths initialize_data();
 std::filesystem::path configured_data_path();
 std::filesystem::path cache_path();

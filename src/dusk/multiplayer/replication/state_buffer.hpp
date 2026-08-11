@@ -68,6 +68,7 @@ public:
     void reset();
 
     bool has_data() const { return !mSamples.empty(); }
+    std::size_t sample_count() const { return mSamples.size(); }
     double delay_ticks() const { return mDelayTicks; }
     std::uint32_t starvation_count() const { return mStarvations; }
     std::uint32_t snap_count() const { return mSnaps; }
@@ -85,6 +86,9 @@ private:
     double mPlaybackTick = 0.0;
     double mDelayTicks = kMinDelayTicks;
     bool mStarted = false;
+    /// True once the cursor has sat between two real samples. Until then a starvation means the
+    /// stream has not started, not that the link is bad, and must not widen the buffer.
+    bool mEverInterpolated = false;
 
     std::uint32_t mTicksSinceStarvation = 0;
     std::uint32_t mConsecutiveStarvations = 0;

@@ -37,6 +37,9 @@ void StateBuffer::reset() {
     mStarted = false;
     mTicksSinceStarvation = 0;
     mConsecutiveStarvations = 0;
+    // Also cleared: after a warp the stream restarts from nothing, so the first starvations are
+    // the sender loading the new scene, not a degraded link.
+    mEverInterpolated = false;
     // Deliberately keep mDelayTicks: the link's jitter is a property of the connection, not of the
     // scene, so a warp shouldn't throw away what we learned about it.
 }
@@ -45,6 +48,21 @@ void StateBuffer::on_starved() {
     ++mStarvations;
     ++mConsecutiveStarvations;
     mTicksSinceStarvation = 0;
+
+    if (!mEverInterpolated) {
+        // The stream has not started properly yet — one or two poses have arrived and playback
+        // trivially outruns them. Widening for that would charge the session permanent latency for
+        // the other end's loading screen, which is the "everyone pays the worst player" trap this
+        // buffer exists to avoid.
+        //
+        // Honest scope: measurement showed this guard does NOT cover the startup burst actually
+        // seen in two-instance runs (27 starvations right after the sender enters the world). By
+        // then interpolation has genuinely begun, so those take the normal path and are capped by
+        // kStallStarvationTicks instead — delay peaks near 7 ticks and decays back to ~3.5 over
+        // the following minute. This guard covers only the colder case before the first successful
+        // interpolation, which is real but was not the one that showed up in the trace.
+        return;
+    }
 
     if (mConsecutiveStarvations > kStallStarvationTicks) {
         // The sender has stalled rather than jittered. Widening the buffer cannot bridge a stall,
@@ -106,6 +124,10 @@ bool StateBuffer::advance(PlayerState& out) {
         on_starved();
         return true;
     }
+
+    // Reaching here means the cursor sits between two real samples, which is the definition of a
+    // healthy stream. Latched so on_starved() can tell "never started" from "hiccuped".
+    mEverInterpolated = true;
 
     // Find the pair bracketing the cursor. The deque is tick-ordered and short (a couple of dozen
     // entries at worst), so a linear scan from the back is cheaper than binary searching.

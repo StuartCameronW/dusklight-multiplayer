@@ -13,6 +13,7 @@
 #include "tracy/Tracy.hpp"
 
 #if TARGET_PC
+#include "dusk/autopilot.hpp"
 #include "dusk/menu_pointer.h"
 #include "dusk/ui/touch_controls.hpp"
 #endif
@@ -65,6 +66,9 @@ void mDoCPd_c::read() {
     ZoneScoped;
 #if TARGET_PC
     dusk::ui::sync_virtual_input();
+    // After the touch controls: both drive the same virtual pad, and when a script is running it
+    // is the one that should win.
+    dusk::autopilot::tick();
 #endif
     JUTGamePad::read();
 

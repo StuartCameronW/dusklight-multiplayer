@@ -77,6 +77,10 @@ struct MigrationStats {
 std::optional<std::filesystem::path> sConfiguredDataPath;
 std::optional<std::filesystem::path> sActiveDescriptorPath;
 std::optional<std::filesystem::path> sActivePrefPath;
+/// Set by --data-dir. Deliberately bypasses the descriptor file rather than writing one: the point
+/// is a throwaway sandbox for a second instance, and it must not leave the real install pointing
+/// somewhere else if it crashes.
+std::optional<std::filesystem::path> sDataPathOverride;
 
 std::filesystem::path path_from_utf8(std::string_view value) {
     return std::filesystem::path{
@@ -935,6 +939,13 @@ bool set_custom_data_path(const char* path, std::string* errorOut) {
     return set_custom_data_path(path_from_utf8(path), errorOut);
 }
 
+void set_data_path_override(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return;
+    }
+    sDataPathOverride = path;
+}
+
 bool set_portable_data_path() {
     return write_location_descriptor(LocationMode::Portable, portable_data_path());
 }
@@ -980,6 +991,20 @@ bool is_data_path_restart_pending() {
 }
 
 Paths initialize_data() {
+    if (sDataPathOverride) {
+        // Everything — save files, config, logs and caches — lands in the one directory, so a
+        // second instance shares nothing with the first and can be deleted wholesale afterwards.
+        sActivePrefPath = *sDataPathOverride;
+        sConfiguredDataPath = *sDataPathOverride;
+        sActiveDescriptorPath.reset();
+        ensure_data_directory(*sDataPathOverride);
+
+        return Paths{
+            .userPath = *sDataPathOverride,
+            .cachePath = *sDataPathOverride,
+        };
+    }
+
     const auto preferredPrefPath = get_pref_path();
     const auto prefPath =
         rename_legacy_pref_path(legacy_path_for_pref_path(preferredPrefPath), preferredPrefPath);

@@ -18,6 +18,12 @@
 
 namespace dusk::mp {
 
+/// True when the game is in real, playable gameplay — not a menu, a load, a cutscene, or the
+/// title screen's attract demo. Exported rather than kept private because the autopilot needs the
+/// identical test: when the two definitions drifted apart, scripts believed they were in the world
+/// several hundred ticks before replication agreed, and the resulting traces were nonsense.
+bool world_is_playable();
+
 /// Read the local player's pose. False when Link doesn't currently exist (loading, title screen),
 /// in which case nothing should be sent this tick.
 bool capture_local_player(PlayerState& out);
@@ -28,6 +34,10 @@ bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb);
 
 /// Push an interpolated pose onto an existing puppet. No-op if the puppet isn't alive.
 void apply_puppet_state(std::uint32_t playerId, const PlayerState& state);
+
+/// Read back where the puppet actor actually is. False when it doesn't exist. Distinct from the
+/// pose we last pushed: if the two disagree, the puppet is not honouring what it was given.
+bool read_puppet_pose(std::uint32_t playerId, PlayerState& out);
 
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);

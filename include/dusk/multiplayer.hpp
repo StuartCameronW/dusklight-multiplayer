@@ -31,6 +31,8 @@ struct StartupOptions {
     const char* nickname = nullptr;
     /// --mp-color: "RRGGBB" hex. Null or empty leaves the colour to the automatic palette.
     const char* color = nullptr;
+    /// --mp-trace: development pose trace, written per sim tick. See multiplayer/session/trace.hpp.
+    const char* trace = nullptr;
 };
 
 /**
