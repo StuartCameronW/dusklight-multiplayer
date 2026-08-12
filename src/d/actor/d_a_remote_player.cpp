@@ -87,14 +87,54 @@ const u16 l_handShapeNum = 11;
 const u16 l_leftHandShape = 0;
 const u16 l_rightHandShape = 6;
 
-/* Matches daAlink_c::initModel (d_a_alink.h:3732 -> d_a_alink.cpp:4131), minus the warp-material
- * branch, which only fires for the midna-warp texture and cannot apply to these.
+/**
+ * Matches daAlink_c::initModel (d_a_alink.cpp:4105-4137), warp-material branch included.
+ *
+ * ★ An earlier version of this skipped that branch with the comment "only fires for the midna-warp
+ * texture and cannot apply to these". That was an ASSUMPTION, not a finding, and it was wrong in
+ * the way that matters: the puppet loads the SAME BMDs the local player does, so whatever is true
+ * of his models is true of ours. The check is a pointer comparison against the shared warp texture
+ * in the Always archive, and if it matches, the model must be built with one extra TEV stage and
+ * texgen and with its own copies of both blocks (0x2000400) — otherwise the puppet's materials are
+ * shaped differently from the local player's for the same mesh.
+ *
+ * The on/off pair brackets creation on purpose: onWarpMaterial bumps the counts on the shared model
+ * DATA, mDoExt_J3DModel__create copies them into the model's own blocks, and offWarpMaterial puts
+ * the data back. Skipping the restore would leave the count raised for anything else using that
+ * data, so the pairing is not optional.
+ *
+ * i_warpTexData comes from the local player rather than from the Always archive directly, because
+ * dRes_ID_ALWAYS_BTI_WARP_TEX_e lives in a per-region header that cannot be included here without
+ * colliding with the outfit headers. It is the identical pointer — daAlink_c::createHeap builds it
+ * the same way (d_a_alink.cpp:4183-4184) — and NULL simply means "no local player yet", in which
+ * case the branch cannot fire and we behave as before.
  */
-J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
+J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags, const void* i_warpTexData) {
     if (i_modelData == NULL) {
         return NULL;
     }
-    return mDoExt_J3DModel__create(i_modelData, 0x80000, i_diffFlags | 0x11000084);
+
+    bool warpMaterial = false;
+    J3DTexture* tex = i_modelData->getTexture();
+    if (i_warpTexData != NULL && tex != NULL) {
+        const int texNo = tex->getNum() - 1;
+        if (texNo >= 0 && i_warpTexData == tex->getImgDataPtr(texNo)) {
+            warpMaterial = true;
+        }
+    }
+
+    if (warpMaterial) {
+        dRes_info_c::onWarpMaterial(i_modelData);
+        i_diffFlags |= 0x2000400;
+    }
+
+    J3DModel* model = mDoExt_J3DModel__create(i_modelData, 0x80000, i_diffFlags | 0x11000084);
+
+    if (warpMaterial) {
+        dRes_info_c::offWarpMaterial(i_modelData);
+    }
+
+    return model;
 }
 
 /* Link's animations do not live in the body archive — they are in AlAnm, mounted in ARAM at boot
@@ -231,6 +271,13 @@ const s16 l_swayLoggedAngle = 0x800;
 
 /* When to report the idle animation's frame — long enough in that a stuck frame is unambiguous. */
 const u16 l_idleFrameLogTick = 200;
+
+/* How often, and how many times, to print the puppet's cap angles next to the local player's. Kept
+ * short because a puppet's life in a scripted run is only a few hundred in-world ticks — an earlier
+ * period of 150 yielded exactly one sample.
+ */
+const u16 l_capComparePeriod = 60;
+const u16 l_capCompareCount = 8;
 
 /* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
  * HIO rates below: this one is about network noise, not about gait.
@@ -429,12 +476,20 @@ int daRemotePlayer_c::createHeap() {
      * differently should cost a head, not the whole puppet. own_archive_res() already logs which
      * name was missing. */
     const OutfitArc& outfit = l_outfits[mOutfit];
-    mpHeadModel =
-        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0);
-    mpHandModel =
-        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0);
-    mpFaceModel = init_model(
-        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)), 0x20200);
+
+    /* The pointer daAlink_c compares against to decide a model carries the shared warp texture.
+     * Read off the local player so the puppet reaches the same verdict he does for the same mesh.
+     */
+    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    const void* warpTexData = link != NULL ? link->mpWarpTexData : NULL;
+
+    mpHeadModel = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0, warpTexData);
+    mpHandModel = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0, warpTexData);
+    mpFaceModel =
+        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)),
+            0x20200, warpTexData);
 
     /* Dusk already fixes Link's eyes vanishing on PC by clamping maxLOD on three face textures
      * (d_a_alink_wolf.inc:379-395). That fix is applied to the local player's face model data, and
@@ -1337,30 +1392,39 @@ void daRemotePlayer_c::setHatAngle() {
     f32 windPower;
     dKyw_get_AllWind_vec(&anchorPos, &windDir, &windPower);
 
-    /* ★ Read the local player's OWN wind push rather than re-deriving one.
+    /* ★ Build the wind the way daAlink_c::setWindSpeed does (d_a_alink.cpp:5521-5539), using the
+     * game's OWN scale constant. This went wrong twice before, in opposite directions, and both
+     * mistakes are worth not repeating:
      *
-     * daAlink_c::field_0x35b8 (d_a_alink.cpp:5539) is the environment wind after three steps the
-     * puppet cannot reproduce on its own: a wind-wall occlusion test, a scale by the HIO-tunable
-     * mMaxWindSpeed whose default lives in a binary parameter file, and a multi-tick smoothing so
-     * gusts ramp instead of snapping. An earlier version of this guessed that scale at 30 and
-     * Stuart found the result "one step too windy" — in the Forest Temple's gusts the puppet's cap
-     * sat permanently in the strong-wind flutter mode while the local player's did not.
+     *   1. The first version invented the scale as 30.0f, on the belief that Link's
+     *      mpHIO->mBasic.m.mMaxWindSpeed was unreachable. Stuart: "one step too windy".
+     *   2. The second read daAlink_c::field_0x35b8 — Link's own already-scaled wind — reasoning
+     *      that copying him exactly must be right. It is not, because setWindSpeed is not the only
+     *      gate: setHatAngle itself only runs `if (!checkWolf())` (d_a_alink.cpp:18537), so with
+     *      the local player in WOLF form there is no cap, no sway, and field_0x35b8 contributes
+     *      nothing. Stuart, playing a wolf save: "the base wind amount is not enough now".
      *
-     * Taking Link's value instead removes the guess completely and makes the two caps respond
-     * IDENTICALLY, which is the thing actually being judged when the two are side by side. All of
-     * daAlink_c's members are public (d_a_alink.h:231-232 opens the class public and the next
-     * top-level specifier is at :4589), so this is a plain read of a live field — no state is
-     * written back, and nothing here can perturb the local player.
+     * The actual answer was in the tree the whole time. daAlinkHIO_basic_c0::m is a public static
+     * const (d_a_alink.h:4650-4653) — the same pattern selectAnimation() already reads gait speeds
+     * from — and mMaxWindSpeed is 20.0f (d_a_alink_HIO_data.inc:22). No guess, no dependence on
+     * what form the local player happens to be in, and sampled at the PUPPET's position rather
+     * than Link's, which is also more correct than reading his value ever was.
      *
-     * The one inaccuracy left is positional: wind varies by location and this is sampled at Link's
-     * position, not the puppet's. In co-op the two are usually in the same room, and being wrong by
-     * a room is far less visible than being wrong by a factor of two everywhere. */
-    cXyz windPush;
-    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (link != NULL) {
-        windPush = link->field_0x35b8;
+     * Dropped from Link's version: checkWindWallRate, which attenuates wind behind geometry using
+     * his own collision state. Its absence means a puppet sheltered by a wall still feels the wind;
+     * that is a smaller error than the two above and needs a raycast to fix. */
+    f32 windTargetPower = windPower;
+    if (dKy_TeachWind_existence_chk() == 0 || windTargetPower < 0.3f) {
+        windTargetPower = 0.0f;
     }
+    windTargetPower *= daAlinkHIO_basic_c0::m.mMaxWindSpeed;
 
+    const cXyz windTarget = windDir * windTargetPower;
+    // Rises three times faster than it falls, so gusts arrive quickly and die away slowly.
+    const f32 windRate = mWindPush.abs2() > windTargetPower * windTargetPower ? 3.0f : 1.0f;
+    cLib_addCalcPos(&mWindPush, windTarget, 0.5f, windRate, 0.5f);
+
+    const cXyz& windPush = mWindPush;
     const bool strongWind = windPush.abs2() > SQUARE(l_strongWindSpeed);
 
     /* Latched the first time the wind is strong enough to change the cap's behaviour. This is the
@@ -1562,6 +1626,40 @@ void daRemotePlayer_c::setHatAngle() {
         mLoggedFirstSway = true;
         Log.debug("Puppet {} cap swaying: X {},{},{}  Y {},{},{}", mPlayerId, mSwayAngleX[7],
             mSwayAngleX[8], mSwayAngleX[9], mSwayAngleY[7], mSwayAngleY[8], mSwayAngleY[9]);
+    }
+
+    /* ★ Side-by-side with the LOCAL player's own cap, which is the only way to answer "is the
+     * puppet's sway right" without eyes on it. Both characters are Link on the same rig, so in the
+     * two-instance test the HOST's own numbers and the GUEST's puppet-of-the-host numbers describe
+     * the same character at the same moment and should agree. daAlink_c's members are public, so
+     * this reads his angle arrays directly rather than inferring anything. */
+    if (mCapCompareTicks < l_capCompareCount * l_capComparePeriod) {
+        mCapCompareTicks++;
+        if (mCapCompareTicks % l_capComparePeriod == 0) {
+            const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+            /* ★ Skip this entirely in wolf form. daAlink_c::setHatAngle only runs `if
+             * (!checkWolf())` (d_a_alink.cpp:18537), so a wolf's angle arrays sit at zero and
+             * comparing against them says nothing — reading them as a mismatch is what sent the
+             * previous wind fix the wrong way. Print the form instead, so a run against a wolf save
+             * is self-evidently not a comparison. */
+            if (link == NULL) {
+                Log.debug("Puppet {} cap @{}: X{} Y{} | wind {:.2f} | no local player", mPlayerId,
+                    mCapCompareTicks, mSwayAngleX[l_capRootJointNo], mSwayAngleY[l_capRootJointNo],
+                    JMAFastSqrt(mWindPush.abs2()));
+            } else if (link->checkWolf()) {
+                Log.debug("Puppet {} cap @{}: X{} Y{} | wind {:.2f} | P1 is a WOLF, no cap to "
+                          "compare against",
+                    mPlayerId, mCapCompareTicks, mSwayAngleX[l_capRootJointNo],
+                    mSwayAngleY[l_capRootJointNo], JMAFastSqrt(mWindPush.abs2()));
+            } else {
+                Log.debug("Puppet {} cap vs P1 @{}: puppet X{} Y{} | P1 X{} Y{} | wind {:.2f} vs "
+                          "{:.2f} | floor {} pitch {}",
+                    mPlayerId, mCapCompareTicks, mSwayAngleX[l_capRootJointNo],
+                    mSwayAngleY[l_capRootJointNo], link->field_0x302c[l_capRootJointNo],
+                    link->field_0x3040[l_capRootJointNo], JMAFastSqrt(mWindPush.abs2()),
+                    JMAFastSqrt(link->field_0x35b8.abs2()), pitchFloor, mHeadPitch);
+            }
+        }
     }
 
     mCapAnchorPrev = anchorPos;

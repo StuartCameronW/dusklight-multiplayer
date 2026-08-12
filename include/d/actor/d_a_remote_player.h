@@ -168,6 +168,8 @@ private:
     bool mLoggedStrongWind;
     /* And the first idle glance — the one eye path the tracking log cannot reach. */
     bool mLoggedIdleGaze;
+    /* Counts out the puppet-vs-local-player cap comparison samples. */
+    u16 mCapCompareTicks;
 
     /* --- Hat and hair sway. One array per axis, indexed by HEAD-MODEL joint number, exactly
      * daAlink_c::field_0x302c / field_0x3040 (d_a_alink.h:4273-4274). Joints 1-5 are hair strands,
@@ -192,6 +194,10 @@ private:
     /* The cap anchor's world position last tick. The apparent wind is measured from how far it
      * moved, so this is the single most important piece of state here (field_0x34c8). */
     cXyz mCapAnchorPrev;
+    /* Smoothed wind push, built the way daAlink_c::setWindSpeed builds his — but at the PUPPET's
+     * position and from the game's own HIO constant, so it is right whatever form the local player
+     * is in. See setHatAngle() for the two wrong answers this replaces. */
+    cXyz mWindPush;
     /* False until mCapAnchorPrev holds a real sample. Without it the first tick reads the whole
      * distance from the world origin as one frame of velocity and flings the cap. */
     bool mSwayInited;
