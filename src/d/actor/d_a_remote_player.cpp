@@ -162,12 +162,21 @@ const u16 l_eyeMaterialNo[2] = {2, 3};
  */
 const f32 l_eyeAngleToOffset = 0.00012207031f;
 
-/* How far the eye texture slides at full deflection, in UV units. 0.2 across the board, from
- * daHoZelda_c::setEyeMove (d_a_hozelda.cpp:729-750). Link uses a slightly asymmetric pair
- * (0.25 inner / 0.15 outer, d_a_alink.cpp:3359-3372); Zelda's symmetric version is the one copied
- * here because the puppet has no notion of which eye is inner to a turn it never makes.
+/* How far the eye texture slides at full deflection, in UV units — daAlink_c::setEyeMove
+ * (d_a_alink.cpp:3359-3372), i.e. LINK's numbers, because this is Link's face rig.
+ *
+ * ★ These MUST come from Link and not from daHoZelda_c, and the reason is the sign, not the
+ * magnitude. Zelda's two eye materials are UV-mirrored, so she slides them by -0.2 and +0.2 to move
+ * both pupils the same way on screen (d_a_hozelda.cpp:741-747). Link's are NOT mirrored: both his
+ * eyes take the SAME sign, and the 0.25/0.15 split is inner-vs-outer — the eye nearer the direction
+ * of gaze travels further. Copying Zelda's opposite signs onto Link's face makes the pupils diverge
+ * instead of track, which reads as cross-eyed one way and wall-eyed the other depending on which
+ * side the viewer stands. That was the "peeling" regression.
  */
-const f32 l_eyeOffsetScale = 0.2f;
+const f32 l_eyeOffsetInner = 0.25f;
+const f32 l_eyeOffsetOuter = 0.15f;
+const f32 l_eyeOffsetUp = 0.2f;
+const f32 l_eyeOffsetDown = 0.1f;
 
 /* Head aim limits, from daHoZelda_c::setNeckAngle (d_a_hozelda.cpp:817-818) and matching
  * daAlink_c's. Asymmetric in X because looking down is easier than looking up.
@@ -783,10 +792,16 @@ void daRemotePlayer_c::playFaceTextureAnime() {
  * the eyelid texture), so replacing the BTK's translation aims the eye without touching the lid.
  * daAlink_matAnm_c and daNpcF_MatAnm_c both do exactly this in their calc override.
  *
- * The geometry is daHoZelda_c::setNeckAngle/setEyeMove (d_a_hozelda.cpp:779-840, :715-777), which
- * is the compact version of daAlink_c's: take the angle from the head to the target, clamp it to
- * what a head can manage, and turn that into a texture offset. Zelda is the right model to copy —
- * a non-Link humanoid on Link's face rig, looking at the player.
+ * Two sources, split on purpose. The TARGETING — pick a target, gate it on whether it is worth
+ * looking at, take the angle from the head to it and clamp it to what a head can manage — is
+ * daHoZelda_c::setNeckAngle (d_a_hozelda.cpp:779-840), because she is a non-Link humanoid doing
+ * exactly this to the player and daAlink_c's equivalent is tangled in his own state. The
+ * ANGLE-TO-OFFSET step is daAlink_c::setEyeMove (d_a_alink.cpp:3355-3383), because that half is a
+ * property of the face RIG rather than of the character, and this puppet wears Link's face.
+ *
+ * ★ Mixing those two the other way is what caused the "peeling" regression: Zelda's eye materials
+ * are UV-mirrored and Link's are not, so her opposite-signed pair made the puppet's pupils diverge.
+ * See the offset constants above.
  *
  * ★ One deliberate departure. Zelda halves the clamped angle (`>> 1`, d_a_hozelda.cpp:820-821)
  * because her NECK takes the other half; the eyes only ever carry the remainder. This puppet has no
@@ -837,36 +852,43 @@ void daRemotePlayer_c::setEyeMove() {
         vertical = cLib_minMaxLimit<f32>(vertical, -1.0f, 1.0f);
         horizontal = cLib_minMaxLimit<f32>(horizontal, -1.0f, 1.0f);
 
-        /* Opposite signs across the pair: the two eye textures are mirrored, so equal and opposite
-         * UV slides move both pupils the same way on screen (d_a_hozelda.cpp:729-737). */
-        wantX[0] = -l_eyeOffsetScale * horizontal;
-        wantX[1] = l_eyeOffsetScale * horizontal;
-        wantY[0] = l_eyeOffsetScale * vertical;
-        wantY[1] = wantY[0];
-
-        /* Keeps a diagonal glance inside the eye white. Without it, looking up-and-across sends the
-         * pupil past the corner, because X and Y are each allowed a full deflection independently
-         * (d_a_hozelda.cpp:752-762). */
-        const f32 radius = JMAFastSqrt(horizontal * horizontal + vertical * vertical);
-        if (radius > 1.0f) {
-            const f32 shrinkX = fabsf(horizontal) / radius;
-            const f32 shrinkY = fabsf(vertical) / radius;
-            if (horizontal * vertical < 0.0f) {
-                wantX[1] *= shrinkX;
-                wantY[1] *= shrinkY;
-            } else {
-                wantX[0] *= shrinkX;
-                wantY[0] *= shrinkY;
-            }
+        /* Both eyes slide the SAME way; the asymmetry is which one leads. Whichever eye is on the
+         * inside of the turn travels the full 0.25, the outer one 0.15 (d_a_alink.cpp:3359-3366).
+         * Vertically Link looks up further than down, and the second eye is not smoothed
+         * separately at all — it copies the first (:3368-3372, :3383). */
+        if (horizontal > 0.0f) {
+            wantX[0] = l_eyeOffsetInner * horizontal;
+            wantX[1] = l_eyeOffsetOuter * horizontal;
+        } else {
+            wantX[0] = l_eyeOffsetOuter * horizontal;
+            wantX[1] = l_eyeOffsetInner * horizontal;
         }
+
+        wantY[0] = (vertical > 0.0f ? l_eyeOffsetUp : l_eyeOffsetDown) * vertical;
+        wantY[1] = wantY[0];
     }
 
-    // Same smoothing constants the game uses for eyes everywhere (d_a_hozelda.cpp:770-773).
+    /* ★ No radial clamp here, deliberately. daHoZelda_c shrinks a diagonal glance back inside the
+     * unit circle (d_a_hozelda.cpp:752-762); daAlink_c does not, and this is Link's face. The clamp
+     * was also written against Zelda's symmetric pair and does not transfer to an asymmetric one.
+     *
+     * Smoothing rates are Link's, and X and Y differ (d_a_alink.cpp:3380-3383). */
+    cLib_addCalc(&mEyeOffset[0][0], wantX[0], 0.5f, 0.1f, 0.03f);
+    cLib_addCalc(&mEyeOffset[1][0], wantX[1], 0.5f, 0.1f, 0.03f);
+    cLib_addCalc(&mEyeOffset[0][1], wantY[0], 0.5f, 0.08f, 0.02f);
+    mEyeOffset[1][1] = mEyeOffset[0][1];
+
     for (int i = 0; i < 2; i++) {
-        cLib_addCalc(&mEyeOffset[i][0], wantX[i], 0.5f, 0.1f, 0.03f);
-        cLib_addCalc(&mEyeOffset[i][1], wantY[i], 0.5f, 0.1f, 0.03f);
         mpEyeMatAnm[i]->setNowOffsetX(mEyeOffset[i][0]);
         mpEyeMatAnm[i]->setNowOffsetY(mEyeOffset[i][1]);
+    }
+
+    if (haveTarget && !mLoggedFirstGaze && fabsf(mEyeOffset[0][0]) > l_eyeCentredEpsilon) {
+        mLoggedFirstGaze = true;
+        // The two X offsets MUST share a sign; opposite signs are the peeling bug returning.
+        Log.debug("Puppet {} gaze engaged: angle {},{} -> L {:.3f},{:.3f} R {:.3f},{:.3f}",
+            mPlayerId, angleX, angleY, mEyeOffset[0][0], mEyeOffset[0][1], mEyeOffset[1][0],
+            mEyeOffset[1][1]);
     }
 
     /* Handing control back to the BTK is the one place this can pop, because daNpcF_MatAnm_c has no

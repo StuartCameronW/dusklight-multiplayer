@@ -81,6 +81,9 @@ private:
     /* Same idea for the first blink — the one observable that separates "attached and running" from
      * "attached and quietly doing nothing". */
     bool mLoggedFirstBlink;
+    /* And for the first time the gaze engages. Prints both eyes' offsets because the bug that
+     * produced the "peeling" was a SIGN disagreement between them, which no other measure sees. */
+    bool mLoggedFirstGaze;
 
     /* Blink cursor, exactly daAlink_c::field_0x2fea: 0 means eyes open, anything else is the frame
      * of a blink in progress. Per-puppet rather than shared, so two puppets never blink in unison.
