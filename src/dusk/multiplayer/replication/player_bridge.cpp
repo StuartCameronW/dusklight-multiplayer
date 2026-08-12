@@ -2,6 +2,7 @@
 
 #include <unordered_map>
 
+#include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_com_inf_game.h"
 #include "dusk/logging.h"
@@ -117,6 +118,24 @@ bool capture_local_player(PlayerState& out) {
     out.angleY = link->shape_angle.y;
     out.speed = link->speedF;
     out.flags = kPlayerStateInWorld;
+
+    /* The sharp turn. Read straight off the proc the state machine is IN rather than inferred from
+     * anything: commonProcInit writes mProcID = the proc it is entering (d_a_alink.cpp:15144) and
+     * procSlipInit enters PROC_SLIP and plays ANM_SLIP in the same two lines
+     * (d_a_alink.cpp:16673-16675), so this bit is true for exactly the ticks Link is skidding.
+     *
+     * Fetched through the LINK_PTR slot rather than reusing `link` above because that is the slot
+     * the rest of the puppet code reads Link from (d_a_remote_player.cpp:414), and it is the one
+     * that is documented to hold a daAlink_c. Null-checked anyway — nothing here may assume a
+     * scene. Wolf Link never reaches PROC_SLIP (he has his own PROC_WOLF_SLIP_TURN), so a wolf
+     * sender simply sends the bit clear, which is the right answer while the puppet has no wolf
+     * model to play it on.
+     */
+    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink != nullptr && alink->mProcID == daAlink_c::PROC_SLIP) {
+        out.flags |= kPlayerStateSharpTurn;
+    }
+
     return true;
 }
 
@@ -176,7 +195,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     }
 
     cXyz pos(state.posX, state.posY, state.posZ);
-    puppet->setNetworkPose(pos, state.angleY, state.speed);
+    puppet->setNetworkPose(pos, state.angleY, state.speed, state.sharp_turn());
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {

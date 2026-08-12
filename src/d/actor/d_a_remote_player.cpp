@@ -232,6 +232,21 @@ const u16 l_walkAnmIdx = dRes_ID_ALANM_BCK_WALKS_e;
  * this is the cycle the local player runs on — not a faster playback of the walk.
  */
 const u16 l_runAnmIdx = dRes_ID_ALANM_BCK_DASHS_e;
+/* The sharp turn: the skid Link plants when the stick is flicked back at speed. This is ANM_SLIP's
+ * m_underID in the same table (index 0x028, d_a_alink.cpp:323), reached from
+ * daAlink_c::procSlipInit (d_a_alink.cpp:16673-16675).
+ *
+ * ★ There is no left/right variant to get backwards, and that is worth stating because two other
+ * "turn" animations in this game DO have one and are MISNAMED in the decomp header: ANM_STEP_TURN
+ * (STEPL) and ANM_SMALL_GUARD (STEPR) are the left and right halves of one standing pivot — the
+ * game picks between them purely on the sign of the yaw delta (d_a_alink.cpp:7709-7713 and
+ * :17776-17779) and tests them as a pair (:15539). ANM_SLIP has no such twin: its table entry is
+ * {SLIP, SLIP}, because the skid is a straight-ahead brake. Link's actual 180 happens AFTERWARDS,
+ * in PROC_MOVE_TURN, and that is carried by shape_angle.y, which the puppet already replicates
+ * exactly (player_bridge.cpp samples link->shape_angle.y). So the pose and the yaw cannot disagree
+ * about direction here — there is only one direction the pose can mean.
+ */
+const u16 l_slipAnmIdx = dRes_ID_ALANM_BCK_SLIP_e;
 
 /* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
 enum AnmFamily {
@@ -552,6 +567,19 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
+    /* The skid, loaded on the SAME family-checked path as the gaits (see anm_kind_matches: a BCK
+     * arrives as J3DAnmTransformKey/TransformFull/TransformFullWithLerp, never as a bare
+     * J3DAnmTransform, so this must be a family test).
+     *
+     * ★ Deliberately NOT joined to the fatal check above. A puppet that cannot play the turn pose
+     * is a puppet with one animation missing; a puppet that fails createHeap is deleted and
+     * respawned every couple of ticks forever, mounting an archive each time. Trading the first
+     * failure for the second would be a bad bargain, so this one degrades to the gait instead. */
+    mpSlipAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_slipAnmIdx, ANM_FAMILY_TRANSFORM));
+    if (mpSlipAnm == NULL) {
+        Log.warn("Puppet has no sharp-turn animation; turns will play the gait instead");
+    }
+
     /* ★ The last two arguments are the model flag and the deferred-display-list flag, and they must
      * match what every other Link model is built with. They were 0, 0 — which made the BODY the
      * only model in the scene created as mDoExt_J3DModel__create(data, 0, 0), while its own head,
@@ -821,13 +849,17 @@ static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
     return 1;
 }
 
-void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed) {
+void daRemotePlayer_c::setNetworkPose(
+    const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn) {
     current.pos = i_pos;
     shape_angle.y = i_angleY;
     // The logical angle is kept in step so anything that reads current.angle (audio, effects) sees
     // a sane value, even though only shape_angle drives the model matrix.
     current.angle.y = i_angleY;
     mNetSpeed = i_speed;
+    // Written every tick before execute() can reach selectAnimation() — execute() returns early
+    // until mHasPose, which is set right below — so this needs no separate initialisation.
+    mNetSharpTurn = i_sharpTurn;
     mHasPose = true;
 }
 
@@ -851,6 +883,38 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_spe
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
+
+    /* The sharp turn wins over the gait outright, exactly as it does for the local player:
+     * PROC_SLIP is a proc of its own and setSingleAnimeParam replaces the move blend wholesale, it
+     * does not layer over it (d_a_alink.cpp:16675). Taken FIRST and returned from, so the gait code
+     * below cannot then overwrite the play speed with a walk/run rate.
+     *
+     * Every playback parameter is daAlink_c's own mSlideAnm, read from daAlinkHIO_move_c0::m rather
+     * than copied — the same single-source rule the gait thresholds already follow. That is start
+     * frame 3.0, end frame 11, rate 0.7 and a 4.0-frame morf in (d_a_alink_HIO_data.inc:34-40), so
+     * the puppet's blend INTO the skid is the player's own interpolation rather than the 5.0f the
+     * gait switch uses, and cannot fight it.
+     *
+     * ★ One deliberate divergence: the play mode is pinned to EMode_NONE (play once, hold the last
+     * frame) instead of taking the BCK's own attribute the way commonSingleAnime does
+     * (d_a_alink.cpp:7180). daAlink_c can afford the asset's mode because his state machine leaves
+     * PROC_SLIP within about ten ticks under its own power; the puppet has no state machine and
+     * leaves only when the wire says so — and StateBuffer HOLDS the last sample while starved
+     * (state_buffer.cpp:164-169). If that held sample had the bit set and the animation looped, a
+     * lagging puppet would skid on the spot over and over, which reads as a bug rather than as the
+     * lag it is. Holding the final frame degrades to a puppet frozen mid-skid, which reads as lag.
+     */
+    if (mNetSharpTurn && mpSlipAnm != NULL) {
+        if (mCurrentAnm != l_slipAnmIdx) {
+            const daAlinkHIO_anm_c& slide = hio.mSlideAnm;
+            mpModelMorf->setAnm(mpSlipAnm, J3DFrameCtrl::EMode_NONE, slide.mInterpolation,
+                slide.mSpeed, slide.mStartFrame, static_cast<f32>(slide.mEndFrame));
+            mCurrentAnm = l_slipAnmIdx;
+        }
+        // The idle-frame probe below counts consecutive IDLE ticks; a skid is not one of them.
+        mIdleTicks = 0;
+        return;
+    }
 
     // Midpoint of the band daAlink_c cross-fades over, i.e. where its blend weight passes 0.5.
     const f32 runFraction = 0.5f * (hio.mWalkChangeRate + hio.mRunChangeRate);

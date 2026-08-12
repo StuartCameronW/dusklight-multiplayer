@@ -23,6 +23,36 @@ enum PlayerStateFlags : std::uint8_t {
     kPlayerStateInWorld = 1 << 0,
     /// Reserved for M3 transform sync; sent as 0 for now so the bit is already allocated.
     kPlayerStateWolf = 1 << 1,
+    /**
+     * The sender is skidding — daAlink_c::PROC_SLIP, the sharp turn you get by flicking the stick
+     * back at speed (d_a_alink.cpp:12413-12417 selects it, :16673 plays ANM_SLIP).
+     *
+     * ★ This is a WIRE bit rather than something the puppet derives from the yaw it already
+     * receives, and the reason is not bandwidth — it is that derivation gives the wrong answer, and
+     * gives it backwards:
+     *
+     *   - During the skid itself daAlink_c::procSlip (d_a_alink.cpp:16685-16726) only decelerates
+     *     mNormalSpeed. It does NOT touch shape_angle.y until the slide has already STOPPED
+     *     (:16688-16691, inside the checkZeroSpeedF branch). So the one state that HAS a distinct
+     *     animation has a yaw rate of ZERO, and a yaw-rate detector would never fire on it.
+     *   - The state with the largest yaw rate is PROC_MOVE_TURN, where shape_angle chases
+     *     current.angle at up to mMaxTurnAngle*2 = 9000 units/tick (:15829-15831) — and
+     *     procMoveTurnInit plays setBlendMoveAnime (:15809), i.e. the ORDINARY GAIT. There is no
+     *     turn animation there to propagate, so a yaw-rate detector would fire hardest exactly
+     *     where playing one is wrong.
+     *
+     * A local derivation would therefore invert the truth: silent on the skid, loud on the walk.
+     * (The usual secondary objections apply too — lerp_state resamples the yaw so the puppet sees
+     * the sender's average rate rather than its peak, StateBuffer holds the last pose while starved
+     * so the derived rate collapses to zero, and a snap manufactures a one-tick spike — but those
+     * are refinements. The inversion above is on its own decisive.)
+     *
+     * It rides in `flags` rather than as a new field because it is a boolean discrete state, which
+     * is what this byte is for: six bits were spare, so the wire cost is ZERO bytes, and lerp_state
+     * already takes `flags` whole from the newer sample, so the "never blend discrete state" rule
+     * is satisfied with no new interpolation code to get wrong.
+     */
+    kPlayerStateSharpTurn = 1 << 2,
 };
 
 /// 19 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
@@ -37,6 +67,7 @@ struct PlayerState {
     std::uint8_t flags = 0;
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
+    bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);
