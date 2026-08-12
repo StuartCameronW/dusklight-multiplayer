@@ -352,6 +352,10 @@ const f32 l_capGravity = 5.0f;
  * of it, which is what daAlink_c feeds checkWindWallRate as mHeight. */
 const f32 l_linkHeight = 180.0f;
 
+/* ★ TEMPORARY — Hang 4. How many of a puppet's calcs get the step-by-step trace. The hang is
+ * always on the first calc, so a few is plenty and the log stays readable. See traceCalc(). */
+const u16 l_calcTraceNum = 3;
+
 /* Above this the wind counts as "strong" and the cap flutters at a fixed hard rate rather than one
  * proportional to how fast the head is moving (d_a_alink.cpp:2568-2576, :2789-2793). Compared
  * against the SAME quantity daAlink_c compares, so the two caps switch modes together.
@@ -2232,6 +2236,15 @@ void daRemotePlayer_c::setRoomInfo() {
     fopAcM_SetRoomNo(this, room_no);
 }
 
+/* ★ TEMPORARY — Hang 4 bisection. See the declaration for why a trace stands in for a minidump
+ * here. Traces only the first few calcs because the hang is always on the FIRST one (14 of 14), so
+ * a handful of lines is enough and the log stays readable. */
+void daRemotePlayer_c::traceCalc(const char* i_step) {
+    if (mCalcTraced < l_calcTraceNum) {
+        Log.debug("Puppet {} calc {}: -> {}", mPlayerId, mCalcTraced, i_step);
+    }
+}
+
 int daRemotePlayer_c::execute() {
     if (!mHasPose) {
         // No network pose yet. Skipping calc keeps the puppet from flashing at its spawn point.
@@ -2259,25 +2272,37 @@ int daRemotePlayer_c::execute() {
     // No guard against the local player owning this model data, and none needed: the puppet's
     // J3DModelData came out of its own private archive mount, so daAlink_c's joint callbacks and
     // mtx calculators are not on it and cannot be.
+    traceCalc("selectAnimation");
     selectAnimation();
+    traceCalc("morf play");
     mpModelMorf->play(0, 0);
     // Independent of the body: the puppet blinks while standing still as much as while running,
     // which is the whole point — a face frozen mid-stare is what reads as "not a real player".
+    traceCalc("playFaceTextureAnime");
     playFaceTextureAnime();
     // Before setMatrix, so the ground check runs against the pose the puppet is about to be drawn
     // at rather than the previous tick's.
+    traceCalc("setRoomInfo");
     setRoomInfo();
+    traceCalc("setMatrix");
     setMatrix();
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
+    traceCalc("setEyeMove");
     setEyeMove();
     // Same reason, and in the same place daAlink_c puts it (d_a_alink.cpp:18530-18538): the sway is
     // integrated from how far this tick's matrices moved, and the joint callback applies the result
     // during the NEXT tick's calc.
+    traceCalc("setHatAngle");
     setHatAngle();
     // Diagnostic for A5, silent unless the material state actually moves. Last, so it reports the
     // state the draw pass is about to use.
+    traceCalc("checkMaterialDrift");
     checkMaterialDrift();
+    traceCalc("execute done");
+    if (mCalcTraced < l_calcTraceNum) {
+        mCalcTraced++;
+    }
     return 1;
 }
 
@@ -2328,18 +2353,21 @@ int daRemotePlayer_c::draw() {
     const f32 savedPatRatio = g_env_light.pat_ratio;
     const cXyz savedPlightNearPos = g_env_light.plight_near_pos;
 
+    traceCalc("draw: settingTevStruct");
     g_env_light.settingTevStruct(10, &current.pos, &tevStr);
 
     g_env_light.UseCol = savedUseCol;
     g_env_light.PrevCol = savedPrevCol;
     g_env_light.pat_ratio = savedPatRatio;
     g_env_light.plight_near_pos = savedPlightNearPos;
+    traceCalc("draw: body");
     drawModel(model);
     // Same order daAlink_c draws them in, which matters for the face: it is drawn after the head so
     // it wins the depth fight at the eyes rather than being buried inside it.
     drawModel(mpHeadModel);
     drawModel(mpFaceModel);
     drawModel(mpHandModel);
+    traceCalc("draw done");
     return 1;
 }
 

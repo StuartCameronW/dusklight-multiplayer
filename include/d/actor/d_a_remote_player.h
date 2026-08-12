@@ -61,6 +61,13 @@ private:
     void setupHeadSway();
     /// Report any change to the puppet's material state. Diagnostic for A5; must run every tick.
     void checkMaterialDrift();
+    /* ★ TEMPORARY — Hang 4 bisection. One line per step of the first few calcs, so the last line in
+     * a frozen host's log names the call that is spinning. Justified by two facts: the logger
+     * fflushes every line (src/dusk/logging.cpp:240), so the last line written really is the last
+     * one executed; and the hang reproduces in 14 of 14 SCRIPTED runs, which are drivable without a
+     * human. That combination makes a checkpoint trace a substitute for the minidump this machine
+     * cannot take (no debugger, and comsvcs MiniDump needs SeDebugPrivilege). Delete once found. */
+    void traceCalc(const char* i_step);
     void setHatAngle();
     /// How much of the ambient wind actually reaches the puppet, 0 (fully sheltered) to 1 (open).
     /// daAlink_c::checkWindWallRate (d_a_alink.cpp:5461-5476), cast from the PUPPET's own position.
@@ -222,6 +229,8 @@ private:
     /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
      * until the first sample. See checkMaterialDrift(). */
     u16 mMaterialSig[4];
+    /* ★ TEMPORARY — Hang 4. How many calcs have been step-traced so far. See traceCalc(). */
+    u16 mCalcTraced;
 
     /* --- Hat and hair sway. One array per axis, indexed by HEAD-MODEL joint number, exactly
      * daAlink_c::field_0x302c / field_0x3040 (d_a_alink.h:4273-4274). Joints 1-5 are hair strands,
