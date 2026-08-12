@@ -1,6 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
+#include "d/d_bg_s_lin_chk.h"
 #include "d/d_resorce.h"
 #include "f_op/f_op_actor.h"
 #include "m_Do/m_Do_ext.h"
@@ -58,7 +59,12 @@ private:
      * the same one-frame lag daAlink_c lives with (d_a_alink.cpp:18530-18538). */
     /// Hook the sway callback onto the head model's joints. Once, at createHeap time.
     void setupHeadSway();
+    /// Report any change to the puppet's material state. Diagnostic for A5; must run every tick.
+    void checkMaterialDrift();
     void setHatAngle();
+    /// How much of the ambient wind actually reaches the puppet, 0 (fully sheltered) to 1 (open).
+    /// daAlink_c::checkWindWallRate (d_a_alink.cpp:5461-5476), cast from the PUPPET's own position.
+    f32 checkWindWallRate(const cXyz& i_windDir);
     void setHairAngle(cXyz* i_apparentWind, f32 i_sinYaw, f32 i_cosYaw);
     void calcHairAngle(s16* o_angle);
     /// Rotate a joint's world matrix about the actor's yaw frame. daAlink_c::setMatrixWorldAxisRot
@@ -170,6 +176,9 @@ private:
     bool mLoggedIdleGaze;
     /* Counts out the puppet-vs-local-player cap comparison samples. */
     u16 mCapCompareTicks;
+    /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
+     * until the first sample. See checkMaterialDrift(). */
+    u16 mMaterialSig[4];
 
     /* --- Hat and hair sway. One array per axis, indexed by HEAD-MODEL joint number, exactly
      * daAlink_c::field_0x302c / field_0x3040 (d_a_alink.h:4273-4274). Joints 1-5 are hair strands,
@@ -194,6 +203,14 @@ private:
     /* The cap anchor's world position last tick. The apparent wind is measured from how far it
      * moved, so this is the single most important piece of state here (field_0x34c8). */
     cXyz mCapAnchorPrev;
+    /* Where the puppet stood last tick, which is daAlink_c::field_0x3798. Used for one thing only:
+     * deciding whether it is standing still, because the original throws away the cap's horizontal
+     * motion input when it is (d_a_alink.cpp:2654-2657). Without that test a stationary puppet's
+     * cap is stirred by the idle animation's own head bob. */
+    cXyz mPrevPos;
+    /* The puppet's own line check for the wind-shelter test. Its own, not a borrow of Link's: the
+     * whole point is to cast from where the PUPPET stands. */
+    dBgS_LinChk mWindLinChk;
     /* Smoothed wind push, built the way daAlink_c::setWindSpeed builds his — but at the PUPPET's
      * position and from the game's own HIO constant, so it is right whatever form the local player
      * is in. See setHatAngle() for the two wrong answers this replaces. */

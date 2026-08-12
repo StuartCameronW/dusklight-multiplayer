@@ -17,6 +17,7 @@
 #include "d/actor/d_a_mirror.h"
 #include "d/actor/d_a_npc4.h"
 #include "d/actor/d_a_remote_player.h"
+#include "d/d_bg_s.h"
 #include "dusk/logging.h"
 #include "f_op/f_op_actor_mng.h"
 // AlAnm.h (the animation indices) arrives via d_a_alink.h. The per-outfit headers are deliberately
@@ -109,19 +110,81 @@ const u16 l_rightHandShape = 6;
  * the same way (d_a_alink.cpp:4183-4184) — and NULL simply means "no local player yet", in which
  * case the branch cannot fire and we behave as before.
  */
+bool has_warp_material(J3DModelData* i_modelData, const void* i_warpTexData) {
+    if (i_modelData == NULL || i_warpTexData == NULL) {
+        return false;
+    }
+
+    J3DTexture* tex = i_modelData->getTexture();
+    if (tex == NULL) {
+        return false;
+    }
+
+    const int texNo = tex->getNum() - 1;
+    return texNo >= 0 && i_warpTexData == tex->getImgDataPtr(texNo);
+}
+
+/**
+ * One line describing a model's material state, for the puppet-vs-local-player comparison.
+ *
+ * ★ Written because the warp-particle bug has now survived two rounds of reasoning that produced
+ * OPPOSITE predictions about which models should break, which is the point at which guessing has to
+ * stop. Everything here is a property the local player's identical mesh also has, so any difference
+ * between the two lines is a difference this actor introduced and nothing else.
+ *
+ * The number that matters is `lastTexMap`. addWarpMaterial appends the dissolve stage at TEV stage
+ * 3 / texmap 3 and leaves it DISABLED by not counting it; onWarpMaterial enables it purely by
+ * raising the stage count (d_resorce.cpp:181-195). So "the last counted stage reads from texmap 3"
+ * is precisely "this model is currently drawing the twilight dissolve", which is what the bug looks
+ * like. A puppet reporting 3 where the local player reports something else is the whole answer.
+ */
+/// The two numbers that decide whether a model is drawing the dissolve. Packed so a per-model
+/// "has this changed since last tick" test is one comparison. 0xFFFF means "nothing sampled yet".
+u16 material_signature(J3DModelData* i_modelData) {
+    if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
+        return 0xFFFF;
+    }
+
+    J3DTevBlock* tevBlock = i_modelData->getMaterialNodePointer(0)->getTevBlock();
+    const u8 stageNum = tevBlock->getTevStageNum();
+    const int lastTexMap = stageNum > 0 ? tevBlock->getTevOrder(stageNum - 1)->getTexMap() : 0xFF;
+    return (u16)((stageNum << 8) | (u8)lastTexMap);
+}
+
+void log_material_state(const char* i_who, const char* i_what, J3DModelData* i_modelData) {
+    if (i_modelData == NULL) {
+        Log.debug("  {} {}: <null>", i_who, i_what);
+        return;
+    }
+
+    const u16 matNum = i_modelData->getMaterialNum();
+    if (matNum == 0) {
+        Log.debug("  {} {}: no materials", i_who, i_what);
+        return;
+    }
+
+    J3DMaterial* material = i_modelData->getMaterialNodePointer(0);
+    J3DTevBlock* tevBlock = material->getTevBlock();
+    const u8 stageNum = tevBlock->getTevStageNum();
+    const u32 texGenNum = material->getTexGenBlock()->getTexGenNum();
+    J3DTexture* tex = i_modelData->getTexture();
+
+    int lastTexMap = -1;
+    if (stageNum > 0) {
+        lastTexMap = tevBlock->getTevOrder(stageNum - 1)->getTexMap();
+    }
+
+    Log.debug("  {} {}: mats {} | stages {} | texgens {} | lastTexMap {} | textures {}{}", i_who,
+        i_what, matNum, stageNum, texGenNum, lastTexMap, tex != NULL ? tex->getNum() : 0,
+        lastTexMap == 3 ? "  <<< WARP MATERIAL IS ON" : "");
+}
+
 J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags, const void* i_warpTexData) {
     if (i_modelData == NULL) {
         return NULL;
     }
 
-    bool warpMaterial = false;
-    J3DTexture* tex = i_modelData->getTexture();
-    if (i_warpTexData != NULL && tex != NULL) {
-        const int texNo = tex->getNum() - 1;
-        if (texNo >= 0 && i_warpTexData == tex->getImgDataPtr(texNo)) {
-            warpMaterial = true;
-        }
-    }
+    const bool warpMaterial = has_warp_material(i_modelData, i_warpTexData);
 
     if (warpMaterial) {
         dRes_info_c::onWarpMaterial(i_modelData);
@@ -256,6 +319,9 @@ const u16 l_capRootJointNo = 7;
  * bias that decides the rest pose.
  */
 const f32 l_capGravity = 2.0f;
+/* Human Link's own height (d_a_alink_wolf.inc:528). The wind-shelter line check is cast from half
+ * of it, which is what daAlink_c feeds checkWindWallRate as mHeight. */
+const f32 l_linkHeight = 180.0f;
 
 /* Above this the wind counts as "strong" and the cap flutters at a fixed hard rate rather than one
  * proportional to how fast the head is moving (d_a_alink.cpp:2568-2576, :2789-2793). Compared
@@ -276,6 +342,8 @@ const u16 l_idleFrameLogTick = 200;
  * short because a puppet's life in a scripted run is only a few hundred in-world ticks — an earlier
  * period of 150 yielded exactly one sample.
  */
+/* Models watched by checkMaterialDrift(), in the order body / head / hands / face. */
+const int l_watchedModelNum = 4;
 const u16 l_capComparePeriod = 60;
 const u16 l_capCompareCount = 8;
 
@@ -461,8 +529,41 @@ int daRemotePlayer_c::createHeap() {
      * For reference, no actor in the tree passes 0 for the deferred flag: 43 McaMorfSO
      * constructions use 0x80000 with a 0x1100xxxx deferred flag, of which 0x11000084 — the value
      * init_model uses — is the most common. */
+    /* ★ The body needs the SAME warp-material bracketing the other three models get, and until now
+     * it was the one model that did not. daAlink_c builds his body with initModel like everything
+     * else (d_a_alink_wolf.inc:364), and al.bmd is a BMWR resource (Kmdl.h) — so dRes_info_c's
+     * loader has already run addWarpMaterial over it, appending a fourth TEV stage, a fourth texgen
+     * and the shared warp texture, and permanently replacing the alpha compare with "discard
+     * anything at or below 0x80" (d_resorce.cpp:127-178, :291-293).
+     *
+     * The consequence of skipping it here is not cosmetic. onWarpMaterial raises the stage and
+     * texgen counts across the bracket so that mDoExt_J3DModel__create sizes the model's own copies
+     * of those blocks to hold the extra stage, which is what the 0x2000400 diff flag asks for.
+     * Without the bracket the puppet's body carries per-instance blocks one stage SHORT of the
+     * material data they were built from, while the local player's body — same mesh, same archive —
+     * carries the full-size ones. A model whose material state and block sizes disagree is exactly
+     * the sort of thing that renders as garbage, and this one also has a hard alpha cut-off to turn
+     * a wrong sample into a hole rather than a blemish.
+     *
+     * Kept as a bracket rather than left on: the counts belong to the shared model DATA, so raising
+     * them and not restoring would change the material for anything else built from it. */
+    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    const void* warpTexData = link != NULL ? link->mpWarpTexData : NULL;
+    const bool bodyWarpMaterial = has_warp_material(modelData, warpTexData);
+
+    u32 bodyDiffFlags = 0x11000084;
+    if (bodyWarpMaterial) {
+        dRes_info_c::onWarpMaterial(modelData);
+        bodyDiffFlags |= 0x2000400;
+    }
+
     mpModelMorf = JKR_NEW mDoExt_McaMorfSO(modelData, NULL, NULL, mpIdleAnm,
-        J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0x80000, 0x11000084);
+        J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0x80000, bodyDiffFlags);
+
+    if (bodyWarpMaterial) {
+        dRes_info_c::offWarpMaterial(modelData);
+    }
+
     if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
         return 0;
     }
@@ -476,12 +577,6 @@ int daRemotePlayer_c::createHeap() {
      * differently should cost a head, not the whole puppet. own_archive_res() already logs which
      * name was missing. */
     const OutfitArc& outfit = l_outfits[mOutfit];
-
-    /* The pointer daAlink_c compares against to decide a model carries the shared warp texture.
-     * Read off the local player so the puppet reaches the same verdict he does for the same mesh.
-     */
-    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
-    const void* warpTexData = link != NULL ? link->mpWarpTexData : NULL;
 
     mpHeadModel = init_model(
         static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0, warpTexData);
@@ -533,6 +628,40 @@ int daRemotePlayer_c::createHeap() {
         if (l_rightHandShape < shapeNum) {
             handData->getMaterialNodePointer(l_rightHandShape)->getShape()->show();
         }
+    }
+
+    /* ★ The warp-particle report (00-status.md A5), measured rather than argued about. Both sides
+     * of the same four meshes, once per puppet.
+     *
+     * The local player's half is skipped in wolf form, and that is not a limitation worth working
+     * around — a wolf has genuinely different models, so there is nothing to compare against. It is
+     * spelled out in the log because the previous bug in this file was diagnosed backwards for
+     * exactly this reason: zeroes from a system that was not running got read as a mismatch. */
+    /* 0xFFFF, not 0: fopAcM_ct zeroes the actor, and a zero would read as a real previous sample
+     * and make checkMaterialDrift() announce a change on its very first tick. */
+    for (int i = 0; i < l_watchedModelNum; i++) {
+        mMaterialSig[i] = 0xFFFF;
+    }
+
+    Log.debug("Puppet {} material state:", mPlayerId);
+    log_material_state("puppet", "body", mpModelMorf->getModel()->getModelData());
+    log_material_state("puppet", "head", mpHeadModel != NULL ? mpHeadModel->getModelData() : NULL);
+    log_material_state("puppet", "hands", mpHandModel != NULL ? mpHandModel->getModelData() : NULL);
+    log_material_state("puppet", "face", mpFaceModel != NULL ? mpFaceModel->getModelData() : NULL);
+
+    if (link == NULL) {
+        Log.debug("  (no local player to compare against)");
+    } else if (link->checkWolf()) {
+        Log.debug("  (local player is a WOLF — different meshes, nothing to compare against)");
+    } else {
+        log_material_state(
+            "P1", "body", link->mpLinkModel != NULL ? link->mpLinkModel->getModelData() : NULL);
+        log_material_state("P1", "head",
+            link->mpLinkHatModel != NULL ? link->mpLinkHatModel->getModelData() : NULL);
+        log_material_state("P1", "hands",
+            link->mpLinkHandModel != NULL ? link->mpLinkHandModel->getModelData() : NULL);
+        log_material_state("P1", "face",
+            link->mpLinkFaceModel != NULL ? link->mpLinkFaceModel->getModelData() : NULL);
     }
 
     // What is LEFT, not what was asked for. Adding the run animation grew the animation footprint
@@ -1367,6 +1496,89 @@ void daRemotePlayer_c::setHairAngle(cXyz* i_apparentWind, f32 i_sinYaw, f32 i_co
  * and the callback consumes its output on the NEXT calc(). daAlink_c has the same one-frame lag
  * (d_a_alink.cpp:18530-18538) — it is not a bug to fix.
  */
+/**
+ * daAlink_c::checkWindWallRate (d_a_alink.cpp:5461-5476), cast from the puppet's own position.
+ *
+ * Look upwind from chest height for the length the game considers wind can travel around an
+ * obstacle. Nothing in the way: full strength. A wall closer than mNoWindInfluenceDist: no wind at
+ * all. Between the two: linear. Wall code 0xA is excluded by the original, so it is excluded here.
+ *
+ * ★ This is the piece whose absence made the puppet windier than the local player INDOORS, which is
+ * where Stuart first noticed the cap over-reacting. Outdoors it changes almost nothing — there is
+ * rarely a wall within 300 units upwind — but in a dungeon corridor geometry is everywhere, so the
+ * local player's wind is attenuated hard and, until now, the puppet's was not attenuated at all.
+ * Two characters standing side by side with visibly different amounts of wind in their caps.
+ *
+ * The height is Link's own 180.0f (d_a_alink_wolf.inc:528) rather than a new invented number; the
+ * puppet is the same character on the same rig, and mHeight is what daAlink_c feeds this.
+ */
+f32 daRemotePlayer_c::checkWindWallRate(const cXyz& i_windDir) {
+    const f32 maxDist = daAlinkHIO_basic_c0::m.mMaxWindInfluenceDist;
+    const f32 noWindDist = daAlinkHIO_basic_c0::m.mNoWindInfluenceDist;
+
+    cXyz start(current.pos.x, current.pos.y + 0.5f * l_linkHeight, current.pos.z);
+    cXyz end = start - i_windDir * maxDist;
+
+    mWindLinChk.Set(&start, &end, this);
+    if (!dComIfG_Bgsp().LineCross(&mWindLinChk) || dComIfG_Bgsp().GetWallCode(mWindLinChk) == 0xA) {
+        return 1.0f;
+    }
+
+    f32 rate = (1.0f / (maxDist - noWindDist)) * (start.abs(mWindLinChk.GetCross()) - noWindDist);
+    if (rate < 0.0f) {
+        rate = 0.0f;
+    }
+
+    return rate;
+}
+
+/**
+ * Watch for the twilight dissolve switching itself on behind our back.
+ *
+ * ★ This exists because A5 — the puppet turning into black warp particles — could not be settled by
+ * reading the code. Two separate chains of reasoning produced OPPOSITE predictions about which
+ * models should break, and Stuart's report (body and head go, face and hands stay) matched neither
+ * cleanly. A spawn-time snapshot would not settle it either: if something enables the dissolve
+ * LATER, a snapshot taken in createHeap looks perfectly healthy.
+ *
+ * So sample every tick and speak only on a change. The signature is (stage count, last stage's
+ * texmap); a last stage reading from texmap 3 IS the dissolve (d_resorce.cpp:127-195). Four reads
+ * per frame, and silence unless something actually moves.
+ *
+ * Note the state being watched belongs to the shared model DATA, which is the point: if the local
+ * player's warp — or anything else — is reaching across into the puppet's materials, this is where
+ * it shows up, with a frame number attached.
+ */
+void daRemotePlayer_c::checkMaterialDrift() {
+    J3DModelData* models[l_watchedModelNum] = {
+        mpModelMorf != NULL && mpModelMorf->getModel() != NULL ?
+            mpModelMorf->getModel()->getModelData() :
+            NULL,
+        mpHeadModel != NULL ? mpHeadModel->getModelData() : NULL,
+        mpHandModel != NULL ? mpHandModel->getModelData() : NULL,
+        mpFaceModel != NULL ? mpFaceModel->getModelData() : NULL,
+    };
+    static const char* const names[l_watchedModelNum] = {"body", "head", "hands", "face"};
+
+    for (int i = 0; i < l_watchedModelNum; i++) {
+        const u16 signature = material_signature(models[i]);
+        if (signature == mMaterialSig[i]) {
+            continue;
+        }
+
+        const u16 previous = mMaterialSig[i];
+        mMaterialSig[i] = signature;
+        if (previous == 0xFFFF) {
+            continue;  // First sample is the baseline, not a change.
+        }
+
+        const u8 texMap = (u8)(signature & 0xFF);
+        Log.warn("Puppet {} {} material CHANGED: stages {}->{}, lastTexMap {}->{}{}", mPlayerId,
+            names[i], previous >> 8, signature >> 8, (u8)(previous & 0xFF), texMap,
+            texMap == 3 ? "  <<< TWILIGHT DISSOLVE JUST TURNED ON" : "");
+    }
+}
+
 void daRemotePlayer_c::setHatAngle() {
     if (mpHeadModel == NULL) {
         return;
@@ -1386,6 +1598,7 @@ void daRemotePlayer_c::setHatAngle() {
     if (!mSwayInited) {
         mSwayInited = true;
         mCapAnchorPrev = anchorPos;
+        mPrevPos = current.pos;
     }
 
     cXyz windDir;
@@ -1410,12 +1623,16 @@ void daRemotePlayer_c::setHatAngle() {
      * what form the local player happens to be in, and sampled at the PUPPET's position rather
      * than Link's, which is also more correct than reading his value ever was.
      *
-     * Dropped from Link's version: checkWindWallRate, which attenuates wind behind geometry using
-     * his own collision state. Its absence means a puppet sheltered by a wall still feels the wind;
-     * that is a smaller error than the two above and needs a raycast to fix. */
+     * The third mistake was quieter than the other two and is fixed just below: this dropped
+     * checkWindWallRate, so a puppet sheltered by geometry still felt the full wind. That is why
+     * the cap could still look wrong after the scale itself was right — indoors the local player's
+     * wind is attenuated hard and the puppet's was not attenuated at all. */
     f32 windTargetPower = windPower;
-    if (dKy_TeachWind_existence_chk() == 0 || windTargetPower < 0.3f) {
+    const s32 teachWind = dKy_TeachWind_existence_chk();
+    if (teachWind == 0 || windTargetPower < 0.3f) {
         windTargetPower = 0.0f;
+    } else if (windTargetPower > 0.0f && teachWind != -1) {
+        windTargetPower *= checkWindWallRate(windDir);
     }
     windTargetPower *= daAlinkHIO_basic_c0::m.mMaxWindSpeed;
 
@@ -1494,6 +1711,17 @@ void daRemotePlayer_c::setHatAngle() {
     /* The apparent wind: how far the anchor moved, REVERSED (a head moving forward feels wind from
      * the front), plus the environment's wind, plus a constant downward bias so the cap hangs. */
     cXyz apparentWind = mCapAnchorPrev - anchorPos;
+
+    /* ★ Standing still, the original throws the horizontal part of that away before adding the
+     * environment's wind (d_a_alink.cpp:2654-2657), and this had been left out. It matters more
+     * than it looks: the anchor term is measured off the head joint, so an idle animation's head
+     * bob feeds a small sideways wobble into the cap every single frame even in dead calm. Link's
+     * cap hangs still in a windless room; the puppet's was always faintly stirring. */
+    if (mPrevPos.abs2XZ(current.pos) < 1.0f) {
+        apparentWind.x = 0.0f;
+        apparentWind.z = 0.0f;
+    }
+
     apparentWind += windPush;
     apparentWind.y -= l_capGravity;
 
@@ -1663,6 +1891,7 @@ void daRemotePlayer_c::setHatAngle() {
     }
 
     mCapAnchorPrev = anchorPos;
+    mPrevPos = current.pos;
     setHairAngle(&apparentWind, sinYaw, cosYaw);
 }
 
@@ -1775,6 +2004,9 @@ int daRemotePlayer_c::execute() {
     // integrated from how far this tick's matrices moved, and the joint callback applies the result
     // during the NEXT tick's calc.
     setHatAngle();
+    // Diagnostic for A5, silent unless the material state actually moves. Last, so it reports the
+    // state the draw pass is about to use.
+    checkMaterialDrift();
     return 1;
 }
 
