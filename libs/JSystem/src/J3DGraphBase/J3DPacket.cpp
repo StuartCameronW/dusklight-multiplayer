@@ -8,6 +8,7 @@
 #include "JSystem/J3DGraphBase/J3DPacket.h"
 #include "JSystem/J3DGraphBase/J3DShapeMtx.h"
 #include "JSystem/JKernel/JKRHeap.h"
+#include "dusk/logging.h"
 #include "global.h"
 #include "tracy/Tracy.hpp"
 
@@ -207,6 +208,42 @@ bool J3DMatPacket::isSame(J3DMatPacket* pOther) const {
     return mMaterialID == pOther->mMaterialID && (mMaterialID & 0x80000000) == 0;
 }
 
+#if TARGET_PC
+namespace {
+
+aurora::Module J3DPacketLog{"J3D"};
+
+/* A cycle repeats on every frame until whatever built it stops, and one line per frame would bury
+ * everything else in the log. The first few carry all the information there is. */
+DUSK_CONSTEXPR int l_shapeCycleReportMax = 4;
+int l_shapeCycleReports = 0;
+
+void reportShapePacketCycle(J3DMatPacket* i_matPacket, J3DShapePacket* i_at) {
+    if (l_shapeCycleReports >= l_shapeCycleReportMax) {
+        return;
+    }
+    l_shapeCycleReports++;
+
+    J3DMaterial* material = i_matPacket->getMaterial();
+    const char* name = material != NULL && material->mMaterialName != NULL ?
+                           material->mMaterialName :
+                           "<unnamed>";
+
+    J3DPacketLog.warn(
+        "shape-packet chain for material '{}' (id {:#x}) loops back on itself at packet {:#x} "
+        "(model {:#x}); truncating the walk. Something entered this material's packet into a draw "
+        "buffer twice in one pass.",
+        name, i_matPacket->mMaterialID, reinterpret_cast<uintptr_t>(i_at),
+        reinterpret_cast<uintptr_t>(i_at != NULL ? i_at->getModel() : NULL));
+
+    if (l_shapeCycleReports == l_shapeCycleReportMax) {
+        J3DPacketLog.warn("further shape-packet cycle reports suppressed");
+    }
+}
+
+}  // namespace
+#endif
+
 void J3DMatPacket::draw() {
     ZoneScoped;
 #if TARGET_PC 
@@ -230,6 +267,28 @@ void J3DMatPacket::draw() {
 #endif
     packet->getShape()->loadPreDrawSetting();
 
+#if TARGET_PC
+    /* ★ Refuse to walk a shape-packet chain that loops back on itself.
+     *
+     * This list is singly linked and terminated only by NULL, so a single bad link makes this loop
+     * emit geometry forever. That is not hypothetical: it hung Dusklight hard enough to need
+     * live-process forensics to find. The GX command stream reached 2,151,079,386 bytes in one
+     * frame while the process sat pinned in the allocator — never crashing, never running out of
+     * memory and never recovering, because Aurora's FIFO growth overflowed uint32 at that size
+     * (fixed separately in extern/aurora, gx/fifo).
+     *
+     * The chain is built by J3DDrawBuffer::entryMatSort/entryMatAnmSort, whose dedup walk merges
+     * packets that report isSame(). isSame() compares only mMaterialID, so a packet always matches
+     * ITSELF — entering one twice in a single pass makes it merge with itself and
+     * addShapePacket() prepends the head onto the head.
+     *
+     * Floyd rather than an iteration cap, so there is no invented "reasonable chain length" to get
+     * wrong: merges make legitimately long chains, as long as the scene wants them. The cost is one
+     * extra pointer chase per two nodes, against a drawFast() for every node. */
+    J3DShapePacket* slowPacket = packet;
+    bool advanceSlowPacket = false;
+#endif
+
     while (packet != NULL) {
         if (packet->getDisplayListObj() != NULL) {
             packet->getDisplayListObj()->callDL();
@@ -237,6 +296,18 @@ void J3DMatPacket::draw() {
 
         packet->drawFast();
         packet = (J3DShapePacket*)packet->getNextPacket();
+
+#if TARGET_PC
+        if (advanceSlowPacket) {
+            slowPacket = (J3DShapePacket*)slowPacket->getNextPacket();
+        }
+        advanceSlowPacket = !advanceSlowPacket;
+
+        if (packet != NULL && packet == slowPacket) {
+            reportShapePacketCycle(this, packet);
+            break;
+        }
+#endif
     }
 
     J3DShape::resetVcdVatCache();

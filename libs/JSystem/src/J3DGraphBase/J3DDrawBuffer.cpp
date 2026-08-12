@@ -8,7 +8,56 @@
 #include "JSystem/J3DGraphBase/J3DDrawBuffer.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/JKernel/JKRHeap.h"
+#include "dusk/logging.h"
 #include "tracy/Tracy.hpp"
+
+#if TARGET_PC
+namespace {
+
+aurora::Module J3DDrawBufferLog{"J3D"};
+
+/* ★ Entering the same packet into a draw buffer twice within one pass is never legitimate, and
+ * before this it was not survivable either.
+ *
+ * Every entry path below PREPENDS, and the dedup walk in entryMatSort/entryMatAnmSort merges on
+ * isSame(), which compares only mMaterialID — so a packet always matches ITSELF. A second entry
+ * therefore ran addShapePacket() with the packet's own shape packet, linking the chain head to
+ * itself. J3DMatPacket::draw then walked that chain forever, and the GX command stream reached
+ * 2.15 GB in a single frame before anything noticed.
+ *
+ * So: refuse the duplicate and say who caused it. Refusing is the conservative choice — the packet
+ * is already in this buffer and will be drawn exactly once, which is what the second entry was
+ * asking for anyway.
+ *
+ * The report names the model rather than only the packet, because the packet address alone does
+ * not say which actor is at fault; the shape packet carries its J3DModel back-pointer. */
+const int l_duplicateEntryReportMax = 4;
+int l_duplicateEntryReports = 0;
+
+void reportDuplicateEntry(const char* i_where, J3DPacket* i_packet, J3DModel* i_model, u32 i_slot) {
+    if (l_duplicateEntryReports >= l_duplicateEntryReportMax) {
+        return;
+    }
+    l_duplicateEntryReports++;
+
+    J3DDrawBufferLog.warn(
+        "{}: packet {:#x} (model {:#x}) is already the head of slot {}; refusing to enter it twice "
+        "in one pass, which would link its shape-packet chain to itself.",
+        i_where, reinterpret_cast<uintptr_t>(i_packet), reinterpret_cast<uintptr_t>(i_model),
+        i_slot);
+
+    if (l_duplicateEntryReports == l_duplicateEntryReportMax) {
+        J3DDrawBufferLog.warn("further duplicate draw-buffer entry reports suppressed");
+    }
+}
+
+J3DModel* modelOf(J3DMatPacket* i_packet) {
+    J3DShapePacket* shapePacket = i_packet->getShapePacket();
+    return shapePacket != NULL ? shapePacket->getModel() : NULL;
+}
+
+}  // namespace
+#endif
 
 void J3DDrawBuffer::calcZRatio() {
     mZRatio = (mZFar - mZNear) / (f32)mEntryTableSize;
@@ -59,6 +108,12 @@ int J3DDrawBuffer::entryMatSort(J3DMatPacket* pMatPacket) {
     pMatPacket->getShapePacket()->drawClear();
 
     if (pMatPacket->isChanged()) {
+#if TARGET_PC
+        if (pMatPacket == mpBuffer[0]) {
+            reportDuplicateEntry("entryMatSort(changed)", pMatPacket, modelOf(pMatPacket), 0);
+            return 0;
+        }
+#endif
         pMatPacket->setNextPacket(mpBuffer[0]);
         mpBuffer[0] = pMatPacket;
         return 1;
@@ -84,6 +139,12 @@ int J3DDrawBuffer::entryMatSort(J3DMatPacket* pMatPacket) {
     J3DMatPacket* packet;
     for (packet = (J3DMatPacket*)mpBuffer[slot]; packet != NULL; packet = (J3DMatPacket*)packet->getNextPacket())
     {
+#if TARGET_PC
+        if (packet == pMatPacket) {
+            reportDuplicateEntry("entryMatSort", pMatPacket, modelOf(pMatPacket), slot);
+            return 0;
+        }
+#endif
         if (packet->isSame(pMatPacket)) {
             packet->addShapePacket(pMatPacket->getShapePacket());
             return 0;
@@ -116,6 +177,12 @@ int J3DDrawBuffer::entryMatAnmSort(J3DMatPacket* pMatPacket) {
     J3DMatPacket* packet;
     for (packet = (J3DMatPacket*)mpBuffer[slot]; packet != NULL; packet = (J3DMatPacket*)packet->getNextPacket())
     {
+#if TARGET_PC
+        if (packet == pMatPacket) {
+            reportDuplicateEntry("entryMatAnmSort", pMatPacket, modelOf(pMatPacket), slot);
+            return 0;
+        }
+#endif
         if (packet->mpMaterialAnm == pMaterialAnm) {
             packet->addShapePacket(pMatPacket->getShapePacket());
             return 0;
@@ -152,6 +219,12 @@ int J3DDrawBuffer::entryZSort(J3DMatPacket* pMatPacket) {
     }
 
     index = (mEntryTableSize - 1) - index;
+#if TARGET_PC
+    if (pMatPacket == mpBuffer[index]) {
+        reportDuplicateEntry("entryZSort", pMatPacket, modelOf(pMatPacket), index);
+        return 0;
+    }
+#endif
     pMatPacket->setNextPacket(mpBuffer[index]);
     mpBuffer[index] = pMatPacket;
     return 1;
@@ -191,6 +264,12 @@ int J3DDrawBuffer::entryNonSort(J3DMatPacket* pMatPacket) {
     pMatPacket->drawClear();
     pMatPacket->getShapePacket()->drawClear();
 
+#if TARGET_PC
+    if (pMatPacket == mpBuffer[0]) {
+        reportDuplicateEntry("entryNonSort", pMatPacket, modelOf(pMatPacket), 0);
+        return 0;
+    }
+#endif
     pMatPacket->setNextPacket(mpBuffer[0]);
     mpBuffer[0] = pMatPacket;
     return 1;
@@ -200,6 +279,14 @@ int J3DDrawBuffer::entryImm(J3DPacket* pPacket, u16 index) {
     J3D_ASSERT_NULLPTR(394, pPacket != NULL);
     J3D_ASSERT_RANGE(395, index < mEntryTableSize);
 
+#if TARGET_PC
+    /* daMirror_c::draw() enters a single static packet here on every draw pass, so this one is
+     * reachable without any duplicate model entry at all. */
+    if (pPacket == mpBuffer[index]) {
+        reportDuplicateEntry("entryImm", pPacket, NULL, index);
+        return 0;
+    }
+#endif
     pPacket->setNextPacket(mpBuffer[index]);
     mpBuffer[index] = pPacket;
     return 1;
