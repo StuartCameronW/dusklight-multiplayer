@@ -34,6 +34,10 @@ public:
     void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn);
 
     u32 getPlayerId() const { return mPlayerId; }
+    /* Index into the outfit table of the archive this puppet ACTUALLY mounted, which is not
+     * necessarily the byte that arrived on the wire — see daRemotePlayer_outfitFromWire. The
+     * network layer compares against this to notice a clothes change. */
+    int getOutfit() const { return mOutfit; }
     /* Networked speed, which is NOT mirrored into speedF: nothing moves this actor locally, so the
      * inherited field would read as a permanent zero and misreport the puppet as standing still. */
     f32 getNetSpeed() const { return mNetSpeed; }
@@ -302,5 +306,45 @@ private:
      * actor. */
     u32 mShadowKey;
 };
+
+/**
+ * How the puppet's fopAcM_create parameter is packed: the player id in the low 24 bits, the wire
+ * outfit byte in the high 8.
+ *
+ * The parameter is used because create() needs the outfit at its VERY FIRST entry — the archive
+ * mount it kicks off is multi-phase and re-entered over several frames, so there is no later moment
+ * at which the choice could still be made. The create parameter is the only channel already in
+ * place then; a setter on the actor would arrive after the mount had started, and a "next puppet
+ * wears X" static would race with a second player joining on the same tick.
+ *
+ * 24 bits is not a practical limit: player ids come from a monotonic counter starting at 1
+ * (network_manager.hpp) and a session holds at most kMaxPlayers of them.
+ */
+const u32 daRemotePlayer_playerIdMask = 0x00FFFFFF;
+const u8 daRemotePlayer_outfitParamShift = 24;
+
+/**
+ * Resolve a replicated outfit byte to an index into the puppet's outfit table.
+ *
+ * The table is file-static in d_a_remote_player.cpp and stays there — this is the one accessor both
+ * ends of the engine seam call, so "which outfit is 2?" has exactly one answer and the network
+ * layer never grows a second copy of the list.
+ *
+ * Anything the table does not name resolves to the hero's clothes rather than refusing to draw:
+ * 0xFF ("nobody has reported an outfit"), a peer built against a longer table, or a byte mangled in
+ * an unreliable packet. Callers that compare a wire byte against a live puppet's outfit MUST
+ * compare the resolved values — see dusk::mp::reconcile_puppet_outfit.
+ */
+int daRemotePlayer_outfitFromWire(u8 i_wireOutfit);
+
+/**
+ * The local player's current outfit, as the byte to put on the wire.
+ *
+ * Wolf is deliberately not an outfit: Wmdl has its own skeleton and animation set, so it is absent
+ * from the table and a wolf reports the hero's clothes. A transformed player therefore looks like a
+ * human Link to everyone else until transform replication exists — the same fallback the puppet has
+ * always had, just now decided by the wearer.
+ */
+u8 daRemotePlayer_localOutfitToWire();
 
 #endif /* D_A_REMOTE_PLAYER_H */

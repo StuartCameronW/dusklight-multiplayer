@@ -80,10 +80,22 @@ void ReplicationManager::drive_puppets() {
             continue;
         }
 
+        // Appearance is owned by the wearer, so a clothes change on the sender has to reach the
+        // puppet. It does so by rebuilding the actor — see reconcile_puppet_outfit() for why an
+        // in-place re-mount is not on offer. Driven off `pose` rather than off the newest sample
+        // received so the change lands on the same delayed timeline as the movement it accompanies.
+        if (reconcile_puppet_outfit(player.playerId, pose.outfit)) {
+            // The puppet is gone for this tick; ensure_puppet() rebuilds it in the new clothes on
+            // the next one. Deliberately not the same tick: it keeps the old actor's archive and
+            // solid heap from having to coexist with the new one's.
+            player.puppetAlive = false;
+            continue;
+        }
+
         // Asked every tick rather than cached in puppetAlive: the actor can be destroyed under us
         // by a room unload, and a cached "alive" would leave us applying poses to nothing forever.
         // ensure_puppet() owns the whole question, including respawning after a scene change.
-        if (!ensure_puppet(player.playerId, player.color)) {
+        if (!ensure_puppet(player.playerId, player.color, pose.outfit)) {
             player.puppetAlive = false;
             continue;
         }

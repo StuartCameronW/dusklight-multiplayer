@@ -413,17 +413,19 @@ const f32 l_idleSpeedThreshold = 0.5f;
 const f32 l_gaitHysteresis = 0.05f;
 
 /**
- * Which outfit archive a puppet should wear.
+ * Which outfit archive the LOCAL player is wearing, as an index into l_outfits.
  *
- * ★ Placeholder: this currently mirrors the LOCAL player. Stuart's rule (2026-08-12) is that
- * appearance is owned by the wearer — whatever P2 is wearing on their own screen is what P1 should
- * see — so this becomes a replicated property of the sender. It is not one yet; PlayerState does
- * not carry the outfit. Matching the local player is the right placeholder because it is correct in
- * the common case (both players in the same clothes) and, unlike the arrangement it replaces, it no
- * longer deliberately shows the WRONG clothes.
+ * This is now a SENDER-side question only. It used to decide what a puppet wore, which was a
+ * placeholder: it was right whenever both players happened to be dressed alike and wrong the moment
+ * they were not. Appearance is owned by the wearer, so the answer is sampled here, put on the wire
+ * (PlayerState::outfit), and the puppet is dressed from the sender's byte instead.
  *
- * Wolf is not an outfit swap. Wmdl has its own skeleton and animation set, so a wolf owner falls
- * back to the hero's clothes and looks like a human Link until transform replication exists.
+ * daAlink_c::setArcName (d_a_alink_swindow.inc:14-25) picks the archive name from the wear flags,
+ * so his own mArcName is the authoritative answer and cannot drift from what is on his screen.
+ *
+ * Wolf is not an outfit swap. mArcName is Wmdl then, which is deliberately absent from l_outfits
+ * because Wmdl has its own skeleton and animation set, so it falls through to the hero's clothes
+ * and a wolf looks like a human Link to everyone else until transform replication exists.
  */
 int outfit_index_for_local_player() {
     const daAlink_c* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
@@ -744,6 +746,23 @@ static int daRemotePlayer_createHeap(fopAc_ac_c* i_this) {
     return static_cast<daRemotePlayer_c*>(i_this)->createHeap();
 }
 
+/* --- The outfit seam. These two are the only way the network layer touches l_outfits; the table
+ * itself stays file-static so there is exactly one copy of it in the program. */
+
+int daRemotePlayer_outfitFromWire(u8 i_wireOutfit) {
+    if (i_wireOutfit >= l_outfitNum) {
+        // Not a name we know. Reasons range from benign (0xFF, nobody has reported an outfit yet)
+        // to hostile (a corrupted byte out of an unreliable packet), and all of them are better
+        // answered with a Link in the hero's clothes than with an out-of-bounds table read.
+        return l_defaultOutfit;
+    }
+    return i_wireOutfit;
+}
+
+u8 daRemotePlayer_localOutfitToWire() {
+    return static_cast<u8>(outfit_index_for_local_player());
+}
+
 /**
  * Mount this puppet's OWN copy of the outfit archive.
  *
@@ -797,8 +816,24 @@ int daRemotePlayer_c::mountOwnArchive() {
 int daRemotePlayer_c::create() {
     fopAcM_ct(this, daRemotePlayer_c);
 
+    /* Both halves of the create parameter, read up front. mPlayerId used to be assigned after the
+     * heap pass; it is set here instead so the mount, and every log line before that point, can
+     * name the player it belongs to. fopAcM_ct only constructs once (it is gated on
+     * fopAcCnd_INIT_e), so re-entry while the archive mounts re-reads the same parameter. */
+    const u32 param = fopAcM_GetParam(this);
+    mPlayerId = param & daRemotePlayer_playerIdMask;
+
     if (!mOutfitChosen) {
-        mOutfit = outfit_index_for_local_player();
+        /* ★ The SENDER's outfit, carried in the create parameter — not the local player's, which is
+         * what this used to copy. Appearance is owned by the wearer: if the other player is in the
+         * Zora armour, that is what we mount, whatever we happen to be wearing ourselves.
+         *
+         * Still latched. create() is re-entered every frame until the mount finishes, and letting
+         * the target change half way through would leave mOwnRes mounting one archive while
+         * createHeap() looked up model names from another. A clothes change that lands mid-mount is
+         * picked up afterwards, by respawning the actor — see dusk::mp::reconcile_puppet_outfit. */
+        mOutfit = daRemotePlayer_outfitFromWire(
+            static_cast<u8>(param >> daRemotePlayer_outfitParamShift));
         mOutfitChosen = true;
     }
 
@@ -814,7 +849,6 @@ int daRemotePlayer_c::create() {
         return cPhs_ERROR_e;
     }
 
-    mPlayerId = fopAcM_GetParam(this);
     mCurrentAnm = l_idleAnmIdx;
     model = mpModelMorf->getModel();
 

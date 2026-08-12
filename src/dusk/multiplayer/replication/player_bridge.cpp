@@ -25,6 +25,14 @@ aurora::Module Log{"dusk::mp"};
 /// loading. Creation is multi-phase and hits the DVD, so this has to be generous; ~4 s at 30 Hz.
 constexpr int kCreateGraceTicks = 120;
 
+/// Floor on how often an outfit change may respawn one player's puppet; ~1 s at 30 Hz.
+///
+/// A real clothes change happens in the pause menu and is rare, so a second of latency on it costs
+/// nothing. What this buys is a bound on the pathological case: poses arrive unreliably and
+/// unauthenticated, so a single flipping byte — or a peer genuinely rummaging through the menu —
+/// must not be able to destroy and rebuild an actor (archive mount included) every tick.
+constexpr int kOutfitRespawnCooldownTicks = 30;
+
 /*
  * ★ Do NOT add a "wait N settled ticks before creating the puppet" gate here.
  *
@@ -117,6 +125,11 @@ bool capture_local_player(PlayerState& out) {
     // logical one and the two diverge while turning. The puppet is a visual, so mirror the visual.
     out.angleY = link->shape_angle.y;
     out.speed = link->speedF;
+    // Sampled every tick rather than on a change event, because there is no change event to hook:
+    // daAlink_c::setArcName just overwrites mArcName during the pause menu's model rebuild. Reading
+    // it is a pointer compare against four names, so the cost of doing it per tick is nil and the
+    // alternative — caching it and missing an unhooked path that changes clothes — is not worth it.
+    out.outfit = daRemotePlayer_localOutfitToWire();
     out.flags = kPlayerStateInWorld;
 
     /* The sharp turn. Read straight off the proc the state machine is IN rather than inferred from
@@ -139,7 +152,7 @@ bool capture_local_player(PlayerState& out) {
     return true;
 }
 
-bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb) {
+bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit) {
     if (const auto it = s_puppets.find(playerId); it != s_puppets.end()) {
         it->second.ticksSinceRequest++;
 
@@ -172,8 +185,15 @@ bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb) {
     const cXyz pos = link->current.pos;
     const csXyz angle(0, link->shape_angle.y, 0);
 
+    // The outfit rides in the top byte of the create parameter. The actor needs it at its first
+    // create() entry, before the multi-phase archive mount starts, and this is the only channel
+    // that exists that early — see the packing note in d_a_remote_player.h.
+    const std::uint32_t param =
+        (static_cast<std::uint32_t>(outfit) << daRemotePlayer_outfitParamShift) |
+        (playerId & daRemotePlayer_playerIdMask);
+
     const fpc_ProcID id = fopAcM_create(
-        fpcNm_REMOTE_PLAYER_e, playerId, &pos, fopAcM_GetRoomNo(link), &angle, nullptr, 0xFF);
+        fpcNm_REMOTE_PLAYER_e, param, &pos, fopAcM_GetRoomNo(link), &angle, nullptr, 0xFF);
 
     if (id == fpcM_ERROR_PROCESS_ID_e) {
         Log.warn("Failed to create puppet for player {}", playerId);
@@ -209,6 +229,10 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     out.posZ = puppet->current.pos.z;
     out.angleY = puppet->shape_angle.y;
     out.speed = puppet->getNetSpeed();
+    // The outfit the puppet actually mounted, not the byte we last received, for the same reason
+    // the rest of this function reads the actor rather than the network: this is the "did the
+    // instruction land?" side of the comparison.
+    out.outfit = static_cast<std::uint8_t>(puppet->getOutfit());
     out.flags = puppet->hasPose() ? kPlayerStateInWorld : 0;
     return true;
 }
@@ -231,6 +255,60 @@ void destroy_puppet(std::uint32_t playerId) {
     // room unload beat us to it.
     fopAcM_delete(it->second.id);
     s_puppets.erase(it);
+}
+
+/**
+ * Make a mid-session clothes change reach the puppet — by respawning it.
+ *
+ * ★ This is the deliberate trade-off, and it is not merely the easy option: an in-place re-mount is
+ * not available. Everything the puppet is made of — the four J3DModels, the McaMorfSO, the material
+ * anms — is allocated inside the actor's own JKRSolidHeap (fopAcM_entrySolidHeap, 0x20000). A solid
+ * heap cannot free an individual allocation; the only way to reclaim it is to destroy the heap, and
+ * destroying an actor's heap is exactly what fopAcM_delete does. So "swap the archive under a live
+ * actor" would mean re-running the whole create phase in place, on machinery designed to run once,
+ * for no gain over letting the actor die and be rebuilt by the path that already handles a room
+ * unload taking a puppet away.
+ *
+ * What it costs is honest to state: the puppet is ABSENT for the tick it takes to notice plus the
+ * frames the DVD mount of the new archive takes, and it loses its accumulated local presentation
+ * state (cap and hair sway, blink phase, eye smoothing). None of that is replicated, all of it
+ * re-converges within a second, and the wearer is standing in a pause menu while it happens.
+ *
+ * Two rules keep it from turning into a respawn storm:
+ *  - The comparison is between RESOLVED indices, not raw bytes. If the actor clamped a byte it did
+ *    not recognise to the hero's clothes and we compared against the raw byte, every single tick
+ *    would read as "still wearing the wrong thing" and rebuild the actor forever.
+ *  - A cooldown, measured on the puppet's own age (ticksSinceRequest is zeroed at create and
+ *    stepped once per tick), so even a genuinely flapping outfit costs one respawn per second at
+ *    worst. It defers a change, never drops one: the sender keeps reporting the new outfit, so the
+ *    mismatch is still there when the cooldown expires.
+ */
+bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit) {
+    const auto it = s_puppets.find(playerId);
+    if (it == s_puppets.end()) {
+        return false;
+    }
+
+    daRemotePlayer_c* puppet = resolve_puppet(playerId);
+    if (puppet == nullptr) {
+        // Still mounting its archive, or already destroyed by a room unload. In the first case the
+        // outfit it will wear is already latched and tearing down a half-created actor is the one
+        // thing worth not doing; in the second, ensure_puppet() is about to rebuild it anyway.
+        return false;
+    }
+
+    const int wanted = daRemotePlayer_outfitFromWire(outfit);
+    if (puppet->getOutfit() == wanted) {
+        return false;
+    }
+    if (it->second.ticksSinceRequest < kOutfitRespawnCooldownTicks) {
+        return false;
+    }
+
+    Log.info("Player {} changed outfit ({} -> {}); rebuilding their puppet", playerId,
+        puppet->getOutfit(), wanted);
+    destroy_puppet(playerId);
+    return true;
 }
 
 void destroy_all_puppets() {
