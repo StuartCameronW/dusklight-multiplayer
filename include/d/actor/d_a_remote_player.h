@@ -44,6 +44,12 @@ private:
     void selectAnimation();
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
     void setRoomInfo();
+    /// Attach the blink texture animations to the face's eye materials. Once, at createHeap time.
+    bool setupFaceAnimation();
+    /// Advance (or start) a blink. Must run every tick.
+    void playFaceTextureAnime();
+    /// This puppet's OWN random stream — deliberately not cM_rnd(). See the .cpp for why.
+    f32 ownRnd();
     /// Drive the private archive mount forward; returns a cPhs_* step for create() to hand back.
     int mountOwnArchive();
     /// Draw one sub-model, lit like the body. Null-tolerant, so a missing part costs a part.
@@ -68,6 +74,17 @@ private:
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
     bool mLoggedFirstCalc;
+    /* Same idea for the first blink — the one observable that separates "attached and running" from
+     * "attached and quietly doing nothing". */
+    bool mLoggedFirstBlink;
+
+    /* Blink cursor, exactly daAlink_c::field_0x2fea: 0 means eyes open, anything else is the frame
+     * of a blink in progress. Per-puppet rather than shared, so two puppets never blink in unison.
+     */
+    s16 mBlinkFrame;
+    /* State of this puppet's private Wichmann-Hill stream (the same generator cM_rnd() uses, with
+     * its own seeds). Private so that blinking a puppet cannot perturb the global game RNG. */
+    s32 mRndSeed[3];
 
     /* ★ This puppet's PRIVATE copy of the outfit archive - not a reference into the global,
      * name-keyed table that dComIfG_resLoad uses. It has to be private because the local player
@@ -87,6 +104,14 @@ private:
     J3DModel* mpHeadModel;
     J3DModel* mpHandModel;
     J3DModel* mpFaceModel;
+
+    /* The blink. BTP swaps the eyelid texture, BTK slides the texture matrix; they are played in
+     * lock-step on the same frame number. Both are this puppet's own copies out of the ARAM
+     * archive, so setting a frame here cannot disturb the local player's eyes. */
+    J3DAnmTexPattern* mpBlinkBtp;
+    J3DAnmTextureSRTKey* mpBlinkBtk;
+    /* One per eye material. They must exist BEFORE the animators are entered — see the .cpp. */
+    J3DMaterialAnm* mpEyeMatAnm[2];
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */

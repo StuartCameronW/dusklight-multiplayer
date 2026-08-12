@@ -5,12 +5,16 @@
 
 #include "d/dolzel_rel.h"  // IWYU pragma: keep
 
+#include <cmath>
 #include <cstring>
 
 #include "JSystem/J3DGraphAnimator/J3DJoint.h"
+#include "JSystem/J3DGraphAnimator/J3DMaterialAnm.h"
+#include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphLoader/J3DAnmLoader.h"
 #include "JSystem/JKernel/JKRArchive.h"
 #include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_mirror.h"
 #include "d/actor/d_a_remote_player.h"
 #include "dusk/logging.h"
 #include "f_op/f_op_actor_mng.h"
@@ -102,6 +106,55 @@ const u16 l_walkAnmIdx = dRes_ID_ALANM_BCK_WALKS_e;
  */
 const u16 l_runAnmIdx = dRes_ID_ALANM_BCK_DASHS_e;
 
+/* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
+enum AnmFamily {
+    ANM_FAMILY_TRANSFORM,    // J3DAnmTransform*   — the BCK gait animations
+    ANM_FAMILY_TEX_PATTERN,  // J3DAnmTexPattern*  — a BTP
+    ANM_FAMILY_TEX_SRT,      // J3DAnmTextureSRTKey* — a BTK
+};
+
+/**
+ * Is a loaded animation safe to downcast to the family the caller asked for?
+ *
+ * ★ It has to be a family test, not an equality test on the base class's kind.
+ * `J3DAnmBase::getKind()` reports the CONCRETE class, and J3DAnmLoaderDataBase always hands back a
+ * concrete subclass: a BCK arrives as J3DAnmTransformKey (8), TransformFull (9) or
+ * TransformFullWithLerp (16) — never as a bare J3DAnmTransform (0). Found the hard way; an equality
+ * check against 0 rejected all three gait animations and left the puppet failing createHeap in a
+ * respawn loop.
+ */
+bool anm_kind_matches(s32 i_kind, AnmFamily i_family) {
+    switch (i_family) {
+    case ANM_FAMILY_TRANSFORM:
+        // J3DAnmTransform and its three descendants (J3DAnimation.h:518, :544, :562, :575).
+        return i_kind == 0 || i_kind == 8 || i_kind == 9 || i_kind == 16;
+    case ANM_FAMILY_TEX_PATTERN:
+        return i_kind == 2;  // J3DAnmTexPattern, no subclasses (J3DAnimation.h:903).
+    case ANM_FAMILY_TEX_SRT:
+        return i_kind == 4;  // J3DAnmTextureSRTKey, no subclasses (J3DAnimation.h:595).
+    }
+    return false;
+}
+
+/* The blink — "mabataki" — is index [0] of daAlink_c::m_faceTexDataTable (d_a_alink.cpp:849-850).
+ * BTP swaps the eyelid texture, BTK slides the texture matrix, and the two are stepped in lock-step
+ * on one frame number. Both live in the same AlAnm ARAM archive the gait animations come from.
+ */
+const u16 l_blinkBtpIdx = dRes_ID_ALANM_BTP_FMABA01_e;
+const u16 l_blinkBtkIdx = dRes_ID_ALANM_BTK_FMABA01_e;
+
+/* Per-frame chance of starting a blink. daAlink_c holds this in field_0x3440 and sets it to 0.012
+ * for the normal face when the MABA pattern is loaded (d_a_alink.cpp:8218) — about one blink every
+ * 83 ticks, i.e. every ~2.8 s at 30 Hz.
+ */
+const f32 l_blinkChance = 0.012f;
+
+/* The two eye materials on the face model. Confirmed for Link at d_a_alink_wolf.inc:501-502 — they
+ * are the only two that ever receive a J3DMaterialAnm. Range-checked at use anyway: the material
+ * count comes out of a binary asset, so it is not verifiable from source for every outfit.
+ */
+const u16 l_eyeMaterialNo[2] = {2, 3};
+
 /* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
  * HIO rates below: this one is about network noise, not about gait.
  */
@@ -176,8 +229,12 @@ void* own_archive_res(dRes_info_c& i_res, const char* i_resName) {
  * room to expand, and treat "the read exactly filled the buffer" as the signature of a clamp
  * rather than of a lucky fit. daAlink_c avoids all of this by hardcoding a generous literal per
  * resource (0x400 to 0x6000 across d_a_alink*), which works only because someone checked each one.
+ *
+ * Returns the loader's own J3DAnmBase* so this can serve BCK, BTP and BTK alike; callers downcast.
+ * `i_family` is that downcast written down and checked, so handing this the wrong resource index is
+ * a log line rather than a wrong-vtable call several frames later.
  */
-J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
+J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family) {
     JKRArchive* archive = dComIfGp_getAnmArchive();
     if (archive == NULL) {
         return NULL;
@@ -227,9 +284,15 @@ J3DAnmTransform* load_aram_anm(u16 i_resIdx) {
             return NULL;
         }
 
-        J3DAnmTransform* anm = static_cast<J3DAnmTransform*>(J3DAnmLoaderDataBase::load(buffer));
+        J3DAnmBase* anm = J3DAnmLoaderDataBase::load(buffer);
         if (anm == NULL) {
             Log.warn("J3D loader rejected animation {} ({} bytes)", i_resIdx, read);
+            return NULL;
+        }
+
+        if (!anm_kind_matches(anm->getKind(), i_family)) {
+            Log.warn("Animation {} is kind {}, which is not family {} — refusing to hand it over",
+                i_resIdx, anm->getKind(), static_cast<int>(i_family));
             return NULL;
         }
 
@@ -251,9 +314,9 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
-    mpIdleAnm = load_aram_anm(l_idleAnmIdx);
-    mpWalkAnm = load_aram_anm(l_walkAnmIdx);
-    mpRunAnm = load_aram_anm(l_runAnmIdx);
+    mpIdleAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_idleAnmIdx, ANM_FAMILY_TRANSFORM));
+    mpWalkAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_walkAnmIdx, ANM_FAMILY_TRANSFORM));
+    mpRunAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_runAnmIdx, ANM_FAMILY_TRANSFORM));
     if (mpIdleAnm == NULL || mpWalkAnm == NULL || mpRunAnm == NULL) {
         return 0;
     }
@@ -317,6 +380,10 @@ int daRemotePlayer_c::createHeap() {
             }
         }
     }
+
+    // Cosmetic and deliberately non-fatal: a puppet with open, staring eyes is a far better failure
+    // than no puppet. setupFaceAnimation() logs its own reason for every way it can decline.
+    setupFaceAnimation();
 
     if (mpHandModel != NULL) {
         J3DModelData* handData = mpHandModel->getModelData();
@@ -425,6 +492,14 @@ int daRemotePlayer_c::create() {
     mCurrentAnm = l_idleAnmIdx;
     model = mpModelMorf->getModel();
 
+    /* Seeded from the player id, so two puppets standing side by side do not blink in unison — the
+     * giveaway that would make them read as copies of one puppet rather than two people. Odd
+     * multipliers keep the three streams from lining up, and every seed stays well inside its
+     * modulus and non-zero. */
+    mRndSeed[0] = 12345 + static_cast<s32>(mPlayerId) * 331;
+    mRndSeed[1] = 6789 + static_cast<s32>(mPlayerId) * 557;
+    mRndSeed[2] = 23456 + static_cast<s32>(mPlayerId) * 173;
+
     // Deliberately NOT calling setMatrix() here. It ends in modelCalc(), and calc'ing before the
     // first network pose has arrived is both pointless (we'd be posing at the spawn point) and the
     // exact place the original crash happened.
@@ -513,6 +588,155 @@ void daRemotePlayer_c::selectAnimation() {
     } else {
         mpModelMorf->setPlaySpeed(rate);
     }
+}
+
+/**
+ * Attach the blink to the face model's eye materials. Runs once, inside createHeap.
+ *
+ * ★ ORDER IS LOAD-BEARING and its failure mode is silent. Both entry points look up
+ * `J3DMaterial::getMaterialAnm()` on each material the animation targets and simply skip any that
+ * has none — `entryTexNoAnimator` returns 1 having attached nothing to that material
+ * (J3DMaterialAttach.cpp:206-215), and `entryTexMtxAnimator` bails out of `createTexMtxForAnimator`
+ * before attaching anything at all (:152-155, :226-231). Nothing crashes; the eyes just never move.
+ * So the J3DMaterialAnm objects have to exist on materials 2 and 3 FIRST. The return codes are
+ * checked here for the same reason: this is a class of bug that otherwise only shows up as "it
+ * looks the same as before".
+ *
+ * ★ Plain J3DMaterialAnm, deliberately NOT daAlink_matAnm_c. Link's subclass reaches for
+ * `daAlink_getAlinkActorClass()->checkStatusWindowDraw()` in its calc (d_a_alink.cpp:2022) and
+ * keeps its blend state in STATIC members shared by every instance (d_a_alink.h:60-61) — a puppet
+ * using it would read and write the local player's eye state. The base class is concrete and does
+ * exactly what a blink needs: apply whatever anms are registered and leave the rest alone
+ * (J3DMaterialAnm.cpp:28-58).
+ *
+ * ★ dEyeHL_c is NOT part of blinking, despite sitting next to it in daAlink_c::setLinkModel. It
+ * only nudges texture LODBias by FOV during events with an HIO flag set (d_eye_hl.cpp:40-55), and
+ * it hard-errors if the texture it is given is absent (:31) — which across outfits it may well be.
+ */
+bool daRemotePlayer_c::setupFaceAnimation() {
+    if (mpFaceModel == NULL) {
+        return false;
+    }
+
+    J3DModelData* faceData = mpFaceModel->getModelData();
+    const u16 materialNum = faceData->getMaterialNum();
+    for (int i = 0; i < 2; i++) {
+        if (l_eyeMaterialNo[i] >= materialNum) {
+            Log.warn(
+                "Face model has {} materials; no eye material {}", materialNum, l_eyeMaterialNo[i]);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < 2; i++) {
+        mpEyeMatAnm[i] = JKR_NEW J3DMaterialAnm();
+        if (mpEyeMatAnm[i] == NULL) {
+            Log.warn("Out of heap for the puppet's eye material anm {}", i);
+            return false;
+        }
+        faceData->getMaterialNodePointer(l_eyeMaterialNo[i])->setMaterialAnm(mpEyeMatAnm[i]);
+    }
+
+    mpBlinkBtp =
+        static_cast<J3DAnmTexPattern*>(load_aram_anm(l_blinkBtpIdx, ANM_FAMILY_TEX_PATTERN));
+    mpBlinkBtk =
+        static_cast<J3DAnmTextureSRTKey*>(load_aram_anm(l_blinkBtkIdx, ANM_FAMILY_TEX_SRT));
+    if (mpBlinkBtp == NULL || mpBlinkBtk == NULL) {
+        // Drop both, so playFaceTextureAnime() never has to reason about half a blink.
+        mpBlinkBtp = NULL;
+        mpBlinkBtk = NULL;
+        return false;
+    }
+
+    /* Through the material table rather than J3DModelData, which is the same call with the return
+     * code thrown away (J3DModelData.h:79, :81) — and the return code is the only way this failure
+     * is visible at all. */
+    J3DMaterialTable& faceMaterials = faceData->getMaterialTable();
+
+    mpBlinkBtp->searchUpdateMaterialID(faceData);
+    const int btpResult = faceMaterials.entryTexNoAnimator(mpBlinkBtp);
+
+    mpBlinkBtk->searchUpdateMaterialID(faceData);
+    const int btkResult = faceMaterials.entryTexMtxAnimator(mpBlinkBtk);
+
+    mpBlinkBtp->setFrame(0.0f);
+    mpBlinkBtk->setFrame(0.0f);
+    mBlinkFrame = 0;
+
+    if (btpResult != 0 || btkResult != 0) {
+        // Non-zero is never fatal but is never right either: 1 means a target material had no
+        // J3DMaterialAnm, 2 means the material table was locked, 4 means a texture matrix had to be
+        // manufactured — and 4 makes entryTexMtxAnimator return before attaching anything.
+        Log.warn("Puppet blink attached with warnings: BTP={} BTK={}", btpResult, btkResult);
+        return false;
+    }
+
+    Log.info("Puppet blink attached to face materials {} and {}", l_eyeMaterialNo[0],
+        l_eyeMaterialNo[1]);
+    return true;
+}
+
+/**
+ * This puppet's own random stream.
+ *
+ * ★ Deliberately not cM_rnd(). That is a single Wichmann-Hill generator over three FILE-STATIC
+ * seeds (c_math.cpp:173-196) shared by every actor in the game. Rolling a blink from it once per
+ * tick per puppet would advance the global sequence by a number of steps that depends on HOW MANY
+ * OTHER PLAYERS ARE IN THE ROOM — so the host and each guest would draw different numbers for
+ * everything else that uses it, and a co-op session would not even match single-player. Cosmetic
+ * eyelids are not worth spending the game's shared randomness on.
+ *
+ * Same generator, private seeds. The three moduli are prime, so a seed that starts non-zero stays
+ * non-zero and the stream cannot collapse.
+ */
+f32 daRemotePlayer_c::ownRnd() {
+    mRndSeed[0] = (mRndSeed[0] * 171) % 30269;
+    mRndSeed[1] = (mRndSeed[1] * 172) % 30307;
+    mRndSeed[2] = (mRndSeed[2] * 170) % 30323;
+
+    const f32 sum = mRndSeed[0] / 30269.0f + mRndSeed[1] / 30307.0f + mRndSeed[2] / 30323.0f;
+    return fabsf(fmodf(sum, 1.0f));
+}
+
+/**
+ * Blink, the way the local player blinks.
+ *
+ * daAlink_c::playFaceTextureAnime (d_a_alink.cpp:8383-8394) is three lines once the demo, hawk and
+ * priority-animation branches are stripped away, and none of those apply to a puppet: roll each
+ * frame to START a blink, then run the cursor to the longer of the two animations' frame counts and
+ * drop back to zero. Both animations are set to the same frame, each clamped to its own maximum.
+ *
+ * ★ There is nothing to replicate here. The blink is a local, random, purely cosmetic roll on the
+ * sender's machine too — it is not part of the sender's state and never crosses the wire, so a
+ * puppet blinking on its own schedule is not an approximation of the original, it IS the original.
+ */
+void daRemotePlayer_c::playFaceTextureAnime() {
+    if (mpBlinkBtp == NULL || mpBlinkBtk == NULL) {
+        return;
+    }
+
+    const s16 btpFrameMax = mpBlinkBtp->getFrameMax();
+    const s16 btkFrameMax = mpBlinkBtk->getFrameMax();
+    const s16 blinkFrameMax = btpFrameMax > btkFrameMax ? btpFrameMax : btkFrameMax;
+
+    if (mBlinkFrame != 0) {
+        mBlinkFrame++;
+        if (mBlinkFrame > blinkFrameMax) {
+            mBlinkFrame = 0;
+        }
+    } else if (ownRnd() < l_blinkChance) {
+        mBlinkFrame++;
+        if (!mLoggedFirstBlink) {
+            mLoggedFirstBlink = true;
+            // One line, latched. "The eyes never move" is otherwise unfalsifiable from a trace:
+            // every silent failure in setupFaceAnimation() and every dead texture animator produce
+            // exactly the same still face. This says the timer ran and the animations are live.
+            Log.debug("Puppet {} blinked for the first time ({} frames)", mPlayerId, blinkFrameMax);
+        }
+    }
+
+    mpBlinkBtp->setFrame(mBlinkFrame > btpFrameMax ? btpFrameMax : mBlinkFrame);
+    mpBlinkBtk->setFrame(mBlinkFrame > btkFrameMax ? btkFrameMax : mBlinkFrame);
 }
 
 void daRemotePlayer_c::setMatrix() {
@@ -610,6 +834,9 @@ int daRemotePlayer_c::execute() {
     // mtx calculators are not on it and cannot be.
     selectAnimation();
     mpModelMorf->play(0, 0);
+    // Independent of the body: the puppet blinks while standing still as much as while running,
+    // which is the whole point — a face frozen mid-stare is what reads as "not a real player".
+    playFaceTextureAnime();
     // Before setMatrix, so the ground check runs against the pose the puppet is about to be drawn
     // at rather than the previous tick's.
     setRoomInfo();
@@ -621,13 +848,23 @@ static int daRemotePlayer_Execute(daRemotePlayer_c* i_this) {
     return i_this->execute();
 }
 
-/// One sub-model, lit like the body. Mirrors daAlink_c::basicModelDraw (d_a_alink.cpp:19370).
+/// One sub-model, lit like the body. This is daAlink_c::modelDraw with its draw flag at 0
+/// (d_a_alink.cpp:19375-19386) — which is the call Link uses for all four of HIS models
+/// (`:19598`, `:19696`, `:19707`, `:19713`); `basicModelDraw` is only the lantern and the pause
+/// menu.
+///
+/// The daMirror_c::entry line is what separates the two under that flag, and without it puppets are
+/// simply **absent from mirrored panes** while the local player is reflected — a mirror showing one
+/// player in a two-player room. It is safe to call unconditionally: the static returns 0 when no
+/// mirror actor exists (d_com_static.cpp:400-405), and the packet drops entries past 64 rather than
+/// overflowing (d_a_mirror.cpp:95-97), against a handful in use.
 void daRemotePlayer_c::drawModel(J3DModel* i_model) {
     if (i_model == NULL) {
         return;
     }
     g_env_light.setLightTevColorType_MAJI(i_model, &tevStr);
     mDoExt_modelEntryDL(i_model);
+    daMirror_c::entry(i_model);
 }
 
 int daRemotePlayer_c::draw() {
