@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../net/transport.hpp"
+#include "../replication/player_state.hpp"
 #include "dusk/multiplayer.hpp"
 
 namespace dusk::mp {
@@ -86,6 +87,10 @@ private:
     void send_local_state();
     void broadcast_snapshot();
 
+    /// The pose to put on the wire this tick, which is a different question from "is there a Link
+    /// to read". Never fails: see the definition for why silence is not an option.
+    PlayerState wire_local_state();
+
     void report_interpolation();
 
     /// What --mp-* asked for, owned as strings so the caller's argv can go away.
@@ -114,6 +119,11 @@ private:
 
     std::unordered_map<PeerId, PeerSession> mPeers;
     std::vector<TransportEvent> mEventScratch;
+
+    /// Last pose we could actually read off Link, resent while there is none. See
+    /// wire_local_state().
+    PlayerState mLastLocalState;
+    bool mHaveLastLocal = false;
 
     std::uint64_t mSimTick = 0;
     std::uint32_t mHeartbeatSeq = 0;

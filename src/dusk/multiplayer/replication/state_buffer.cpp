@@ -46,6 +46,8 @@ void StateBuffer::reset() {
     mStarted = false;
     mTicksSinceStarvation = 0;
     mConsecutiveStarvations = 0;
+    mStarveNewestAtStart = 0.0;
+    mStarveWidened = 0.0;
     // Also cleared: after a warp the stream restarts from nothing, so the first starvations are
     // the sender loading the new scene, not a degraded link.
     mEverInterpolated = false;
@@ -53,8 +55,14 @@ void StateBuffer::reset() {
     // scene, so a warp shouldn't throw away what we learned about it.
 }
 
-void StateBuffer::on_starved() {
+void StateBuffer::on_starved(double newest) {
     ++mStarvations;
+    if (mConsecutiveStarvations == 0) {
+        // Opening a new run: remember where the sender's clock had got to, so on_clean() can work
+        // out afterwards whether it kept running through the gap.
+        mStarveNewestAtStart = newest;
+        mStarveWidened = 0.0;
+    }
     ++mConsecutiveStarvations;
     mTicksSinceStarvation = 0;
 
@@ -64,12 +72,14 @@ void StateBuffer::on_starved() {
         // the other end's loading screen, which is the "everyone pays the worst player" trap this
         // buffer exists to avoid.
         //
-        // Honest scope: measurement showed this guard does NOT cover the startup burst actually
-        // seen in two-instance runs (27 starvations right after the sender enters the world). By
-        // then interpolation has genuinely begun, so those take the normal path and are capped by
-        // kStallStarvationTicks instead — delay peaks near 7 ticks and decays back to ~3.5 over
-        // the following minute. This guard covers only the colder case before the first successful
-        // interpolation, which is real but was not the one that showed up in the trace.
+        // Honest scope: this guard only ever covered the cold case before the first successful
+        // interpolation. The bursts that actually dominated two-instance runs arrived AFTER
+        // interpolation had begun, so they took the normal path below and ratcheted the delay to
+        // its 12-tick ceiling. That is no longer this guard's problem to solve, because the cause
+        // was upstream — senders went silent whenever they had no pose to report, and silence is
+        // indistinguishable from loss. NetworkManager::wire_local_state() now keeps the stream
+        // running, which took the same 200 s two-instance run from 162 starvations pinned at 12.0
+        // ticks down to 2 starvations peaking at 3.0.
         return;
     }
 
@@ -80,15 +90,40 @@ void StateBuffer::on_starved() {
     }
 
     // Widen fast. A visible stutter costs more than a tick of extra latency.
+    const double before = mDelayTicks;
     mDelayTicks = std::min(kMaxDelayTicks, mDelayTicks + 1.0);
+    mStarveWidened += mDelayTicks - before;
 }
 
-void StateBuffer::on_clean() {
+void StateBuffer::on_clean(double newest) {
+    if (mConsecutiveStarvations > 0) {
+        // ★ The stream just resumed, so the gap can finally be diagnosed — and widening is the
+        // right answer to only one of the two things it might have been.
+        //
+        // If the LINK hiccuped, the sender went on producing a tick per tick throughout and the
+        // packets merely arrived late, in a clump. Its counter will have advanced by roughly the
+        // number of ticks we sat waiting. That is genuine jitter and a deeper buffer really does
+        // absorb the next one, so the widening is earned and stays.
+        //
+        // If the SENDER stalled — loading a room, a shader compile, a frame hitch — its counter
+        // barely moved, because the data we were waiting for was never produced. No buffer depth
+        // can conjure that, so the widening bought precisely nothing, and left alone it would be
+        // charged to the session as latency for the next minute. Give it back.
+        //
+        // Note this degrades in the safe direction: real packet LOSS leaves the sender's counter
+        // racing ahead of what we received, which reads as jitter and keeps the buffer wide.
+        const double produced = newest - mStarveNewestAtStart;
+        if (produced * 2.0 < static_cast<double>(mConsecutiveStarvations)) {
+            mDelayTicks = std::max(kMinDelayTicks, mDelayTicks - mStarveWidened);
+        }
+        mStarveWidened = 0.0;
+    }
+
     mConsecutiveStarvations = 0;
     ++mTicksSinceStarvation;
     if (mTicksSinceStarvation >= kShrinkWindowTicks && mDelayTicks > kMinDelayTicks) {
-        // Narrow slowly, and only after a long clean stretch, so one hiccup doesn't tax the whole
-        // session but a genuinely improved link does get its responsiveness back.
+        // Still asymmetric — widening is 30x faster than this — but on a timescale a player can
+        // actually feel the end of, so one hiccup no longer taxes the rest of the session.
         mDelayTicks = std::max(kMinDelayTicks, mDelayTicks - 0.5);
         mTicksSinceStarvation = 0;
     }
@@ -122,7 +157,7 @@ bool StateBuffer::advance(PlayerState& out) {
         // Still filling the buffer after a (re)start. Hold the first pose rather than extrapolate
         // from a single sample, which would be a guess with nothing behind it.
         out = mSamples.front().state;
-        on_clean();
+        on_clean(newest);
         return true;
     }
 
@@ -130,7 +165,7 @@ bool StateBuffer::advance(PlayerState& out) {
         // Nothing left to interpolate towards: the sender's data has not arrived. Hold the last
         // known pose. Extrapolating here is what makes puppets skate into walls under packet loss.
         out = mSamples.back().state;
-        on_starved();
+        on_starved(newest);
         return true;
     }
 
@@ -156,7 +191,7 @@ bool StateBuffer::advance(PlayerState& out) {
         mSamples.pop_front();
     }
 
-    on_clean();
+    on_clean(newest);
     return true;
 }
 

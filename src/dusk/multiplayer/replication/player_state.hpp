@@ -71,6 +71,16 @@ inline std::int16_t lerp_angle(std::int16_t a, std::int16_t b, float t) {
 /// Linear blend of two poses. `t` is expected in [0, 1] but is not clamped here — callers that
 /// extrapolate briefly past the newest sample pass t > 1 deliberately.
 inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float t) {
+    // Never blend ACROSS the in-world boundary. A not-in-world sample carries no position — the
+    // sender had no Link to read and sent zeroes — so interpolating out of one would walk the
+    // puppet from the world origin towards the spawn point over a couple of ticks, and it would
+    // visibly fly in from the horizon on the first tick of every session. Position is only
+    // meaningful when both endpoints have it; when they disagree the discrete state wins and the
+    // newer sample is taken whole.
+    if (a.in_world() != b.in_world()) {
+        return b;
+    }
+
     PlayerState out;
     out.posX = a.posX + (b.posX - a.posX) * t;
     out.posY = a.posY + (b.posY - a.posY) * t;

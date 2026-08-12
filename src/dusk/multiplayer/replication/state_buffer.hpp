@@ -24,6 +24,16 @@
  *
  * Everything is measured in SIM TICKS, never milliseconds or rendered frames: the pump runs on
  * the 30 Hz sim tick and the measured RTT floor is one tick (00-status.md).
+ *
+ * ★ The trap this design walked into, and what now guards it. Feedback from starvation is
+ * REACTIVE: it only learns after a stutter, and it cannot see WHY the data was missing. For a long
+ * time everything missing was treated as link trouble, so every load, cutscene and boot ratcheted
+ * the delay upward and the slow decay never gave it back — measured pinned at the 12-tick ceiling
+ * (400 ms) and still 5.5 ticks two minutes later, which is precisely the "everyone pays the worst
+ * player" outcome tpmp's fixed /buffer knob was criticised for. Two things now prevent it: senders
+ * never go quiet (NetworkManager::wire_local_state), and a gap that turns out to have been the
+ * SENDER stalling has its widening refunded (on_clean). Same 200 s two-instance run: 162
+ * starvations pinned at 12.0 ticks before, 2 starvations peaking at 3.0 after.
  */
 
 namespace dusk::mp {
@@ -47,8 +57,15 @@ public:
     static constexpr double kMaxTimeWarp = 0.35;
     /// Proportional gain on the trailing-distance error.
     static constexpr double kCatchupGain = 0.10;
-    /// Clean ticks required before the buffer dares to narrow again (~5 s at 30 Hz).
-    static constexpr std::uint32_t kShrinkWindowTicks = 150;
+    /// Clean ticks required before the buffer dares to narrow again (~1.5 s at 30 Hz).
+    ///
+    /// Widening is deliberately far faster than narrowing, because a stutter costs more than a
+    /// tick of latency — but the original 150 made the asymmetry absurd: a single event added up
+    /// to 5 ticks in 5 ticks and took 50 SECONDS to hand back, so a session accumulated latency
+    /// monotonically and never recovered inside a play session (measured: pinned at the 12-tick
+    /// ceiling, still 5.5 two minutes later). Growth is still 30x faster than decay at this value,
+    /// which is ample hysteresis; what it no longer does is treat one bad second as permanent.
+    static constexpr std::uint32_t kShrinkWindowTicks = 45;
     /// Consecutive starved ticks after which we stop treating this as jitter. A long dry spell is
     /// the sender stalling (a load, a hitch); widening the buffer for that adds permanent latency
     /// and fixes nothing, so past this point we hold the pose without inflating further.
@@ -79,8 +96,8 @@ private:
         PlayerState state;
     };
 
-    void on_starved();
-    void on_clean();
+    void on_starved(double newest);
+    void on_clean(double newest);
 
     std::deque<Sample> mSamples;
     double mPlaybackTick = 0.0;
@@ -92,6 +109,11 @@ private:
 
     std::uint32_t mTicksSinceStarvation = 0;
     std::uint32_t mConsecutiveStarvations = 0;
+    /// Newest sender tick held when the current starvation run began, and how much that run has
+    /// widened the buffer so far. Together these let the run be judged in hindsight — see
+    /// on_clean().
+    double mStarveNewestAtStart = 0.0;
+    double mStarveWidened = 0.0;
     std::uint32_t mStarvations = 0;
     std::uint32_t mSnaps = 0;
 };

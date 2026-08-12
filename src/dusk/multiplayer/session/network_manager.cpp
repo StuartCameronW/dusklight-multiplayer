@@ -595,13 +595,39 @@ void NetworkManager::broadcast_peer_left(std::uint32_t playerId) {
     mTransport->broadcast(w.data().data(), w.size(), kChannelControl, true);
 }
 
-void NetworkManager::send_local_state() {
+/**
+ * ★ Always produce something to send. Going quiet is what used to cost the session its latency.
+ *
+ * capture_local() fails whenever world_is_playable() does: a load, the title screen, a cutscene, a
+ * warp transition. That is a large fraction of a real session. The old code returned early and
+ * sent nothing at all, which looks harmless — until you read it from the far end, where the
+ * interpolation buffer has no way to tell "he has nothing to report" from "the link is dropping
+ * packets". It assumes the latter, widens by up to five ticks per event, and then gives the
+ * latency back at 0.5 ticks per five seconds. Measured on a staggered two-instance boot: the
+ * buffer pinned at its 12-tick ceiling (400 ms) and was still at 5.5 ticks two minutes later.
+ *
+ * So we send every tick regardless. Holding the LAST GOOD pose, rather than sending a cleared
+ * one, is deliberate: it reproduces exactly what the far end already displayed during these gaps
+ * (its buffer held the last sample), so this change moves no puppet by a single unit. It only
+ * stops the timeline stalling. Whether a puppet should instead HIDE during the other player's
+ * cutscenes is a real question, but it is a visual-design decision and not this one's to make —
+ * kPlayerStateInWorld is already allocated for it.
+ *
+ * Before the first readable pose there is genuinely nothing to show, so the flags stay clear and
+ * drive_puppets() declines to spawn a puppet at the origin.
+ */
+PlayerState NetworkManager::wire_local_state() {
     PlayerState state;
-    if (!replication_manager().capture_local(state)) {
-        // No Link in the world (loading, title screen). Sending a stale pose would park our
-        // puppet at wherever we last were instead of hiding it.
-        return;
+    if (replication_manager().capture_local(state)) {
+        mLastLocalState = state;
+        mHaveLastLocal = true;
+        return state;
     }
+    return mHaveLastLocal ? mLastLocalState : PlayerState{};
+}
+
+void NetworkManager::send_local_state() {
+    const PlayerState state = wire_local_state();
 
     Writer w;
     w.write_u8(static_cast<std::uint8_t>(PacketId::PlayerStateUpdate));
@@ -617,8 +643,9 @@ void NetworkManager::broadcast_snapshot() {
         return;
     }
 
-    PlayerState localState;
-    const bool haveLocal = replication_manager().capture_local(localState);
+    // Never conditional, and never skipped: see wire_local_state(). The host loading a room used
+    // to drop itself out of its own snapshot, starving every client's buffer for the whole load.
+    const PlayerState localState = wire_local_state();
 
     // Serialize once and send the same bytes to everyone — clients skip their own entry. Building
     // a per-recipient packet would cost N serializations for no benefit at this size.
@@ -626,28 +653,22 @@ void NetworkManager::broadcast_snapshot() {
     w.write_u8(static_cast<std::uint8_t>(PacketId::WorldSnapshot));
     w.write_u64(mSimTick);
 
-    std::uint8_t count = haveLocal ? 1 : 0;
+    std::uint8_t count = 1;
     for (const auto& entry : replication_manager().players()) {
         if (entry.second.hasLatest) {
             ++count;
         }
-    }
-    if (count == 0) {
-        return;
     }
     if (count > kMaxPlayers) {
         count = static_cast<std::uint8_t>(kMaxPlayers);
     }
     w.write_u8(count);
 
-    std::uint8_t written = 0;
-    if (haveLocal) {
-        w.write_u32(kHostPlayerId);
-        // Our own pose was captured this tick, so our clock is its origin.
-        w.write_u64(mSimTick);
-        localState.write(w);
-        ++written;
-    }
+    w.write_u32(kHostPlayerId);
+    // Our own pose was captured this tick, so our clock is its origin.
+    w.write_u64(mSimTick);
+    localState.write(w);
+    std::uint8_t written = 1;
     for (const auto& entry : replication_manager().players()) {
         if (written >= count) {
             break;
