@@ -196,6 +196,24 @@ PuppetLookup look_up_puppet(std::uint32_t playerId, daRemotePlayer_c** o_puppet)
         return known ? PuppetLookup::Creating : PuppetLookup::Gone;
     }
 
+    daRemotePlayer_c* const puppet = static_cast<daRemotePlayer_c*>(actor);
+
+    /* ★ Findable is NOT the same as created, and this cost a test run to learn. create() can log
+     * its failure, return cPhs_ERROR_e, and STILL be handed back by fopAcM_SearchByID on the next
+     * tick — measured, with createHeap forced to return 0. Treating that as "alive" set
+     * everResolved on a puppet that never existed, so the failure below was classified as a vanish
+     * and respawned immediately, forever: 234 failures and 233 respawns in one 200 s run, with the
+     * backoff never once engaging. So take the actor's own explicit end-of-create() flag instead of
+     * inferring success from the framework's bookkeeping.
+     *
+     * Reporting Creating rather than Gone here is correct for both cases it covers: a puppet that
+     * is genuinely still mounting, and a failed one in the tick before the framework drops it. The
+     * failed one becomes Gone on the next tick with everResolved still false, which is exactly the
+     * path that counts it as a creation failure. */
+    if (!puppet->createComplete()) {
+        return PuppetLookup::Creating;
+    }
+
     if (!it->second.everResolved) {
         it->second.everResolved = true;
         // One line, once, on the tick the actor first becomes resolvable. The hang on 2026-08-11
@@ -206,7 +224,7 @@ PuppetLookup look_up_puppet(std::uint32_t playerId, daRemotePlayer_c** o_puppet)
             playerId, it->second.ticksSinceRequest);
     }
 
-    *o_puppet = static_cast<daRemotePlayer_c*>(actor);
+    *o_puppet = puppet;
     return PuppetLookup::Alive;
 }
 

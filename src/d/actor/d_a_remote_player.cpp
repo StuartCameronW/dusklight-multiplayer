@@ -291,6 +291,15 @@ const u16 l_blinkBtkIdx = dRes_ID_ALANM_BTK_FMABA01_e;
  */
 const f32 l_blinkChance = 0.012f;
 
+/* How far ABOVE the puppet's feet to ask the bg system for the floor.
+ *
+ * Not a number picked for this actor: it is dBgS_Acch's own m_gnd_chk_offset default
+ * (d_bg_s_acch.cpp:65), i.e. the raise every grounded actor in the game already queries from. The
+ * ground test rejects a floor at exactly the query height (cBgW::RwgGroundCheckCommon's strict
+ * `cy < y`, d_bg_w.cpp:606-625) and grounded actors stand at exactly floor height, so querying
+ * from the feet finds nothing at all. See the mGndChk comment in the header. */
+const f32 l_gndCheckOffset = 60.0f;
+
 /* The two eye materials on the face model. Confirmed for Link at d_a_alink_wolf.inc:501-502 — they
  * are the only two that ever receive a J3DMaterialAnm. Range-checked at use anyway: the material
  * count comes out of a binary asset, so it is not verifiable from source for every outfit.
@@ -843,10 +852,9 @@ int daRemotePlayer_c::create() {
     const int mountPhase = mountOwnArchive();
     if (mountPhase != cPhs_COMPLEATE_e) {
         /* cPhs_LOADING_e here is the normal case and must NOT be reported as a failure — the mount
-         * legitimately takes many frames. Only the error step is worth recording. mPlayerId is not
-         * assigned until the heap is up, so read the create parameter directly. */
+         * legitimately takes many frames. Only the error step is worth recording. */
         if (mountPhase == cPhs_ERROR_e) {
-            g_daRemotePlayer_lastCreateFail.mPlayerId = fopAcM_GetParam(this);
+            g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
             g_daRemotePlayer_lastCreateFail.mReason = "the private archive mount failed";
         }
         return mountPhase;
@@ -856,7 +864,12 @@ int daRemotePlayer_c::create() {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
-        g_daRemotePlayer_lastCreateFail.mPlayerId = fopAcM_GetParam(this);
+        /* ★ mPlayerId, NOT fopAcM_GetParam(this). The create parameter is no longer the player id
+         * on its own — it carries the outfit in its top byte — so keying the reason on the raw
+         * parameter made every lookup miss and the give-up line read "not reported by the actor".
+         * Measured; the two halves of that change landed together and neither could see the other.
+         */
+        g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
         g_daRemotePlayer_lastCreateFail.mReason =
             "the 0x20000 solid heap, or one of the models/animations createHeap() loads into it";
         return cPhs_ERROR_e;
@@ -878,6 +891,9 @@ int daRemotePlayer_c::create() {
     // exact place the original crash happened.
     Log.info("Puppet for player {} wearing '{}' from its own archive copy", mPlayerId,
         l_outfits[mOutfit].arcName);
+    // Last line, deliberately: this is the network layer's ONLY trustworthy "creation succeeded"
+    // signal. See createComplete() in the header for why findability is not one.
+    mCreateComplete = true;
     return cPhs_COMPLEATE_e;
 }
 
@@ -2325,18 +2341,35 @@ void daRemotePlayer_c::setMatrix() {
 ///    so the puppet keeps its spawn room's six light vectors forever
 ///    (dKy_setLight_nowroom_actor, d_kankyo.cpp:8775).
 ///
-/// Mirrors daMidna_c::setRoomInfo (d_a_midna.cpp:1171-1182) — the game's own answer for a companion
-/// actor with no ground check of its own. Deliberately NOT daAlink_c's version, which reads the
-/// collision result out of his own dBgS_LinkAcch. Midna's reverb line is dropped: a puppet makes no
-/// sound of its own.
-///
-/// fopAcM_gc_c's ground check is static shared state, so the result has to be consumed in the same
-/// breath as the check rather than cached (f_op_actor_mng.h:874-889).
+/// ★ This was written to mirror daMidna_c::setRoomInfo (d_a_midna.cpp:1171-1182), on the reasoning
+/// that Midna is the game's own answer for a companion actor with no ground check of its own. That
+/// was the WRONG template and it silently did nothing: Midna's query works only because she HOVERS,
+/// so her origin is above the floor. Measured on a standing puppet, the fopAcM_gc_c query it used
+/// failed 800 times out of 800 and this function took its fallback branch for the puppet's whole
+/// life. It now reads daAlink_c's version instead — the collision result out of the actor's own
+/// ground-check member — which is what every grounded actor in the tree does. Midna's reverb line
+/// is still dropped: a puppet makes no sound of its own.
+/**
+ * Find the floor under the puppet, into the actor's OWN check object.
+ *
+ * Run once per tick from execute(), so the draw pass reads a settled answer instead of asking the
+ * bg system a second time — and so mGndChk still describes THIS puppet's floor when the shadow
+ * wants it. See the mGndChk comment in the header for why the query is raised and why the shared
+ * fopAcM_gc_c static cannot do this job.
+ */
+void daRemotePlayer_c::groundCheck() {
+    cXyz probe = current.pos;
+    probe.y += l_gndCheckOffset;
+    mGndChk.SetPos(&probe);
+    mGroundHeight = dComIfG_Bgsp().GroundCross(&mGndChk);
+    mGroundValid = mGroundHeight != -G_CM3D_F_INF;
+}
+
 void daRemotePlayer_c::setRoomInfo() {
     int room_no;
-    if (fopAcM_gc_c::gndCheck(&current.pos)) {
-        room_no = fopAcM_gc_c::getRoomId();
-        tevStr.YukaCol = fopAcM_gc_c::getPolyColor();
+    if (mGroundValid) {
+        room_no = dComIfG_Bgsp().GetRoomId(mGndChk);
+        tevStr.YukaCol = dComIfG_Bgsp().GetPolyColor(mGndChk);
     } else {
         // Over a hole, mid-warp, or handed a pose with no floor under it. Keep the last floor
         // colour and fall back to the room the local player is in, which is the room the puppet is
@@ -2393,6 +2426,8 @@ int daRemotePlayer_c::execute() {
     playFaceTextureAnime();
     // Before setMatrix, so the ground check runs against the pose the puppet is about to be drawn
     // at rather than the previous tick's.
+    traceCalc("groundCheck");
+    groundCheck();
     traceCalc("setRoomInfo");
     setRoomInfo();
     traceCalc("setMatrix");
@@ -2478,13 +2513,12 @@ void daRemotePlayer_c::shadowDraw() {
         return;
     }
 
-    /* The ground under the puppet's feet. fopAcM_gc_c is shared STATIC state, so the height and the
-     * polygon it came from are both taken here, in the same breath as the check that produced them
-     * (f_op_actor_mng.h:874-893) — this is a second, fresh check rather than a value cached by
-     * setRoomInfo() during execute(), because every other actor's own ground query between the two
-     * passes would have overwritten it. It is the same idiom daAlink_c uses for the iron ball's
-     * shadow (d_a_alink.cpp:19297-19302). */
-    if (!fopAcM_gc_c::gndCheck(&current.pos)) {
+    /* The ground under the puppet's feet, found during execute() by groundCheck() into this
+     * actor's own mGndChk. Deliberately NOT re-queried here: the shared fopAcM_gc_c static that
+     * this used to call cannot answer the question at all for a grounded actor (header comment),
+     * and a per-actor member is exactly what daAlink_c reads at the same point
+     * (mLinkAcch.m_gnd, d_a_alink.cpp:19246), so there is no stale-static hazard to dodge. */
+    if (!mGroundValid) {
         // Over a hole, mid-warp, or handed a pose with no floor under it. No ground, no shadow —
         // and this is dComIfGd_setShadow's own guard restated (d_com_inf_game.cpp:2280), so we are
         // only declining a call that would have declined itself.
@@ -2492,7 +2526,7 @@ void daRemotePlayer_c::shadowDraw() {
         return;
     }
 
-    const f32 groundY = fopAcM_gc_c::getGroundY();
+    const f32 groundY = mGroundHeight;
 
     /* Shadow centre = the body model's ROOT JOINT in world space, NOT current.pos. daAlink_c feeds
      * `field_0x3834` (d_a_alink.cpp:19226), which is exactly this quantity (:5605). It matters
@@ -2523,8 +2557,18 @@ void daRemotePlayer_c::shadowDraw() {
      *    falling through to the scene-global one — and, incidentally, out of the branch at
      *    d_drawlist.cpp:1324 that writes through a pointer it has just proven to be NULL. */
     mShadowKey = dComIfGd_setShadow(mShadowKey, 0, model, &shadowPos, 800.0f, 0.0f, current.pos.y,
-        groundY, *fopAcM_gc_c::getGroundCheck(), &tevStr, 0, 1.0f,
-        dDlst_shadowControl_c::getSimpleTex());
+        groundY, mGndChk, &tevStr, 0, 1.0f, dDlst_shadowControl_c::getSimpleTex());
+
+    /* One line, once, the first time a shadow is actually granted. This feature fails SILENTLY —
+     * setReal declines for several reasons and simply returns 0, and the puppet then looks exactly
+     * as it did when it had no shadow code at all. That is how the original ground-check bug
+     * survived: the code was present, compiled, called every frame, and never once succeeded. If
+     * this line is absent from a session's log, the puppet had no shadow for the whole session. */
+    if (mShadowKey != 0 && !mLoggedShadow) {
+        mLoggedShadow = true;
+        Log.debug("Puppet {} shadow registered (key {}, ground {:.1f}, {:.1f} above it)", mPlayerId,
+            mShadowKey, groundY, current.pos.y - groundY);
+    }
 
     if (mShadowKey != 0) {
         // The other three models cast into the SAME shadow, so the silhouette has a head and hands
