@@ -193,6 +193,10 @@ private:
     f32 mLinkLateralMovePeak;
     s16 mPrevLinkHeadYaw;
     bool mPrevLinkHeadYawValid;
+    /* True once the local player has been sampled in the current window. Without it a wolf's
+     * never-running cap would report peaks of 0 and read as a measured "his does not swing either".
+     */
+    bool mLinkSampled;
     /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
      * until the first sample. See checkMaterialDrift(). */
     u16 mMaterialSig[4];

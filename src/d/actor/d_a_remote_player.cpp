@@ -1779,6 +1779,7 @@ void daRemotePlayer_c::setHatAngle() {
             }
             mPrevLinkHeadYaw = tickLink->field_0x3062;
             mPrevLinkHeadYawValid = true;
+            mLinkSampled = true;
 
             cXyz linkAnchor;
             mDoMtx_multVecZero(tickLink->mpLinkHatModel->getAnmMtx(l_capRootJointNo), &linkAnchor);
@@ -2018,15 +2019,29 @@ void daRemotePlayer_c::setHatAngle() {
              * rather than an inference. Whichever column is small on the puppet and large on his is
              * the one to fix; if BOTH match, the fault is downstream and the inputs are innocent.
              */
-            Log.debug("Puppet {} capY inputs #{}: peak yaw kick/tick {} vs P1 {} | peak lateral "
-                      "anchor move/tick {:.2f} vs P1 {:.2f} | capY {} vs P1 {}",
-                mPlayerId, mWindLogCount, mYawKickPeak, mLinkYawKickPeak, mLateralMovePeak,
-                mLinkLateralMovePeak, mSwayAngleY[l_capRootJointNo],
-                windLink != NULL ? windLink->field_0x3040[l_capRootJointNo] : 0);
+            /* ★ Say so when there was no local cap to measure, rather than printing zeroes. A wolf
+             * never runs setHatAngle, so his peaks would sit at 0 and read as "Link's cap does not
+             * swing either" — which is the exact shape of mistake (zeroes from a system that was
+             * not running, taken as data) that sent an earlier wind fix the wrong way. */
+            if (!mLinkSampled) {
+                Log.debug("Puppet {} capY inputs #{}: peak yaw kick/tick {} | peak lateral anchor "
+                          "move/tick {:.2f} | capY {} | NO P1 COMPARISON (wolf or no local player)",
+                    mPlayerId, mWindLogCount, mYawKickPeak, mLateralMovePeak,
+                    mSwayAngleY[l_capRootJointNo]);
+            } else {
+                Log.debug(
+                    "Puppet {} capY inputs #{}: peak yaw kick/tick {} vs P1 {} | peak lateral "
+                    "anchor move/tick {:.2f} vs P1 {:.2f} | capY {} vs P1 {}",
+                    mPlayerId, mWindLogCount, mYawKickPeak, mLinkYawKickPeak, mLateralMovePeak,
+                    mLinkLateralMovePeak, mSwayAngleY[l_capRootJointNo],
+                    windLink != NULL ? windLink->field_0x3040[l_capRootJointNo] : 0);
+            }
+
             mYawKickPeak = 0;
             mLinkYawKickPeak = 0;
             mLateralMovePeak = 0.0f;
             mLinkLateralMovePeak = 0.0f;
+            mLinkSampled = false;
         }
     }
 
