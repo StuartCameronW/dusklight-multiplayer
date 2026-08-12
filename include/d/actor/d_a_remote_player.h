@@ -5,6 +5,8 @@
 #include "f_op/f_op_actor.h"
 #include "m_Do/m_Do_ext.h"
 
+class daNpcF_MatAnm_c;
+
 /**
  * Remote player puppet — a Dusk-only actor, not part of the original game.
  *
@@ -48,6 +50,8 @@ private:
     bool setupFaceAnimation();
     /// Advance (or start) a blink. Must run every tick.
     void playFaceTextureAnime();
+    /// Aim the eyes at the local player. Must run every tick, AFTER setMatrix().
+    void setEyeMove();
     /// This puppet's OWN random stream — deliberately not cM_rnd(). See the .cpp for why.
     f32 ownRnd();
     /// Drive the private archive mount forward; returns a cPhs_* step for create() to hand back.
@@ -110,8 +114,16 @@ private:
      * archive, so setting a frame here cannot disturb the local player's eyes. */
     J3DAnmTexPattern* mpBlinkBtp;
     J3DAnmTextureSRTKey* mpBlinkBtk;
-    /* One per eye material. They must exist BEFORE the animators are entered — see the .cpp. */
-    J3DMaterialAnm* mpEyeMatAnm[2];
+    /* One per eye material, [0] left and [1] right. They must exist BEFORE the animators are
+     * entered — see the .cpp. daNpcF_MatAnm_c rather than a plain J3DMaterialAnm because it also
+     * aims the eyes, and rather than daAlink_matAnm_c because its state is per-instance. */
+    daNpcF_MatAnm_c* mpEyeMatAnm[2];
+    /* Smoothed eye texture offsets, [eye][0]=X [eye][1]=Y. Held here rather than read back out of
+     * the material anm because daNpcF_MatAnm_c exposes setters only. */
+    f32 mEyeOffset[2][2];
+    /* True while the material anm is overriding the BTK's translation with our aim. Dropped only
+     * once the offsets have smoothed to centre, so handing control back does not pop. */
+    bool mEyeMoveOn;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */

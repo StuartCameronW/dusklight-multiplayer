@@ -15,6 +15,7 @@
 #include "JSystem/JKernel/JKRArchive.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_mirror.h"
+#include "d/actor/d_a_npc4.h"
 #include "d/actor/d_a_remote_player.h"
 #include "dusk/logging.h"
 #include "f_op/f_op_actor_mng.h"
@@ -154,6 +155,39 @@ const f32 l_blinkChance = 0.012f;
  * count comes out of a binary asset, so it is not verifiable from source for every outfit.
  */
 const u16 l_eyeMaterialNo[2] = {2, 3};
+
+/* s16 angle -> the -1..1 the eye offset is expressed in. 1/0x2000, so ±45° is full deflection.
+ * Same constant daAlink_c::setEyeMove (d_a_alink.cpp:3296) and daHoZelda_c (d_a_hozelda.cpp:711)
+ * use; written as the literal they use rather than 1.0f/8192.0f to stay greppable against them.
+ */
+const f32 l_eyeAngleToOffset = 0.00012207031f;
+
+/* How far the eye texture slides at full deflection, in UV units. 0.2 across the board, from
+ * daHoZelda_c::setEyeMove (d_a_hozelda.cpp:729-750). Link uses a slightly asymmetric pair
+ * (0.25 inner / 0.15 outer, d_a_alink.cpp:3359-3372); Zelda's symmetric version is the one copied
+ * here because the puppet has no notion of which eye is inner to a turn it never makes.
+ */
+const f32 l_eyeOffsetScale = 0.2f;
+
+/* Head aim limits, from daHoZelda_c::setNeckAngle (d_a_hozelda.cpp:817-818) and matching
+ * daAlink_c's. Asymmetric in X because looking down is easier than looking up.
+ */
+const s16 l_eyeLimitUp = -10000;
+const s16 l_eyeLimitDown = 8000;
+const s16 l_eyeLimitSide = 20000;
+
+/* When the local player is worth looking at. Mirrors daHoZelda_c (d_a_hozelda.cpp:797-806): always
+ * within a quarter turn, and a little past that if they are close. Beyond it the puppet faces
+ * front rather than craning after someone behind it.
+ */
+const s16 l_eyeGateAngle = 0x4000;
+const s16 l_eyeGateAngleNear = 0x5000;
+const f32 l_eyeGateNearDistSq = 90000.0f;
+
+/* Below this the eyes count as centred, so the override can be handed back to the BTK without a
+ * visible jump. In UV units, against a full deflection of 0.2.
+ */
+const f32 l_eyeCentredEpsilon = 0.002f;
 
 /* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
  * HIO rates below: this one is about network noise, not about gait.
@@ -602,12 +636,13 @@ void daRemotePlayer_c::selectAnimation() {
  * checked here for the same reason: this is a class of bug that otherwise only shows up as "it
  * looks the same as before".
  *
- * ★ Plain J3DMaterialAnm, deliberately NOT daAlink_matAnm_c. Link's subclass reaches for
+ * ★ daNpcF_MatAnm_c, deliberately NOT daAlink_matAnm_c. Link's subclass reaches for
  * `daAlink_getAlinkActorClass()->checkStatusWindowDraw()` in its calc (d_a_alink.cpp:2022) and
  * keeps its blend state in STATIC members shared by every instance (d_a_alink.h:60-61) — a puppet
- * using it would read and write the local player's eye state. The base class is concrete and does
- * exactly what a blink needs: apply whatever anms are registered and leave the rest alone
- * (J3DMaterialAnm.cpp:28-58).
+ * using it would read and write the local player's eye state — and merely constructing one would
+ * stomp it, since the constructor calls init() and init() zeroes those statics. daNpcF_MatAnm_c
+ * (d_a_npc4.cpp:103-130) is the same calc with the flags as INSTANCE members and no singleton
+ * lookup, which is what an actor that is not a singleton needs.
  *
  * ★ dEyeHL_c is NOT part of blinking, despite sitting next to it in daAlink_c::setLinkModel. It
  * only nudges texture LODBias by FOV during events with an HIO flag set (d_eye_hl.cpp:40-55), and
@@ -629,7 +664,7 @@ bool daRemotePlayer_c::setupFaceAnimation() {
     }
 
     for (int i = 0; i < 2; i++) {
-        mpEyeMatAnm[i] = JKR_NEW J3DMaterialAnm();
+        mpEyeMatAnm[i] = JKR_NEW daNpcF_MatAnm_c();
         if (mpEyeMatAnm[i] == NULL) {
             Log.warn("Out of heap for the puppet's eye material anm {}", i);
             return false;
@@ -739,6 +774,124 @@ void daRemotePlayer_c::playFaceTextureAnime() {
     mpBlinkBtk->setFrame(mBlinkFrame > btkFrameMax ? btkFrameMax : mBlinkFrame);
 }
 
+/**
+ * Aim the eyes at the local player.
+ *
+ * ★ Eyes in this engine do not rotate — nothing swivels an eyeball joint. The eye texture is SLID,
+ * by overwriting the translation of the tex matrix the face's BTK animates. That is the whole
+ * mechanism, and it is why this composes with the blink for free: the blink is the BTP (it swaps
+ * the eyelid texture), so replacing the BTK's translation aims the eye without touching the lid.
+ * daAlink_matAnm_c and daNpcF_MatAnm_c both do exactly this in their calc override.
+ *
+ * The geometry is daHoZelda_c::setNeckAngle/setEyeMove (d_a_hozelda.cpp:779-840, :715-777), which
+ * is the compact version of daAlink_c's: take the angle from the head to the target, clamp it to
+ * what a head can manage, and turn that into a texture offset. Zelda is the right model to copy —
+ * a non-Link humanoid on Link's face rig, looking at the player.
+ *
+ * ★ One deliberate departure. Zelda halves the clamped angle (`>> 1`, d_a_hozelda.cpp:820-821)
+ * because her NECK takes the other half; the eyes only ever carry the remainder. This puppet has no
+ * joint callback, so its head is rigid and there is no other half — it uses the full clamped angle,
+ * so the total gaze lands in roughly the right place instead of half way there. Turning the neck
+ * too is the better answer and is a separate change.
+ *
+ * The local player's eyePos as the target is not a stand-in for something replicated: it is what
+ * daHoZelda_c and daMidna_c both genuinely use. Aiming at what the REMOTE player is looking at
+ * would need their target on the wire, and is only worth it once there is a target worth sending.
+ */
+void daRemotePlayer_c::setEyeMove() {
+    if (mpEyeMatAnm[0] == NULL || mpEyeMatAnm[1] == NULL) {
+        return;
+    }
+
+    /* The head joint's world position, taken from the matrix the head model is already posed off,
+     * so this costs nothing and cannot disagree with where the head actually is. Valid only after
+     * setMatrix()'s modelCalc(), which is why this runs at the end of execute(). */
+    MtxP headMtx = model->getAnmMtx(l_headJointNo);
+    cXyz headPos(headMtx[0][3], headMtx[1][3], headMtx[2][3]);
+
+    daPy_py_c* player = daPy_getLinkPlayerActorClass();
+    bool haveTarget = false;
+    s16 angleX = 0;
+    s16 angleY = 0;
+
+    if (player != NULL) {
+        const cXyz toPlayer = player->current.pos - current.pos;
+        const int away = cLib_distanceAngleS(toPlayer.atan2sX_Z(), shape_angle.y);
+        if (away <= l_eyeGateAngle ||
+            (away <= l_eyeGateAngleNear && toPlayer.abs2XZ() < l_eyeGateNearDistSq))
+        {
+            const cXyz toTarget = player->eyePos - headPos;
+            angleX = cLib_minMaxLimit<s16>(toTarget.atan2sY_XZ(), l_eyeLimitUp, l_eyeLimitDown);
+            angleY = cLib_minMaxLimit<s16>(
+                toTarget.atan2sX_Z() - shape_angle.y, -l_eyeLimitSide, l_eyeLimitSide);
+            haveTarget = true;
+        }
+    }
+
+    f32 wantX[2] = {0.0f, 0.0f};
+    f32 wantY[2] = {0.0f, 0.0f};
+
+    if (haveTarget) {
+        f32 vertical = l_eyeAngleToOffset * angleX;
+        f32 horizontal = l_eyeAngleToOffset * angleY;
+        vertical = cLib_minMaxLimit<f32>(vertical, -1.0f, 1.0f);
+        horizontal = cLib_minMaxLimit<f32>(horizontal, -1.0f, 1.0f);
+
+        /* Opposite signs across the pair: the two eye textures are mirrored, so equal and opposite
+         * UV slides move both pupils the same way on screen (d_a_hozelda.cpp:729-737). */
+        wantX[0] = -l_eyeOffsetScale * horizontal;
+        wantX[1] = l_eyeOffsetScale * horizontal;
+        wantY[0] = l_eyeOffsetScale * vertical;
+        wantY[1] = wantY[0];
+
+        /* Keeps a diagonal glance inside the eye white. Without it, looking up-and-across sends the
+         * pupil past the corner, because X and Y are each allowed a full deflection independently
+         * (d_a_hozelda.cpp:752-762). */
+        const f32 radius = JMAFastSqrt(horizontal * horizontal + vertical * vertical);
+        if (radius > 1.0f) {
+            const f32 shrinkX = fabsf(horizontal) / radius;
+            const f32 shrinkY = fabsf(vertical) / radius;
+            if (horizontal * vertical < 0.0f) {
+                wantX[1] *= shrinkX;
+                wantY[1] *= shrinkY;
+            } else {
+                wantX[0] *= shrinkX;
+                wantY[0] *= shrinkY;
+            }
+        }
+    }
+
+    // Same smoothing constants the game uses for eyes everywhere (d_a_hozelda.cpp:770-773).
+    for (int i = 0; i < 2; i++) {
+        cLib_addCalc(&mEyeOffset[i][0], wantX[i], 0.5f, 0.1f, 0.03f);
+        cLib_addCalc(&mEyeOffset[i][1], wantY[i], 0.5f, 0.1f, 0.03f);
+        mpEyeMatAnm[i]->setNowOffsetX(mEyeOffset[i][0]);
+        mpEyeMatAnm[i]->setNowOffsetY(mEyeOffset[i][1]);
+    }
+
+    /* Handing control back to the BTK is the one place this can pop, because daNpcF_MatAnm_c has no
+     * morf frame to cross-fade with (daAlink_c and daHoZelda_c both use one; the field is private
+     * with no setter here). Instead the override is held ON until the offsets have smoothed to
+     * centre, at which point dropping it changes nothing visible. */
+    if (haveTarget) {
+        mEyeMoveOn = true;
+    } else if (mEyeMoveOn && fabsf(mEyeOffset[0][0]) < l_eyeCentredEpsilon &&
+               fabsf(mEyeOffset[0][1]) < l_eyeCentredEpsilon &&
+               fabsf(mEyeOffset[1][0]) < l_eyeCentredEpsilon &&
+               fabsf(mEyeOffset[1][1]) < l_eyeCentredEpsilon)
+    {
+        mEyeMoveOn = false;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (mEyeMoveOn) {
+            mpEyeMatAnm[i]->onEyeMoveFlag();
+        } else {
+            mpEyeMatAnm[i]->offEyeMoveFlag();
+        }
+    }
+}
+
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
     mDoMtx_stack_c::YrotM(shape_angle.y);
@@ -841,6 +994,9 @@ int daRemotePlayer_c::execute() {
     // at rather than the previous tick's.
     setRoomInfo();
     setMatrix();
+    // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
+    // only exists once modelCalc() has run.
+    setEyeMove();
     return 1;
 }
 
