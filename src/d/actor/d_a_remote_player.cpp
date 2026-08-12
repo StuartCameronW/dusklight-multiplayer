@@ -338,8 +338,9 @@ const u16 l_capJointFirst = 6;
 const u16 l_capRootJointNo = 7;
 
 /* Constant downward pull added to the apparent wind, so the cap hangs rather than sticking straight
- * out when the puppet is still (d_a_alink.cpp:2673). Not gravity in any physical sense — it is the
- * bias that decides the rest pose.
+ * out when the puppet is still (d_a_alink.cpp:2669 — the not-swimming-up branch, which is the only
+ * one a puppet can be in; the 5.0f at :2673 belongs to the swimming case). Not gravity in any
+ * physical sense — it is the bias that decides the rest pose.
  */
 const f32 l_capGravity = 2.0f;
 /* Human Link's own height (d_a_alink_wolf.inc:528). The wind-shelter line check is cast from half
@@ -369,6 +370,12 @@ const u16 l_idleFrameLogTick = 200;
 const int l_watchedModelNum = 4;
 const u16 l_capComparePeriod = 60;
 const u16 l_capCompareCount = 8;
+/* The wind breakdown samples on its own schedule, and only while there is wind, because unlike the
+ * cap comparison it has to survive the walk to somewhere windy. Forty samples two seconds apart is
+ * over a minute of windy time — enough to cross a field and back — and it costs nothing anywhere
+ * still, which is most places. */
+const u16 l_windLogPeriod = 120;
+const u16 l_windLogCount = 40;
 
 /* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
  * HIO rates below: this one is about network noise, not about gait.
@@ -1522,11 +1529,13 @@ void daRemotePlayer_c::setHairAngle(cXyz* i_apparentWind, f32 i_sinYaw, f32 i_co
  * obstacle. Nothing in the way: full strength. A wall closer than mNoWindInfluenceDist: no wind at
  * all. Between the two: linear. Wall code 0xA is excluded by the original, so it is excluded here.
  *
- * ★ This is the piece whose absence made the puppet windier than the local player INDOORS, which is
- * where Stuart first noticed the cap over-reacting. Outdoors it changes almost nothing — there is
- * rarely a wall within 300 units upwind — but in a dungeon corridor geometry is everywhere, so the
- * local player's wind is attenuated hard and, until now, the puppet's was not attenuated at all.
- * Two characters standing side by side with visibly different amounts of wind in their caps.
+ * ★ The CLASS of the line check is load-bearing, and getting it wrong is why this term went in as a
+ * fix and came back out as a bug. mWindLinChk is a dBgS_LinkLinChk, whose constructor calls
+ * SetLink() (d_bg_s_lin_chk.cpp:69-71) so the cast passes through every link-through polygon
+ * (d_bg_w_kcol.cpp:205). Given a plain dBgS_LinChk instead, the ray stops on collision that Link's
+ * own ray ignores, the cross point comes back short, and the rate collapses toward zero — wind
+ * killed OUTDOORS, which is the opposite of what this term is for and precisely what Stuart saw
+ * standing south of Hyrule Castle. Link casts his through mLinkLinChk (d_a_alink.h:4027).
  *
  * The height is Link's own 180.0f (d_a_alink_wolf.inc:528) rather than a new invented number; the
  * puppet is the same character on the same rig, and mHeight is what daAlink_c feeds this.
@@ -1540,6 +1549,9 @@ f32 daRemotePlayer_c::checkWindWallRate(const cXyz& i_windDir) {
 
     mWindLinChk.Set(&start, &end, this);
     if (!dComIfG_Bgsp().LineCross(&mWindLinChk) || dComIfG_Bgsp().GetWallCode(mWindLinChk) == 0xA) {
+        mWindChkHit = false;
+        mWindChkDist = -1.0f;
+        mWindWallRate = 1.0f;
         return 1.0f;
     }
 
@@ -1548,6 +1560,9 @@ f32 daRemotePlayer_c::checkWindWallRate(const cXyz& i_windDir) {
         rate = 0.0f;
     }
 
+    mWindChkHit = true;
+    mWindChkDist = start.abs(mWindLinChk.GetCross());
+    mWindWallRate = rate;
     return rate;
 }
 
@@ -1620,9 +1635,25 @@ void daRemotePlayer_c::setHatAngle() {
         mPrevPos = current.pos;
     }
 
-    cXyz windDir;
+    /* ★ TWO samples, at two different points, because the original takes two — and collapsing them
+     * into one is a mistake that cannot be fixed by choosing the better point, only by splitting:
+     *
+     *   - The BEND (field_0x35b8) is sampled at current.pos in daAlink_c::setWindSpeed
+     *     (d_a_alink.cpp:5521), then shelter-attenuated and multiplied by mMaxWindSpeed.
+     *   - The FLUTTER energy is sampled at the HAT ANCHOR in setHatAngle itself (:2577) and used
+     *     raw, 0..1 — never attenuated, never scaled.
+     *
+     * They are genuinely different quantities from different places, so one sample serving both
+     * necessarily gets one of them wrong whichever point is picked. Outdoors on open ground the two
+     * points see the same ambient wind and this changes nothing; near a local wind source it does.
+     */
+    cXyz bendWindDir;
+    f32 bendWindPower;
+    dKyw_get_AllWind_vec(&current.pos, &bendWindDir, &bendWindPower);
+
+    cXyz flutterWindDir;
     f32 windPower;
-    dKyw_get_AllWind_vec(&anchorPos, &windDir, &windPower);
+    dKyw_get_AllWind_vec(&anchorPos, &flutterWindDir, &windPower);
 
     /* ★ Build the wind the way daAlink_c::setWindSpeed does (d_a_alink.cpp:5521-5539), using the
      * game's OWN scale constant. This went wrong twice before, in opposite directions, and both
@@ -1646,16 +1677,19 @@ void daRemotePlayer_c::setHatAngle() {
      * checkWindWallRate, so a puppet sheltered by geometry still felt the full wind. That is why
      * the cap could still look wrong after the scale itself was right — indoors the local player's
      * wind is attenuated hard and the puppet's was not attenuated at all. */
-    f32 windTargetPower = windPower;
+    f32 windTargetPower = bendWindPower;
     const s32 teachWind = dKy_TeachWind_existence_chk();
+    mWindWallRate = 1.0f;
+    mWindChkHit = false;
+    mWindChkDist = -1.0f;
     if (teachWind == 0 || windTargetPower < 0.3f) {
         windTargetPower = 0.0f;
     } else if (windTargetPower > 0.0f && teachWind != -1) {
-        windTargetPower *= checkWindWallRate(windDir);
+        windTargetPower *= checkWindWallRate(bendWindDir);
     }
     windTargetPower *= daAlinkHIO_basic_c0::m.mMaxWindSpeed;
 
-    const cXyz windTarget = windDir * windTargetPower;
+    const cXyz windTarget = bendWindDir * windTargetPower;
     // Rises three times faster than it falls, so gusts arrive quickly and die away slowly.
     const f32 windRate = mWindPush.abs2() > windTargetPower * windTargetPower ? 3.0f : 1.0f;
     cLib_addCalcPos(&mWindPush, windTarget, 0.5f, windRate, 0.5f);
@@ -1875,6 +1909,39 @@ void daRemotePlayer_c::setHatAngle() {
             mSwayAngleX[8], mSwayAngleX[9], mSwayAngleY[7], mSwayAngleY[8], mSwayAngleY[9]);
     }
 
+    /* ★ The wind as a BREAKDOWN, not a magnitude. Every previous attempt at this read one number at
+     * the end of the chain and adjusted a constant in front of it, and got the direction wrong
+     * twice. These are the places the value can be lost — the ambient sample, the teach-wind gate,
+     * the shelter cast, the smoothing — printed next to the same ambient sample taken at the LOCAL
+     * player's own feet. If the two raw figures agree and the rates do not, the shelter cast is at
+     * fault. If the raws disagree, the puppet is standing somewhere the wind genuinely differs. If
+     * everything agrees and the pushes still do not, only then is the scale worth touching.
+     *
+     * ★ Gated separately from the cap comparison below, and that separation is the point. The cap
+     * comparison is a spawn-time sanity check and stops a few seconds in; the wind question can
+     * only be answered somewhere windy, and somewhere windy is somewhere the player has to WALK to.
+     * This samples only while there is wind to describe, so a report from an open field arrives
+     * with its own numbers attached instead of costing another trip out there. */
+    if (mWindLogCount < l_windLogCount && (bendWindPower > 0.0f || mWindPush.abs2() > 0.0f)) {
+        mWindLogTicks++;
+        if (mWindLogTicks % l_windLogPeriod == 0) {
+            mWindLogCount++;
+            const daAlink_c* windLink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+            f32 linkRaw = -1.0f;
+            if (windLink != NULL) {
+                cXyz linkPos = windLink->current.pos;
+                cXyz linkWindDir;
+                dKyw_get_AllWind_vec(&linkPos, &linkWindDir, &linkRaw);
+            }
+            Log.debug("Puppet {} wind #{}: bend raw {:.2f} (P1 raw {:.2f}) flutter {:.2f} | "
+                      "teach {} | rate {:.2f} (hit {}, dist {:.0f}) | push {:.2f} vs P1 {:.2f}",
+                mPlayerId, mWindLogCount, bendWindPower, linkRaw, windPower, teachWind,
+                mWindWallRate, mWindChkHit ? "yes" : "no", mWindChkDist,
+                JMAFastSqrt(mWindPush.abs2()),
+                windLink != NULL ? JMAFastSqrt(windLink->field_0x35b8.abs2()) : -1.0f);
+        }
+    }
+
     /* ★ Side-by-side with the LOCAL player's own cap, which is the only way to answer "is the
      * puppet's sway right" without eyes on it. Both characters are Link on the same rig, so in the
      * two-instance test the HOST's own numbers and the GUEST's puppet-of-the-host numbers describe
@@ -1884,6 +1951,7 @@ void daRemotePlayer_c::setHatAngle() {
         mCapCompareTicks++;
         if (mCapCompareTicks % l_capComparePeriod == 0) {
             const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+
             /* ★ Skip this entirely in wolf form. daAlink_c::setHatAngle only runs `if
              * (!checkWolf())` (d_a_alink.cpp:18537), so a wolf's angle arrays sit at zero and
              * comparing against them says nothing — reading them as a mismatch is what sent the

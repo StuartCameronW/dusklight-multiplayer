@@ -176,6 +176,11 @@ private:
     bool mLoggedIdleGaze;
     /* Counts out the puppet-vs-local-player cap comparison samples. */
     u16 mCapCompareTicks;
+    /* Counts out the wind breakdown samples, which run on their own schedule and only accumulate
+     * while there is actually wind — see setHatAngle() for why they are not gated with the cap
+     * comparison above. */
+    u16 mWindLogTicks;
+    u16 mWindLogCount;
     /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
      * until the first sample. See checkMaterialDrift(). */
     u16 mMaterialSig[4];
@@ -209,8 +214,21 @@ private:
      * cap is stirred by the idle animation's own head bob. */
     cXyz mPrevPos;
     /* The puppet's own line check for the wind-shelter test. Its own, not a borrow of Link's: the
-     * whole point is to cast from where the PUPPET stands. */
-    dBgS_LinChk mWindLinChk;
+     * whole point is to cast from where the PUPPET stands.
+     *
+     * ★ dBgS_LinkLinChk, not the plain dBgS_LinChk this started as. The subclass's only job is to
+     * call SetLink() (d_bg_s_lin_chk.cpp:69-71), which makes the check PASS THROUGH every polygon
+     * flagged link-through (d_bg_w_kcol.cpp:205). With the base class the puppet's upwind ray
+     * stopped on collision that Link's ray walks straight past, so the shelter rate collapsed and
+     * the wind was killed in exactly the open outdoor areas where it should be strongest. Link
+     * casts his through mLinkLinChk (d_a_alink.h:4027) for this reason. */
+    dBgS_LinkLinChk mWindLinChk;
+    /* What the last shelter cast actually did, kept only so the wind can be logged as a breakdown
+     * rather than a single opaque magnitude. Diagnosing this by adjusting the scale and asking how
+     * it looked went wrong twice, in opposite directions. */
+    f32 mWindWallRate;
+    f32 mWindChkDist;
+    bool mWindChkHit;
     /* Smoothed wind push, built the way daAlink_c::setWindSpeed builds his — but at the PUPPET's
      * position and from the game's own HIO constant, so it is right whatever form the local player
      * is in. See setHatAngle() for the two wrong answers this replaces. */
