@@ -198,6 +198,46 @@ const f32 l_eyeGateNearDistSq = 90000.0f;
  */
 const f32 l_eyeCentredEpsilon = 0.002f;
 
+/* Head-model joint layout for the sway, read off daAlink_c::headModelCallBack
+ * (d_a_alink.cpp:2477-2496). Joints 1-5 are hair strands, each rotated independently in a world
+ * axis frame; 6-9 are the cap, a chain where 6 and 7 share segment 7's angle (halved, so the crown
+ * of the cap moves half as far as its body) and 8, 9 trail behind it.
+ *
+ * ★ "Hat model" in daAlink_c is the HEAD model — mpLinkHatModel is loaded from al_head.bmd
+ * (d_a_alink_wolf.inc:364-366). Hair and cap live on the same model and are driven by the same
+ * callback, which is why B was always one job and not two.
+ */
+const u16 l_swayJointNum = 10;
+const u16 l_capJointFirst = 6;
+const u16 l_capRootJointNo = 7;
+
+/* Constant downward pull added to the apparent wind, so the cap hangs rather than sticking straight
+ * out when the puppet is still (d_a_alink.cpp:2673). Not gravity in any physical sense — it is the
+ * bias that decides the rest pose.
+ */
+const f32 l_capGravity = 2.0f;
+
+/* ★ THE ONE INVENTED NUMBER HERE. daAlink_c scales the environment's wind by
+ * mpHIO->mBasic.m.mMaxWindSpeed (d_a_alink.cpp:5529) before it reaches the cap, and that HIO block
+ * is a private member of daAlink_c (d_a_alink.h:4068) with its default in a binary parameter file —
+ * not reachable, and not derivable from source. The order of magnitude IS derivable: the code
+ * treats |wind| > 10 as "strong" (d_a_alink.cpp:2570), so the scale has to be tens, not units.
+ * Everything else in this file is transcribed; this is a fitted estimate and should be checked
+ * against the local player somewhere genuinely windy.
+ */
+const f32 l_windPushScale = 30.0f;
+
+/* Above this the wind is "strong" and the cap flutters at a fixed hard rate rather than one
+ * proportional to how fast the head is moving (d_a_alink.cpp:2568-2576, :2789-2793).
+ */
+const f32 l_strongWindSpeed = 10.0f;
+
+/* Threshold for the one-shot "this is actually moving" traces below — about 11 degrees. Chosen to
+ * sit ABOVE the ~6 degrees the cap reaches just settling under its own weight at spawn, so the log
+ * reports motion rather than the puppet finishing standing up.
+ */
+const s16 l_swayLoggedAngle = 0x800;
+
 /* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
  * HIO rates below: this one is about network noise, not about gait.
  */
@@ -427,6 +467,8 @@ int daRemotePlayer_c::createHeap() {
     // Cosmetic and deliberately non-fatal: a puppet with open, staring eyes is a far better failure
     // than no puppet. setupFaceAnimation() logs its own reason for every way it can decline.
     setupFaceAnimation();
+
+    setupHeadSway();
 
     if (mpHandModel != NULL) {
         J3DModelData* handData = mpHandModel->getModelData();
@@ -742,6 +784,11 @@ f32 daRemotePlayer_c::ownRnd() {
     return fabsf(fmodf(sum, 1.0f));
 }
 
+/* cM_rndF's contract (c_math.cpp:198), on the puppet's own stream. */
+f32 daRemotePlayer_c::ownRndF(f32 i_max) {
+    return i_max * ownRnd();
+}
+
 /**
  * Blink, the way the local player blinks.
  *
@@ -914,6 +961,487 @@ void daRemotePlayer_c::setEyeMove() {
     }
 }
 
+/**
+ * J3D calls this for every joint of the head model, twice per joint. Shape matches
+ * daAlink_headModelCallBack (d_a_alink.cpp:2505-2515): act on the first pass only, and resolve the
+ * owning actor from the model rather than from any global, so it stays correct with several
+ * puppets on screen.
+ */
+static int daRemotePlayer_headModelCallBack(J3DJoint* i_joint, int i_pass) {
+    if (i_pass != 0) {
+        return 1;
+    }
+
+    J3DModel* model = j3dSys.getModel();
+    if (model == NULL || i_joint == NULL) {
+        return 1;
+    }
+
+    daRemotePlayer_c* puppet = reinterpret_cast<daRemotePlayer_c*>(model->getUserArea());
+    if (puppet == NULL) {
+        return 1;
+    }
+
+    return puppet->headModelCallBack(i_joint->getJntNo());
+}
+
+/**
+ * Hook the sway callback onto this puppet's head model. Once, at createHeap time.
+ *
+ * ★ setCallBack lives on the model DATA, i.e. on the shared joint tree — which is exactly why this
+ * is only safe because the puppet mounts its OWN archive (see mountOwnArchive). Against the global
+ * copy this would install a daRemotePlayer_c callback on the joint tree the LOCAL PLAYER's head is
+ * drawn from, and the trampoline would then cast Link to a puppet. The private mount is not an
+ * optimisation here; it is the precondition.
+ *
+ * The trampoline resolves the actor from J3DModel::getUserArea, which is per-MODEL rather than per
+ * model data, so even a shared tree would dispatch to the right actor — but it would still be
+ * dispatching Link's joints into puppet code. Both halves have to be private, and they are.
+ *
+ * Joint 0 is skipped, matching daAlink_c (d_a_alink_swindow.inc:175-177): it is the head model's
+ * root and carries the whole head, so rotating it would sway the face and skull too.
+ */
+void daRemotePlayer_c::setupHeadSway() {
+    if (mpHeadModel == NULL) {
+        return;
+    }
+
+    J3DModelData* headData = mpHeadModel->getModelData();
+    if (headData == NULL) {
+        return;
+    }
+
+    const u16 jointNum = headData->getJointNum();
+    if (jointNum <= l_capRootJointNo) {
+        // Not a head model with a cap chain on it. Leave it rigid rather than index off the end.
+        Log.warn("Puppet head model has only {} joints; no hat or hair sway", jointNum);
+        return;
+    }
+
+    mpHeadModel->setUserArea((uintptr_t)this);
+
+    const u16 last = jointNum < l_swayJointNum ? jointNum : l_swayJointNum;
+    for (u16 i = 1; i < last; i++) {
+        headData->getJointNodePointer(i)->setCallBack(daRemotePlayer_headModelCallBack);
+    }
+
+    Log.info("Puppet hat and hair sway attached to head joints 1-{}", last - 1);
+}
+
+/**
+ * Rotate one joint's world matrix about the puppet's yaw frame, in place.
+ *
+ * daAlink_c::setMatrixWorldAxisRot (d_a_alink.cpp:2098-2120) with the magne-boot frame dropped —
+ * a puppet never wears the iron boots, and concatMagneBootMtx is daAlink_c state. Deliberately
+ * does NOT write J3DSys::mCurrentMtx, matching the param_4 == 0 form the hair uses: each hair
+ * strand is rotated on its own and must not drag the rest of the head with it.
+ */
+void daRemotePlayer_c::setJointWorldAxisRot(MtxP i_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ) {
+    cXyz jointPos;
+    mDoMtx_multVecZero(i_mtx, &jointPos);
+
+    mDoMtx_stack_c::transS(jointPos);
+    mDoMtx_stack_c::YrotM(shape_angle.y);
+    mDoMtx_stack_c::ZXYrotM(i_rotX, i_rotY, i_rotZ);
+    mDoMtx_stack_c::YrotM(-shape_angle.y);
+    mDoMtx_stack_c::transM(-jointPos.x, -jointPos.y, -jointPos.z);
+    mDoMtx_stack_c::concat(i_mtx);
+    mDoMtx_copy(mDoMtx_stack_c::get(), i_mtx);
+}
+
+/**
+ * Apply this tick's sway to one joint of the head model, during that model's calc().
+ *
+ * Transcribed from daAlink_c::headModelCallBack (d_a_alink.cpp:2477-2496), keeping only the branch
+ * that runs during ordinary play: no demo BCK override, no status-window tilt, no metamorphose
+ * squash, no Zora-helmet widening.
+ *
+ * The two halves work differently on purpose. The CAP (joints >= 6) multiplies into
+ * J3DSys::mCurrentMtx and writes it back, so each segment's rotation is inherited by the next and
+ * the chain bends cumulatively. The HAIR (joints < 6) rewrites only its own matrix, so strands
+ * stay independent of one another.
+ */
+int daRemotePlayer_c::headModelCallBack(int i_jointNo) {
+    if (mpHeadModel == NULL || i_jointNo <= 0 || i_jointNo >= l_swayJointNum) {
+        return 1;
+    }
+
+    if (i_jointNo >= l_capJointFirst) {
+        mDoMtx_stack_c::copy(J3DSys::mCurrentMtx);
+
+        if (i_jointNo == l_capJointFirst) {
+            mDoMtx_stack_c::XYZrotM(
+                0, mSwayAngleY[l_capRootJointNo] >> 1, mSwayAngleX[l_capRootJointNo] >> 1);
+        } else if (i_jointNo == l_capRootJointNo) {
+            mDoMtx_stack_c::XYZrotM(0, mSwayAngleY[l_capRootJointNo] >> 1,
+                (mSwayAngleX[l_capRootJointNo] >> 1) + mFlutterAngle[0]);
+        } else {
+            const int segment = i_jointNo - l_capRootJointNo;
+            mDoMtx_stack_c::XYZrotM(
+                0, mSwayAngleY[i_jointNo], mSwayAngleX[i_jointNo] + mFlutterAngle[segment]);
+        }
+
+        mpHeadModel->setAnmMtx(i_jointNo, mDoMtx_stack_c::get());
+        cMtx_copy(mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
+    } else {
+        /* The rotation is applied in a yaw frame built from where the HEAD points, not where the
+         * body does, so hair blows the same way whichever way the puppet has turned its head.
+         * daAlink_c swaps shape_angle.y the same way for the same reason (d_a_alink.cpp:2488-2491)
+         * — it is the only argument setMatrixWorldAxisRot does not take. Restored immediately;
+         * nothing between the two lines can yield. */
+        const s16 bodyYaw = shape_angle.y;
+        shape_angle.y = mHeadYaw;
+        setJointWorldAxisRot(
+            mpHeadModel->getAnmMtx(i_jointNo), mSwayAngleX[i_jointNo], 0, mSwayAngleY[i_jointNo]);
+        shape_angle.y = bodyYaw;
+    }
+
+    return 1;
+}
+
+/**
+ * Decay one hair angle back to rest.
+ *
+ * daAlink_c::calcHairAngle (d_a_alink.cpp:2801-2803). Note the 400 — it is a decimal literal in the
+ * original, not 0x400, and the difference is a factor of two and a half in how fast hair settles.
+ */
+void daRemotePlayer_c::calcHairAngle(s16* o_angle) {
+    cLib_addCalcAngleS(o_angle, 0, 5, 400, 50);
+}
+
+/**
+ * Blow the hair around.
+ *
+ * daAlink_c::setHairAngle (d_a_alink.cpp:2805-2878), transcribed whole. This is NOT a spring: it is
+ * four free-running phase accumulators whose rates depend on how hard the apparent wind is blowing,
+ * turned into 0..1 envelopes by `0.5 * (1 + cos)` and multiplied by the wind's lateral and forward
+ * components. Each of the five strands gets its own amplitude, and the amplitudes differ by sign of
+ * the wind so hair blown forward does not simply mirror hair blown back.
+ *
+ * ★ The one substantive change: cM_rndF becomes ownRndF. The original jitters all four phase rates
+ * with the global random stream FOUR TIMES PER FRAME PER ACTOR. Puppets running that would advance
+ * the shared Wichmann-Hill sequence by an amount depending on how many players are in the session,
+ * so host and guest would draw different numbers for everything else in the game. Same hazard as
+ * the blink, same fix, and it matters more here because the call rate is four times higher.
+ */
+void daRemotePlayer_c::setHairAngle(cXyz* i_apparentWind, f32 i_sinYaw, f32 i_cosYaw) {
+    f32 strength = i_apparentWind->abs();
+    f32 lateralLen = i_apparentWind->absXZ();
+
+    if (strength < 1.0f || lateralLen < 1.0f) {
+        for (int i = 1; i <= 5; i++) {
+            calcHairAngle(&mSwayAngleX[i]);
+            calcHairAngle(&mSwayAngleY[i]);
+        }
+
+        /* Parked at -0x8000 rather than 0 so cos() is -1 and every envelope starts at zero: the
+         * hair picks back up from rest instead of snapping to mid-swing. */
+        for (int i = 0; i < 4; i++) {
+            mHairPhase[i] = -0x8000;
+        }
+        return;
+    }
+
+    strength *= 0.033333335f;
+    if (strength > 1.0f) {
+        strength = 1.0f;
+    }
+    strength = 0.15f + 0.85f * strength;
+
+    ANGLE_ADD(mHairPhase[0], 1000.0f + ownRndF(500.0f) + strength * (3000.0f + ownRndF(1000.0f)));
+    ANGLE_ADD(mHairPhase[1], 1000.0f + ownRndF(500.0f) + strength * (3000.0f + ownRndF(1000.0f)));
+    ANGLE_ADD(mHairPhase[2], 1000.0f + ownRndF(500.0f) + strength * (5000.0f + ownRndF(1500.0f)));
+    ANGLE_ADD(mHairPhase[3], 1000.0f + ownRndF(500.0f) + strength * (5000.0f + ownRndF(1500.0f)));
+
+    lateralLen = 1.0f / lateralLen;
+    i_apparentWind->x *= lateralLen;
+    i_apparentWind->z *= lateralLen;
+
+    // The wind, rotated into the head's frame: sideways component and front-to-back component.
+    const f32 lateral = i_apparentWind->x * i_cosYaw - i_apparentWind->z * i_sinYaw;
+    const f32 forward = i_apparentWind->x * i_sinYaw + i_apparentWind->z * i_cosYaw;
+
+    const f32 envA = strength * (0.5f * (1.0f + cM_scos(mHairPhase[0])));
+    const f32 envB = strength * (0.5f * (1.0f + cM_scos(mHairPhase[1])));
+    const f32 envC = strength * (0.5f * (1.0f + cM_scos(mHairPhase[2])));
+    const f32 envD = strength * (0.5f * (1.0f + cM_scos(mHairPhase[3])));
+
+    if (lateral > 0.0f) {
+        mSwayAngleY[1] = 6000.0f * envA * lateral;
+        mSwayAngleY[2] = 8000.0f * envA * lateral;
+        mSwayAngleY[3] = 2000.0f * envB * lateral;
+        mSwayAngleY[4] = 7000.0f * envC * lateral;
+        mSwayAngleY[5] = 2500.0f * envD * lateral;
+    } else {
+        mSwayAngleY[1] = 10000.0f * envA * lateral;
+        mSwayAngleY[2] = 2000.0f * envA * lateral;
+        mSwayAngleY[3] = 8000.0f * envB * lateral;
+        mSwayAngleY[4] = 2500.0f * envC * lateral;
+        mSwayAngleY[5] = 7000.0f * envD * lateral;
+    }
+
+    if (forward > 0.0f) {
+        mSwayAngleX[1] = -9000.0f * envA * forward;
+        mSwayAngleX[2] = -15000.0f * envA * forward;
+        mSwayAngleX[3] = -15000.0f * envB * forward;
+    } else {
+        mSwayAngleX[1] = -1000.0f * envA * forward;
+        mSwayAngleX[2] = -5000.0f * envA * forward;
+        mSwayAngleX[3] = -5000.0f * envB * forward;
+    }
+
+    mSwayAngleX[4] = -7000.0f * envC * forward;
+    mSwayAngleX[5] = -7000.0f * envD * forward;
+
+    /* Separate latch from the cap's, because the two are driven differently and one working proves
+     * nothing about the other: the cap settles under its own weight the moment the puppet spawns,
+     * whereas the hair only ever moves when the apparent wind is over a unit long. All five strands
+     * are printed — they take different amplitudes off the same envelopes, so a run of identical
+     * values would mean the per-strand constants are not being applied. */
+    if (!mLoggedFirstHair && abs(mSwayAngleX[1]) > l_swayLoggedAngle) {
+        mLoggedFirstHair = true;
+        Log.debug("Puppet {} hair moving: X {},{},{},{},{}  Y {},{},{},{},{}", mPlayerId,
+            mSwayAngleX[1], mSwayAngleX[2], mSwayAngleX[3], mSwayAngleX[4], mSwayAngleX[5],
+            mSwayAngleY[1], mSwayAngleY[2], mSwayAngleY[3], mSwayAngleY[4], mSwayAngleY[5]);
+    }
+}
+
+/**
+ * Integrate one tick of hat and hair motion.
+ *
+ * daAlink_c::setHatAngle (d_a_alink.cpp:2541-2799), which is the whole of Link's hat and hair
+ * physics. Everything Link-only is dropped: magne boots, swimming, horse and goat riding, the
+ * metamorphose stretch, the status-window pose, and the HIO tuning block. What is left is the
+ * mechanism, transcribed rather than approximated.
+ *
+ * ★ THE PUPPET CAN RUN THE REAL ALGORITHM, and this is worth stating because 00-status.md offered
+ * a spring driven off replicated velocity as the cheap alternative. It is not needed. The ONLY
+ * motion input the original uses is how far the cap's anchor joint moved in world space since last
+ * tick — which the puppet measures from its own head matrix, exactly as the local player does. That
+ * measurement already contains the animation's head bob, the gait, and the network interpolation,
+ * so it is strictly better information than a replicated velocity scalar would have been. Nothing
+ * about hat physics needs to go on the wire.
+ *
+ * Runs at the end of execute(), after setMatrix(), so it reads matrices this tick's calc() produced
+ * and the callback consumes its output on the NEXT calc(). daAlink_c has the same one-frame lag
+ * (d_a_alink.cpp:18530-18538) — it is not a bug to fix.
+ */
+void daRemotePlayer_c::setHatAngle() {
+    if (mpHeadModel == NULL) {
+        return;
+    }
+
+    J3DModelData* headData = mpHeadModel->getModelData();
+    if (headData == NULL || headData->getJointNum() <= l_capRootJointNo) {
+        return;
+    }
+
+    cXyz anchorPos;
+    mDoMtx_multVecZero(mpHeadModel->getAnmMtx(l_capRootJointNo), &anchorPos);
+
+    /* First tick: there is no previous sample, so the difference below would be the whole distance
+     * from wherever the matrix happened to start. Seed it and let the next tick measure properly.
+     */
+    if (!mSwayInited) {
+        mSwayInited = true;
+        mCapAnchorPrev = anchorPos;
+    }
+
+    cXyz windDir;
+    f32 windPower;
+    dKyw_get_AllWind_vec(&anchorPos, &windDir, &windPower);
+
+    /* Link smooths the environment's wind into a velocity before it reaches the cap
+     * (d_a_alink.cpp:5539) rather than using it raw, so a gust ramps in over several ticks instead
+     * of snapping the cap sideways. Same smoothing here, same reason. */
+    cXyz windTarget = windDir * (windPower * l_windPushScale);
+    cLib_addCalcPos(&mWindPush, windTarget, 0.5f, 3.0f, 0.5f);
+
+    const bool strongWind = mWindPush.abs2() > SQUARE(l_strongWindSpeed);
+
+    /* Which way the head is pointing. daAlink_c gets this as eyePos - field_0x34e0, but those are
+     * head-joint-matrix * (12,-8,0) and * (0,-8,0) (d_a_alink.cpp:5596-5599), whose difference is
+     * just the head joint's local X axis. Taking the axis directly says the same thing and needs no
+     * body-part positions the puppet does not keep. */
+    cXyz headFwd;
+    mDoMtx_multVecSR(model->getAnmMtx(l_headJointNo), &cXyz::BaseX, &headFwd);
+
+    const s16 prevPitch = mHeadPitch;
+    const s16 prevYaw = mHeadYaw;
+
+    mHeadYaw = headFwd.atan2sX_Z();
+    if (cLib_distanceAngleS(mHeadYaw, shape_angle.y) > 0x7000) {
+        // Head turned nearly backwards: measure the pitch the other way up or it reads inverted.
+        mHeadPitch = cM_atan2s(-headFwd.y, -headFwd.absXZ());
+    } else {
+        mHeadPitch = headFwd.atan2sY_XZ();
+    }
+
+    f32 sinYaw;
+    f32 cosYaw;
+    f32 lateralLen = headFwd.absXZ();
+    if (lateralLen < 0.01f) {
+        sinYaw = cM_ssin(shape_angle.y);
+        cosYaw = cM_scos(shape_angle.y);
+    } else {
+        lateralLen = 1.0f / lateralLen;
+        sinYaw = headFwd.x * lateralLen;
+        cosYaw = headFwd.z * lateralLen;
+    }
+
+    /* Half of however far the head turned this tick is fed back into the cap as inertia — the cap
+     * lags the head rather than being welded to it (d_a_alink.cpp:2642-2648). The dead zone around
+     * a quarter turn is the original's: near straight up or straight down, yaw is ill-conditioned
+     * and feeding it in makes the cap spin. */
+    const s16 pitchKick = (s16)(mHeadPitch - prevPitch) >> 1;
+    s16 yawKick;
+    if (abs(mHeadPitch) > 0x3000 && abs(mHeadPitch) < 0x5000) {
+        yawKick = 0;
+    } else {
+        yawKick = (s16)(mHeadYaw - prevYaw) >> 1;
+    }
+
+    /* The apparent wind: how far the anchor moved, REVERSED (a head moving forward feels wind from
+     * the front), plus the environment's wind, plus a constant downward bias so the cap hangs. */
+    cXyz apparentWind = mCapAnchorPrev - anchorPos;
+    apparentWind += mWindPush;
+    apparentWind.y -= l_capGravity;
+
+    // Kills the jitter a resting animation's sub-unit drift would otherwise put into the cap.
+    if (fabsf(apparentWind.x) < 0.01f) {
+        apparentWind.x = 0.0f;
+    }
+    if (fabsf(apparentWind.z) < 0.01f) {
+        apparentWind.z = 0.0f;
+    }
+
+    /* A floor on how far the cap may swing back, taken from the body's own up axis rather than
+     * world up, so it still holds when the puppet is on a slope (d_a_alink.cpp:2686-2699). Without
+     * it the cap passes through the shoulders. */
+    mDoMtx_stack_c::copy(model->getAnmMtx(2));
+    cXyz bodyUp;
+    cXyz bodyFwdPos;
+    mDoMtx_stack_c::multVecSR(&cXyz::BaseY, &bodyUp);
+    mDoMtx_stack_c::multVec(&cXyz::BaseX, &bodyFwdPos);
+
+    s16 pitchFloor;
+    if (bodyFwdPos.y < mDoMtx_stack_c::get()[1][3]) {
+        pitchFloor = cM_atan2s(-bodyUp.y, -bodyUp.absXZ());
+    } else {
+        pitchFloor = bodyUp.atan2sY_XZ();
+    }
+    pitchFloor -= 0x3800;
+
+    /* --- The cap chain. Three segments walked with parallel pointers, kept in the original's shape
+     * because the trailing term reads each segment against the one in front of it. */
+    s16* angX = &mSwayAngleX[l_capRootJointNo];
+    s16* angY = &mSwayAngleY[l_capRootJointNo];
+    s16* velX = &mCapVelX[0];
+    s16* velY = &mCapVelY[0];
+
+    *angX -= pitchKick;
+    *angY -= yawKick;
+
+    s16 beforeX = *angX;
+    s16 beforeY = *angY;
+
+    const f32 forward = apparentWind.z * cosYaw + apparentWind.x * sinYaw;
+
+    // Aim the first segment down the apparent wind, but never more than 5/8 of a turn off the head.
+    s16 want = cM_atan2s(apparentWind.y, -forward);
+    int delta = cLib_minMaxLimit<int>(want - mHeadPitch, -0x3800, 0x3800);
+    want = delta + mHeadPitch;
+    if (want < pitchFloor) {
+        want = pitchFloor;
+    }
+    delta = want - mHeadPitch;
+
+    cLib_addCalcAngleS2(angX, delta, 5, 0x400);
+    *angX = cLib_minMaxLimit<s16>(*angX + *velX, -0x3800, 0x3800);
+
+    const s16 wantY =
+        cLib_minMaxLimit<s16>(cM_atan2s(-(apparentWind.x * cosYaw - apparentWind.z * sinYaw),
+                                  JMAFastSqrt(SQUARE(forward) + SQUARE(apparentWind.y))),
+            -0x2800, 0x2800);
+
+    cLib_addCalcAngleS2(angY, wantY, 5, 0x400);
+    *angY = cLib_minMaxLimit<s16>(*angY + *velY, -0x2800, 0x2800);
+
+    /* Velocity is a fifth of the distance just travelled, carried into next tick. This is what
+     * makes the cap overshoot and settle rather than tracking the target rigidly. */
+    *velX = 0.2f * (*angX - beforeX);
+    *velY = 0.2f * (*angY - beforeY);
+
+    s16 pitchSum = *angX + mHeadPitch;
+    angX++;
+    angY++;
+    velX++;
+    velY++;
+
+    for (int i = 1; i < 3; i++, angX++, angY++, velX++, velY++) {
+        // Half of whatever the segment in front just did, propagated down as a delayed tug.
+        ANGLE_SUB_2(angX[0], ((s16)(angX[-1] - beforeX) >> 1));
+        ANGLE_SUB_2(angY[0], ((s16)(angY[-1] - beforeY) >> 1));
+        beforeX = angX[0];
+        beforeY = angY[0];
+
+        // Trailing segments have no target of their own; they relax toward straight.
+        cLib_addCalcAngleS2(angX, 0, 5, 0x400);
+        cLib_addCalcAngleS2(angY, 0, 5, 0x400);
+
+        angX[0] = cLib_minMaxLimit<s16>(angX[0] + *velX, -0x1000, 0x1000);
+
+        // The floor applies to the accumulated bend, not to each segment on its own.
+        pitchSum += angX[0];
+        if (pitchSum < pitchFloor) {
+            ANGLE_ADD_2(angX[0], pitchFloor - pitchSum);
+            pitchSum = pitchFloor;
+        }
+
+        angY[0] = cLib_minMaxLimit<s16>(angY[0] + *velY, -0x2000, 0x2000);
+
+        *velX = 0.2f * (angX[0] - beforeX);
+        *velY = 0.2f * (angY[0] - beforeY);
+    }
+
+    /* Flutter. A cosine running through the three segments at a phase offset, so a ripple travels
+     * down the cap. Amplitude and rate both scale with how hard things are blowing, which is why a
+     * standing puppet's cap still stirs slightly instead of freezing (d_a_alink.cpp:2778-2796). */
+    const f32 windEnergy = 25.0f * (windPower * windPower);
+    f32 rate = (windEnergy + 0.65f * mCapAnchorPrev.abs(anchorPos)) / 30.0f;
+    if (rate > 1.0f) {
+        rate = 1.0f;
+    }
+
+    f32 amplitude = rate;
+    if (strongWind) {
+        rate = 3.5f;
+        amplitude = 1.0f;
+    }
+
+    const s16 step = 1500.0f + 4060.0f * rate;
+    mFlutterPhase += step;
+
+    for (int i = 0; i < 3; i++) {
+        mFlutterAngle[i] =
+            amplitude * cM_deg2s((i + 1) * 4) * cM_scos(mFlutterPhase - ((i + 3) * step));
+    }
+
+    /* One line, latched, on the first tick the cap has actually bent. Same reason as the blink and
+     * the gaze: "the callback is attached" and "the callback is attached and every angle is still
+     * zero" look identical from outside, and the second is what a wrong anchor joint or a wind term
+     * stuck at zero would produce. Prints all three segments so a chain that moves only at the root
+     * — i.e. one where the trailing term is broken — is distinguishable from one that works. */
+    if (!mLoggedFirstSway && abs(mSwayAngleX[l_capRootJointNo]) > l_swayLoggedAngle) {
+        mLoggedFirstSway = true;
+        Log.debug("Puppet {} cap swaying: X {},{},{}  Y {},{},{}", mPlayerId, mSwayAngleX[7],
+            mSwayAngleX[8], mSwayAngleX[9], mSwayAngleY[7], mSwayAngleY[8], mSwayAngleY[9]);
+    }
+
+    mCapAnchorPrev = anchorPos;
+    setHairAngle(&apparentWind, sinYaw, cosYaw);
+}
+
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
     mDoMtx_stack_c::YrotM(shape_angle.y);
@@ -1019,6 +1547,10 @@ int daRemotePlayer_c::execute() {
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     setEyeMove();
+    // Same reason, and in the same place daAlink_c puts it (d_a_alink.cpp:18530-18538): the sway is
+    // integrated from how far this tick's matrices moved, and the joint callback applies the result
+    // during the NEXT tick's calc.
+    setHatAngle();
     return 1;
 }
 

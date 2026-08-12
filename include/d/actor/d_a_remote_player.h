@@ -52,8 +52,29 @@ private:
     void playFaceTextureAnime();
     /// Aim the eyes at the local player. Must run every tick, AFTER setMatrix().
     void setEyeMove();
+
+    /* Hat and hair sway. setHatAngle() integrates the angles once per tick after setMatrix(); the
+     * joint callback then applies them during the head model's calc() on the NEXT tick, which is
+     * the same one-frame lag daAlink_c lives with (d_a_alink.cpp:18530-18538). */
+    /// Hook the sway callback onto the head model's joints. Once, at createHeap time.
+    void setupHeadSway();
+    void setHatAngle();
+    void setHairAngle(cXyz* i_apparentWind, f32 i_sinYaw, f32 i_cosYaw);
+    void calcHairAngle(s16* o_angle);
+    /// Rotate a joint's world matrix about the actor's yaw frame. daAlink_c::setMatrixWorldAxisRot
+    /// (d_a_alink.cpp:2098) minus the magne-boot frame, which a puppet never wears.
+    void setJointWorldAxisRot(MtxP i_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ);
+
+public:
+    /// Applies the sway to one head-model joint. Public only because the static J3D callback
+    /// trampoline has to reach it; nothing else should call it.
+    int headModelCallBack(int i_jointNo);
+
+private:
     /// This puppet's OWN random stream — deliberately not cM_rnd(). See the .cpp for why.
     f32 ownRnd();
+    /// ownRnd() scaled, matching cM_rndF's contract.
+    f32 ownRndF(f32 i_max);
     /// Drive the private archive mount forward; returns a cPhs_* step for create() to hand back.
     int mountOwnArchive();
     /// Draw one sub-model, lit like the body. Null-tolerant, so a missing part costs a part.
@@ -84,6 +105,12 @@ private:
     /* And for the first time the gaze engages. Prints both eyes' offsets because the bug that
      * produced the "peeling" was a SIGN disagreement between them, which no other measure sees. */
     bool mLoggedFirstGaze;
+    /* And for the first tick the cap has actually bent, which is the only thing that separates a
+     * live sway from an attached-but-dead one. */
+    bool mLoggedFirstSway;
+    /* Hair gets its own latch: it is driven by a different mechanism from the cap, so one moving is
+     * no evidence at all about the other. */
+    bool mLoggedFirstHair;
 
     /* Blink cursor, exactly daAlink_c::field_0x2fea: 0 means eyes open, anything else is the frame
      * of a blink in progress. Per-puppet rather than shared, so two puppets never blink in unison.
@@ -127,6 +154,35 @@ private:
     /* True while the material anm is overriding the BTK's translation with our aim. Dropped only
      * once the offsets have smoothed to centre, so handing control back does not pop. */
     bool mEyeMoveOn;
+
+    /* --- Hat and hair sway. One array per axis, indexed by HEAD-MODEL joint number, exactly
+     * daAlink_c::field_0x302c / field_0x3040 (d_a_alink.h:4273-4274). Joints 1-5 are hair strands,
+     * 7-9 the cap's three segments; joint 6 borrows segment 7's angle halved. */
+    s16 mSwayAngleX[10];
+    s16 mSwayAngleY[10];
+    /* Per-cap-segment angular velocity, carried between ticks so the chain overshoots and settles
+     * instead of tracking rigidly (field_0x3054 / field_0x305a). */
+    s16 mCapVelX[3];
+    s16 mCapVelY[3];
+    /* Where the HEAD is pointing, in world terms. The cap chain is expressed relative to these, and
+     * the hair is rotated in a yaw frame built from the second (field_0x3060 / field_0x3062). */
+    s16 mHeadPitch;
+    s16 mHeadYaw;
+    /* Free-running phase for the cap's flutter, and the three per-segment offsets it produces
+     * (field_0x3064 / field_0x3066). This is what keeps the cap alive when nothing else moves. */
+    s16 mFlutterPhase;
+    s16 mFlutterAngle[3];
+    /* Four independent phases driving the hair, at deliberately unrelated rates so strands never
+     * move in unison (field_0x3070 / 0x3072 / 0x3074 / 0x3076). */
+    s16 mHairPhase[4];
+    /* The cap anchor's world position last tick. The apparent wind is measured from how far it
+     * moved, so this is the single most important piece of state here (field_0x34c8). */
+    cXyz mCapAnchorPrev;
+    /* Smoothed wind push. Stands in for daAlink_c::field_0x35b8; see the .cpp. */
+    cXyz mWindPush;
+    /* False until mCapAnchorPrev holds a real sample. Without it the first tick reads the whole
+     * distance from the world origin as one frame of velocity and flings the cap. */
+    bool mSwayInited;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */
