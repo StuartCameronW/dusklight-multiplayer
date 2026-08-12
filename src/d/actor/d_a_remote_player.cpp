@@ -1689,6 +1689,21 @@ void daRemotePlayer_c::setHatAngle() {
     }
     windTargetPower *= daAlinkHIO_basic_c0::m.mMaxWindSpeed;
 
+    /* ★ Latched, and loud, the first time this room has cap-bending wind at all.
+     *
+     * Three rounds of "the puppet's cap has no wind" were spent in rooms where `teach` is 0 — which
+     * gates the bend off for the LOCAL PLAYER TOO (d_a_alink.cpp:5523), so there was never anything
+     * to see and no amount of staring could have distinguished a bug from correct behaviour. The
+     * flag comes from kytag02 actors placed per room (d_a_kytag02.cpp); rooms without one have no
+     * teach-wind by design, and both test rooms so far had none. Walk until this line appears —
+     * that is where a wind comparison actually means something. */
+    if (!mLoggedWindArea && teachWind != 0) {
+        mLoggedWindArea = true;
+        Log.warn("Puppet {} WIND AREA: teach {} — this room HAS cap-bending wind (raw {:.2f}). A "
+                 "cap comparison here is meaningful; one in a teach-0 room is not.",
+            mPlayerId, teachWind, bendWindPower);
+    }
+
     const cXyz windTarget = bendWindDir * windTargetPower;
     // Rises three times faster than it falls, so gusts arrive quickly and die away slowly.
     const f32 windRate = mWindPush.abs2() > windTargetPower * windTargetPower ? 3.0f : 1.0f;
@@ -1933,12 +1948,21 @@ void daRemotePlayer_c::setHatAngle() {
                 cXyz linkWindDir;
                 dKyw_get_AllWind_vec(&linkPos, &linkWindDir, &linkRaw);
             }
+            /* ★ Both SPEEDS go on this line, and they are not decoration. The cap's lateral swing
+             * is driven by how far the cap anchor moved, so a walking character's cap swings and a
+             * standing one's hangs — by design, and confirmed by Stuart when the idle hang was
+             * added. A comparison taken while one side walks and the other stands therefore shows a
+             * large difference that has NOTHING to do with wind, and that is exactly what the first
+             * human-form comparison caught: P1 walking, puppet parked. Trust the cap angles only
+             * when these two numbers are close. */
             Log.debug("Puppet {} wind #{}: bend raw {:.2f} (P1 raw {:.2f}) flutter {:.2f} | "
-                      "teach {} | rate {:.2f} (hit {}, dist {:.0f}) | push {:.2f} vs P1 {:.2f}",
+                      "teach {} | rate {:.2f} (hit {}, dist {:.0f}) | push {:.2f} vs P1 {:.2f} | "
+                      "speed {:.2f} vs P1 {:.2f}",
                 mPlayerId, mWindLogCount, bendWindPower, linkRaw, windPower, teachWind,
                 mWindWallRate, mWindChkHit ? "yes" : "no", mWindChkDist,
                 JMAFastSqrt(mWindPush.abs2()),
-                windLink != NULL ? JMAFastSqrt(windLink->field_0x35b8.abs2()) : -1.0f);
+                windLink != NULL ? JMAFastSqrt(windLink->field_0x35b8.abs2()) : -1.0f, mNetSpeed,
+                windLink != NULL ? windLink->speedF : -1.0f);
         }
     }
 

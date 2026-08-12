@@ -181,6 +181,9 @@ private:
      * comparison above. */
     u16 mWindLogTicks;
     u16 mWindLogCount;
+    /* Latches the first room that actually has cap-bending wind, so the search for one stops being
+     * guesswork. See setHatAngle(). */
+    bool mLoggedWindArea;
     /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
      * until the first sample. See checkMaterialDrift(). */
     u16 mMaterialSig[4];
