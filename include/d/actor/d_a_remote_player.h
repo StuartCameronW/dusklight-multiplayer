@@ -210,15 +210,9 @@ private:
     s32 mCapYSum;
     s32 mLinkCapYSum;
     u16 mProjTicks;
-    /* ★ How many ticks in the window each side's STANDING-STILL zeroing actually fired. The at-rest
-     * samples are the ones that matter: with both characters parked and both per-tick inputs
-     * effectively identical, Link's cap Y still wanders by hundreds of units and the puppet's does
-     * not — and atan2s(0.3, 2.0) is about 1550, which is exactly the scale of that wander. So the
-     * suspicion is that the sub-unit anchor jitter an idle animation produces is a real driver of
-     * Link's cap, and that the puppet is throwing it away. These two counters say plainly whether
-     * the branch fires on one side and not the other, instead of inferring it. */
-    u16 mStillFired;
-    u16 mLinkStillFired;
+    /* (The standing-still fire counters that used to live here did their job and were removed. They
+     * came back 120/120 on BOTH sides, which killed that theory and sent the search one branch
+     * further up, to the FLG0_SWIM_UP guard where the actual difference was. See setHatAngle().) */
     s16 mPrevLinkHeadYaw;
     bool mPrevLinkHeadYawValid;
     /* True once the local player has been sampled in the current window. Without it a wolf's
@@ -252,11 +246,6 @@ private:
     /* The cap anchor's world position last tick. The apparent wind is measured from how far it
      * moved, so this is the single most important piece of state here (field_0x34c8). */
     cXyz mCapAnchorPrev;
-    /* Where the puppet stood last tick, which is daAlink_c::field_0x3798. Used for one thing only:
-     * deciding whether it is standing still, because the original throws away the cap's horizontal
-     * motion input when it is (d_a_alink.cpp:2654-2657). Without that test a stationary puppet's
-     * cap is stirred by the idle animation's own head bob. */
-    cXyz mPrevPos;
     /* The puppet's own line check for the wind-shelter test. Its own, not a borrow of Link's: the
      * whole point is to cast from where the PUPPET stands.
      *

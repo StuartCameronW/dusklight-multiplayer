@@ -338,11 +338,16 @@ const u16 l_capJointFirst = 6;
 const u16 l_capRootJointNo = 7;
 
 /* Constant downward pull added to the apparent wind, so the cap hangs rather than sticking straight
- * out when the puppet is still (d_a_alink.cpp:2669 — the not-swimming-up branch, which is the only
- * one a puppet can be in; the 5.0f at :2673 belongs to the swimming case). Not gravity in any
- * physical sense — it is the bias that decides the rest pose.
- */
-const f32 l_capGravity = 2.0f;
+ * out when the puppet is still. Not gravity in any physical sense — it is the bias that decides the
+ * rest pose, and it is also the denominator the sideways swing is measured against, so its value
+ * changes how far the cap can be blown out.
+ *
+ * ★ 5.0f, the `else` at d_a_alink.cpp:2673 — NOT the 2.0f at :2669. An earlier version of this file
+ * had 2.0f and called it "the only branch a puppet can be in", which was backwards. See the
+ * FLG0_SWIM_UP note in setHatAngle(): that flag is ON while standing on dry land, so a walking Link
+ * takes the :2673 branch and 2.0f is the UNDERWATER value. Getting this wrong shrinks the swing
+ * twice over — once directly, and once by suppressing the wind term that shares the branch. */
+const f32 l_capGravity = 5.0f;
 /* Human Link's own height (d_a_alink_wolf.inc:528). The wind-shelter line check is cast from half
  * of it, which is what daAlink_c feeds checkWindWallRate as mHeight. */
 const f32 l_linkHeight = 180.0f;
@@ -1632,7 +1637,6 @@ void daRemotePlayer_c::setHatAngle() {
     if (!mSwayInited) {
         mSwayInited = true;
         mCapAnchorPrev = anchorPos;
-        mPrevPos = current.pos;
     }
 
     /* ★ TWO samples, at two different points, because the original takes two — and collapsing them
@@ -1811,12 +1815,13 @@ void daRemotePlayer_c::setHatAngle() {
             mLinkProjLateralSum += fabsf(linkWind.x * linkCos - linkWind.z * linkSin);
             mLinkCapYSum += abs(tickLink->field_0x3040[l_capRootJointNo]);
 
-            /* Link's own standing-still test, read from the same members his setHatAngle reads
-             * (d_a_alink.cpp:2654). field_0x3798 is his position at the top of the frame, so this
-             * is exactly how far he moved this tick. */
-            if (tickLink->field_0x3798.abs2XZ(tickLink->current.pos) < 1.0f) {
-                mLinkStillFired++;
-            }
+            /* ★ Link's standing-still test used to be counted here, and its answer is what cracked
+             * this: it fired 120/120 on BOTH sides, which killed the theory that the puppet was
+             * zeroing where he was not, and forced a reading of the branch in front of that test —
+             * where the real difference turned out to be. Removed now that the puppet has no
+             * corresponding branch to compare against, and because counting the inner test on its
+             * own was misleading regardless: the FLG0_SWIM_UP guard means Link never reaches it on
+             * dry land however still he stands. */
         }
     }
 
@@ -1848,16 +1853,31 @@ void daRemotePlayer_c::setHatAngle() {
      * the front), plus the environment's wind, plus a constant downward bias so the cap hangs. */
     cXyz apparentWind = mCapAnchorPrev - anchorPos;
 
-    /* ★ Standing still, the original throws the horizontal part of that away before adding the
-     * environment's wind (d_a_alink.cpp:2654-2657), and this had been left out. It matters more
-     * than it looks: the anchor term is measured off the head joint, so an idle animation's head
-     * bob feeds a small sideways wobble into the cap every single frame even in dead calm. Link's
-     * cap hangs still in a windless room; the puppet's was always faintly stirring. */
-    if (mPrevPos.abs2XZ(current.pos) < 1.0f) {
-        apparentWind.x = 0.0f;
-        apparentWind.z = 0.0f;
-        mStillFired++;
-    }
+    /* ★★ THE term that makes a cap stream sideways in wind, and the one this actor was missing.
+     *
+     * The original is an if/else-if (d_a_alink.cpp:2652-2657): when FLG0_SWIM_UP is set it adds the
+     * ambient wind scaled by the flutter energy and does NOT zero anything; only in the `else` does
+     * the standing-still test throw the horizontal part away. An earlier version of this function
+     * transcribed the second branch alone, on the reasoning that a puppet is never swimming.
+     *
+     * ★ That reasoning inverted the flag. FLG0_SWIM_UP is turned ON in Link's create
+     * (d_a_alink.cpp:4597) and is only ever turned OFF inside d_a_alink_swim.inc and
+     * d_a_alink_hvyboots.inc — i.e. it means "head above water" and is TRUE while standing on dry
+     * land. The name reads like "is swimming upward" and it is a trap. So a walking Link takes the
+     * FIRST branch, always; the standing-still zeroing is the UNDERWATER case and had no business
+     * running here at all.
+     *
+     * Measured rather than argued: with both characters parked in the same spot, Link's cap Y sat
+     * pinned at the -0x2800 clamp (mean 10233 over 12 samples) while the puppet's sat at 7, and the
+     * arithmetic of this branch reproduces his number exactly — flutter power 0.60 gives an energy
+     * of 25*0.6^2 = 9.0 horizontally against the 5.0 downward bias, and atan2s(9, 5) is about 61
+     * degrees, which clamps to the 45 degrees that IS 10240.
+     *
+     * ★ Note this is NOT the teach-wind path. field_0x35b8 (`windPush` below) is gated by
+     * dKy_TeachWind_existence_chk and measured at 0.00 for both players here; the wind still
+     * reaches the cap ANGLE through this term, which is ungated. That is why the room reads `teach
+     * 0` and why the flutter — which also ignores the gate — was the only thing visibly working. */
+    apparentWind += flutterWindDir * (25.0f * (windPower * windPower));
 
     apparentWind += windPush;
     apparentWind.y -= l_capGravity;
@@ -2076,20 +2096,17 @@ void daRemotePlayer_c::setHatAngle() {
 
             if (!mLinkSampled) {
                 Log.debug("Puppet {} capY inputs #{}: yaw kick/tick mean {:.0f} peak {} | proj "
-                          "lateral/tick mean {:.2f} (raw peak {:.2f}) | still-zero fired {}/{} | "
-                          "capY mean {:.0f} now {} | NO P1 COMPARISON (wolf or no local player)",
+                          "lateral/tick mean {:.2f} (raw peak {:.2f}) | capY mean {:.0f} now {} | "
+                          "NO P1 COMPARISON (wolf or no local player)",
                     mPlayerId, mWindLogCount, meanKick, mYawKickPeak, meanProj, mLateralMovePeak,
-                    mStillFired, mProjTicks, meanCapY, mSwayAngleY[l_capRootJointNo]);
+                    meanCapY, mSwayAngleY[l_capRootJointNo]);
             } else {
-                Log.debug(
-                    "Puppet {} capY inputs #{}: yaw kick/tick mean {:.0f} vs P1 {:.0f} (peak "
-                    "{} vs {}) | proj lateral/tick mean {:.2f} vs P1 {:.2f} (raw peak {:.2f} "
-                    "vs {:.2f}) | still-zero fired {}/{} vs P1 {}/{} | capY mean {:.0f} vs P1 "
-                    "{:.0f} (now {} vs {})",
+                Log.debug("Puppet {} capY inputs #{}: yaw kick/tick mean {:.0f} vs P1 {:.0f} (peak "
+                          "{} vs {}) | proj lateral/tick mean {:.2f} vs P1 {:.2f} (raw peak {:.2f} "
+                          "vs {:.2f}) | capY mean {:.0f} vs P1 {:.0f} (now {} vs {})",
                     mPlayerId, mWindLogCount, meanKick, meanLinkKick, mYawKickPeak,
                     mLinkYawKickPeak, meanProj, meanLinkProj, mLateralMovePeak,
-                    mLinkLateralMovePeak, mStillFired, mProjTicks, mLinkStillFired, mLinkKickTicks,
-                    meanCapY, meanLinkCapY, mSwayAngleY[l_capRootJointNo],
+                    mLinkLateralMovePeak, meanCapY, meanLinkCapY, mSwayAngleY[l_capRootJointNo],
                     windLink != NULL ? windLink->field_0x3040[l_capRootJointNo] : 0);
             }
 
@@ -2106,8 +2123,6 @@ void daRemotePlayer_c::setHatAngle() {
             mCapYSum = 0;
             mLinkCapYSum = 0;
             mProjTicks = 0;
-            mStillFired = 0;
-            mLinkStillFired = 0;
             mLinkSampled = false;
         }
     }
@@ -2148,7 +2163,6 @@ void daRemotePlayer_c::setHatAngle() {
     }
 
     mCapAnchorPrev = anchorPos;
-    mPrevPos = current.pos;
     setHairAngle(&apparentWind, sinYaw, cosYaw);
 }
 
