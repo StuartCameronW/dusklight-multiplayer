@@ -8,6 +8,7 @@
 #include "m_Do/m_Do_ext.h"
 
 class daNpcF_MatAnm_c;
+class J3DShape;
 
 /**
  * Remote player puppet — a Dusk-only actor, not part of the original game.
@@ -52,13 +53,20 @@ public:
      * inherited field would read as a permanent zero and misreport the puppet as standing still. */
     f32 getNetSpeed() const { return mNetSpeed; }
     bool hasPose() const { return mHasPose; }
-    /* Resource index of the gait currently playing. Exposed for --mp-trace: which animation a
-     * puppet picked is otherwise only checkable by looking at the other player's screen. */
-    u16 getCurrentAnm() const { return mCurrentAnm; }
+    /* BCK resource index of the gait currently playing. Exposed for --mp-trace: which animation a
+     * puppet picked is otherwise only checkable by looking at the other player's screen.
+     *
+     * Out of line because it is DERIVED — mCurrentAnm holds daAlink_c's animation id and the
+     * resource index is looked up in the game's own m_anmDataTable, so the two can never disagree.
+     * The value handed back is unchanged, and .claude/scripts' analyzers still match on it. */
+    u16 getCurrentAnm() const;
 
 private:
     void setMatrix();
     void selectAnimation();
+    /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
+    /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
+    void setDrawHand();
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
     void groundCheck();
     void setRoomInfo();
@@ -125,8 +133,22 @@ private:
      * truth.
      */
     bool mNetSharpTurn;
-    /* Resource index of the animation currently playing, so setAnm only fires on a real change. */
+    /* daAlink_c::daAlink_ANM id of the animation currently playing, so setAnm only fires on a real
+     * change. Held as the ID rather than as the BCK resource index because the id is the key into
+     * daAlink_c::m_anmDataTable, which owns BOTH the resource index AND the pair of hand poses that
+     * animation is meant to be drawn with. Stored as u16 purely so this header does not have to
+     * pull in d_a_alink.h; the .cpp casts it back. */
     u16 mCurrentAnm;
+
+    /* --- Hands. Link wears TWO pairs and shows one shape per hand out of either model; see
+     * setDrawHand() in the .cpp for the whole mechanism and for what the puppet used to get wrong.
+     */
+    /* The two shapes currently shown, so the next tick can hide exactly them — daAlink_c's
+     * field_0x06d0 / field_0x06d4 (d_a_alink.cpp:18929-18930). Either may be NULL. */
+    J3DShape* mpShownHandShape[2];
+    /* The BODY model's own plain hands, which is what an animation asking for hand 0xFE means —
+     * daAlink_c's field_0x06d8 / field_0x06dc, per outfit (d_a_alink_wolf.inc:426-477). */
+    J3DShape* mpDefaultHandShape[2];
     /* False until the first network pose lands, so the puppet is never drawn at its spawn pose. */
     bool mHasPose;
     /* Latches the outfit choice, so create() being re-entered while the mount completes cannot
@@ -136,6 +158,8 @@ private:
     bool mCreateComplete;
     /// Latches the one-shot "the shadow was actually granted" line; see shadowDraw().
     bool mLoggedShadow;
+    /// Same for the first hand pose actually taken off the hands model; see setDrawHand().
+    bool mLoggedHands;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */

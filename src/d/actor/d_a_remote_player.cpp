@@ -44,18 +44,35 @@ struct OutfitArc {
     const char* headResName;
     const char* handsResName;
     const char* faceResName;
+    /* BODY-model materials whose shapes are this outfit's plain hands — daAlink_c's field_0x06d8
+     * and field_0x06dc, which an animation selects by asking for hand index 0xFE. They differ per
+     * outfit and are NOT on the hands model; see setDrawHand(). */
+    u16 defaultHandMatNo[2];
+    /* One BODY-model material daAlink_c hides as it builds the model and never shows again for a
+     * player in this state, or l_noBodyMat for none. Two outfits have one: the hero's clothes hide
+     * material 16 outright (d_a_alink_wolf.inc:471), and the Zora armour hides material 9 — its
+     * mask — which only comes back for checkZoraWearMaskDraw(), a Zora-swimming state a puppet has
+     * no way to be in yet (:447-449, :488-490). */
+    u16 hiddenBodyMatNo;
 };
+
+/* "This outfit hides nothing." Not 0 — material 0 is a real material on every one of these. */
+const u16 l_noBodyMat = 0xFFFF;
 
 /* Link is four models, not one — body, head, hands and face — and the outfits do not name them
  * consistently (Zora and magic armour reuse al_hands.bmd; only Zora has its own face). Taken from
  * the outfit branches of daAlink_c::setLinkModel, d_a_alink_wolf.inc:328-377.
  */
+/* The per-outfit numbers on the right are the four wear branches of daAlink_c::setLinkModel
+ * (d_a_alink_wolf.inc:434-477), in the same order the branches test for them. The first branch
+ * there — checkNoResetFlg2(FLG2_UNK_80000) — is deliberately not represented: it is a transient
+ * state of the LOCAL player, not one of the four archives, and a puppet is never in it. */
 const OutfitArc l_outfits[] = {
-    // arc      body       head            hands            face
-    {"Bmdl", "bl.bmd", "bl_head.bmd", "bl_hands.bmd", "al_face.bmd"},  // Ordon / casual clothes
-    {"Kmdl", "al.bmd", "al_head.bmd", "al_hands.bmd", "al_face.bmd"},  // hero's clothes
-    {"Zmdl", "zl.bmd", "zl_head.bmd", "al_hands.bmd", "zl_face.bmd"},  // Zora armour
-    {"Mmdl", "ml.bmd", "ml_head.bmd", "al_hands.bmd", "al_face.bmd"},  // magic armour
+    // arc      body       head            hands            face             hands  hide
+    {"Bmdl", "bl.bmd", "bl_head.bmd", "bl_hands.bmd", "al_face.bmd", {3, 4}, l_noBodyMat},
+    {"Kmdl", "al.bmd", "al_head.bmd", "al_hands.bmd", "al_face.bmd", {11, 12}, 16},
+    {"Zmdl", "zl.bmd", "zl_head.bmd", "al_hands.bmd", "zl_face.bmd", {4, 5}, 9},
+    {"Mmdl", "ml.bmd", "ml_head.bmd", "al_hands.bmd", "al_face.bmd", {4, 5}, l_noBodyMat},
 };
 
 const int l_outfitNum = sizeof(l_outfits) / sizeof(l_outfits[0]);
@@ -77,16 +94,14 @@ const u16 l_headJointNo = 4;
 const u16 l_leftHandJointNo = 9;
 const u16 l_rightHandJointNo = 0xE;
 
-/* The hands model holds ELEVEN alternative hand poses as separate shapes and shows exactly one per
- * hand (daAlink_c::setDrawHand, d_a_alink.cpp:18928-19057); draw them all and Link sprouts a
- * bouquet of hands. daAlink_c picks per frame from what he is holding. A puppet has no replicated
- * equipment yet, so it takes the pair the pause menu uses as its neutral
- * (d_a_alink.cpp:18936-18946) and holds them. Item-dependent hands arrive with equipment
- * replication.
- */
+/* How many alternative hand poses the hands model holds, as separate shapes 0..10. Exactly the
+ * bound daAlink_c::setLinkModel hides at build time (d_a_alink_wolf.inc:495-498) before setDrawHand
+ * starts showing one of them per hand. */
 const u16 l_handShapeNum = 11;
-const u16 l_leftHandShape = 0;
-const u16 l_rightHandShape = 6;
+/* The hand index meaning "not one of those eleven — use the BODY model's own plain hand". It is
+ * daAlink_c's own sentinel, tested by name at d_a_alink.cpp:19017 and :19038 and appearing all over
+ * m_anmDataTable's hand columns. */
+const u8 l_defaultHandIdx = 0xFE;
 
 /**
  * Matches daAlink_c::initModel (d_a_alink.cpp:4105-4137), warp-material branch included.
@@ -223,15 +238,25 @@ J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
     return model;
 }
 
-/* Link's animations do not live in the body archive — they are in AlAnm, mounted in ARAM at boot
- * and streamed by index.
+/* The four of daAlink_c's animations the puppet can be in.
+ *
+ * ★ These are ANIMATION IDS, not BCK resource indices, and that is the point. daAlink_c's
+ * m_anmDataTable row for an id carries everything about how that animation is meant to be drawn:
+ * which BCK to stream (m_bckData.m_underID) AND which hand pose belongs on each hand
+ * (m_handIndexL/R). The puppet used to hold the resource indices directly and pick its hands
+ * separately, which is exactly how it ended up walking around with the pause menu's sword-and-
+ * shield grips — two lists that could disagree, and did. Going through the id means there is one
+ * table describing a gait and it is the game's own.
+ *
+ * Link's animations do not live in the body archive — they are in AlAnm, mounted in ARAM at boot
+ * and streamed by the index this table hands back.
  */
-const u16 l_idleAnmIdx = dRes_ID_ALANM_BCK_WAITS_e;
-const u16 l_walkAnmIdx = dRes_ID_ALANM_BCK_WALKS_e;
-/* Pairs with WALKS in daAlink_c::m_anmDataTable (ANM_WALK / ANM_RUN, d_a_alink.cpp:301-302), so
- * this is the cycle the local player runs on — not a faster playback of the walk.
+const daAlink_c::daAlink_ANM l_idleAnm = daAlink_c::ANM_WAIT;
+const daAlink_c::daAlink_ANM l_walkAnm = daAlink_c::ANM_WALK;
+/* Pairs with ANM_WALK in m_anmDataTable (d_a_alink.cpp:301-302) — its own DASHS cycle, so this is
+ * what the local player runs on, not a faster playback of the walk.
  */
-const u16 l_runAnmIdx = dRes_ID_ALANM_BCK_DASHS_e;
+const daAlink_c::daAlink_ANM l_runAnm = daAlink_c::ANM_RUN;
 /* The sharp turn: the skid Link plants when the stick is flicked back at speed. This is ANM_SLIP's
  * m_underID in the same table (index 0x028, d_a_alink.cpp:323), reached from
  * daAlink_c::procSlipInit (d_a_alink.cpp:16673-16675).
@@ -246,7 +271,20 @@ const u16 l_runAnmIdx = dRes_ID_ALANM_BCK_DASHS_e;
  * exactly (player_bridge.cpp samples link->shape_angle.y). So the pose and the yaw cannot disagree
  * about direction here — there is only one direction the pose can mean.
  */
-const u16 l_slipAnmIdx = dRes_ID_ALANM_BCK_SLIP_e;
+const daAlink_c::daAlink_ANM l_slipAnm = daAlink_c::ANM_SLIP;
+
+/* An animation's row in daAlink_c's table — the one place the puppet learns anything about a gait.
+ * The table is a public static of the class (d_a_alink.h:3919) with constant initialisers, so this
+ * is a plain array read with no ordering or lifetime concerns. */
+const daAlink_AnmData& anm_data(daAlink_c::daAlink_ANM i_anm) {
+    return daAlink_c::m_anmDataTable[i_anm];
+}
+
+/* The BCK resource index to stream for an animation. daAlink_c reads the same field through
+ * getMainBckData (d_a_alink.cpp:6948). */
+u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm) {
+    return anm_data(i_anm).m_bckData.m_underID;
+}
 
 /* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
 enum AnmFamily {
@@ -571,9 +609,12 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
-    mpIdleAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_idleAnmIdx, ANM_FAMILY_TRANSFORM));
-    mpWalkAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_walkAnmIdx, ANM_FAMILY_TRANSFORM));
-    mpRunAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_runAnmIdx, ANM_FAMILY_TRANSFORM));
+    mpIdleAnm =
+        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_idleAnm), ANM_FAMILY_TRANSFORM));
+    mpWalkAnm =
+        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_walkAnm), ANM_FAMILY_TRANSFORM));
+    mpRunAnm =
+        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_runAnm), ANM_FAMILY_TRANSFORM));
     if (mpIdleAnm == NULL || mpWalkAnm == NULL || mpRunAnm == NULL) {
         return 0;
     }
@@ -586,7 +627,8 @@ int daRemotePlayer_c::createHeap() {
      * is a puppet with one animation missing; a puppet that fails createHeap is deleted and
      * respawned every couple of ticks forever, mounting an archive each time. Trading the first
      * failure for the second would be a bad bargain, so this one degrades to the gait instead. */
-    mpSlipAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_slipAnmIdx, ANM_FAMILY_TRANSFORM));
+    mpSlipAnm =
+        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_slipAnm), ANM_FAMILY_TRANSFORM));
     if (mpSlipAnm == NULL) {
         Log.warn("Puppet has no sharp-turn animation; turns will play the gait instead");
     }
@@ -686,21 +728,45 @@ int daRemotePlayer_c::createHeap() {
 
     setupHeadSway();
 
+    /* Hands, and the one body shape this outfit is built with hidden. Both are the tail of
+     * daAlink_c::setLinkModel (d_a_alink_wolf.inc:471-498) and both were missing; see setDrawHand()
+     * for what that looked like on screen. */
+    if (outfit.hiddenBodyMatNo != l_noBodyMat &&
+        outfit.hiddenBodyMatNo < modelData->getMaterialNum())
+    {
+        modelData->getMaterialNodePointer(outfit.hiddenBodyMatNo)->getShape()->hide();
+    }
+
+    for (int i = 0; i < 2; i++) {
+        mpDefaultHandShape[i] =
+            outfit.defaultHandMatNo[i] < modelData->getMaterialNum() ?
+                modelData->getMaterialNodePointer(outfit.defaultHandMatNo[i])->getShape() :
+                NULL;
+    }
+
+    u16 hiddenShapeNum = 0;
     if (mpHandModel != NULL) {
         J3DModelData* handData = mpHandModel->getModelData();
-        const u16 shapeNum = handData->getMaterialNum() < l_handShapeNum ?
-                                 handData->getMaterialNum() :
-                                 l_handShapeNum;
-        for (u16 i = 0; i < shapeNum; i++) {
+        hiddenShapeNum = handData->getMaterialNum() < l_handShapeNum ? handData->getMaterialNum() :
+                                                                       l_handShapeNum;
+        for (u16 i = 0; i < hiddenShapeNum; i++) {
             handData->getMaterialNodePointer(i)->getShape()->hide();
         }
-        if (l_leftHandShape < shapeNum) {
-            handData->getMaterialNodePointer(l_leftHandShape)->getShape()->show();
-        }
-        if (l_rightHandShape < shapeNum) {
-            handData->getMaterialNodePointer(l_rightHandShape)->getShape()->show();
-        }
     }
+
+    /* Start where daAlink_c starts, with the body's own pair showing (d_a_alink_wolf.inc:492-493).
+     * setDrawHand() replaces them on the first tick that has a pose. */
+    mpShownHandShape[0] = mpDefaultHandShape[0];
+    mpShownHandShape[1] = mpDefaultHandShape[1];
+
+    /* Latched and permanent. Every way this can be wrong is silent: a body material index that is
+     * out of range for this outfit's model leaves the default hand NULL and setDrawHand() then
+     * draws nothing for that hand, and hiding fewer than eleven alternates leaves a spare pair on
+     * screen — which is the bug being fixed, and it left no trace in any log. */
+    Log.debug("Puppet {} hands: '{}' body defaults mat {}/{} ({}/{}), {} of {} alternates hidden",
+        mPlayerId, outfit.arcName, outfit.defaultHandMatNo[0], outfit.defaultHandMatNo[1],
+        mpDefaultHandShape[0] != NULL ? "ok" : "MISSING",
+        mpDefaultHandShape[1] != NULL ? "ok" : "MISSING", hiddenShapeNum, l_handShapeNum);
 
     /* ★ The warp-particle report (00-status.md A5), measured rather than argued about. Both sides
      * of the same four meshes, once per puppet.
@@ -875,7 +941,7 @@ int daRemotePlayer_c::create() {
         return cPhs_ERROR_e;
     }
 
-    mCurrentAnm = l_idleAnmIdx;
+    mCurrentAnm = static_cast<u16>(l_idleAnm);
     model = mpModelMorf->getModel();
 
     /* Seeded from the player id, so two puppets standing side by side do not blink in unison — the
@@ -968,11 +1034,11 @@ void daRemotePlayer_c::selectAnimation() {
      * lag it is. Holding the final frame degrades to a puppet frozen mid-skid, which reads as lag.
      */
     if (mNetSharpTurn && mpSlipAnm != NULL) {
-        if (mCurrentAnm != l_slipAnmIdx) {
+        if (mCurrentAnm != l_slipAnm) {
             const daAlinkHIO_anm_c& slide = hio.mSlideAnm;
             mpModelMorf->setAnm(mpSlipAnm, J3DFrameCtrl::EMode_NONE, slide.mInterpolation,
                 slide.mSpeed, slide.mStartFrame, static_cast<f32>(slide.mEndFrame));
-            mCurrentAnm = l_slipAnmIdx;
+            mCurrentAnm = static_cast<u16>(l_slipAnm);
         }
         // The idle-frame probe below counts consecutive IDLE ticks; a skid is not one of them.
         mIdleTicks = 0;
@@ -983,21 +1049,21 @@ void daRemotePlayer_c::selectAnimation() {
     const f32 runFraction = 0.5f * (hio.mWalkChangeRate + hio.mRunChangeRate);
     const f32 fraction = mNetSpeed / hio.mMaxSpeed;
 
-    u16 wanted;
+    daAlink_c::daAlink_ANM wanted;
     if (mNetSpeed <= l_idleSpeedThreshold) {
-        wanted = l_idleAnmIdx;
-    } else if (mCurrentAnm == l_runAnmIdx) {
-        wanted = fraction < runFraction - l_gaitHysteresis ? l_walkAnmIdx : l_runAnmIdx;
+        wanted = l_idleAnm;
+    } else if (mCurrentAnm == l_runAnm) {
+        wanted = fraction < runFraction - l_gaitHysteresis ? l_walkAnm : l_runAnm;
     } else {
-        wanted = fraction > runFraction + l_gaitHysteresis ? l_runAnmIdx : l_walkAnmIdx;
+        wanted = fraction > runFraction + l_gaitHysteresis ? l_runAnm : l_walkAnm;
     }
 
     J3DAnmTransform* anm;
     f32 rate;
-    if (wanted == l_runAnmIdx) {
+    if (wanted == l_runAnm) {
         anm = mpRunAnm;
         rate = hio.mRunAnmSpeed;
-    } else if (wanted == l_walkAnmIdx) {
+    } else if (wanted == l_walkAnm) {
         anm = mpWalkAnm;
         rate = hio.mWalkAnmSpeed;
     } else {
@@ -1011,7 +1077,7 @@ void daRemotePlayer_c::selectAnimation() {
      * the frame is actually ADVANCING, which nothing else in the trace can answer. One latched line
      * once the puppet has been idle a while; a frame near the animation's end means it is running.
      */
-    if (wanted == l_idleAnmIdx) {
+    if (wanted == l_idleAnm) {
         if (mIdleTicks < 0xFFFF) {
             mIdleTicks++;
         }
@@ -1031,9 +1097,92 @@ void daRemotePlayer_c::selectAnimation() {
         // A short morf, so changing gait doesn't pop. This is the one place we are standing in for
         // the player's cross-fade, so it is doing more work here than a plain animation change.
         mpModelMorf->setAnm(anm, J3DFrameCtrl::EMode_LOOP, 5.0f, rate, 0.0f, -1.0f);
-        mCurrentAnm = wanted;
+        mCurrentAnm = static_cast<u16>(wanted);
     } else {
         mpModelMorf->setPlaySpeed(rate);
+    }
+}
+
+/* See the header. Out of line so it can go through the same table everything else here does. */
+u16 daRemotePlayer_c::getCurrentAnm() const {
+    return anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm));
+}
+
+/**
+ * Show exactly one hand shape per hand, the pair the current animation asks for.
+ *
+ * ★ Link wears TWO pairs of hands, and the puppet was drawing both. This is not obvious from any
+ * one place in daAlink_c, so it is worth writing down in full:
+ *
+ *   - The BODY model carries a plain pair as ordinary shapes. Which materials they are depends on
+ *     the outfit, and setLinkModel picks them per wear branch into field_0x06d8 / field_0x06dc
+ *     (d_a_alink_wolf.inc:426-477) — off field_0x064C, which IS mpLinkModel->getModelData()
+ *     (d_a_alink_swindow.inc:163). They are shapes on the body, so they are always drawn unless
+ *     something hides them.
+ *   - The SEPARATE al_hands.bmd holds eleven alternative poses as shapes 0-10, and setLinkModel
+ *     hides all eleven (:495-498).
+ *   - setDrawHand then hides whichever two are currently up and shows exactly one per hand
+ *     (d_a_alink.cpp:18928-19057) — taken from EITHER model, because hand index 0xFE means "the
+ *     body's plain one".
+ *
+ * The puppet used to hide the eleven and then show hand-model shapes 0 and 6, and never touch the
+ * body's pair. So it had a spare set of hands hanging off its wrists — Stuart's report — and the
+ * visible pair was wrong as well: 0 and 6 are not neutral poses, they are the grips daAlink_c uses
+ * ONLY on the pause-menu branch, "0 if he owns a sword, 6 if he owns a shield"
+ * (d_a_alink.cpp:18936-18946). Hence a puppet walking around clenched around a sword and shield
+ * that were not there.
+ *
+ * ★ The pose is a property of the ANIMATION, not of the actor, and that is the whole fix: the hand
+ * indices sit in m_anmDataTable next to the BCK id (m_handIndexL/R, d_a_alink.h:212-213). Walking,
+ * running and standing all ask for 4 and 10 (d_a_alink.cpp:301, :302, :308); the skid asks for
+ * 0xFE/0xFE (:323) and so shows the body's own hands. Reading them from there rather than choosing
+ * a "neutral" pair means the puppet cannot be holding something the animation is not shaped for,
+ * and it stays right for free when equipment replication starts driving other animations.
+ *
+ * What is NOT reproduced is daAlink_c's item override chain (field_0x2f94-0x2f97, the 0x64 and 0xFB
+ * demo cases). Those are all "the hand is holding a specific item", and a puppet has no replicated
+ * equipment yet; every one of them falls through to mLeftHandIndex/mRightHandIndex, which is
+ * exactly what this reads.
+ */
+void daRemotePlayer_c::setDrawHand() {
+    for (int i = 0; i < 2; i++) {
+        if (mpShownHandShape[i] != NULL) {
+            mpShownHandShape[i]->hide();
+        }
+    }
+
+    const daAlink_AnmData& anmData = anm_data(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm));
+    const u8 handIdx[2] = {anmData.m_handIndexL, anmData.m_handIndexR};
+
+    J3DModelData* handData = mpHandModel != NULL ? mpHandModel->getModelData() : NULL;
+    for (int i = 0; i < 2; i++) {
+        /* Anything this cannot honour — the 0xFE sentinel, an item pose, a hands model that failed
+         * to load — resolves to the body's plain hand, which is also daAlink_c's own answer for
+         * 0xFE. The range checks are not defensive padding: the shape count comes out of a binary
+         * asset, so it is not verifiable from source for every outfit. */
+        const bool useBodyHand = handIdx[i] == l_defaultHandIdx || handData == NULL ||
+                                 handIdx[i] >= l_handShapeNum ||
+                                 handIdx[i] >= handData->getMaterialNum();
+
+        if (useBodyHand) {
+            mpShownHandShape[i] = mpDefaultHandShape[i];
+        } else {
+            mpShownHandShape[i] = handData->getMaterialNodePointer(handIdx[i])->getShape();
+        }
+
+        if (mpShownHandShape[i] != NULL) {
+            mpShownHandShape[i]->show();
+        }
+    }
+
+    /* One line, latched, the first time a pose actually comes off the hands model. Without it
+     * "the hands are right now" is unfalsifiable from a trace: a table read that silently resolved
+     * to the body's hands every tick would look identical to the old bug minus one pair, and the
+     * animation id is the thing worth seeing because it is what selects the pair. */
+    if (!mLoggedHands && (handIdx[0] != l_defaultHandIdx || handIdx[1] != l_defaultHandIdx)) {
+        mLoggedHands = true;
+        Log.debug("Puppet {} hands: anim {} (bck {}) asks for L={} R={}", mPlayerId, mCurrentAnm,
+            getCurrentAnm(), handIdx[0], handIdx[1]);
     }
 }
 
@@ -2418,6 +2567,10 @@ int daRemotePlayer_c::execute() {
     // mtx calculators are not on it and cannot be.
     traceCalc("selectAnimation");
     selectAnimation();
+    // Immediately after, and never before: the hand pose is a column of the animation's own table
+    // row, so it can only be right once the animation for this tick has been chosen.
+    traceCalc("setDrawHand");
+    setDrawHand();
     traceCalc("morf play");
     mpModelMorf->play(0, 0);
     // Independent of the body: the puppet blinks while standing still as much as while running,
