@@ -1752,6 +1752,43 @@ void daRemotePlayer_c::setHatAngle() {
         mHeadPitch = headFwd.atan2sY_XZ();
     }
 
+    /* ★ Cap-Y inputs, sampled EVERY tick and reported as peaks, because the thing being measured is
+     * a per-tick delta and reading it once every 120 ticks would compare the puppet's one-tick turn
+     * against 120 ticks of Link's. Peaks rather than means: the cap is thrown sideways by sharp
+     * turns, and a mean over a straight run would hide exactly the events that matter.
+     *
+     * Link's equivalents are reconstructed from public members — field_0x3062 is his head yaw and
+     * field_0x34c8 his previous cap anchor — so this is like-for-like, not inference. */
+    {
+        const s16 yawKickNow = (s16)(mHeadYaw - prevYaw);
+        if (abs(yawKickNow) > abs(mYawKickPeak)) {
+            mYawKickPeak = yawKickNow;
+        }
+        const f32 lateralNow = (mCapAnchorPrev - anchorPos).absXZ();
+        if (lateralNow > mLateralMovePeak) {
+            mLateralMovePeak = lateralNow;
+        }
+
+        const daAlink_c* tickLink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+        if (tickLink != NULL && !tickLink->checkWolf() && tickLink->mpLinkHatModel != NULL) {
+            if (mPrevLinkHeadYawValid) {
+                const s16 linkKick = (s16)(tickLink->field_0x3062 - mPrevLinkHeadYaw);
+                if (abs(linkKick) > abs(mLinkYawKickPeak)) {
+                    mLinkYawKickPeak = linkKick;
+                }
+            }
+            mPrevLinkHeadYaw = tickLink->field_0x3062;
+            mPrevLinkHeadYawValid = true;
+
+            cXyz linkAnchor;
+            mDoMtx_multVecZero(tickLink->mpLinkHatModel->getAnmMtx(l_capRootJointNo), &linkAnchor);
+            const f32 linkLateral = (tickLink->field_0x34c8 - linkAnchor).absXZ();
+            if (linkLateral > mLinkLateralMovePeak) {
+                mLinkLateralMovePeak = linkLateral;
+            }
+        }
+    }
+
     f32 sinYaw;
     f32 cosYaw;
     f32 lateralLen = headFwd.absXZ();
@@ -1963,6 +2000,33 @@ void daRemotePlayer_c::setHatAngle() {
                 JMAFastSqrt(mWindPush.abs2()),
                 windLink != NULL ? JMAFastSqrt(windLink->field_0x35b8.abs2()) : -1.0f, mNetSpeed,
                 windLink != NULL ? windLink->speedF : -1.0f);
+
+            /* ★ The cap's SIDEWAYS swing, broken into its two inputs, because Stuart's report is
+             * that the puppet's cap pitches like his but never gets thrown out to the side — and
+             * the angle log confirms it (his Y pinned at the ±0x2800 clamp, the puppet's near 0).
+             *
+             * Cap Y has exactly two drivers, and they need separating before anything is changed:
+             *   1. The per-tick HEAD YAW CHANGE, fed in as inertia (`spA`, d_a_alink.cpp:2646).
+             *      Network rotation arrives interpolated, so the puppet's per-tick delta may simply
+             *      be far smaller than a human yanking the stick — a replication-fidelity problem,
+             *      not a hat one.
+             *   2. The LATERAL component of cap-anchor motion, which is what `sp10` is built from
+             *      (:2730). If the anchor barely moves sideways, there is no target to swing to.
+             *
+             * Both of Link's are reconstructable from public members — field_0x3062 is his head yaw
+             * and field_0x34c8 his previous cap anchor — so this is a like-for-like comparison
+             * rather than an inference. Whichever column is small on the puppet and large on his is
+             * the one to fix; if BOTH match, the fault is downstream and the inputs are innocent.
+             */
+            Log.debug("Puppet {} capY inputs #{}: peak yaw kick/tick {} vs P1 {} | peak lateral "
+                      "anchor move/tick {:.2f} vs P1 {:.2f} | capY {} vs P1 {}",
+                mPlayerId, mWindLogCount, mYawKickPeak, mLinkYawKickPeak, mLateralMovePeak,
+                mLinkLateralMovePeak, mSwayAngleY[l_capRootJointNo],
+                windLink != NULL ? windLink->field_0x3040[l_capRootJointNo] : 0);
+            mYawKickPeak = 0;
+            mLinkYawKickPeak = 0;
+            mLateralMovePeak = 0.0f;
+            mLinkLateralMovePeak = 0.0f;
         }
     }
 

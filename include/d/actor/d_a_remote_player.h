@@ -184,6 +184,15 @@ private:
     /* Latches the first room that actually has cap-bending wind, so the search for one stops being
      * guesswork. See setHatAngle(). */
     bool mLoggedWindArea;
+    /* Peak per-tick cap-Y drivers since the last wind log, for the puppet and for the local player
+     * alongside. Sampled every tick and reported as peaks; see setHatAngle() for why a periodic
+     * sample of a per-tick delta would be meaningless. */
+    s16 mYawKickPeak;
+    s16 mLinkYawKickPeak;
+    f32 mLateralMovePeak;
+    f32 mLinkLateralMovePeak;
+    s16 mPrevLinkHeadYaw;
+    bool mPrevLinkHeadYawValid;
     /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
      * until the first sample. See checkMaterialDrift(). */
     u16 mMaterialSig[4];
