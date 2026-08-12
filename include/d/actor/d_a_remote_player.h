@@ -280,4 +280,26 @@ private:
     bool mSwayInited;
 };
 
+/**
+ * Why the last puppet creation attempt failed, for the network layer's spawn backoff
+ * (src/dusk/multiplayer/replication/player_bridge.cpp).
+ *
+ * The framework tells the bridge THAT a creation failed — it cancels the create request, which the
+ * bridge sees as an id that is neither creating nor in the actor layer — but it cannot tell it why.
+ * Without a reason the "gave up on this puppet" line would be exactly the kind of message that
+ * hides a real bug behind a shrug, so create() leaves one here.
+ *
+ * A global rather than a call into dusk::mp, so the dependency keeps pointing the one way it
+ * already does: the bridge includes this header and nothing under src/dusk/multiplayer is included
+ * from here. The player id is carried alongside so a reason left behind by a DIFFERENT puppet's
+ * failure is detectable rather than silently misattributed; the bridge clears the reason as it
+ * takes it. mReason is always a string literal, so there is no lifetime to manage.
+ */
+struct daRemotePlayer_createFail_c {
+    u32 mPlayerId;
+    const char* mReason;
+};
+
+extern daRemotePlayer_createFail_c g_daRemotePlayer_lastCreateFail;
+
 #endif /* D_A_REMOTE_PLAYER_H */

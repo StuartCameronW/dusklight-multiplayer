@@ -30,6 +30,11 @@ bool capture_local_player(PlayerState& out);
 
 /// Create the puppet actor for `playerId` if it isn't alive yet. Returns false when creation isn't
 /// possible right now (no scene loaded, allocation refused) — callers just retry next tick.
+///
+/// Calling it every tick is correct and cheap: it owns the whole spawn policy, including backing
+/// off after a failed creation and eventually disabling a puppet that will not come up. A false
+/// return therefore does NOT mean "try harder"; it means there is no puppet this tick, for a reason
+/// the log already carries. See the failure-policy block at the top of player_bridge.cpp.
 bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb);
 
 /// Push an interpolated pose onto an existing puppet. No-op if the puppet isn't alive.
