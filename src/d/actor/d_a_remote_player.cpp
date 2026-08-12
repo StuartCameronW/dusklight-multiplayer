@@ -1752,10 +1752,16 @@ void daRemotePlayer_c::setHatAngle() {
         mHeadPitch = headFwd.atan2sY_XZ();
     }
 
-    /* ★ Cap-Y inputs, sampled EVERY tick and reported as peaks, because the thing being measured is
-     * a per-tick delta and reading it once every 120 ticks would compare the puppet's one-tick turn
-     * against 120 ticks of Link's. Peaks rather than means: the cap is thrown sideways by sharp
-     * turns, and a mean over a straight run would hide exactly the events that matter.
+    /* ★ Cap-Y inputs, sampled EVERY tick, because the thing being measured is a per-tick delta and
+     * reading it once every 120 ticks would compare the puppet's one-tick turn against 120 ticks of
+     * Link's.
+     *
+     * ★ MEAN as well as peak, and the mean is the one that decides this. The yaw kick is subtracted
+     * straight into the accumulated angle with nothing damping it, so it is a kick SUSTAINED over
+     * consecutive ticks that walks the cap out to the ±0x2800 clamp and holds it there; a single
+     * spike is pulled back to zero within about five ticks by the addCalc. Peaks alone cannot tell
+     * a spike from a sustained turn, so matching peaks — which is what the first pass measured —
+     * are not evidence that the inputs agree. Means are.
      *
      * Link's equivalents are reconstructed from public members — field_0x3062 is his head yaw and
      * field_0x34c8 his previous cap anchor — so this is like-for-like, not inference. */
@@ -1764,6 +1770,9 @@ void daRemotePlayer_c::setHatAngle() {
         if (abs(yawKickNow) > abs(mYawKickPeak)) {
             mYawKickPeak = yawKickNow;
         }
+        mYawKickSum += abs(yawKickNow);
+        mKickTicks++;
+
         const f32 lateralNow = (mCapAnchorPrev - anchorPos).absXZ();
         if (lateralNow > mLateralMovePeak) {
             mLateralMovePeak = lateralNow;
@@ -1776,6 +1785,8 @@ void daRemotePlayer_c::setHatAngle() {
                 if (abs(linkKick) > abs(mLinkYawKickPeak)) {
                     mLinkYawKickPeak = linkKick;
                 }
+                mLinkYawKickSum += abs(linkKick);
+                mLinkKickTicks++;
             }
             mPrevLinkHeadYaw = tickLink->field_0x3062;
             mPrevLinkHeadYawValid = true;
@@ -1783,9 +1794,28 @@ void daRemotePlayer_c::setHatAngle() {
 
             cXyz linkAnchor;
             mDoMtx_multVecZero(tickLink->mpLinkHatModel->getAnmMtx(l_capRootJointNo), &linkAnchor);
-            const f32 linkLateral = (tickLink->field_0x34c8 - linkAnchor).absXZ();
+            const cXyz linkWind = tickLink->field_0x34c8 - linkAnchor;
+            const f32 linkLateral = linkWind.absXZ();
             if (linkLateral > mLinkLateralMovePeak) {
                 mLinkLateralMovePeak = linkLateral;
+            }
+
+            /* ★ Link's anchor motion PROJECTED onto his sideways axis — the term his Y target is
+             * really built from. His frame is the gaze direction, and field_0x3062 is precisely
+             * that direction's yaw (d_a_alink.cpp:2604), so sin/cos of it reproduce his var_f29 and
+             * var_f28 without needing his locals. Accumulated here so the puppet's equivalent,
+             * which can only be formed further down once the apparent wind exists, has something to
+             * be compared against over the same window. */
+            const f32 linkSin = cM_ssin(tickLink->field_0x3062);
+            const f32 linkCos = cM_scos(tickLink->field_0x3062);
+            mLinkProjLateralSum += fabsf(linkWind.x * linkCos - linkWind.z * linkSin);
+            mLinkCapYSum += abs(tickLink->field_0x3040[l_capRootJointNo]);
+
+            /* Link's own standing-still test, read from the same members his setHatAngle reads
+             * (d_a_alink.cpp:2654). field_0x3798 is his position at the top of the frame, so this
+             * is exactly how far he moved this tick. */
+            if (tickLink->field_0x3798.abs2XZ(tickLink->current.pos) < 1.0f) {
+                mLinkStillFired++;
             }
         }
     }
@@ -1826,6 +1856,7 @@ void daRemotePlayer_c::setHatAngle() {
     if (mPrevPos.abs2XZ(current.pos) < 1.0f) {
         apparentWind.x = 0.0f;
         apparentWind.z = 0.0f;
+        mStillFired++;
     }
 
     apparentWind += windPush;
@@ -1883,13 +1914,23 @@ void daRemotePlayer_c::setHatAngle() {
     cLib_addCalcAngleS2(angX, delta, 5, 0x400);
     *angX = cLib_minMaxLimit<s16>(*angX + *velX, -0x3800, 0x3800);
 
-    const s16 wantY =
-        cLib_minMaxLimit<s16>(cM_atan2s(-(apparentWind.x * cosYaw - apparentWind.z * sinYaw),
-                                  JMAFastSqrt(SQUARE(forward) + SQUARE(apparentWind.y))),
-            -0x2800, 0x2800);
+    const f32 projLateral = apparentWind.x * cosYaw - apparentWind.z * sinYaw;
+
+    const s16 wantY = cLib_minMaxLimit<s16>(
+        cM_atan2s(-projLateral, JMAFastSqrt(SQUARE(forward) + SQUARE(apparentWind.y))), -0x2800,
+        0x2800);
 
     cLib_addCalcAngleS2(angY, wantY, 5, 0x400);
     *angY = cLib_minMaxLimit<s16>(*angY + *velY, -0x2800, 0x2800);
+
+    /* ★ The projected term itself, not the magnitude of the motion it came from. The first pass
+     * measured |anchor motion| and found it matched Link's, but the Y target uses only the part of
+     * that motion lying across the look direction — a cap anchor moving straight down the gaze
+     * contributes nothing to Y however fast it moves. Sampled here rather than with the other
+     * inputs above because it cannot be formed until the apparent wind and the head frame exist. */
+    mProjLateralSum += fabsf(projLateral);
+    mCapYSum += abs(*angY);
+    mProjTicks++;
 
     /* Velocity is a fifth of the distance just travelled, carried into next tick. This is what
      * makes the cap overshoot and settle rather than tracking the target rigidly. */
@@ -2023,17 +2064,32 @@ void daRemotePlayer_c::setHatAngle() {
              * never runs setHatAngle, so his peaks would sit at 0 and read as "Link's cap does not
              * swing either" — which is the exact shape of mistake (zeroes from a system that was
              * not running, taken as data) that sent an earlier wind fix the wrong way. */
+            const f32 meanKick = mKickTicks != 0 ? (f32)mYawKickSum / mKickTicks : 0.0f;
+            const f32 meanLinkKick =
+                mLinkKickTicks != 0 ? (f32)mLinkYawKickSum / mLinkKickTicks : 0.0f;
+            const f32 meanProj = mProjTicks != 0 ? mProjLateralSum / mProjTicks : 0.0f;
+            const f32 meanLinkProj =
+                mLinkKickTicks != 0 ? mLinkProjLateralSum / mLinkKickTicks : 0.0f;
+            const f32 meanCapY = mProjTicks != 0 ? (f32)mCapYSum / mProjTicks : 0.0f;
+            const f32 meanLinkCapY =
+                mLinkKickTicks != 0 ? (f32)mLinkCapYSum / mLinkKickTicks : 0.0f;
+
             if (!mLinkSampled) {
-                Log.debug("Puppet {} capY inputs #{}: peak yaw kick/tick {} | peak lateral anchor "
-                          "move/tick {:.2f} | capY {} | NO P1 COMPARISON (wolf or no local player)",
-                    mPlayerId, mWindLogCount, mYawKickPeak, mLateralMovePeak,
-                    mSwayAngleY[l_capRootJointNo]);
+                Log.debug("Puppet {} capY inputs #{}: yaw kick/tick mean {:.0f} peak {} | proj "
+                          "lateral/tick mean {:.2f} (raw peak {:.2f}) | still-zero fired {}/{} | "
+                          "capY mean {:.0f} now {} | NO P1 COMPARISON (wolf or no local player)",
+                    mPlayerId, mWindLogCount, meanKick, mYawKickPeak, meanProj, mLateralMovePeak,
+                    mStillFired, mProjTicks, meanCapY, mSwayAngleY[l_capRootJointNo]);
             } else {
                 Log.debug(
-                    "Puppet {} capY inputs #{}: peak yaw kick/tick {} vs P1 {} | peak lateral "
-                    "anchor move/tick {:.2f} vs P1 {:.2f} | capY {} vs P1 {}",
-                    mPlayerId, mWindLogCount, mYawKickPeak, mLinkYawKickPeak, mLateralMovePeak,
-                    mLinkLateralMovePeak, mSwayAngleY[l_capRootJointNo],
+                    "Puppet {} capY inputs #{}: yaw kick/tick mean {:.0f} vs P1 {:.0f} (peak "
+                    "{} vs {}) | proj lateral/tick mean {:.2f} vs P1 {:.2f} (raw peak {:.2f} "
+                    "vs {:.2f}) | still-zero fired {}/{} vs P1 {}/{} | capY mean {:.0f} vs P1 "
+                    "{:.0f} (now {} vs {})",
+                    mPlayerId, mWindLogCount, meanKick, meanLinkKick, mYawKickPeak,
+                    mLinkYawKickPeak, meanProj, meanLinkProj, mLateralMovePeak,
+                    mLinkLateralMovePeak, mStillFired, mProjTicks, mLinkStillFired, mLinkKickTicks,
+                    meanCapY, meanLinkCapY, mSwayAngleY[l_capRootJointNo],
                     windLink != NULL ? windLink->field_0x3040[l_capRootJointNo] : 0);
             }
 
@@ -2041,6 +2097,17 @@ void daRemotePlayer_c::setHatAngle() {
             mLinkYawKickPeak = 0;
             mLateralMovePeak = 0.0f;
             mLinkLateralMovePeak = 0.0f;
+            mYawKickSum = 0;
+            mLinkYawKickSum = 0;
+            mKickTicks = 0;
+            mLinkKickTicks = 0;
+            mProjLateralSum = 0.0f;
+            mLinkProjLateralSum = 0.0f;
+            mCapYSum = 0;
+            mLinkCapYSum = 0;
+            mProjTicks = 0;
+            mStillFired = 0;
+            mLinkStillFired = 0;
             mLinkSampled = false;
         }
     }

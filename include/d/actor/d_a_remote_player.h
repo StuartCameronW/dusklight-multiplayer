@@ -184,13 +184,41 @@ private:
     /* Latches the first room that actually has cap-bending wind, so the search for one stops being
      * guesswork. See setHatAngle(). */
     bool mLoggedWindArea;
-    /* Peak per-tick cap-Y drivers since the last wind log, for the puppet and for the local player
-     * alongside. Sampled every tick and reported as peaks; see setHatAngle() for why a periodic
-     * sample of a per-tick delta would be meaningless. */
+    /* Per-tick cap-Y drivers since the last wind log, for the puppet and for the local player
+     * alongside. Sampled every tick; see setHatAngle() for why a periodic sample of a per-tick
+     * delta would be meaningless.
+     *
+     * ★ Reported as MEAN as well as peak, and the mean is the one that matters. The yaw kick is
+     * subtracted straight into the accumulated angle with no damping on it, so it is a SUSTAINED
+     * kick over consecutive ticks that walks the cap out to the clamp; a lone spike decays back
+     * within about five ticks. A peak alone cannot tell those two apart, and reading matching
+     * peaks as "the inputs agree" is exactly the mistake that sent this the wrong way once. */
     s16 mYawKickPeak;
     s16 mLinkYawKickPeak;
+    s32 mYawKickSum;
+    s32 mLinkYawKickSum;
+    u16 mKickTicks;
+    u16 mLinkKickTicks;
+    /* Raw magnitude of cap-anchor motion, and — separately — that motion PROJECTED onto the head's
+     * sideways axis, which is the term the Y target is actually built from (d_a_alink.cpp:2730).
+     * The two diverge whenever the anchor moves along the look direction, so the raw figure
+     * agreeing says nothing about the projected one. */
     f32 mLateralMovePeak;
     f32 mLinkLateralMovePeak;
+    f32 mProjLateralSum;
+    f32 mLinkProjLateralSum;
+    s32 mCapYSum;
+    s32 mLinkCapYSum;
+    u16 mProjTicks;
+    /* ★ How many ticks in the window each side's STANDING-STILL zeroing actually fired. The at-rest
+     * samples are the ones that matter: with both characters parked and both per-tick inputs
+     * effectively identical, Link's cap Y still wanders by hundreds of units and the puppet's does
+     * not — and atan2s(0.3, 2.0) is about 1550, which is exactly the scale of that wander. So the
+     * suspicion is that the sub-unit anchor jitter an idle animation produces is a real driver of
+     * Link's cap, and that the puppet is throwing it away. These two counters say plainly whether
+     * the branch fires on one side and not the other, instead of inferring it. */
+    u16 mStillFired;
+    u16 mLinkStillFired;
     s16 mPrevLinkHeadYaw;
     bool mPrevLinkHeadYawValid;
     /* True once the local player has been sampled in the current window. Without it a wolf's
