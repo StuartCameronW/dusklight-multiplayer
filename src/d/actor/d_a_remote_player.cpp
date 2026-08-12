@@ -258,8 +258,24 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
-    mpModelMorf = JKR_NEW mDoExt_McaMorfSO(
-        modelData, NULL, NULL, mpIdleAnm, J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0, 0);
+    /* ★ The last two arguments are the model flag and the deferred-display-list flag, and they must
+     * match what every other Link model is built with. They were 0, 0 — which made the BODY the
+     * only model in the scene created as mDoExt_J3DModel__create(data, 0, 0), while its own head,
+     * hands and face go through init_model at (0x80000, 0x11000084), and so does every one of
+     * daAlink_c's models (initModel, d_a_alink_wolf.inc:364-366). A body shaded on different terms
+     * from the head bolted onto it is exactly the seam Stuart reported at the neck: "the puppet's
+     * body is a few shades darker, noticeable by the head, the skin colour to the neck is a bit
+     * different."
+     *
+     * 0x80000 also matters on its own: mDoExt_McaMorfSO::create calls mDoExt_changeMaterial for any
+     * model flag OTHER than 0x80000 (m_Do_ext.cpp:1579-1581), so the old value put the body through
+     * a material rewrite the other three never saw.
+     *
+     * For reference, no actor in the tree passes 0 for the deferred flag: 43 McaMorfSO
+     * constructions use 0x80000 with a 0x1100xxxx deferred flag, of which 0x11000084 — the value
+     * init_model uses — is the most common. */
+    mpModelMorf = JKR_NEW mDoExt_McaMorfSO(modelData, NULL, NULL, mpIdleAnm,
+        J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0x80000, 0x11000084);
     if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
         return 0;
     }
