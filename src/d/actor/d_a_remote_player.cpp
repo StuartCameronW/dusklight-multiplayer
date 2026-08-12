@@ -529,6 +529,42 @@ void daRemotePlayer_c::setMatrix() {
     }
 }
 
+/// Keep the puppet lit by the floor and the room it is actually standing on.
+///
+/// Both inputs otherwise sit at defaults that quietly mis-light it, which is what Stuart saw as
+/// "the body is lit a bit differently than p1":
+///
+///  - `tevStr.YukaCol` is left at 0xFF by dKy_tevstr_init (d_kankyo.cpp:9507). At 0xFF,
+///    settingTevStruct_colget_player takes its fallback branch and pins the light-influence ratio
+///    to 1.0 (d_kankyo.cpp:3166-3170), where Link's is YukaCol/100 (:3160-3165). That ratio scales
+///    both the actor ambient colour and the room light colours, so on any floor whose colour index
+///    is not 100 the puppet is lit at a different intensity from Link on the very same tile.
+///  - `tevStr.room_no` is seeded from home.roomNo at spawn (f_op_actor.cpp:493) and never updated,
+///    so the puppet keeps its spawn room's six light vectors forever
+///    (dKy_setLight_nowroom_actor, d_kankyo.cpp:8775).
+///
+/// Mirrors daMidna_c::setRoomInfo (d_a_midna.cpp:1171-1182) — the game's own answer for a companion
+/// actor with no ground check of its own. Deliberately NOT daAlink_c's version, which reads the
+/// collision result out of his own dBgS_LinkAcch. Midna's reverb line is dropped: a puppet makes no
+/// sound of its own.
+///
+/// fopAcM_gc_c's ground check is static shared state, so the result has to be consumed in the same
+/// breath as the check rather than cached (f_op_actor_mng.h:874-889).
+void daRemotePlayer_c::setRoomInfo() {
+    int room_no;
+    if (fopAcM_gc_c::gndCheck(&current.pos)) {
+        room_no = fopAcM_gc_c::getRoomId();
+        tevStr.YukaCol = fopAcM_gc_c::getPolyColor();
+    } else {
+        // Over a hole, mid-warp, or handed a pose with no floor under it. Keep the last floor
+        // colour and fall back to the room the local player is in, which is the room the puppet is
+        // being drawn into anyway.
+        room_no = dComIfGp_roomControl_getStayNo();
+    }
+    tevStr.room_no = room_no;
+    fopAcM_SetRoomNo(this, room_no);
+}
+
 int daRemotePlayer_c::execute() {
     if (!mHasPose) {
         // No network pose yet. Skipping calc keeps the puppet from flashing at its spawn point.
@@ -558,6 +594,9 @@ int daRemotePlayer_c::execute() {
     // mtx calculators are not on it and cannot be.
     selectAnimation();
     mpModelMorf->play(0, 0);
+    // Before setMatrix, so the ground check runs against the pose the puppet is about to be drawn
+    // at rather than the previous tick's.
+    setRoomInfo();
     setMatrix();
     return 1;
 }
@@ -580,9 +619,31 @@ int daRemotePlayer_c::draw() {
         return 1;
     }
 
-    // 10 is the light type daAlink_c uses for human Link (d_a_alink.cpp:19468), so the puppet is
+    // 10 is the light type daAlink_c uses for human Link (d_a_alink.cpp:19470), so the puppet is
     // lit consistently with the local player rather than as scenery.
+    //
+    // That type carries a sting: the 9/10 path writes SCENE-WIDE state, not just our own tevStr.
+    // settingTevStruct_colget_player drives the room-colour crossfade machine in g_env_light
+    // (d_kankyo.cpp:3185-3197) and the 9/10 branch parks plight_near_pos (:4060-4062), which
+    // dDlst_shadowReal_c::set reads back (d_drawlist.cpp:1318). Until now daAlink_c was the only
+    // caller of type 9/10 in the whole tree; a puppet standing in a differently-coloured room makes
+    // two callers per frame, which flips UseCol/pat_ratio back and forth and would disturb the
+    // LOCAL player's lighting and shadow.
+    //
+    // So take the reading and put the scene back exactly as we found it. The puppet keeps the
+    // tevStr the call computed for it; what it gives up is a vote in a crossfade that should be
+    // driven by the local player alone. Cheap, and entirely contained in Dusk code.
+    const u8 savedUseCol = g_env_light.UseCol;
+    const u8 savedPrevCol = g_env_light.PrevCol;
+    const f32 savedPatRatio = g_env_light.pat_ratio;
+    const cXyz savedPlightNearPos = g_env_light.plight_near_pos;
+
     g_env_light.settingTevStruct(10, &current.pos, &tevStr);
+
+    g_env_light.UseCol = savedUseCol;
+    g_env_light.PrevCol = savedPrevCol;
+    g_env_light.pat_ratio = savedPatRatio;
+    g_env_light.plight_near_pos = savedPlightNearPos;
     drawModel(model);
     // Same order daAlink_c draws them in, which matters for the face: it is drawn after the head so
     // it wins the depth fight at the eyes rather than being buried inside it.

@@ -42,6 +42,8 @@ public:
 private:
     void setMatrix();
     void selectAnimation();
+    /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
+    void setRoomInfo();
     /// Drive the private archive mount forward; returns a cPhs_* step for create() to hand back.
     int mountOwnArchive();
     /// Draw one sub-model, lit like the body. Null-tolerant, so a missing part costs a part.
