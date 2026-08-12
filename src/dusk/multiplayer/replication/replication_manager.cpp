@@ -44,6 +44,7 @@ void ReplicationManager::record_remote(
     }
     it->second.buffer.push(tick, state);
     it->second.latest = state;
+    it->second.latestTick = tick;
     it->second.hasLatest = true;
 }
 

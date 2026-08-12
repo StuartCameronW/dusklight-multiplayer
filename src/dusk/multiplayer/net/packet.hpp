@@ -14,7 +14,7 @@ namespace dusk::mp {
 
 /// Bumped on ANY incompatible wire change. Peers with a mismatched version are rejected at
 /// handshake rather than being allowed to desync in confusing ways later.
-inline constexpr std::uint32_t kProtocolVersion = 2;
+inline constexpr std::uint32_t kProtocolVersion = 3;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -48,7 +48,11 @@ enum class PacketId : std::uint8_t {
     /// Host -> clients, every sim tick on the unreliable channel. Carries every player including
     /// the recipient's own entry (which the recipient skips) so the packet is identical for all
     /// peers and can be serialized once and broadcast.
-    /// [u64 hostTick][u8 count][{u32 playerId, PlayerState} * count]
+    ///
+    /// Each entry carries its OWN originTick — the tick that player captured the pose on, in their
+    /// own clock — rather than being described by the snapshot's hostTick. Poses only interpolate
+    /// correctly on the clock they were produced on; re-stamping them on relay distorts speed.
+    /// [u64 hostTick][u8 count][{u32 playerId, u64 originTick, PlayerState} * count]
     WorldSnapshot = 6,
 
     /// Host -> client, reliable. The full roster at join time, so a client learns about players
@@ -65,7 +69,7 @@ enum class PacketId : std::uint8_t {
 inline constexpr std::uint32_t kHostPlayerId = 0;
 
 /// Ceiling on players in one snapshot. Keeps WorldSnapshot inside a single unfragmented datagram
-/// (8 * 23 bytes + header is comfortably under the ~1200-byte safe MTU).
+/// (8 * 31 bytes + header is comfortably under the ~1200-byte safe MTU).
 inline constexpr std::size_t kMaxPlayers = 8;
 
 }  // namespace dusk::mp

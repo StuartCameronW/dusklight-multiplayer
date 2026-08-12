@@ -6,6 +6,15 @@
 namespace dusk::mp {
 
 void StateBuffer::push(std::uint64_t tick, const PlayerState& state) {
+    // Ticks are the SENDER's, so the timeline stays uniform however jittered arrival was. The cost
+    // is that the origin is not ours: a peer that restarts its session restarts its tick counter,
+    // and every sample would then look hopelessly stale and be dropped forever — a puppet frozen
+    // for the rest of the session. A sample this far behind the cursor is a new origin rather than
+    // a late packet, so start over on it.
+    if (mStarted && static_cast<double>(tick) + kSnapTicks < mPlaybackTick) {
+        reset();
+    }
+
     // Already played past this one — it arrived too late to be useful, so dropping it is strictly
     // better than rewinding the puppet.
     if (mStarted && static_cast<double>(tick) < mPlaybackTick - 1.0) {

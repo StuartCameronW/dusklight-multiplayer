@@ -29,6 +29,11 @@ struct RemotePlayer {
     /// Most recent pose received, kept verbatim for the host to rebroadcast. Distinct from what
     /// the buffer plays back, which is deliberately delayed.
     PlayerState latest;
+    /// The tick `latest` was captured on, in the SENDER's own clock. Rebroadcast alongside the pose
+    /// so a third player interpolates this player on the timeline they actually moved on, rather
+    /// than on whenever the host happened to relay it. Also what makes a re-sent unchanged pose
+    /// identifiable as a duplicate instead of looking like a genuine "stood still for a tick".
+    std::uint64_t latestTick = 0;
     bool hasLatest = false;
 
     /// True once the puppet actor is confirmed alive, so we stop retrying creation every tick.
