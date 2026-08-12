@@ -31,7 +31,7 @@ public:
     int draw();
 
     /// Push an interpolated pose in from the network layer, before the actor pass runs.
-    void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed);
+    void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn);
 
     u32 getPlayerId() const { return mPlayerId; }
     /* Networked speed, which is NOT mirrored into speedF: nothing moves this actor locally, so the
@@ -101,6 +101,11 @@ private:
     /* Horizontal speed from the network. Picks the gait, against the same thresholds daAlink_c
      * uses; it does NOT rate-scale a single cycle. */
     f32 mNetSpeed;
+    /* True on the ticks the SENDER was in daAlink_c::PROC_SLIP. Replicated rather than derived from
+     * the yaw — see kPlayerStateSharpTurn in player_state.hpp for why deriving it inverts the
+     * truth.
+     */
+    bool mNetSharpTurn;
     /* Resource index of the animation currently playing, so setAnm only fires on a real change. */
     u16 mCurrentAnm;
     /* False until the first network pose lands, so the puppet is never drawn at its spawn pose. */
@@ -144,6 +149,9 @@ private:
     J3DAnmTransform* mpIdleAnm;
     J3DAnmTransform* mpWalkAnm;
     J3DAnmTransform* mpRunAnm;
+    /* The skid. Deliberately OPTIONAL — NULL just costs the turn pose, it does not fail createHeap,
+     * because a createHeap failure puts the puppet into a permanent full-speed respawn loop. */
+    J3DAnmTransform* mpSlipAnm;
 
     /* Link is four models. The body is the one the animation drives; these three are posed off its
      * joints every frame in setMatrix(). Any of them may be NULL — a puppet missing a head is a
