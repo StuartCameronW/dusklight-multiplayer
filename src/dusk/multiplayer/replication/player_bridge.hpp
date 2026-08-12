@@ -28,9 +28,21 @@ bool world_is_playable();
 /// in which case nothing should be sent this tick.
 bool capture_local_player(PlayerState& out);
 
-/// Create the puppet actor for `playerId` if it isn't alive yet. Returns false when creation isn't
-/// possible right now (no scene loaded, allocation refused) — callers just retry next tick.
-bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb);
+/// Create the puppet actor for `playerId` if it isn't alive yet, wearing the outfit the sender
+/// reported. Returns false when creation isn't possible right now (no scene loaded, allocation
+/// refused) — callers just retry next tick.
+///
+/// Calling it every tick is correct and cheap: it owns the whole spawn policy, including backing
+/// off after a failed creation and eventually disabling a puppet that will not come up. A false
+/// return therefore does NOT mean "try harder"; it means there is no puppet this tick, for a reason
+/// the log already carries. See the failure-policy block at the top of player_bridge.cpp.
+bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit);
+
+/// Destroy `playerId`'s puppet if it is wearing an outfit the sender is no longer in, so the next
+/// ensure_puppet() rebuilds it in the right clothes. Returns true when it did — the caller should
+/// skip the rest of this tick for that player. No-op when the puppet is absent, still being
+/// created, or already dressed correctly.
+bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit);
 
 /// Push an interpolated pose onto an existing puppet. No-op if the puppet isn't alive.
 void apply_puppet_state(std::uint32_t playerId, const PlayerState& state);

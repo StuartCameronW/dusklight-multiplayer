@@ -1,6 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
+#include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
 #include "d/d_resorce.h"
 #include "f_op/f_op_actor.h"
@@ -31,9 +32,22 @@ public:
     int draw();
 
     /// Push an interpolated pose in from the network layer, before the actor pass runs.
-    void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed);
+    void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn);
 
     u32 getPlayerId() const { return mPlayerId; }
+    /* Index into the outfit table of the archive this puppet ACTUALLY mounted, which is not
+     * necessarily the byte that arrived on the wire — see daRemotePlayer_outfitFromWire. The
+     * network layer compares against this to notice a clothes change. */
+    int getOutfit() const { return mOutfit; }
+
+    /* ★ Set on the LAST line of create(), so it is true only for a puppet that got all the way
+     * through. The network layer needs this because "the actor framework can find this id" does
+     * NOT mean creation succeeded — measured: with createHeap forced to fail, create() logs its
+     * failure and returns cPhs_ERROR_e, and fopAcM_SearchByID still hands the actor back on the
+     * following tick. Inferring success from findability therefore marked a permanently failing
+     * puppet as "it was alive once", which classified every subsequent failure as a vanish and
+     * respawned it at full speed forever — the exact bug the spawn policy exists to stop. */
+    bool createComplete() const { return mCreateComplete; }
     /* Networked speed, which is NOT mirrored into speedF: nothing moves this actor locally, so the
      * inherited field would read as a permanent zero and misreport the puppet as standing still. */
     f32 getNetSpeed() const { return mNetSpeed; }
@@ -46,6 +60,7 @@ private:
     void setMatrix();
     void selectAnimation();
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
+    void groundCheck();
     void setRoomInfo();
     /// Attach the blink texture animations to the face's eye materials. Once, at createHeap time.
     bool setupFaceAnimation();
@@ -92,6 +107,10 @@ private:
     int mountOwnArchive();
     /// Draw one sub-model, lit like the body. Null-tolerant, so a missing part costs a part.
     void drawModel(J3DModel* i_model);
+    /// Register the puppet's projected shadow for this frame. Must run every draw, and last, since
+    /// it wants the models already posed. No one-time setup to pair with it: the shadow slots are
+    /// static in the draw list and mShadowKey starts at 0 courtesy of fopAcM_ct.
+    void shadowDraw();
 
     /* Which replicated player this puppet represents; arrives as the create parameter. */
     u32 mPlayerId;
@@ -101,6 +120,11 @@ private:
     /* Horizontal speed from the network. Picks the gait, against the same thresholds daAlink_c
      * uses; it does NOT rate-scale a single cycle. */
     f32 mNetSpeed;
+    /* True on the ticks the SENDER was in daAlink_c::PROC_SLIP. Replicated rather than derived from
+     * the yaw — see kPlayerStateSharpTurn in player_state.hpp for why deriving it inverts the
+     * truth.
+     */
+    bool mNetSharpTurn;
     /* Resource index of the animation currently playing, so setAnm only fires on a real change. */
     u16 mCurrentAnm;
     /* False until the first network pose lands, so the puppet is never drawn at its spawn pose. */
@@ -108,6 +132,10 @@ private:
     /* Latches the outfit choice, so create() being re-entered while the mount completes cannot
      * change which body we are loading half way through. */
     bool mOutfitChosen;
+    /// See createComplete(). Zero at spawn via fopAcM_ct's zeroing of the actor.
+    bool mCreateComplete;
+    /// Latches the one-shot "the shadow was actually granted" line; see shadowDraw().
+    bool mLoggedShadow;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
@@ -144,6 +172,9 @@ private:
     J3DAnmTransform* mpIdleAnm;
     J3DAnmTransform* mpWalkAnm;
     J3DAnmTransform* mpRunAnm;
+    /* The skid. Deliberately OPTIONAL — NULL just costs the turn pose, it does not fail createHeap,
+     * because a createHeap failure puts the puppet into a permanent full-speed respawn loop. */
+    J3DAnmTransform* mpSlipAnm;
 
     /* Link is four models. The body is the one the animation drives; these three are posed off its
      * joints every frame in setMatrix(). Any of them may be NULL — a puppet missing a head is a
@@ -278,6 +309,111 @@ private:
     /* False until mCapAnchorPrev holds a real sample. Without it the first tick reads the whole
      * distance from the world origin as one frame of velocity and flings the cap. */
     bool mSwayInited;
+
+    /* Handle for this puppet's entry in the global real-shadow list, exactly
+     * daAlink_c::field_0x31a4 (d_a_alink.cpp:19246) and daCow_c::mShadowKey. It is re-issued every
+     * frame — the list is reset wholesale each frame (dDlst_list_c::reset, d_drawlist.cpp:1940) and
+     * setReal hands out a fresh id (:1761-1762) — so this is really "the id valid for the frame
+     * being drawn", used to hang the head, face and hand models off the same shadow the body
+     * opened. Kept as a member rather than a local because that is the shape every caller in the
+     * tree uses, and because dComIfGd_setShadow still takes the previous key as its first argument
+     * even though the current decomp ignores it. Zero at spawn via fopAcM_ct's zeroing of the
+     * actor. */
+    u32 mShadowKey;
+
+    /* ★ The puppet's OWN ground check, and the height it last found.
+     *
+     * It cannot use fopAcM_gc_c::gndCheck(&current.pos), which is what it did before, and the
+     * reason is worth writing down because the failure is silent and total:
+     *
+     * The bg ground test is "the highest floor strictly BELOW the query point", and the `strictly`
+     * is literal — cBgW::RwgGroundCheckCommon compares `cy < pgndchk->GetPointP().y`
+     * (d_bg_w.cpp:606-625), so a floor at EXACTLY the query height is rejected. Meanwhile every
+     * grounded actor in the game finishes its tick standing at exactly the floor height, because
+     * dBgS_Acch::GroundCheck writes pos.y = ground_h (d_bg_s_acch.cpp:164-167). The puppet
+     * replicates the sender's already-snapped position verbatim, so asking from the feet is asking
+     * for a floor strictly below a point that is ON the floor. Measured: 800 consecutive failures
+     * for a standing puppet; the only successes were the settling frames right after a load, and
+     * frames where the sender happened to be airborne.
+     *
+     * daAlink_c never hits this because he does not use fopAcM_gc_c at all for his own footing — he
+     * reads mLinkAcch.m_gnd (d_a_alink.cpp:5134, :19246), filled by a query raised 60 units above
+     * the feet. So do the same thing here, with the same 60: it is dBgS_Acch's own
+     * m_gnd_chk_offset default (d_bg_s_acch.cpp:65) rather than a number invented for this actor.
+     *
+     * A full dBgS_Acch was the other candidate and is deliberately NOT used: CrrPos() WRITES
+     * pos.y and zeroes speed.y (d_bg_s_acch.cpp:166-169), which would let local collision overrule
+     * a position the wire owns, and its line check runs against an old_pos that means nothing for
+     * an interpolated actor. The one thing given up by not using it is the thin-ceiling clamp
+     * (:148-157), which matters only where a floor sits under 60 units below a ceiling. */
+    dBgS_ObjGndChk mGndChk;
+    f32 mGroundHeight;
+    /* False when the puppet genuinely has no floor under it — over a pit, mid-warp, or airborne.
+     * Distinct from "we failed to ask properly", which is what the old code could not tell apart.
+     */
+    bool mGroundValid;
 };
+
+/**
+ * How the puppet's fopAcM_create parameter is packed: the player id in the low 24 bits, the wire
+ * outfit byte in the high 8.
+ *
+ * The parameter is used because create() needs the outfit at its VERY FIRST entry — the archive
+ * mount it kicks off is multi-phase and re-entered over several frames, so there is no later moment
+ * at which the choice could still be made. The create parameter is the only channel already in
+ * place then; a setter on the actor would arrive after the mount had started, and a "next puppet
+ * wears X" static would race with a second player joining on the same tick.
+ *
+ * 24 bits is not a practical limit: player ids come from a monotonic counter starting at 1
+ * (network_manager.hpp) and a session holds at most kMaxPlayers of them.
+ */
+const u32 daRemotePlayer_playerIdMask = 0x00FFFFFF;
+const u8 daRemotePlayer_outfitParamShift = 24;
+
+/**
+ * Resolve a replicated outfit byte to an index into the puppet's outfit table.
+ *
+ * The table is file-static in d_a_remote_player.cpp and stays there — this is the one accessor both
+ * ends of the engine seam call, so "which outfit is 2?" has exactly one answer and the network
+ * layer never grows a second copy of the list.
+ *
+ * Anything the table does not name resolves to the hero's clothes rather than refusing to draw:
+ * 0xFF ("nobody has reported an outfit"), a peer built against a longer table, or a byte mangled in
+ * an unreliable packet. Callers that compare a wire byte against a live puppet's outfit MUST
+ * compare the resolved values — see dusk::mp::reconcile_puppet_outfit.
+ */
+int daRemotePlayer_outfitFromWire(u8 i_wireOutfit);
+
+/**
+ * The local player's current outfit, as the byte to put on the wire.
+ *
+ * Wolf is deliberately not an outfit: Wmdl has its own skeleton and animation set, so it is absent
+ * from the table and a wolf reports the hero's clothes. A transformed player therefore looks like a
+ * human Link to everyone else until transform replication exists — the same fallback the puppet has
+ * always had, just now decided by the wearer.
+ */
+u8 daRemotePlayer_localOutfitToWire();
+
+/**
+ * Why the last puppet creation attempt failed, for the network layer's spawn backoff
+ * (src/dusk/multiplayer/replication/player_bridge.cpp).
+ *
+ * The framework tells the bridge THAT a creation failed — it cancels the create request, which the
+ * bridge sees as an id that is neither creating nor in the actor layer — but it cannot tell it why.
+ * Without a reason the "gave up on this puppet" line would be exactly the kind of message that
+ * hides a real bug behind a shrug, so create() leaves one here.
+ *
+ * A global rather than a call into dusk::mp, so the dependency keeps pointing the one way it
+ * already does: the bridge includes this header and nothing under src/dusk/multiplayer is included
+ * from here. The player id is carried alongside so a reason left behind by a DIFFERENT puppet's
+ * failure is detectable rather than silently misattributed; the bridge clears the reason as it
+ * takes it. mReason is always a string literal, so there is no lifetime to manage.
+ */
+struct daRemotePlayer_createFail_c {
+    u32 mPlayerId;
+    const char* mReason;
+};
+
+extern daRemotePlayer_createFail_c g_daRemotePlayer_lastCreateFail;
 
 #endif /* D_A_REMOTE_PLAYER_H */

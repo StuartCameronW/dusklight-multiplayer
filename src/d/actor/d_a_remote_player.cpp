@@ -232,6 +232,21 @@ const u16 l_walkAnmIdx = dRes_ID_ALANM_BCK_WALKS_e;
  * this is the cycle the local player runs on — not a faster playback of the walk.
  */
 const u16 l_runAnmIdx = dRes_ID_ALANM_BCK_DASHS_e;
+/* The sharp turn: the skid Link plants when the stick is flicked back at speed. This is ANM_SLIP's
+ * m_underID in the same table (index 0x028, d_a_alink.cpp:323), reached from
+ * daAlink_c::procSlipInit (d_a_alink.cpp:16673-16675).
+ *
+ * ★ There is no left/right variant to get backwards, and that is worth stating because two other
+ * "turn" animations in this game DO have one and are MISNAMED in the decomp header: ANM_STEP_TURN
+ * (STEPL) and ANM_SMALL_GUARD (STEPR) are the left and right halves of one standing pivot — the
+ * game picks between them purely on the sign of the yaw delta (d_a_alink.cpp:7709-7713 and
+ * :17776-17779) and tests them as a pair (:15539). ANM_SLIP has no such twin: its table entry is
+ * {SLIP, SLIP}, because the skid is a straight-ahead brake. Link's actual 180 happens AFTERWARDS,
+ * in PROC_MOVE_TURN, and that is carried by shape_angle.y, which the puppet already replicates
+ * exactly (player_bridge.cpp samples link->shape_angle.y). So the pose and the yaw cannot disagree
+ * about direction here — there is only one direction the pose can mean.
+ */
+const u16 l_slipAnmIdx = dRes_ID_ALANM_BCK_SLIP_e;
 
 /* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
 enum AnmFamily {
@@ -275,6 +290,15 @@ const u16 l_blinkBtkIdx = dRes_ID_ALANM_BTK_FMABA01_e;
  * 83 ticks, i.e. every ~2.8 s at 30 Hz.
  */
 const f32 l_blinkChance = 0.012f;
+
+/* How far ABOVE the puppet's feet to ask the bg system for the floor.
+ *
+ * Not a number picked for this actor: it is dBgS_Acch's own m_gnd_chk_offset default
+ * (d_bg_s_acch.cpp:65), i.e. the raise every grounded actor in the game already queries from. The
+ * ground test rejects a floor at exactly the query height (cBgW::RwgGroundCheckCommon's strict
+ * `cy < y`, d_bg_w.cpp:606-625) and grounded actors stand at exactly floor height, so querying
+ * from the feet finds nothing at all. See the mGndChk comment in the header. */
+const f32 l_gndCheckOffset = 60.0f;
 
 /* The two eye materials on the face model. Confirmed for Link at d_a_alink_wolf.inc:501-502 — they
  * are the only two that ever receive a J3DMaterialAnm. Range-checked at use anyway: the material
@@ -398,17 +422,19 @@ const f32 l_idleSpeedThreshold = 0.5f;
 const f32 l_gaitHysteresis = 0.05f;
 
 /**
- * Which outfit archive a puppet should wear.
+ * Which outfit archive the LOCAL player is wearing, as an index into l_outfits.
  *
- * ★ Placeholder: this currently mirrors the LOCAL player. Stuart's rule (2026-08-12) is that
- * appearance is owned by the wearer — whatever P2 is wearing on their own screen is what P1 should
- * see — so this becomes a replicated property of the sender. It is not one yet; PlayerState does
- * not carry the outfit. Matching the local player is the right placeholder because it is correct in
- * the common case (both players in the same clothes) and, unlike the arrangement it replaces, it no
- * longer deliberately shows the WRONG clothes.
+ * This is now a SENDER-side question only. It used to decide what a puppet wore, which was a
+ * placeholder: it was right whenever both players happened to be dressed alike and wrong the moment
+ * they were not. Appearance is owned by the wearer, so the answer is sampled here, put on the wire
+ * (PlayerState::outfit), and the puppet is dressed from the sender's byte instead.
  *
- * Wolf is not an outfit swap. Wmdl has its own skeleton and animation set, so a wolf owner falls
- * back to the hero's clothes and looks like a human Link until transform replication exists.
+ * daAlink_c::setArcName (d_a_alink_swindow.inc:14-25) picks the archive name from the wear flags,
+ * so his own mArcName is the authoritative answer and cannot drift from what is on his screen.
+ *
+ * Wolf is not an outfit swap. mArcName is Wmdl then, which is deliberately absent from l_outfits
+ * because Wmdl has its own skeleton and animation set, so it falls through to the hero's clothes
+ * and a wolf looks like a human Link to everyone else until transform replication exists.
  */
 int outfit_index_for_local_player() {
     const daAlink_c* link = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
@@ -550,6 +576,19 @@ int daRemotePlayer_c::createHeap() {
     mpRunAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_runAnmIdx, ANM_FAMILY_TRANSFORM));
     if (mpIdleAnm == NULL || mpWalkAnm == NULL || mpRunAnm == NULL) {
         return 0;
+    }
+
+    /* The skid, loaded on the SAME family-checked path as the gaits (see anm_kind_matches: a BCK
+     * arrives as J3DAnmTransformKey/TransformFull/TransformFullWithLerp, never as a bare
+     * J3DAnmTransform, so this must be a family test).
+     *
+     * ★ Deliberately NOT joined to the fatal check above. A puppet that cannot play the turn pose
+     * is a puppet with one animation missing; a puppet that fails createHeap is deleted and
+     * respawned every couple of ticks forever, mounting an archive each time. Trading the first
+     * failure for the second would be a bad bargain, so this one degrades to the gait instead. */
+    mpSlipAnm = static_cast<J3DAnmTransform*>(load_aram_anm(l_slipAnmIdx, ANM_FAMILY_TRANSFORM));
+    if (mpSlipAnm == NULL) {
+        Log.warn("Puppet has no sharp-turn animation; turns will play the gait instead");
     }
 
     /* ★ The last two arguments are the model flag and the deferred-display-list flag, and they must
@@ -716,6 +755,23 @@ static int daRemotePlayer_createHeap(fopAc_ac_c* i_this) {
     return static_cast<daRemotePlayer_c*>(i_this)->createHeap();
 }
 
+/* --- The outfit seam. These two are the only way the network layer touches l_outfits; the table
+ * itself stays file-static so there is exactly one copy of it in the program. */
+
+int daRemotePlayer_outfitFromWire(u8 i_wireOutfit) {
+    if (i_wireOutfit >= l_outfitNum) {
+        // Not a name we know. Reasons range from benign (0xFF, nobody has reported an outfit yet)
+        // to hostile (a corrupted byte out of an unreliable packet), and all of them are better
+        // answered with a Link in the hero's clothes than with an out-of-bounds table read.
+        return l_defaultOutfit;
+    }
+    return i_wireOutfit;
+}
+
+u8 daRemotePlayer_localOutfitToWire() {
+    return static_cast<u8>(outfit_index_for_local_player());
+}
+
 /**
  * Mount this puppet's OWN copy of the outfit archive.
  *
@@ -766,16 +822,41 @@ int daRemotePlayer_c::mountOwnArchive() {
     return cPhs_COMPLEATE_e;
 }
 
+/* Read and cleared by the network layer's spawn backoff; see d_a_remote_player.h. */
+daRemotePlayer_createFail_c g_daRemotePlayer_lastCreateFail = {0, NULL};
+
 int daRemotePlayer_c::create() {
     fopAcM_ct(this, daRemotePlayer_c);
 
+    /* Both halves of the create parameter, read up front. mPlayerId used to be assigned after the
+     * heap pass; it is set here instead so the mount, and every log line before that point, can
+     * name the player it belongs to. fopAcM_ct only constructs once (it is gated on
+     * fopAcCnd_INIT_e), so re-entry while the archive mounts re-reads the same parameter. */
+    const u32 param = fopAcM_GetParam(this);
+    mPlayerId = param & daRemotePlayer_playerIdMask;
+
     if (!mOutfitChosen) {
-        mOutfit = outfit_index_for_local_player();
+        /* ★ The SENDER's outfit, carried in the create parameter — not the local player's, which is
+         * what this used to copy. Appearance is owned by the wearer: if the other player is in the
+         * Zora armour, that is what we mount, whatever we happen to be wearing ourselves.
+         *
+         * Still latched. create() is re-entered every frame until the mount finishes, and letting
+         * the target change half way through would leave mOwnRes mounting one archive while
+         * createHeap() looked up model names from another. A clothes change that lands mid-mount is
+         * picked up afterwards, by respawning the actor — see dusk::mp::reconcile_puppet_outfit. */
+        mOutfit = daRemotePlayer_outfitFromWire(
+            static_cast<u8>(param >> daRemotePlayer_outfitParamShift));
         mOutfitChosen = true;
     }
 
     const int mountPhase = mountOwnArchive();
     if (mountPhase != cPhs_COMPLEATE_e) {
+        /* cPhs_LOADING_e here is the normal case and must NOT be reported as a failure — the mount
+         * legitimately takes many frames. Only the error step is worth recording. */
+        if (mountPhase == cPhs_ERROR_e) {
+            g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
+            g_daRemotePlayer_lastCreateFail.mReason = "the private archive mount failed";
+        }
         return mountPhase;
     }
 
@@ -783,10 +864,17 @@ int daRemotePlayer_c::create() {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
+        /* ★ mPlayerId, NOT fopAcM_GetParam(this). The create parameter is no longer the player id
+         * on its own — it carries the outfit in its top byte — so keying the reason on the raw
+         * parameter made every lookup miss and the give-up line read "not reported by the actor".
+         * Measured; the two halves of that change landed together and neither could see the other.
+         */
+        g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
+        g_daRemotePlayer_lastCreateFail.mReason =
+            "the 0x20000 solid heap, or one of the models/animations createHeap() loads into it";
         return cPhs_ERROR_e;
     }
 
-    mPlayerId = fopAcM_GetParam(this);
     mCurrentAnm = l_idleAnmIdx;
     model = mpModelMorf->getModel();
 
@@ -803,6 +891,9 @@ int daRemotePlayer_c::create() {
     // exact place the original crash happened.
     Log.info("Puppet for player {} wearing '{}' from its own archive copy", mPlayerId,
         l_outfits[mOutfit].arcName);
+    // Last line, deliberately: this is the network layer's ONLY trustworthy "creation succeeded"
+    // signal. See createComplete() in the header for why findability is not one.
+    mCreateComplete = true;
     return cPhs_COMPLEATE_e;
 }
 
@@ -821,13 +912,17 @@ static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
     return 1;
 }
 
-void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed) {
+void daRemotePlayer_c::setNetworkPose(
+    const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn) {
     current.pos = i_pos;
     shape_angle.y = i_angleY;
     // The logical angle is kept in step so anything that reads current.angle (audio, effects) sees
     // a sane value, even though only shape_angle drives the model matrix.
     current.angle.y = i_angleY;
     mNetSpeed = i_speed;
+    // Written every tick before execute() can reach selectAnimation() — execute() returns early
+    // until mHasPose, which is set right below — so this needs no separate initialisation.
+    mNetSharpTurn = i_sharpTurn;
     mHasPose = true;
 }
 
@@ -851,6 +946,38 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_spe
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
+
+    /* The sharp turn wins over the gait outright, exactly as it does for the local player:
+     * PROC_SLIP is a proc of its own and setSingleAnimeParam replaces the move blend wholesale, it
+     * does not layer over it (d_a_alink.cpp:16675). Taken FIRST and returned from, so the gait code
+     * below cannot then overwrite the play speed with a walk/run rate.
+     *
+     * Every playback parameter is daAlink_c's own mSlideAnm, read from daAlinkHIO_move_c0::m rather
+     * than copied — the same single-source rule the gait thresholds already follow. That is start
+     * frame 3.0, end frame 11, rate 0.7 and a 4.0-frame morf in (d_a_alink_HIO_data.inc:34-40), so
+     * the puppet's blend INTO the skid is the player's own interpolation rather than the 5.0f the
+     * gait switch uses, and cannot fight it.
+     *
+     * ★ One deliberate divergence: the play mode is pinned to EMode_NONE (play once, hold the last
+     * frame) instead of taking the BCK's own attribute the way commonSingleAnime does
+     * (d_a_alink.cpp:7180). daAlink_c can afford the asset's mode because his state machine leaves
+     * PROC_SLIP within about ten ticks under its own power; the puppet has no state machine and
+     * leaves only when the wire says so — and StateBuffer HOLDS the last sample while starved
+     * (state_buffer.cpp:164-169). If that held sample had the bit set and the animation looped, a
+     * lagging puppet would skid on the spot over and over, which reads as a bug rather than as the
+     * lag it is. Holding the final frame degrades to a puppet frozen mid-skid, which reads as lag.
+     */
+    if (mNetSharpTurn && mpSlipAnm != NULL) {
+        if (mCurrentAnm != l_slipAnmIdx) {
+            const daAlinkHIO_anm_c& slide = hio.mSlideAnm;
+            mpModelMorf->setAnm(mpSlipAnm, J3DFrameCtrl::EMode_NONE, slide.mInterpolation,
+                slide.mSpeed, slide.mStartFrame, static_cast<f32>(slide.mEndFrame));
+            mCurrentAnm = l_slipAnmIdx;
+        }
+        // The idle-frame probe below counts consecutive IDLE ticks; a skid is not one of them.
+        mIdleTicks = 0;
+        return;
+    }
 
     // Midpoint of the band daAlink_c cross-fades over, i.e. where its blend weight passes 0.5.
     const f32 runFraction = 0.5f * (hio.mWalkChangeRate + hio.mRunChangeRate);
@@ -2214,18 +2341,35 @@ void daRemotePlayer_c::setMatrix() {
 ///    so the puppet keeps its spawn room's six light vectors forever
 ///    (dKy_setLight_nowroom_actor, d_kankyo.cpp:8775).
 ///
-/// Mirrors daMidna_c::setRoomInfo (d_a_midna.cpp:1171-1182) — the game's own answer for a companion
-/// actor with no ground check of its own. Deliberately NOT daAlink_c's version, which reads the
-/// collision result out of his own dBgS_LinkAcch. Midna's reverb line is dropped: a puppet makes no
-/// sound of its own.
-///
-/// fopAcM_gc_c's ground check is static shared state, so the result has to be consumed in the same
-/// breath as the check rather than cached (f_op_actor_mng.h:874-889).
+/// ★ This was written to mirror daMidna_c::setRoomInfo (d_a_midna.cpp:1171-1182), on the reasoning
+/// that Midna is the game's own answer for a companion actor with no ground check of its own. That
+/// was the WRONG template and it silently did nothing: Midna's query works only because she HOVERS,
+/// so her origin is above the floor. Measured on a standing puppet, the fopAcM_gc_c query it used
+/// failed 800 times out of 800 and this function took its fallback branch for the puppet's whole
+/// life. It now reads daAlink_c's version instead — the collision result out of the actor's own
+/// ground-check member — which is what every grounded actor in the tree does. Midna's reverb line
+/// is still dropped: a puppet makes no sound of its own.
+/**
+ * Find the floor under the puppet, into the actor's OWN check object.
+ *
+ * Run once per tick from execute(), so the draw pass reads a settled answer instead of asking the
+ * bg system a second time — and so mGndChk still describes THIS puppet's floor when the shadow
+ * wants it. See the mGndChk comment in the header for why the query is raised and why the shared
+ * fopAcM_gc_c static cannot do this job.
+ */
+void daRemotePlayer_c::groundCheck() {
+    cXyz probe = current.pos;
+    probe.y += l_gndCheckOffset;
+    mGndChk.SetPos(&probe);
+    mGroundHeight = dComIfG_Bgsp().GroundCross(&mGndChk);
+    mGroundValid = mGroundHeight != -G_CM3D_F_INF;
+}
+
 void daRemotePlayer_c::setRoomInfo() {
     int room_no;
-    if (fopAcM_gc_c::gndCheck(&current.pos)) {
-        room_no = fopAcM_gc_c::getRoomId();
-        tevStr.YukaCol = fopAcM_gc_c::getPolyColor();
+    if (mGroundValid) {
+        room_no = dComIfG_Bgsp().GetRoomId(mGndChk);
+        tevStr.YukaCol = dComIfG_Bgsp().GetPolyColor(mGndChk);
     } else {
         // Over a hole, mid-warp, or handed a pose with no floor under it. Keep the last floor
         // colour and fall back to the room the local player is in, which is the room the puppet is
@@ -2282,6 +2426,8 @@ int daRemotePlayer_c::execute() {
     playFaceTextureAnime();
     // Before setMatrix, so the ground check runs against the pose the puppet is about to be drawn
     // at rather than the previous tick's.
+    traceCalc("groundCheck");
+    groundCheck();
     traceCalc("setRoomInfo");
     setRoomInfo();
     traceCalc("setMatrix");
@@ -2329,6 +2475,113 @@ void daRemotePlayer_c::drawModel(J3DModel* i_model) {
     daMirror_c::entry(i_model);
 }
 
+/// Cast the puppet's shadow onto the floor, the same way the local player casts his.
+///
+/// Without this the puppet is the only character in the scene standing on nothing, which reads as
+/// "pasted on top of the world" far more strongly than any shading difference does. daAlink_c does
+/// it in `shadowDraw()` (d_a_alink.cpp:19201-19362) and this is that function with everything
+/// player-specific removed — no horse, no boar, no canoe, no Midna, no held item, no boots.
+///
+/// **This is the REAL (projected) shadow, not the simple blob.** That was a deliberate choice
+/// between the two APIs, and the blob was the tempting one because it is cheaper and cannot fail:
+///
+///  - `dComIfGd_setSimpleShadow` draws a flat round texture on the ground plane. A round blob
+///    parked next to the local player's crisp silhouette would itself be the tell we are trying to
+///    remove — it would say "that one is not a real character" every bit as loudly as no shadow.
+///  - `dComIfGd_setShadow` (d_com_inf_game.cpp:2277-2288) projects the actual models. Checked
+///    before committing to it: nothing on that path touches the local player. It forwards to
+///    `dDlst_shadowControl_c::setReal` -> `dDlst_shadowReal_c::set` -> `setShadowRealMtx`
+///    (d_drawlist.cpp:1692, :1308, :1245), and the only place that path reaches for player-ish
+///    global state is `dKy_plight_near_pos()` at d_drawlist.cpp:1318 — which is the `tevStr ==
+///    NULL` branch, and we pass ours. There is no `daPy_getPlayerActorClass()` anywhere in
+///    d_drawlist.cpp (grepped), so the unguarded deref that 00-status.md warns about in the
+///    type-9/10 lighting path has no counterpart here. This adds no new exposure to a teardown
+///    window in which the puppet draws and Link does not; `draw()` already calls
+///    `settingTevStruct(10, ...)`, which is the call that carries that risk, and this changes
+///    nothing about it.
+///
+/// The cost is one of the **eight** global real-shadow slots (`dDlst_shadowControl_c::mReal[8]`,
+/// d_drawlist.h:314), so two players spend two. When all eight are taken `setReal` returns 0 and
+/// the newest caller simply gets no shadow that frame (d_drawlist.cpp:1738-1741) — a graceful
+/// degradation the game already lives with. The local player can never be the one to lose out:
+/// daAlink_c is created before any puppet, so at equal draw priority he registers first.
+///
+/// Zero heap cost. Every slot is in the statically allocated draw list; the only new storage is
+/// `mShadowKey`, four bytes in the actor struct, which is not on the 0x20000 solid heap at all.
+void daRemotePlayer_c::shadowDraw() {
+    if (model == NULL) {
+        return;
+    }
+
+    /* The ground under the puppet's feet, found during execute() by groundCheck() into this
+     * actor's own mGndChk. Deliberately NOT re-queried here: the shared fopAcM_gc_c static that
+     * this used to call cannot answer the question at all for a grounded actor (header comment),
+     * and a per-actor member is exactly what daAlink_c reads at the same point
+     * (mLinkAcch.m_gnd, d_a_alink.cpp:19246), so there is no stale-static hazard to dodge. */
+    if (!mGroundValid) {
+        // Over a hole, mid-warp, or handed a pose with no floor under it. No ground, no shadow —
+        // and this is dComIfGd_setShadow's own guard restated (d_com_inf_game.cpp:2280), so we are
+        // only declining a call that would have declined itself.
+        mShadowKey = 0;
+        return;
+    }
+
+    const f32 groundY = mGroundHeight;
+
+    /* Shadow centre = the body model's ROOT JOINT in world space, NOT current.pos. daAlink_c feeds
+     * `field_0x3834` (d_a_alink.cpp:19226), which is exactly this quantity (:5605). It matters
+     * because the root joint carries the animation's own translation, so the shadow leans and
+     * slides with the pose instead of staying pinned under the actor origin. Valid by this point:
+     * setMatrix() ran modelCalc() during execute(), and draw() has already returned early if no
+     * network pose has landed. */
+    cXyz shadowPos;
+    mDoMtx_multVecZero(model->getAnmMtx(0), &shadowPos);
+
+    /* Argument by argument against daAlink_c's call (d_a_alink.cpp:19246):
+     *
+     *  - water flag 0. Link computes `mWaterY > groundH`, and on dry land that is 0 for him too —
+     *    including while airborne, since mWaterY is -inf with no water — so 0 reproduces his
+     *    behaviour exactly everywhere except over water, where his shadow fades with height and
+     *    ours would not. Water state is not replicated at all yet, and faking a bg water query here
+     *    would buy a fade nobody can see under a swimming puppet. Revisit when water is on the
+     *    wire.
+     *  - 800.0f radius and the trailing 0, 1.0f, simple-texture arguments are Link's verbatim, so
+     *    the puppet's shadow is sized and shaped like his rather than merely present.
+     *  - current.pos.y as the caster height. Link passes the lower of his two target cylinders'
+     *    centres, which `setCollisionPos` places at foot level (d_a_alink.cpp:6721-6738), so the
+     *    height-above-ground this resolves to is ~0 while grounded and grows in the air. The actor
+     *    origin is at the feet, so current.pos.y is that same quantity. daCow_c passes exactly this
+     *    pair for the same reason (d_a_cow.cpp:3256-3258).
+     *  - &tevStr, not NULL. Non-null is what keeps `dDlst_shadowReal_c::set` on its own light
+     *    direction (mLightPosWorld, filled by the settingTevStruct(10) call above) instead of
+     *    falling through to the scene-global one — and, incidentally, out of the branch at
+     *    d_drawlist.cpp:1324 that writes through a pointer it has just proven to be NULL. */
+    mShadowKey = dComIfGd_setShadow(mShadowKey, 0, model, &shadowPos, 800.0f, 0.0f, current.pos.y,
+        groundY, mGndChk, &tevStr, 0, 1.0f, dDlst_shadowControl_c::getSimpleTex());
+
+    /* One line, once, the first time a shadow is actually granted. This feature fails SILENTLY —
+     * setReal declines for several reasons and simply returns 0, and the puppet then looks exactly
+     * as it did when it had no shadow code at all. That is how the original ground-check bug
+     * survived: the code was present, compiled, called every frame, and never once succeeded. If
+     * this line is absent from a session's log, the puppet had no shadow for the whole session. */
+    if (mShadowKey != 0 && !mLoggedShadow) {
+        mLoggedShadow = true;
+        Log.debug("Puppet {} shadow registered (key {}, ground {:.1f}, {:.1f} above it)", mPlayerId,
+            mShadowKey, groundY, current.pos.y - groundY);
+    }
+
+    if (mShadowKey != 0) {
+        // The other three models cast into the SAME shadow, so the silhouette has a head and hands
+        // rather than being a decapitated torso. Null-tolerant by the API's own contract:
+        // dDlst_shadowReal_c::add returns false for a NULL model (d_drawlist.cpp:1355-1357), so a
+        // missing sub-model costs that part of the outline and nothing else. Same set, same order,
+        // as daAlink_c (d_a_alink.cpp:19277-19279).
+        dComIfGd_addRealShadow(mShadowKey, mpHeadModel);
+        dComIfGd_addRealShadow(mShadowKey, mpFaceModel);
+        dComIfGd_addRealShadow(mShadowKey, mpHandModel);
+    }
+}
+
 int daRemotePlayer_c::draw() {
     if (!mHasPose) {
         return 1;
@@ -2367,6 +2620,11 @@ int daRemotePlayer_c::draw() {
     drawModel(mpHeadModel);
     drawModel(mpFaceModel);
     drawModel(mpHandModel);
+    // Last, exactly where daAlink_c puts it (d_a_alink.cpp:19849-19853): the shadow projects the
+    // models, so it wants them posed and their tevStr settled, and it renders in its own later pass
+    // rather than into the draw list we have just filled.
+    traceCalc("draw: shadow");
+    shadowDraw();
     traceCalc("draw done");
     return 1;
 }
