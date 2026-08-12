@@ -217,18 +217,9 @@ const u16 l_capRootJointNo = 7;
  */
 const f32 l_capGravity = 2.0f;
 
-/* ★ THE ONE INVENTED NUMBER HERE. daAlink_c scales the environment's wind by
- * mpHIO->mBasic.m.mMaxWindSpeed (d_a_alink.cpp:5529) before it reaches the cap, and that HIO block
- * is a private member of daAlink_c (d_a_alink.h:4068) with its default in a binary parameter file —
- * not reachable, and not derivable from source. The order of magnitude IS derivable: the code
- * treats |wind| > 10 as "strong" (d_a_alink.cpp:2570), so the scale has to be tens, not units.
- * Everything else in this file is transcribed; this is a fitted estimate and should be checked
- * against the local player somewhere genuinely windy.
- */
-const f32 l_windPushScale = 30.0f;
-
-/* Above this the wind is "strong" and the cap flutters at a fixed hard rate rather than one
- * proportional to how fast the head is moving (d_a_alink.cpp:2568-2576, :2789-2793).
+/* Above this the wind counts as "strong" and the cap flutters at a fixed hard rate rather than one
+ * proportional to how fast the head is moving (d_a_alink.cpp:2568-2576, :2789-2793). Compared
+ * against the SAME quantity daAlink_c compares, so the two caps switch modes together.
  */
 const f32 l_strongWindSpeed = 10.0f;
 
@@ -237,6 +228,9 @@ const f32 l_strongWindSpeed = 10.0f;
  * reports motion rather than the puppet finishing standing up.
  */
 const s16 l_swayLoggedAngle = 0x800;
+
+/* When to report the idle animation's frame — long enough in that a stuck frame is unambiguous. */
+const u16 l_idleFrameLogTick = 200;
 
 /* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
  * HIO rates below: this one is about network noise, not about gait.
@@ -665,6 +659,28 @@ void daRemotePlayer_c::selectAnimation() {
         rate = hio.mWaitAnmSpeed;
     }
 
+    /* Stuart reported the puppet as having "no idle body animation". The animation it plays IS the
+     * one the local player plays — ANM_WAIT resolves to WAITS (d_a_alink.cpp:308) and it is set to
+     * loop at mWaitAnmSpeed, which is 1.0 (d_a_alink_HIO_data.inc:33) — so the question is whether
+     * the frame is actually ADVANCING, which nothing else in the trace can answer. One latched line
+     * once the puppet has been idle a while; a frame near the animation's end means it is running.
+     */
+    if (wanted == l_idleAnmIdx) {
+        if (mIdleTicks < 0xFFFF) {
+            mIdleTicks++;
+        }
+        if (mIdleTicks == l_idleFrameLogTick && !mLoggedIdleFrame) {
+            mLoggedIdleFrame = true;
+            Log.debug(
+                "Puppet {} idle body anim after {} ticks: frame {:.1f} of {:.1f}, rate {:.2f}, "
+                "mode {}",
+                mPlayerId, mIdleTicks, mpModelMorf->getFrame(), mpModelMorf->getEndFrame(),
+                mpModelMorf->getPlaySpeed(), mpModelMorf->getPlayMode());
+        }
+    } else {
+        mIdleTicks = 0;
+    }
+
     if (wanted != mCurrentAnm) {
         // A short morf, so changing gait doesn't pop. This is the one place we are standing in for
         // the player's cross-fade, so it is doing more work here than a plain animation change.
@@ -890,15 +906,85 @@ void daRemotePlayer_c::setEyeMove() {
         }
     }
 
+    /* Link restarts the idle countdown and forgets the idle direction on EVERY call, whatever the
+     * eyes end up doing (d_a_alink.cpp:3287-3291). Both are read back below through the copies
+     * taken here, so a tick spent looking at something costs the wander its progress — the puppet
+     * does not resume a half-finished glance after tracking a player. */
+    const u8 prevIdleTimer = mIdleGazeTimer;
+    const f32 prevIdleH = mIdleGaze[0];
+    const f32 prevIdleV = mIdleGaze[1];
+
+    mIdleGazeTimer = 75.0f + ownRndF(30.0f);
+    mIdleGaze[0] = 0.0f;
+    mIdleGaze[1] = 0.0f;
+
+    f32 horizontal = 0.0f;
+    f32 vertical = 0.0f;
+    bool eyesActive = false;
+
+    if (haveTarget) {
+        vertical = cLib_minMaxLimit<f32>(l_eyeAngleToOffset * angleX, -1.0f, 1.0f);
+        horizontal = cLib_minMaxLimit<f32>(l_eyeAngleToOffset * angleY, -1.0f, 1.0f);
+        eyesActive = true;
+    } else if (mNetSpeed < l_idleSpeedThreshold) {
+        /* Nobody worth watching and standing still, so look about. daAlink_c::setEyeMove's idle
+         * branch (d_a_alink.cpp:3337-3358), which is what stops a waiting Link from staring dead
+         * ahead. His version gates on mProcID == PROC_WAIT and friends; a puppet has no proc, and
+         * "not moving" is the same idea.
+         *
+         * Unlike the tracking path these are NOT angles — they are already the -1..1 deflection,
+         * so an idle glance always goes to full travel. */
+        if (prevIdleTimer != 0) {
+            // Mid-glance: hold it and run the clock down.
+            mIdleGazeTimer = prevIdleTimer - 1;
+            mIdleGaze[0] = prevIdleH;
+            mIdleGaze[1] = prevIdleV;
+        } else if (prevIdleH != 0.0f || prevIdleV != 0.0f) {
+            /* Was looking somewhere and the clock ran out: half the time settle back to centre,
+             * half the time glance somewhere else.
+             *
+             * ★ Transcribed WITH an oddity in the original. It rotates "the current direction" via
+             * cM_atan2s(field_0x3418, field_0x341c) — but both were zeroed at the top of the
+             * function a few lines earlier and the copies were never written back, so the atan2 is
+             * of (0, 0) and the result is always one of three fixed directions rather than an
+             * offset from where the eyes already were. Kept, because looking like the original is
+             * the point and the outcome is perfectly reasonable idle behaviour: down-left, down, or
+             * down-right. Do not "fix" this into using the copies without deciding that
+             * deliberately. */
+            if (ownRnd() < 0.5f) {
+                mIdleGaze[0] = 0.0f;
+                mIdleGaze[1] = 0.0f;
+            } else {
+                s16 dir = cM_atan2s(mIdleGaze[0], mIdleGaze[1]);
+                ANGLE_ADD(dir, ((int)ownRndF(3.0f) << 13) + 0x6000);
+                mIdleGaze[0] = cM_ssin(dir);
+                mIdleGaze[1] = cM_scos(dir);
+            }
+        } else {
+            // Eyes were centred: pick one of eight directions around the clock face.
+            const s16 dir = (s16)((int)ownRndF(8.0f) << 13);
+            mIdleGaze[0] = cM_ssin(dir);
+            mIdleGaze[1] = cM_scos(dir);
+        }
+
+        horizontal = mIdleGaze[0];
+        vertical = mIdleGaze[1];
+        eyesActive = true;
+
+        /* Latched on the first idle glance that actually goes somewhere. The tracking log below
+         * cannot cover this path by definition — it only fires when there IS a target — so without
+         * this line the wander is the one eye behaviour with no evidence behind it. */
+        if (!mLoggedIdleGaze && (horizontal != 0.0f || vertical != 0.0f)) {
+            mLoggedIdleGaze = true;
+            Log.debug("Puppet {} idle glance: {:.2f},{:.2f} held for {} ticks", mPlayerId,
+                horizontal, vertical, mIdleGazeTimer);
+        }
+    }
+
     f32 wantX[2] = {0.0f, 0.0f};
     f32 wantY[2] = {0.0f, 0.0f};
 
-    if (haveTarget) {
-        f32 vertical = l_eyeAngleToOffset * angleX;
-        f32 horizontal = l_eyeAngleToOffset * angleY;
-        vertical = cLib_minMaxLimit<f32>(vertical, -1.0f, 1.0f);
-        horizontal = cLib_minMaxLimit<f32>(horizontal, -1.0f, 1.0f);
-
+    if (eyesActive) {
         /* Both eyes slide the SAME way; the asymmetry is which one leads. Whichever eye is on the
          * inside of the turn travels the full 0.25, the outer one 0.15 (d_a_alink.cpp:3359-3366).
          * Vertically Link looks up further than down, and the second eye is not smoothed
@@ -942,7 +1028,7 @@ void daRemotePlayer_c::setEyeMove() {
      * morf frame to cross-fade with (daAlink_c and daHoZelda_c both use one; the field is private
      * with no setter here). Instead the override is held ON until the offsets have smoothed to
      * centre, at which point dropping it changes nothing visible. */
-    if (haveTarget) {
+    if (eyesActive) {
         mEyeMoveOn = true;
     } else if (mEyeMoveOn && fabsf(mEyeOffset[0][0]) < l_eyeCentredEpsilon &&
                fabsf(mEyeOffset[0][1]) < l_eyeCentredEpsilon &&
@@ -1251,13 +1337,53 @@ void daRemotePlayer_c::setHatAngle() {
     f32 windPower;
     dKyw_get_AllWind_vec(&anchorPos, &windDir, &windPower);
 
-    /* Link smooths the environment's wind into a velocity before it reaches the cap
-     * (d_a_alink.cpp:5539) rather than using it raw, so a gust ramps in over several ticks instead
-     * of snapping the cap sideways. Same smoothing here, same reason. */
-    cXyz windTarget = windDir * (windPower * l_windPushScale);
-    cLib_addCalcPos(&mWindPush, windTarget, 0.5f, 3.0f, 0.5f);
+    /* ★ Read the local player's OWN wind push rather than re-deriving one.
+     *
+     * daAlink_c::field_0x35b8 (d_a_alink.cpp:5539) is the environment wind after three steps the
+     * puppet cannot reproduce on its own: a wind-wall occlusion test, a scale by the HIO-tunable
+     * mMaxWindSpeed whose default lives in a binary parameter file, and a multi-tick smoothing so
+     * gusts ramp instead of snapping. An earlier version of this guessed that scale at 30 and
+     * Stuart found the result "one step too windy" — in the Forest Temple's gusts the puppet's cap
+     * sat permanently in the strong-wind flutter mode while the local player's did not.
+     *
+     * Taking Link's value instead removes the guess completely and makes the two caps respond
+     * IDENTICALLY, which is the thing actually being judged when the two are side by side. All of
+     * daAlink_c's members are public (d_a_alink.h:231-232 opens the class public and the next
+     * top-level specifier is at :4589), so this is a plain read of a live field — no state is
+     * written back, and nothing here can perturb the local player.
+     *
+     * The one inaccuracy left is positional: wind varies by location and this is sampled at Link's
+     * position, not the puppet's. In co-op the two are usually in the same room, and being wrong by
+     * a room is far less visible than being wrong by a factor of two everywhere. */
+    cXyz windPush;
+    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (link != NULL) {
+        windPush = link->field_0x35b8;
+    }
 
-    const bool strongWind = mWindPush.abs2() > SQUARE(l_strongWindSpeed);
+    const bool strongWind = windPush.abs2() > SQUARE(l_strongWindSpeed);
+
+    /* Latched the first time the wind is strong enough to change the cap's behaviour. This is the
+     * one number that was previously guessed, and the place Stuart saw it go wrong (the Forest
+     * Temple's gusts) is somewhere autopilot cannot drive to. If the cap ever looks over-eager
+     * again, this line settles the question immediately: a large magnitude here means the puppet is
+     * faithfully copying a genuinely strong wind that the LOCAL player is feeling too, and anything
+     * else means the fault is on this side. */
+    if (strongWind && !mLoggedStrongWind) {
+        mLoggedStrongWind = true;
+        Log.debug("Puppet {} in strong wind: Link's push {:.1f},{:.1f},{:.1f} (len {:.1f}, "
+                  "threshold {:.1f})",
+            mPlayerId, windPush.x, windPush.y, windPush.z, JMAFastSqrt(windPush.abs2()),
+            l_strongWindSpeed);
+    }
+
+    /* In a strong wind the original stops caring how hard the wind actually blows and pins the
+     * flutter input to full (d_a_alink.cpp:2578-2582). Transcribed here because leaving it out was
+     * the second half of "too windy": the flutter kept scaling past the point the original caps it.
+     */
+    if (strongWind) {
+        windPower = 1.0f;
+    }
 
     /* Which way the head is pointing. daAlink_c gets this as eyePos - field_0x34e0, but those are
      * head-joint-matrix * (12,-8,0) and * (0,-8,0) (d_a_alink.cpp:5596-5599), whose difference is
@@ -1304,7 +1430,7 @@ void daRemotePlayer_c::setHatAngle() {
     /* The apparent wind: how far the anchor moved, REVERSED (a head moving forward feels wind from
      * the front), plus the environment's wind, plus a constant downward bias so the cap hangs. */
     cXyz apparentWind = mCapAnchorPrev - anchorPos;
-    apparentWind += mWindPush;
+    apparentWind += windPush;
     apparentWind.y -= l_capGravity;
 
     // Kills the jitter a resting animation's sub-unit drift would otherwise put into the cap.
