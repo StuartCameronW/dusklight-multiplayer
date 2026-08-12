@@ -92,6 +92,10 @@ private:
     int mountOwnArchive();
     /// Draw one sub-model, lit like the body. Null-tolerant, so a missing part costs a part.
     void drawModel(J3DModel* i_model);
+    /// Register the puppet's projected shadow for this frame. Must run every draw, and last, since
+    /// it wants the models already posed. No one-time setup to pair with it: the shadow slots are
+    /// static in the draw list and mShadowKey starts at 0 courtesy of fopAcM_ct.
+    void shadowDraw();
 
     /* Which replicated player this puppet represents; arrives as the create parameter. */
     u32 mPlayerId;
@@ -278,6 +282,17 @@ private:
     /* False until mCapAnchorPrev holds a real sample. Without it the first tick reads the whole
      * distance from the world origin as one frame of velocity and flings the cap. */
     bool mSwayInited;
+
+    /* Handle for this puppet's entry in the global real-shadow list, exactly
+     * daAlink_c::field_0x31a4 (d_a_alink.cpp:19246) and daCow_c::mShadowKey. It is re-issued every
+     * frame — the list is reset wholesale each frame (dDlst_list_c::reset, d_drawlist.cpp:1940) and
+     * setReal hands out a fresh id (:1761-1762) — so this is really "the id valid for the frame
+     * being drawn", used to hang the head, face and hand models off the same shadow the body
+     * opened. Kept as a member rather than a local because that is the shape every caller in the
+     * tree uses, and because dComIfGd_setShadow still takes the previous key as its first argument
+     * even though the current decomp ignores it. Zero at spawn via fopAcM_ct's zeroing of the
+     * actor. */
+    u32 mShadowKey;
 };
 
 #endif /* D_A_REMOTE_PLAYER_H */

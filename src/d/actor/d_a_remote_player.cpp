@@ -2329,6 +2329,104 @@ void daRemotePlayer_c::drawModel(J3DModel* i_model) {
     daMirror_c::entry(i_model);
 }
 
+/// Cast the puppet's shadow onto the floor, the same way the local player casts his.
+///
+/// Without this the puppet is the only character in the scene standing on nothing, which reads as
+/// "pasted on top of the world" far more strongly than any shading difference does. daAlink_c does
+/// it in `shadowDraw()` (d_a_alink.cpp:19201-19362) and this is that function with everything
+/// player-specific removed — no horse, no boar, no canoe, no Midna, no held item, no boots.
+///
+/// **This is the REAL (projected) shadow, not the simple blob.** That was a deliberate choice
+/// between the two APIs, and the blob was the tempting one because it is cheaper and cannot fail:
+///
+///  - `dComIfGd_setSimpleShadow` draws a flat round texture on the ground plane. A round blob
+///    parked next to the local player's crisp silhouette would itself be the tell we are trying to
+///    remove — it would say "that one is not a real character" every bit as loudly as no shadow.
+///  - `dComIfGd_setShadow` (d_com_inf_game.cpp:2277-2288) projects the actual models. Checked
+///    before committing to it: nothing on that path touches the local player. It forwards to
+///    `dDlst_shadowControl_c::setReal` -> `dDlst_shadowReal_c::set` -> `setShadowRealMtx`
+///    (d_drawlist.cpp:1692, :1308, :1245), and the only place that path reaches for player-ish
+///    global state is `dKy_plight_near_pos()` at d_drawlist.cpp:1318 — which is the `tevStr ==
+///    NULL` branch, and we pass ours. There is no `daPy_getPlayerActorClass()` anywhere in
+///    d_drawlist.cpp (grepped), so the unguarded deref that 00-status.md warns about in the
+///    type-9/10 lighting path has no counterpart here. This adds no new exposure to a teardown
+///    window in which the puppet draws and Link does not; `draw()` already calls
+///    `settingTevStruct(10, ...)`, which is the call that carries that risk, and this changes
+///    nothing about it.
+///
+/// The cost is one of the **eight** global real-shadow slots (`dDlst_shadowControl_c::mReal[8]`,
+/// d_drawlist.h:314), so two players spend two. When all eight are taken `setReal` returns 0 and
+/// the newest caller simply gets no shadow that frame (d_drawlist.cpp:1738-1741) — a graceful
+/// degradation the game already lives with. The local player can never be the one to lose out:
+/// daAlink_c is created before any puppet, so at equal draw priority he registers first.
+///
+/// Zero heap cost. Every slot is in the statically allocated draw list; the only new storage is
+/// `mShadowKey`, four bytes in the actor struct, which is not on the 0x20000 solid heap at all.
+void daRemotePlayer_c::shadowDraw() {
+    if (model == NULL) {
+        return;
+    }
+
+    /* The ground under the puppet's feet. fopAcM_gc_c is shared STATIC state, so the height and the
+     * polygon it came from are both taken here, in the same breath as the check that produced them
+     * (f_op_actor_mng.h:874-893) — this is a second, fresh check rather than a value cached by
+     * setRoomInfo() during execute(), because every other actor's own ground query between the two
+     * passes would have overwritten it. It is the same idiom daAlink_c uses for the iron ball's
+     * shadow (d_a_alink.cpp:19297-19302). */
+    if (!fopAcM_gc_c::gndCheck(&current.pos)) {
+        // Over a hole, mid-warp, or handed a pose with no floor under it. No ground, no shadow —
+        // and this is dComIfGd_setShadow's own guard restated (d_com_inf_game.cpp:2280), so we are
+        // only declining a call that would have declined itself.
+        mShadowKey = 0;
+        return;
+    }
+
+    const f32 groundY = fopAcM_gc_c::getGroundY();
+
+    /* Shadow centre = the body model's ROOT JOINT in world space, NOT current.pos. daAlink_c feeds
+     * `field_0x3834` (d_a_alink.cpp:19226), which is exactly this quantity (:5605). It matters
+     * because the root joint carries the animation's own translation, so the shadow leans and
+     * slides with the pose instead of staying pinned under the actor origin. Valid by this point:
+     * setMatrix() ran modelCalc() during execute(), and draw() has already returned early if no
+     * network pose has landed. */
+    cXyz shadowPos;
+    mDoMtx_multVecZero(model->getAnmMtx(0), &shadowPos);
+
+    /* Argument by argument against daAlink_c's call (d_a_alink.cpp:19246):
+     *
+     *  - water flag 0. Link computes `mWaterY > groundH`, and on dry land that is 0 for him too —
+     *    including while airborne, since mWaterY is -inf with no water — so 0 reproduces his
+     *    behaviour exactly everywhere except over water, where his shadow fades with height and
+     *    ours would not. Water state is not replicated at all yet, and faking a bg water query here
+     *    would buy a fade nobody can see under a swimming puppet. Revisit when water is on the
+     *    wire.
+     *  - 800.0f radius and the trailing 0, 1.0f, simple-texture arguments are Link's verbatim, so
+     *    the puppet's shadow is sized and shaped like his rather than merely present.
+     *  - current.pos.y as the caster height. Link passes the lower of his two target cylinders'
+     *    centres, which `setCollisionPos` places at foot level (d_a_alink.cpp:6721-6738), so the
+     *    height-above-ground this resolves to is ~0 while grounded and grows in the air. The actor
+     *    origin is at the feet, so current.pos.y is that same quantity. daCow_c passes exactly this
+     *    pair for the same reason (d_a_cow.cpp:3256-3258).
+     *  - &tevStr, not NULL. Non-null is what keeps `dDlst_shadowReal_c::set` on its own light
+     *    direction (mLightPosWorld, filled by the settingTevStruct(10) call above) instead of
+     *    falling through to the scene-global one — and, incidentally, out of the branch at
+     *    d_drawlist.cpp:1324 that writes through a pointer it has just proven to be NULL. */
+    mShadowKey = dComIfGd_setShadow(mShadowKey, 0, model, &shadowPos, 800.0f, 0.0f, current.pos.y,
+        groundY, *fopAcM_gc_c::getGroundCheck(), &tevStr, 0, 1.0f,
+        dDlst_shadowControl_c::getSimpleTex());
+
+    if (mShadowKey != 0) {
+        // The other three models cast into the SAME shadow, so the silhouette has a head and hands
+        // rather than being a decapitated torso. Null-tolerant by the API's own contract:
+        // dDlst_shadowReal_c::add returns false for a NULL model (d_drawlist.cpp:1355-1357), so a
+        // missing sub-model costs that part of the outline and nothing else. Same set, same order,
+        // as daAlink_c (d_a_alink.cpp:19277-19279).
+        dComIfGd_addRealShadow(mShadowKey, mpHeadModel);
+        dComIfGd_addRealShadow(mShadowKey, mpFaceModel);
+        dComIfGd_addRealShadow(mShadowKey, mpHandModel);
+    }
+}
+
 int daRemotePlayer_c::draw() {
     if (!mHasPose) {
         return 1;
@@ -2367,6 +2465,11 @@ int daRemotePlayer_c::draw() {
     drawModel(mpHeadModel);
     drawModel(mpFaceModel);
     drawModel(mpHandModel);
+    // Last, exactly where daAlink_c puts it (d_a_alink.cpp:19849-19853): the shadow projects the
+    // models, so it wants them posed and their tevStr settled, and it renders in its own later pass
+    // rather than into the draw list we have just filled.
+    traceCalc("draw: shadow");
+    shadowDraw();
     traceCalc("draw done");
     return 1;
 }
