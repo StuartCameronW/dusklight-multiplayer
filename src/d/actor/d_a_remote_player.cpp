@@ -110,18 +110,41 @@ const u16 l_rightHandShape = 6;
  * the same way (d_a_alink.cpp:4183-4184) — and NULL simply means "no local player yet", in which
  * case the branch cannot fire and we behave as before.
  */
-bool has_warp_material(J3DModelData* i_modelData, const void* i_warpTexData) {
-    if (i_modelData == NULL || i_warpTexData == NULL) {
+/**
+ * Does this model carry the twilight-dissolve material, and is it currently ON?
+ *
+ * ★ THIS IS THE A5 FIX, and the mistake it replaces is worth spelling out because the whole bug
+ * came from reading `addWarpMaterial` too quickly.
+ *
+ * `addWarpMaterial` does not merely *append* a dormant stage — it **raises both counts**
+ * (`d_resorce.cpp:157`, `:167`). So every `BMWR` model, which is all four of Link's
+ * (`Kmdl.h`), arrives out of the loader with the dissolve **already enabled**. That reframes
+ * `daAlink_c::initModel`'s bracket completely: `onWarpMaterial` hits its "already on" `break` and
+ * does nothing, and the real work is the **trailing `offWarpMaterial`, which turns the dissolve
+ * OFF**. Turning it off is not cleanup after the model is built; it is the entire point.
+ *
+ * The puppet used to decide whether to run that bracket by comparing the model's last texture
+ * pointer against `daAlink_c::mpWarpTexData`, copying the shape of `initModel`. Measured on
+ * 2026-08-12, that comparison never matched for the puppet's privately-mounted copies, so the
+ * bracket never ran, so the dissolve was never switched off — and all four models drew it. Its UVs
+ * come from world position through a camera-dependent matrix nothing drives for a puppet
+ * (`d_resorce.cpp:212-225`), and the same function hard-cuts any pixel at or below alpha 0x80. That
+ * is precisely Stuart's *"turns into warp particles (then disappears)... then when he walks away
+ * its fine again"*.
+ *
+ * So ask the state directly instead of inferring it from pointer identity. "The last counted TEV
+ * stage samples texmap 3" is the *same predicate* `onWarpMaterial` and `offWarpMaterial` use to
+ * decide what to do (`:187`, `:203`), it is what actually governs rendering, and it cannot be
+ * defeated by a pointer that means something different on PC than it did on GameCube.
+ */
+bool has_warp_material(J3DModelData* i_modelData) {
+    if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
         return false;
     }
 
-    J3DTexture* tex = i_modelData->getTexture();
-    if (tex == NULL) {
-        return false;
-    }
-
-    const int texNo = tex->getNum() - 1;
-    return texNo >= 0 && i_warpTexData == tex->getImgDataPtr(texNo);
+    J3DTevBlock* tevBlock = i_modelData->getMaterialNodePointer(0)->getTevBlock();
+    const u8 stageNum = tevBlock->getTevStageNum();
+    return stageNum > 0 && tevBlock->getTevOrder(stageNum - 1)->getTexMap() == 3;
 }
 
 /**
@@ -179,12 +202,12 @@ void log_material_state(const char* i_who, const char* i_what, J3DModelData* i_m
         lastTexMap == 3 ? "  <<< WARP MATERIAL IS ON" : "");
 }
 
-J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags, const void* i_warpTexData) {
+J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
     if (i_modelData == NULL) {
         return NULL;
     }
 
-    const bool warpMaterial = has_warp_material(i_modelData, i_warpTexData);
+    const bool warpMaterial = has_warp_material(i_modelData);
 
     if (warpMaterial) {
         dRes_info_c::onWarpMaterial(i_modelData);
@@ -536,20 +559,15 @@ int daRemotePlayer_c::createHeap() {
      * and the shared warp texture, and permanently replacing the alpha compare with "discard
      * anything at or below 0x80" (d_resorce.cpp:127-178, :291-293).
      *
-     * The consequence of skipping it here is not cosmetic. onWarpMaterial raises the stage and
-     * texgen counts across the bracket so that mDoExt_J3DModel__create sizes the model's own copies
-     * of those blocks to hold the extra stage, which is what the 0x2000400 diff flag asks for.
-     * Without the bracket the puppet's body carries per-instance blocks one stage SHORT of the
-     * material data they were built from, while the local player's body — same mesh, same archive —
-     * carries the full-size ones. A model whose material state and block sizes disagree is exactly
-     * the sort of thing that renders as garbage, and this one also has a hard alpha cut-off to turn
-     * a wrong sample into a hole rather than a blemish.
+     * ★ And the bracket's trailing half is the one that matters: BMWR models come out of the loader
+     * with the dissolve already ENABLED, so `offWarpMaterial` is what switches it off. Skipping the
+     * bracket does not leave the body slightly mis-sized — it leaves the body **drawing the
+     * twilight dissolve**, which is the A5 bug. See has_warp_material() for the full account.
      *
-     * Kept as a bracket rather than left on: the counts belong to the shared model DATA, so raising
-     * them and not restoring would change the material for anything else built from it. */
-    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
-    const void* warpTexData = link != NULL ? link->mpWarpTexData : NULL;
-    const bool bodyWarpMaterial = has_warp_material(modelData, warpTexData);
+     * The leading half still earns its place: it makes mDoExt_J3DModel__create size the model's own
+     * copies of the TEV and texgen blocks to hold the extra stage, which is what 0x2000400 asks
+     * for, matching what daAlink_c's body gets from initModel (d_a_alink_wolf.inc:364). */
+    const bool bodyWarpMaterial = has_warp_material(modelData);
 
     u32 bodyDiffFlags = 0x11000084;
     if (bodyWarpMaterial) {
@@ -578,13 +596,12 @@ int daRemotePlayer_c::createHeap() {
      * name was missing. */
     const OutfitArc& outfit = l_outfits[mOutfit];
 
-    mpHeadModel = init_model(
-        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0, warpTexData);
-    mpHandModel = init_model(
-        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0, warpTexData);
-    mpFaceModel =
-        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)),
-            0x20200, warpTexData);
+    mpHeadModel =
+        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0);
+    mpHandModel =
+        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0);
+    mpFaceModel = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)), 0x20200);
 
     /* Dusk already fixes Link's eyes vanishing on PC by clamping maxLOD on three face textures
      * (d_a_alink_wolf.inc:379-395). That fix is applied to the local player's face model data, and
@@ -642,6 +659,8 @@ int daRemotePlayer_c::createHeap() {
     for (int i = 0; i < l_watchedModelNum; i++) {
         mMaterialSig[i] = 0xFFFF;
     }
+
+    const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
 
     Log.debug("Puppet {} material state:", mPlayerId);
     log_material_state("puppet", "body", mpModelMorf->getModel()->getModelData());
