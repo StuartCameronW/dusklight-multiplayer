@@ -813,6 +813,9 @@ int daRemotePlayer_c::mountOwnArchive() {
     return cPhs_COMPLEATE_e;
 }
 
+/* Read and cleared by the network layer's spawn backoff; see d_a_remote_player.h. */
+daRemotePlayer_createFail_c g_daRemotePlayer_lastCreateFail = {0, NULL};
+
 int daRemotePlayer_c::create() {
     fopAcM_ct(this, daRemotePlayer_c);
 
@@ -839,6 +842,13 @@ int daRemotePlayer_c::create() {
 
     const int mountPhase = mountOwnArchive();
     if (mountPhase != cPhs_COMPLEATE_e) {
+        /* cPhs_LOADING_e here is the normal case and must NOT be reported as a failure — the mount
+         * legitimately takes many frames. Only the error step is worth recording. mPlayerId is not
+         * assigned until the heap is up, so read the create parameter directly. */
+        if (mountPhase == cPhs_ERROR_e) {
+            g_daRemotePlayer_lastCreateFail.mPlayerId = fopAcM_GetParam(this);
+            g_daRemotePlayer_lastCreateFail.mReason = "the private archive mount failed";
+        }
         return mountPhase;
     }
 
@@ -846,6 +856,9 @@ int daRemotePlayer_c::create() {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
+        g_daRemotePlayer_lastCreateFail.mPlayerId = fopAcM_GetParam(this);
+        g_daRemotePlayer_lastCreateFail.mReason =
+            "the 0x20000 solid heap, or one of the models/animations createHeap() loads into it";
         return cPhs_ERROR_e;
     }
 

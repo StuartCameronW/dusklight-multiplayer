@@ -14,7 +14,11 @@ namespace dusk::mp {
 
 /// Bumped on ANY incompatible wire change. Peers with a mismatched version are rejected at
 /// handshake rather than being allowed to desync in confusing ways later.
-inline constexpr std::uint32_t kProtocolVersion = 3;
+/* 4: PlayerState grew the sender's outfit byte (19 -> 20) and claimed flag bit 2 for the sharp
+ * turn. The size change is the reason this MUST be bumped: a v3 peer's read() under-runs on the
+ * trailing flags byte, returns false, and every pose packet is silently discarded — a session that
+ * connects fine and then shows nobody moving. */
+inline constexpr std::uint32_t kProtocolVersion = 4;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -69,7 +73,7 @@ enum class PacketId : std::uint8_t {
 inline constexpr std::uint32_t kHostPlayerId = 0;
 
 /// Ceiling on players in one snapshot. Keeps WorldSnapshot inside a single unfragmented datagram
-/// (8 * 31 bytes + header is comfortably under the ~1200-byte safe MTU).
+/// (8 * 32 bytes + header is comfortably under the ~1200-byte safe MTU).
 inline constexpr std::size_t kMaxPlayers = 8;
 
 }  // namespace dusk::mp
