@@ -42,6 +42,16 @@ struct daRemotePlayer_anm_c {
 const int daRemotePlayer_anmSlotNum = 3;
 
 /**
+ * How many texture-matrix slots the sword-effect measurement watches.
+ *
+ * Three, because that is what is actually there: `log_tex_mtx_layout` measured slots 0x07 occupied
+ * on `sword master` materials 0 and 1, `sword ordon` material 0 and `sheath PODM` material 0 —
+ * three matrices and two texgens each, with the last TEV stage sampling texmap 1. Not a guess at
+ * how many might exist, and not the one slot an earlier version assumed.
+ */
+const u32 daRemotePlayer_texMtxSlotsWatched = 3;
+
+/**
  * Per-leg state for the foot IK. daAlink_c::daAlink_footData_c (d_a_alink.h:181), with its
  * field_0xNN names resolved to what the code actually does with them.
  *
@@ -809,16 +819,17 @@ private:
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
 
-    /// The env texture matrix this puppet's own calc produced for its sheath, and whether there is
-    /// one. Compared against the value present at entry to find out whether the local player, who
-    /// shares that J3DModelData, calc'd in between. See read_tex_mtx() in the .cpp.
-    f32 mSheathTexMtxAtCalc[2];
-    bool mHaveSheathTexMtx;
+    /// The env texture matrices this puppet's own calc produced for its SWORD, plus the mask of
+    /// which slots exist. Swapped into the shared J3DModelData for the length of this puppet's
+    /// entry and swapped straight back out, because the local player shares that data and would
+    /// otherwise have us drawing his — measured, not assumed. See swap_in_tex_mtx() in the .cpp.
+    Mtx mSwordTexMtxOurs[daRemotePlayer_texMtxSlotsWatched];
+    u8 mSwordTexMtxSlots;
     /// Latches the comparison's answer, so it logs on the first frame and again only when the
     /// answer FLIPS — the question is "does this ever happen", not "how many frames did it happen
     /// on".
-    bool mLoggedSheathTexMtx;
-    bool mLoggedSheathTexMtxChanged;
+    bool mLoggedSwordTexMtx;
+    bool mLoggedSwordTexMtxChanged;
     /// And the same for the shield, which needs its OWN latch rather than sharing mLoggedEquip: the
     /// two halves of the equipment byte are drawn independently, so a session in which the sword
     /// line appears and the shield line does not is a real and interesting state. Zero at spawn via
