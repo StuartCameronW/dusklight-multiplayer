@@ -785,7 +785,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
      * Its layout lives in dusk/player_equip.hpp precisely so both ends can read it without this
      * function becoming the place that knows which bit pattern means the master sword. */
     puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
-        state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip);
+        state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip, state.idleKind);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -813,6 +813,10 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     // change is required to pass: the trace can compare the byte the sender packed against the byte
     // the receiver is actually drawing from.
     out.equip = puppet->getNetEquip();
+    // Same again, and this one is the reason the trace has an idleKind column at all: "the sender
+    // chose the fidget idle" and "the puppet is playing the fidget idle" are two different claims,
+    // and only the second one is about the feature working.
+    out.idleKind = puppet->getNetIdleKind();
     return true;
 }
 

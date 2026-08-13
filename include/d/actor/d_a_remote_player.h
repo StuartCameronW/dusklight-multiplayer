@@ -92,8 +92,13 @@ public:
     int draw();
 
     /// Push an interpolated pose in from the network layer, before the actor pass runs.
+    ///
+    /// i_idleKind is the wire's PlayerIdleKind — which idle the SENDER is genuinely playing, read
+    /// off his own animation heap rather than re-derived from his flags. A plain byte here for the
+    /// same reason i_equip is: the .cpp is the one place that maps a wire value to a daAlink_c
+    /// animation id, and this header deliberately does not include the wire layout.
     void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn,
-        bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff, u8 i_equip);
+        bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff, u8 i_equip, u8 i_idleKind);
 
     u32 getPlayerId() const { return mPlayerId; }
     /* Index into the outfit table of the archive this puppet ACTUALLY mounted, which is not
@@ -120,6 +125,11 @@ public:
     /// The equipment byte as this puppet received it. Exposed for --mp-trace and for the
     /// both-ends comparison a wire change has to pass; see PlayerEquipFlags for the layout.
     u8 getNetEquip() const { return mNetEquip; }
+    /// The idle byte as this puppet received it, for --mp-trace and for the both-ends comparison
+    /// every wire change has to pass: the trace's `actor` row is only meaningful next to the
+    /// `local` row that produced it, and a byte that never arrived looks exactly like one that
+    /// arrived as 0. See PlayerIdleKind for the values.
+    u8 getNetIdleKind() const { return mNetIdleKind; }
     bool hasPose() const { return mHasPose; }
     /* BCK resource index of the gait currently playing. Exposed for --mp-trace: which animation a
      * puppet picked is otherwise only checkable by looking at the other player's screen.
@@ -148,6 +158,14 @@ private:
     /// Which run animation the puppet is entitled to — the armed one when the wire says a sword is
     /// in hand, which is getMainBckData's own test (d_a_alink.cpp:6939). Out of line.
     const daRemotePlayer_anm_c& runAnm() const;
+    /// Which IDLE the puppet is entitled to — the one the sender says he is playing, or the plain
+    /// wait for any kind this build has no animation for. Reports the animation id alongside, as a
+    /// u16 for the same reason mCurrentAnm is one: this header does not include d_a_alink.h.
+    ///
+    /// Both halves of the answer have to travel together. The id is what daAlink_c's own tables are
+    /// keyed on — the hand pair, the BCK pair, the tired special cases — so returning the animation
+    /// without it would leave every caller re-deriving which one it got.
+    const daRemotePlayer_anm_c& idleAnm(u16* o_anmID) const;
     /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
     /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
     void setDrawHand();
@@ -439,6 +457,35 @@ private:
      * loop. */
     daRemotePlayer_anm_c mSlipAnm;
 
+    /* The three ALERT idles the wire can ask for, on top of the plain wait above. Each is a whole
+     * animation of its own rather than a variation on mIdleAnm: daAlink_c reaches all three through
+     * setBlendMoveAnime's wait slot, and which one he is in is a decision he has already made and
+     * sent (PlayerIdleKind), never something to re-derive here.
+     *
+     *   mWaitBAnm       ANM_WAIT_B 0x1A       the braced/alert idle. Fires constantly in co-op — a
+     *                                         lock-on, an enemy looked at in the last 0x50 ticks, a
+     *                                         boss room, or heavy boots/armour alone. It is the one
+     *                                         visible in a STILL frame, because its table row asks
+     *                                         for hands 1/6 where every other idle asks 4/10.
+     *   mServiceWaitAnm ANM_SERVICE_WAIT 0x90 the idle-fidget performance, after 10-15 s of
+     *                                         unbroken standing. A partner in a menu hits this one
+     *                                         constantly.
+     *   mTiredWaitAnm   ANM_WAIT_TIRED 0xB6   the low-health idle. Gameplay INFORMATION rather than
+     *                                         decoration: a partner is on his last heart.
+     *
+     * ★ All three are OPTIONAL, on exactly the terms mSlipAnm is: a NULL mpUnder costs one pose and
+     * idleAnm() falls back to the plain wait, where a fatal createHeap would put the puppet into a
+     * permanent respawn loop. They are also the three most likely to be squeezed out of the solid
+     * heap, so the degrading path is the one that will actually be taken if anything is.
+     *
+     * ★ Every one of these three rows names ONE resource twice ({WAITB, WAITB}, {SWAITA, SWAITA},
+     * {WAITD, WAITD} — d_a_alink.cpp:309, :427, :465), so load_gait_anm takes its
+     * m_upperID == m_underID early-out and leaves mpUpper NULL. One animation object, one frame
+     * controller, no aliasing to reason about. Verified against the table, not assumed. */
+    daRemotePlayer_anm_c mWaitBAnm;
+    daRemotePlayer_anm_c mServiceWaitAnm;
+    daRemotePlayer_anm_c mTiredWaitAnm;
+
     /* Link is four models. The body is the one the animation drives; these three are posed off its
      * joints every frame in setMatrix(). Any of them may be NULL — a puppet missing a head is a
      * better failure than no puppet at all. */
@@ -701,6 +748,22 @@ private:
     /* The SENDER's equipment byte, whole. Every field in it is an answer he computed rather than a
      * fact about the world, so there is nothing here to re-derive; see PlayerEquipFlags. */
     u8 mNetEquip;
+    /* The SENDER's idle byte, whole, for exactly the same reason: which idle he is in is not a fact
+     * about the world at all. It is sampled off his own animation heap — what he is genuinely
+     * PLAYING, every substitution already applied — so there is nothing here to re-derive and no
+     * combination of position, rate and yaw that could have answered it. See PlayerIdleKind, and
+     * idleAnm() in the .cpp for the subset this build can honour. Zero (the plain wait) at spawn
+     * via fopAcM_ct's zeroing of the actor, which is the right reading before any pose arrives. */
+    u8 mNetIdleKind;
+    /* The idle animation id resolved LAST tick, so a change of idle can be cross-faded exactly once
+     * rather than every tick. daAlink_c's own equivalent is the "did getUnderUpperAnime actually
+     * swap anything" return that setDoubleAnime tests (d_a_alink.cpp:7085-7087) before it
+     * substitutes a morf. Seeded in create() alongside mCurrentAnm; u16 for the same reason. */
+    u16 mCurrentIdleAnm;
+    /// Latches the one-shot "an alert idle is genuinely being drawn" line. Its whole job is to make
+    /// the feature falsifiable: a fallback for a resource that failed to load looks identical to
+    /// the feature not existing. See selectAnimation().
+    bool mLoggedIdleKind;
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
     /// And the same for the shield, which needs its OWN latch rather than sharing mLoggedEquip: the

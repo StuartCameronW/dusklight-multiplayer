@@ -21,6 +21,7 @@
 #include "dusk/frame_interpolation.h"
 #include "dusk/logging.h"
 #include "dusk/player_equip.hpp"
+#include "dusk/player_idle.hpp"
 #include "f_op/f_op_actor_mng.h"
 // The sword and sheath resource indices. Safe to include even though the per-outfit headers are
 // not: Alink.h's joint enums are all prefixed by their own model (AL_SWA_JNT, AL_PODM_JNT), so
@@ -448,6 +449,40 @@ const daAlink_c::daAlink_ANM l_runAnm = daAlink_c::ANM_RUN;
  * about direction here — there is only one direction the pose can mean.
  */
 const daAlink_c::daAlink_ANM l_slipAnm = daAlink_c::ANM_SLIP;
+
+/* The three ALERT idles, which replace l_idleAnm in the wait slot when the sender says he is in one
+ * (setBlendMoveAnime picks exactly ONE wait, d_a_alink.cpp:7585-7598, and procWait/procTiredWait
+ * can replace it outright). See idleAnm() for the mapping and the members in the header for what
+ * each one is.
+ *
+ * ★ None of the three lies inside anm_bck_data's substitution window [ANM_ATN_WAIT_LEFT 0x10,
+ * ANM_STEP_TURN 0x15), so a drawn sword cannot change which resources they name and they load with
+ * equip 0. That is a fact about the table rather than a simplification, and it is stated here so
+ * nobody later "fixes" the load to pass mNetEquip and reads meaning into it.
+ *
+ * ★ ANM_WAIT_B_TO_A (0x1B) and ANM_WAIT_TO_TIRED (0xB7), the one-shot transitions INTO two of
+ * these, are deliberately absent: daAlink_c plays them through setSingleAnimeBase, not through the
+ * blend, so they need the skid's one-shot path rather than a wait slot. The cross-fade in
+ * selectAnimation stands in for them.
+ *
+ * ★ The attention stance (ANM_ATN_WAIT_LEFT/RIGHT) is absent for a different reason, and it is not
+ * an oversight: setBlendAtnMoveAnime blends the stance with ATN_WALK and ATN_RUN inside ONE branch
+ * (:7951-8027), so the stance and the strafe are one animation set. Shipping the stance alone gives
+ * a puppet that stands correctly and then snaps to a forward-facing walk the instant its owner
+ * strafes — trading a wrong-but-stable pose for one that pops, which reads as a bug rather than as
+ * low fidelity. Job D3b, with the eight ATN gait BCKs and their own band arithmetic. */
+const daAlink_c::daAlink_ANM l_waitBAnm = daAlink_c::ANM_WAIT_B;
+const daAlink_c::daAlink_ANM l_serviceWaitAnm = daAlink_c::ANM_SERVICE_WAIT;
+const daAlink_c::daAlink_ANM l_tiredWaitAnm = daAlink_c::ANM_WAIT_TIRED;
+
+/* The wire's idle kinds come from dusk::mp::PlayerIdleKind in include/dusk/player_idle.hpp, which
+ * this actor and the protocol layer BOTH include — the arrangement player_equip.hpp already uses
+ * for the equipment byte, and for the same reason.
+ *
+ * ★ This landed first as four mirrored constants here, and that is worth remembering rather than
+ * quietly deleting: a mirror of a wire enum compiles perfectly and plays the WRONG ANIMATION the
+ * day either side is renumbered, with nothing to catch it. The shared header is not tidiness, it is
+ * the only version a compiler can check. */
 
 /* An animation's row in daAlink_c's table — the one place the puppet learns anything about a gait.
  * The table is a public static of the class (d_a_alink.h:3919) with constant initialisers, so this
@@ -1031,6 +1066,31 @@ int daRemotePlayer_c::createHeap() {
      * failure for the second would be a bad bargain, so this one degrades to the gait instead. */
     if (!load_gait_anm(&mSlipAnm, l_slipAnm, 0)) {
         Log.warn("Puppet has no sharp-turn animation; turns will play the gait instead");
+    }
+
+    /* The three alert idles, each NON-FATALLY and each with its own line, on exactly the terms the
+     * skid above is loaded on: a missing variant costs one pose — idleAnm() falls back to the plain
+     * wait — where a fatal createHeap costs the puppet permanently. They are also the three most
+     * likely to be squeezed out of the 0x20000 solid heap, SWAITA especially: it is a long
+     * performance animation and its buffer size is the one figure in this file that is extrapolated
+     * rather than measured. So this degrading path is the one that will actually be taken if
+     * anything is, and each warning names what is lost rather than reporting an anonymous failure.
+     *
+     * ★ Equip 0, not mNetEquip, and mNetEquip would be wrong in a way that reads as right: none of
+     * 0x1A / 0x90 / 0xB6 is inside anm_bck_data's [0x10, 0x15) window, so the substitution cannot
+     * fire for any of them, and passing the real byte would only invite a reader to think it might.
+     * (It is also not available yet — nothing has arrived on the wire when createHeap runs.) */
+    if (!load_gait_anm(&mWaitBAnm, l_waitBAnm, 0)) {
+        Log.warn("Puppet has no ANM_WAIT_B; its alert/braced idle will play the plain wait, and "
+                 "its hands will hold 4/10 instead of 1/6");
+    }
+    if (!load_gait_anm(&mServiceWaitAnm, l_serviceWaitAnm, 0)) {
+        Log.warn("Puppet has no ANM_SERVICE_WAIT; a standing player's idle fidget will play the "
+                 "plain wait");
+    }
+    if (!load_gait_anm(&mTiredWaitAnm, l_tiredWaitAnm, 0)) {
+        Log.warn("Puppet has no ANM_WAIT_TIRED; a player on his last heart will look unhurt, and "
+                 "the walk floor stays at mMinWalkRate");
     }
 
     /* The body model, built on exactly the terms the other three sub-models are — init_model
@@ -1628,7 +1688,25 @@ int daRemotePlayer_c::create() {
         return mountPhase;
     }
 
-    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x20000)) {
+    /* ★ 0x30000, raised from 0x20000 when the idle variants landed, and the number is measured
+     * rather than chosen. The loader keeps each animation's whole staging buffer resident, so an
+     * animation costs its buffer, not its expanded size, and the three idle variants weighed:
+     *
+     *     598 WAITB   6,784      604 WAITD  10,080      567 SWAITA  55,488
+     *
+     * SWAITA is four times any other animation this actor loads and on its own is 42% of the old
+     * budget. With them in, `Puppet heap after setup` fell from 76,768 free to 4,224 — and the
+     * danger there is not the animations, which each fail non-fatally. createHeap loads the
+     * animations BEFORE it builds the body, head, hands, face and equipment models, so an
+     * over-full heap does not cost an idle variant, it costs a MODEL, and the actor with it.
+     *
+     * The cost of the raise is real and worth stating: this is per puppet, so eight players is
+     * +448 KB of actor heap, and the spawn-failure policy in player_bridge.cpp exists precisely
+     * because 0x20000 already failed to fit in some rooms. SWAITA buys roughly a quarter of a
+     * standing player's idle ticks (measured: `idle applied: wait 74%, service 26%`), which is
+     * worth 55 KB; if a room is ever found where this does not fit, drop ANM_SERVICE_WAIT before
+     * dropping the other two — it is 78% of the added weight. */
+    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x30000)) {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
@@ -1639,13 +1717,17 @@ int daRemotePlayer_c::create() {
          */
         g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
         g_daRemotePlayer_lastCreateFail.mReason =
-            "the 0x20000 solid heap, or one of the models/animations createHeap() loads into it";
+            "the 0x30000 solid heap, or one of the models/animations createHeap() loads into it";
         return cPhs_ERROR_e;
     }
 
     // `model` itself was set by createHeap, which is where it is built; setupAnimation() has
     // already put the idle animation on it.
     mCurrentAnm = static_cast<u16>(l_idleAnm);
+    /* Seeded to the same plain wait, and it has to be seeded rather than left at fopAcM_ct's zero:
+     * animation id 0 is a real row (ANM_ATN_RETURN_FROM_WALK), so a zero here would read as "the
+     * idle changed" on the very first selectAnimation and cross-fade out of a pose nothing set. */
+    mCurrentIdleAnm = static_cast<u16>(l_idleAnm);
 
     /* Seeded from the player id, so two puppets standing side by side do not blink in unison — the
      * giveaway that would make them read as copies of one puppet rather than two people. Odd
@@ -1682,7 +1764,8 @@ static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
 }
 
 void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_moveRate,
-    bool i_sharpTurn, bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff, u8 i_equip) {
+    bool i_sharpTurn, bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff, u8 i_equip,
+    u8 i_idleKind) {
     current.pos = i_pos;
     shape_angle.y = i_angleY;
     // The logical angle is kept in step so anything that reads current.angle (audio, effects) sees
@@ -1696,6 +1779,11 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_mov
     mNetModeIdle = i_modeIdle;
     mNetFootIkOff = i_footIkOff;
     mNetEquip = i_equip;
+    /* Stored whole and unvalidated, like the equipment byte beside it: idleAnm() resolves it, and a
+     * value this build does not know resolves to the plain wait there rather than being rejected
+     * here. A peer built against a longer table is then a puppet with one idle missing, which is
+     * what every other unknown wire value already degrades to. */
+    mNetIdleKind = i_idleKind;
     mHasPose = true;
 }
 
@@ -1794,6 +1882,23 @@ void daRemotePlayer_c::selectAnimation() {
      * motionless puppet on the spot. It costs a compare and removes a class of wire bug. */
     const bool zeroSpeed = mNetZeroSpeed || fraction <= 0.0f;
 
+    /* Which idle the sender says he is in, resolved to something this puppet can actually play.
+     * Taken ONCE, before the bands, because three separate things downstream have to agree on it:
+     * the wait slot of band 1, the walk floor inside it, and the idle-tick probe below. See
+     * idleAnm(). */
+    u16 idleAnmID;
+    const daRemotePlayer_anm_c& idle = idleAnm(&idleAnmID);
+    /* The same value as the enum, once, so the four places below that want it as an animation id
+     * are not four separate casts of the u16 the header traffics in. */
+    const daAlink_c::daAlink_ANM idleID = static_cast<daAlink_c::daAlink_ANM>(idleAnmID);
+    /* ★ Keyed off the RESOLVED id rather than off mNetIdleKind, and that matters in exactly one
+     * case: a sender who is tired while this puppet failed to load WAITD. The two follow-on rules
+     * below are properties of the animation being PLAYED — the tired cycle is authored at rate 1.0
+     * and its walk floor is lower because the tired idle reads as heavier — so a puppet that fell
+     * back to the plain wait must take the plain wait's rules with it. Keying off the wire byte
+     * would give it a 0.4 walk floor over a WAITS cycle, which is neither player's behaviour. */
+    const bool tiredIdle = idleID == l_tiredWaitAnm;
+
     const daRemotePlayer_anm_c* anmA;
     const daRemotePlayer_anm_c* anmB;
     daAlink_c::daAlink_ANM idA;
@@ -1815,20 +1920,31 @@ void daRemotePlayer_c::selectAnimation() {
          * tick, for the same reason: he crosses from the standing branch to this one whole. A ramp
          * here would be a divergence invented to hide a divergence.
          *
-         * mMinTiredWalkRate (0.4) is the low-HP variant and belongs with ANM_WAIT_TIRED, which the
-         * puppet cannot play until the wire carries the sender's health — job D. */
+         * ★ WHICH floor depends on the idle: mMinTiredWalkRate (0.4) replaces mMinWalkRate (0.7)
+         * for the whole of band 1 while the wait slot holds ANM_WAIT_TIRED, which is the same
+         * `spC` selection daAlink_c makes on his own wait id (d_a_alink.cpp:7753-7757). It is not a
+         * detail of the idle: it changes how much walk weight a player on his last heart carries at
+         * every speed below the walk threshold, so a puppet using the 0.7 floor would walk visibly
+         * harder than the player it is copying for the whole time he is hurt. */
         if (!zeroSpeed) {
-            blend = hio.mMinWalkRate + blend * (1.0f - hio.mMinWalkRate);
+            const f32 floor = tiredIdle ? hio.mMinTiredWalkRate : hio.mMinWalkRate;
+            blend = floor + blend * (1.0f - floor);
         }
         /* Nothing pins the standing case to a hard zero, and deliberately: daAlink_c's standing
          * branch keeps the raw ratio too, it simply never reaches the remap. The ratio is already
          * zero to five decimal places whenever the bit is set — the bit means the sender's speed is
          * under 0.001 — so pinning it would only be inventing a rule the game does not have. */
-        anmA = &mIdleAnm;
+        anmA = &idle;
         anmB = &mWalkAnm;
-        idA = l_idleAnm;
+        idA = idleID;
         idB = l_walkAnm;
-        speedA = hio.mWaitAnmSpeed;
+        /* ★ 1.0f for the tired idle, NOT mWaitAnmSpeed, and daAlink_c overrides it in exactly this
+         * place for exactly this animation (d_a_alink.cpp:7766-7769, alongside ANM_HORSE_WAIT_D_B).
+         * WAITD is authored to be played at its own rate; at mWaitAnmSpeed it runs subtly fast, and
+         * "subtly fast" is invisible in a screenshot and invisible in the trace — the animation id,
+         * the BCK and the blend are all still correct. It only shows as a low-health idle that does
+         * not read as tired. */
+        speedA = tiredIdle ? 1.0f : hio.mWaitAnmSpeed;
         speedB = hio.mWalkAnmSpeed;
     } else if (fraction < hio.mRunChangeRate) {
         blend = (fraction - hio.mWalkChangeRate) / (hio.mRunChangeRate - hio.mWalkChangeRate);
@@ -1871,8 +1987,15 @@ void daRemotePlayer_c::selectAnimation() {
      * loop at mWaitAnmSpeed, which is 1.0 (d_a_alink_HIO_data.inc:33) — so the question is whether
      * the frame is actually ADVANCING, which nothing else in the trace can answer. One latched line
      * once the puppet has been idle a while; a frame near the animation's end means it is running.
-     */
-    if (wanted == l_idleAnm) {
+     *
+     * ★ Compared against the RESOLVED idle id, not against l_idleAnm, and this is the third of the
+     * three follow-ons the variable idle forces. With l_idleAnm hard-coded here the counter would
+     * reset to zero on the first tick the sender took an alert idle and stay there for as long as
+     * he held it — so the probe would silently never fire in precisely the sessions where there is
+     * something new to measure. It cannot be `wanted == idA` either: idA is the WALK in band 2, so
+     * that would count a walking puppet's ticks as idle ones. Only the resolved idle id is right,
+     * and it is right in every band, because the idle can only ever appear as band 1's anmA. */
+    if (wanted == idleID) {
         if (mIdleTicks < 0xFFFF) {
             mIdleTicks++;
         }
@@ -1894,7 +2017,71 @@ void daRemotePlayer_c::selectAnimation() {
     /* No morf between gaits — the blend IS the transition, and asking for one on top would fade
      * from a pose to itself. The only thing there is to fade out of is the skid, which is a single
      * animation, and mDoubleAnmSet is exactly "the last thing set was a blended pair". */
-    setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, mDoubleAnmSet ? -1.0f : l_gaitMorf);
+    f32 morf = mDoubleAnmSet ? -1.0f : l_gaitMorf;
+
+    /* ★ ONE exception, and the variable idle is what creates it: the wait SLOT can now change
+     * animation outright while the blend weights do not move at all. Nothing else in this function
+     * can — a band crossing hands over at a weight of 0 or 1, so the pose is continuous through
+     * it — but WAITS becoming WAITB is a different pose at the same weight, and with no cross-fade
+     * it arrives in a single frame as a pop.
+     *
+     * daAlink_c has exactly this case and exactly this remedy: setDoubleAnime asks whether
+     * getUnderUpperAnime actually swapped anything and, if it did, SUBSTITUTES a morf for the -1
+     * its caller passed — mWaitBInterpolation when the new wait is ANM_WAIT_B and he is standing
+     * (checkModeFlg(MODE_IDLE), which is the bit mNetModeIdle carries), mBasicInterpolation
+     * otherwise (d_a_alink.cpp:7085-7101). Both numbers are read from his HIO rather than copied,
+     * the same single-source rule the gait thresholds follow.
+     *
+     * Gated on band 1 because that is the only band in which the idle is in the packs at all. An
+     * idle change while the sender is running would otherwise cross-fade the whole body out of a
+     * pose that is carrying zero weight. mCurrentIdleAnm is still updated in every band, so the
+     * change is CONSUMED rather than deferred: re-entering band 1 later ramps the idle back in from
+     * a weight of 0 under the blend, which needs no morf of its own. */
+    if (idleAnmID != mCurrentIdleAnm) {
+        if (fraction < hio.mWalkChangeRate) {
+            if (idleID == l_waitBAnm && mNetModeIdle) {
+                morf = hio.mWaitBInterpolation;
+            } else if (morf < 0.0f) {
+                morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+            }
+        }
+        mCurrentIdleAnm = idleAnmID;
+    }
+
+    setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, morf);
+
+    /* ★ Latched and permanent, and it is the ONLY thing that makes "the alert idle works" a
+     * falsifiable claim. Everything downstream of the resolver degrades quietly by design — a WAITB
+     * that did not fit in the solid heap resolves to the plain wait and draws a puppet that looks
+     * exactly like a build without this feature at all — so without one line naming what was asked
+     * for AND what was resolved, the two are indistinguishable from any log, any trace and any
+     * screenshot.
+     *
+     * Fires on a non-zero KIND rather than on a successful resolution, which is the whole point: a
+     * line reading `kind 1 -> anm 25` is the fallback and a line reading `kind 1 -> anm 26` is the
+     * feature. The hand pair is printed because it is the one observable visible in a still frame —
+     * ANM_WAIT_B's row asks for 1/6 where every other idle asks 4/10 — and setDrawHand needs no
+     * change to produce it, since it reads anm_data(mCurrentAnm) and mCurrentAnm is now the alert
+     * idle's id. The BCK index is what --mp-trace's `actor` row will carry, so it is the value to
+     * compare against the sender's `local` row on the same tick.
+     *
+     * Gated on band 1 for the same reason the morf above is: outside it the idle carries no weight,
+     * so it is not being DRAWN, and a line claiming otherwise would be the kind of evidence that
+     * looks like proof and is not. */
+    if (!mLoggedIdleKind && mNetIdleKind != dusk::mp::kPlayerIdleWait &&
+        fraction < hio.mWalkChangeRate)
+    {
+        mLoggedIdleKind = true;
+        const daAlink_AnmData& idleData = anm_data(idleID);
+        Log.debug("Puppet {} alert idle live: wire kind {} -> anm {} (bck {}), hands {}/{}, "
+                  "speed {:.2f}, walk floor {:.2f}{}",
+            mPlayerId, static_cast<unsigned>(mNetIdleKind), idleAnmID,
+            anm_bck_idx(idleID, mNetEquip), idleData.m_handIndexL, idleData.m_handIndexR, speedA,
+            tiredIdle ? hio.mMinTiredWalkRate : hio.mMinWalkRate,
+            idleID == l_idleAnm ?
+                " — FELL BACK to the plain wait; the animation for this kind is not resident" :
+                "");
+    }
 
     /* ★ Latched and permanent. The armed run and the empty-handed one share their LEGS — both are
      * DASHS under — so the trace's animation id, the frame numbers and the blend are all identical
@@ -1981,6 +2168,56 @@ u16 daRemotePlayer_c::getCurrentAnm() const {
  * rest of the animation code. */
 const daRemotePlayer_anm_c& daRemotePlayer_c::runAnm() const {
     return (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0 ? mRunSwordAnm : mRunAnm;
+}
+
+/**
+ * Which idle the puppet plays this tick, and which animation id that is.
+ *
+ * ★ This is a LOOKUP, not a decision. Every one of daAlink_c's own tests for these — a lock-on, an
+ * enemy looked at within the last 0x50 ticks, a boss room, heavy boots, `dComIfGs_getLife() <= 4`,
+ * 10-15 seconds of unbroken standing — reads state that is not on the wire and could not be put
+ * there cheaply. What IS on the wire is his answer, sampled off his own animation heap after every
+ * substitution has been applied (fill_idle_kind, player_bridge.cpp), so there is nothing to
+ * re-derive and nothing to get subtly different from him. That rule has now retired four bugs on
+ * this actor.
+ *
+ * ★ The fallback is on mpUnder, NOT on the kind, and the difference is the whole point of the
+ * one-shot log in selectAnimation(). A kind this build knows but whose BCK did not fit in the solid
+ * heap has to behave exactly like a kind it does not know — the plain wait — because the other
+ * outcome is setDoubleAnm returning early on a NULL and freezing the puppet's pose outright.
+ *
+ * Anything not named here (the wind and insect idles, and both attention stances) falls through to
+ * the plain wait deliberately; see l_waitBAnm above for why the stances are not a "todo".
+ */
+const daRemotePlayer_anm_c& daRemotePlayer_c::idleAnm(u16* o_anmID) const {
+    const daRemotePlayer_anm_c* anm = &mIdleAnm;
+    daAlink_c::daAlink_ANM id = l_idleAnm;
+
+    switch (mNetIdleKind) {
+    case dusk::mp::kPlayerIdleWaitB:
+        if (mWaitBAnm.mpUnder != NULL) {
+            anm = &mWaitBAnm;
+            id = l_waitBAnm;
+        }
+        break;
+    case dusk::mp::kPlayerIdleService:
+        if (mServiceWaitAnm.mpUnder != NULL) {
+            anm = &mServiceWaitAnm;
+            id = l_serviceWaitAnm;
+        }
+        break;
+    case dusk::mp::kPlayerIdleTired:
+        if (mTiredWaitAnm.mpUnder != NULL) {
+            anm = &mTiredWaitAnm;
+            id = l_tiredWaitAnm;
+        }
+        break;
+    default:
+        break;
+    }
+
+    *o_anmID = static_cast<u16>(id);
+    return *anm;
 }
 
 /**
@@ -2117,11 +2354,16 @@ void daRemotePlayer_c::setDrawHand() {
      * getMainBckData does NOT substitute — it swaps the BCK pair only, never the hands. So the
      * sword cannot be in the wrong place, and the pose cannot be a table read gone wrong.
      *
-     * What is left is that daAlink_c may not be in the same ANIMATION. His armed idle is
-     * ANM_ATN_WAIT_LEFT/RIGHT (0x10/0x11), whose table row asks for 0xFE/0xFE — the BODY's own
-     * hands, which are modelled closed in those animations — where the puppet has no armed idle and
-     * plays ANM_WAIT, which asks for the generic 4/10. If that is it, the two numbers below differ
-     * and the fix is an animation the puppet cannot pick yet, not a hand override.
+     * What is left is that daAlink_c may not be in the same ANIMATION.
+     *
+     * ★ Corrected 2026-08-13 (.claude/plan/12-d3-idle-spec.md §0): ANM_ATN_WAIT_LEFT/RIGHT
+     * (0x10/0x11) is NOT "his armed idle", which is what this comment used to claim. It is the
+     * ATTENTION stance — the sideways-on pose he takes whenever Z is held, the shield is up or a
+     * throwable is readied — and he takes it armed or not. A player standing still with the sword
+     * out and no lock-on plays ANM_WAIT, exactly as the puppet does, and getMainBckData does not
+     * substitute it because 0x19 is outside the [0x10, 0x15) window. So there is no armed-idle
+     * divergence for a plain standing player, and a difference in the two numbers below points at
+     * the stance (job D3b) or at the alert idle (idleAnm(), above), not at a missing armed wait.
      *
      * Both sides are printed because either alone proves nothing: the puppet's pair is only wrong
      * relative to what the local player is showing on the same tick. */

@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "dusk/player_equip.hpp"
+#include "dusk/player_idle.hpp"
 
 #include "../net/serializer.hpp"
 
@@ -103,27 +104,6 @@ enum PlayerStateFlags : std::uint8_t {
      * sender's own timeline, which is the timeline the puppet is replaying.
      */
     kPlayerStateNoFootIk = 1 << 5,
-};
-
-/**
- * Which idle daAlink_c actually chose. Not a set of independent flags: setBlendMoveAnime picks
- * exactly ONE (d_a_alink.cpp:7585-7598, :7732-7737), and procWait/procTiredWait can override it
- * wholesale (:15624-15625, :15637-15643). An enumeration is that structure.
- *
- * The comment beside each name is the daAlink_c::daAlink_ANM enumerator it stands for, and its
- * resource id. The ANM ids are NOT sent — they are 16-bit and they are an engine detail this layer
- * is not allowed to know (layering rule, 04) — so this byte is the stable wire name for them and
- * d_a_remote_player.cpp is the single place that maps it back.
- */
-enum PlayerIdleKind : std::uint8_t {
-    kPlayerIdleWait = 0,      // ANM_WAIT 0x19
-    kPlayerIdleWaitB = 1,     // ANM_WAIT_B 0x1A
-    kPlayerIdleTired = 2,     // ANM_WAIT_TIRED 0xB6
-    kPlayerIdleService = 3,   // ANM_SERVICE_WAIT 0x90
-    kPlayerIdleWind = 4,      // ANM_WAIT_WIND 0xFF
-    kPlayerIdleInsect = 5,    // ANM_WAIT_INSECT 0x185
-    kPlayerIdleAtnLeft = 6,   // ANM_ATN_WAIT_LEFT 0x10
-    kPlayerIdleAtnRight = 7,  // ANM_ATN_WAIT_RIGHT 0x11
 };
 
 /// 22 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
