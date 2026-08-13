@@ -1,4 +1,5 @@
 #include "dusk/autosave.h"
+#include "dusk/multiplayer/session/save_guard.hpp"
 #include "dusk/ui/ui.hpp"
 #include "imgui/ImGuiConsole.hpp"
 
@@ -9,7 +10,11 @@ int autoSaveWriteState = 0;
 
 typedef void (*AutoSaveFuncs)();
 static AutoSaveFuncs AutoSaveFuncsProc[] = {
-    noAutoSave, enterAutoSave, autoSaving, waitingForWrite, endAutoSave,
+    noAutoSave,
+    enterAutoSave,
+    autoSaving,
+    waitingForWrite,
+    endAutoSave,
 };
 
 void noAutoSave() {}
@@ -24,14 +29,21 @@ bool canAutoSave() {
         return false;
     }
 
+    // Never serialise a game state that another player authored into this machine's own card.
+    // Returns false unconditionally today — see save_guard.hpp for what it will mean, and for why
+    // this line currently protects nothing. It is here so the flag-replication work cannot ship
+    // without tripping over it.
+    if (dusk::mp::save_would_be_contaminated()) {
+        return false;
+    }
+
     return dusk::getSettings().game.autoSave && shouldAutoSave && mAutoSaveProc == 0 &&
            strcmp(dComIfGp_getStartStageName(), "F_SP102") != 0 &&
            strcmp(dComIfGp_getStartStageName(), "F_SP112") != 0;
 }
 
 void triggerAutoSave() {
-    if (canAutoSave())
-    {
+    if (canAutoSave()) {
         mAutoSaveProc = 1;
     }
 }
