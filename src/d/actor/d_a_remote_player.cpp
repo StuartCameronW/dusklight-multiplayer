@@ -112,6 +112,10 @@ const char l_woodSwordResName[] = "al_SWB.bmd";
  * overwritten with the body's hand joints after its calc (d_a_alink.cpp:19013-19014).
  */
 const u16 l_headJointNo = 4;
+/* How many grip comparison lines to print per puppet, and daAlink_c's "the sword is in hand" value
+ * for mEquipItem (dItemNo_SWORD_e). Both used by setDrawHand's grip series. */
+const u16 l_gripLogMax = 12;
+const u16 l_swordInHandEquipItem = 0x103;
 const u16 l_leftHandJointNo = 9;
 const u16 l_rightHandJointNo = 0xE;
 
@@ -198,6 +202,54 @@ bool has_warp_material(J3DModelData* i_modelData) {
     J3DTevBlock* tevBlock = i_modelData->getMaterialNodePointer(0)->getTevBlock();
     const u8 stageNum = tevBlock->getTevStageNum();
     return stageNum > 0 && tevBlock->getTevOrder(stageNum - 1)->getTexMap() == 3;
+}
+
+/**
+ * How many of a model's materials are drawing the dissolve RIGHT NOW — all of them, not material 0.
+ *
+ * ★ has_warp_material() above reads material 0 alone, and that is correct for what it is used for:
+ * onWarpMaterial and offWarpMaterial both BREAK on the first material already in the target state
+ * (d_resorce.cpp:181-211), so material 0 gates the whole loop and asking it is asking what the
+ * bracket will do. It is NOT a correct answer to "is this model dissolving", and reading it as one
+ * is a measurement error I made on 2026-08-13: material 0 of the master sword's sheath is off, I
+ * reported the model as clean, and Stuart could still see the effect on it.
+ *
+ * addWarpMaterial installs the stage on EVERY material of a BMWR model (:145-178), so a model whose
+ * material 0 disagrees with its material 5 is a model something has half-toggled. This counts them.
+ */
+u16 warp_material_count(J3DModelData* i_modelData) {
+    if (i_modelData == NULL) {
+        return 0;
+    }
+
+    u16 count = 0;
+    for (u16 i = 0; i < i_modelData->getMaterialNum(); i++) {
+        J3DTevBlock* tevBlock = i_modelData->getMaterialNodePointer(i)->getTevBlock();
+        const u8 stageNum = tevBlock->getTevStageNum();
+        if (stageNum > 0 && tevBlock->getTevOrder(stageNum - 1)->getTexMap() == 3) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/**
+ * Did addWarpMaterial ever run on this model data — i.e. does a dormant dissolve stage EXIST here?
+ *
+ * ★ This is the question daAlink_c::initModel's pointer test is really asking, expressed in a way
+ * that survives a private archive copy. He compares the model's last texture against
+ * mpWarpTexData; addWarpMaterial is what appended that texture, and the same function asserts
+ * `tevBlock->getTexNo(3) == 0xffff` immediately before writing the texture number into slot 3
+ * (d_resorce.cpp:301-302). So slot 3 being occupied is exactly "the dissolve was installed here",
+ * and unlike the pointer it is a property of the data rather than of which copy of it we hold —
+ * which is why the pointer test measured FALSE for every one of the puppet's private mounts on
+ * 2026-08-12 and left all four body models dissolving.
+ */
+bool warp_texture_installed(J3DModelData* i_modelData) {
+    if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
+        return false;
+    }
+    return i_modelData->getMaterialNodePointer(0)->getTevBlock()->getTexNo(3) != 0xFFFF;
 }
 
 /**
@@ -293,9 +345,10 @@ J3DModel* init_model_common(
      * with 0x2000400 the model keeps its own copy of it. sigBefore says what the shared data
      * happened to be in when we got here, which depends on who created a model from it first. */
     Log.debug("Puppet init_model {}: warp bracket {} | data sig 0x{:04x} -> built from 0x{:04x} "
-              "-> restored 0x{:04x}",
+              "-> restored 0x{:04x} | dissolve installed {} | materials dissolving {} of {}",
         i_what, warpMaterial ? "TAKEN" : "not taken", sigBefore, sigAtCreate,
-        material_signature(i_modelData));
+        material_signature(i_modelData), warp_texture_installed(i_modelData) ? "YES" : "no",
+        warp_material_count(i_modelData), i_modelData->getMaterialNum());
 
     return model;
 }
@@ -1034,6 +1087,7 @@ int daRemotePlayer_c::createHeap() {
      * and make checkMaterialDrift() announce a change on its very first tick. */
     for (int i = 0; i < l_watchedModelNum; i++) {
         mMaterialSig[i] = 0xFFFF;
+        mWarpMatCount[i] = 0xFFFF;
     }
 
     const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
@@ -1888,6 +1942,45 @@ void daRemotePlayer_c::setDrawHand() {
         Log.debug("Puppet {} hands: anim {} (bck {}) asks for L={} R={}", mPlayerId, mCurrentAnm,
             getCurrentAnm(), handIdx[0], handIdx[1]);
     }
+
+    /* ★ Latched, and it is the measurement for "the puppet doesn't grip the sword with his hands".
+     *
+     * Everything structural about the grip already matches daAlink_c and was checked line by line:
+     * the in-hand sword's base transform IS `model->getAnmMtx(10)`, the same expression he uses
+     * (d_a_alink.cpp:5895); the hands model is posed off body joints 9 and 14 exactly as he poses
+     * his (:19007-19014); and the hand indices come from the same m_anmDataTable row, which
+     * getMainBckData does NOT substitute — it swaps the BCK pair only, never the hands. So the
+     * sword cannot be in the wrong place, and the pose cannot be a table read gone wrong.
+     *
+     * What is left is that daAlink_c may not be in the same ANIMATION. His armed idle is
+     * ANM_ATN_WAIT_LEFT/RIGHT (0x10/0x11), whose table row asks for 0xFE/0xFE — the BODY's own
+     * hands, which are modelled closed in those animations — where the puppet has no armed idle and
+     * plays ANM_WAIT, which asks for the generic 4/10. If that is it, the two numbers below differ
+     * and the fix is an animation the puppet cannot pick yet, not a hand override.
+     *
+     * Both sides are printed because either alone proves nothing: the puppet's pair is only wrong
+     * relative to what the local player is showing on the same tick. */
+    if (mLoggedGrip < l_gripLogMax && (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
+        const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+        if (link != NULL && link->mEquipItem == l_swordInHandEquipItem) {
+            /* A SERIES rather than one latched line, and the first version of this was the latched
+             * one and was useless: it fired on the first armed tick, which is the tick right after
+             * a B press, so it caught the local player mid-swing (every 0x64 hand index in
+             * m_anmDataTable belongs to a CUT* animation) against a puppet that was running. Two
+             * actors in unrelated states compare to nothing. Sampling on CHANGE, capped, covers
+             * standing, running and swinging in one run, and his proc id says which is which. */
+            const u32 state = ((u32)link->mProcID << 16) | ((u32)link->mLeftHandIndex << 8) |
+                              (u32)link->mRightHandIndex;
+            if (state != mLastGripState) {
+                mLastGripState = state;
+                mLoggedGrip++;
+                Log.debug("Puppet {} grip: puppet anim {} asks L={} R={} | local player proc {} "
+                          "shows L={} R={}",
+                    mPlayerId, mCurrentAnm, handIdx[0], handIdx[1], link->mProcID,
+                    link->mLeftHandIndex, link->mRightHandIndex);
+            }
+        }
+    }
 }
 
 /**
@@ -2572,20 +2665,32 @@ void daRemotePlayer_c::checkMaterialDrift() {
 
     for (int i = 0; i < l_watchedModelNum; i++) {
         const u16 signature = material_signature(models[i]);
-        if (signature == mMaterialSig[i]) {
-            continue;
+        if (signature != mMaterialSig[i]) {
+            const u16 previous = mMaterialSig[i];
+            mMaterialSig[i] = signature;
+            if (previous != 0xFFFF) {  // First sample is the baseline, not a change.
+                const u8 texMap = (u8)(signature & 0xFF);
+                Log.warn("Puppet {} {} material CHANGED: stages {}->{}, lastTexMap {}->{}{}",
+                    mPlayerId, names[i], previous >> 8, signature >> 8, (u8)(previous & 0xFF),
+                    texMap, texMap == 3 ? "  <<< TWILIGHT DISSOLVE JUST TURNED ON" : "");
+            }
         }
 
-        const u16 previous = mMaterialSig[i];
-        mMaterialSig[i] = signature;
-        if (previous == 0xFFFF) {
-            continue;  // First sample is the baseline, not a change.
+        /* ★ Separate from the signature above and NOT redundant with it. The signature is material
+         * 0's, which is the right thing to watch for what the bracket will do and the WRONG thing
+         * to watch for what is on screen — the toggles break on the first material already in the
+         * target state, so a model can sit with material 0 off and every other material dissolving
+         * and never move this signature at all. That is exactly the state I failed to look for the
+         * first time round. This counts all of them. */
+        const u16 dissolving = warp_material_count(models[i]);
+        if (dissolving != mWarpMatCount[i]) {
+            const u16 previous = mWarpMatCount[i];
+            mWarpMatCount[i] = dissolving;
+            if (previous != 0xFFFF) {
+                Log.warn("Puppet {} {} DISSOLVING MATERIALS {}->{} of {}", mPlayerId, names[i],
+                    previous, dissolving, models[i] != NULL ? models[i]->getMaterialNum() : 0);
+            }
         }
-
-        const u8 texMap = (u8)(signature & 0xFF);
-        Log.warn("Puppet {} {} material CHANGED: stages {}->{}, lastTexMap {}->{}{}", mPlayerId,
-            names[i], previous >> 8, signature >> 8, (u8)(previous & 0xFF), texMap,
-            texMap == 3 ? "  <<< TWILIGHT DISSOLVE JUST TURNED ON" : "");
     }
 }
 
@@ -3786,9 +3891,36 @@ void daRemotePlayer_c::setupEquipModels() {
     mpSwordModel[dusk::mp::kPlayerEquipSwordWood] = init_model(
         static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_woodSwordResName)), 0, "sword wood");
 
-    // Two sheaths, three swords: the wooden sword carries the master sword's (d_a_alink.cpp:4356).
-    J3DModel* podaModel = init_model(podaData, 0, "sheath PODA");
-    J3DModel* podmModel = init_model_env(podmData, 0, "sheath PODM");
+    /* Two sheaths, three swords: the wooden sword carries the master sword's (d_a_alink.cpp:4356).
+     *
+     * ★ DELIBERATE DIVERGENCE, and the only one in this function: daAlink_c builds both sheaths
+     * with diffFlags 0 (:4247, :4251) and these pass J3D_DIFF_TEXGENNUM(2) = 0x200 — the same value
+     * he gives the two SWORDS (:4239, :4243), not a number invented here.
+     *
+     * The reason is that he is a singleton and a puppet is not. `J3DDiffFlag`'s TexGenNum field is
+     * what makes a model RE-EMIT its own texture matrices on diff (J3DTexGenBlockPatched::diff ->
+     * diffTexMtx, J3DMatBlock.cpp:545-562); with it at zero a model uses whatever was last baked
+     * into the display list. The J3DTexMtx objects live on the model DATA, and for these four
+     * models the puppet shares one J3DModelData with the local player — so the last actor to calc
+     * before an entry decides what BOTH of them draw. PODM is the one model of the four that is
+     * both shared AND environment-mapped (two TEV stages, the second sampling texmap 1, which is
+     * why daAlink_c builds it with initModelEnv), so it is the only one where that matters, and it
+     * is exactly the model Stuart reports the effect on. An env matrix is camera-derived, which is
+     * why it shows "on certain camera angles".
+     *
+     * This is the same hazard the blade-visibility bracket in drawEquip() exists for — one piece of
+     * state serving two actors that can disagree about it — and it is applied to BOTH sheaths
+     * rather than only to PODM, because fixing only the one that is visibly wrong leaves the other
+     * latent.
+     *
+     * ⚠ NOT yet confirmed by eye. The measurements rule the twilight dissolve out completely (no
+     * equipment model ever carries a counted dissolve stage, and zero material changes over 150 s
+     * on both instances); this is the mechanism that survives, not one that has been watched to
+     * work. If the effect persists, the next step is NOT another flag — it is giving the puppet its
+     * own copy of the sheath model data, because sharing is the root and this only stops one of its
+     * consequences. */
+    J3DModel* podaModel = init_model(podaData, 0x200, "sheath PODA");
+    J3DModel* podmModel = init_model_env(podmData, 0x200, "sheath PODM");
     mpSheathModel[dusk::mp::kPlayerEquipSwordOrdon] = podaModel;
     mpSheathModel[dusk::mp::kPlayerEquipSwordMaster] = podmModel;
     mpSheathModel[dusk::mp::kPlayerEquipSwordWood] = podmModel;

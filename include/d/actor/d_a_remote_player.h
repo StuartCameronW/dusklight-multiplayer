@@ -303,6 +303,13 @@ private:
     bool mLoggedShadow;
     /// Same for the first hand pose actually taken off the hands model; see setDrawHand().
     bool mLoggedHands;
+    /// And once for the first tick the puppet holds a drawn sword, printing its hand pair next to
+    /// the local player's. Either alone proves nothing; the pair is only wrong relative to what he
+    /// is showing on the same tick. See setDrawHand().
+    u16 mLoggedGrip;
+    /// Packed (local player proc id, his left hand index, his right hand index) as last printed, so
+    /// the grip series samples on CHANGE rather than every tick.
+    u32 mLastGripState;
     /// And for the first tick the body's two animation halves are actually running SEPARATE
     /// animations, which is the only observable that separates the split rig from the single one it
     /// replaced. Everything else about it — the model, the joints, the morf — looks identical.
@@ -504,6 +511,12 @@ private:
     /* Last-seen material signature per watched model, in the order body/head/hands/face and then
      * the three swords and two sheaths. 0xFFFF until the first sample. See checkMaterialDrift(). */
     u16 mMaterialSig[9];
+    /* Last-seen COUNT of materials drawing the dissolve, same model order. Watched separately from
+     * the signature above because the signature is material 0's, and the warp toggles break on the
+     * first material already in the target state — so a model can sit with material 0 clean and
+     * every other material dissolving without the signature ever moving. 0xFFFF until first
+     * sampled. */
+    u16 mWarpMatCount[9];
     /* ★ TEMPORARY — Hang 4. How many calcs have been step-traced so far. See traceCalc(). */
     u16 mCalcTraced;
 
