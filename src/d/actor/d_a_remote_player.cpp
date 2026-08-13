@@ -18,6 +18,7 @@
 #include "d/actor/d_a_npc4.h"
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_bg_s.h"
+#include "dusk/frame_interpolation.h"
 #include "dusk/logging.h"
 #include "dusk/player_equip.hpp"
 #include "f_op/f_op_actor_mng.h"
@@ -4055,6 +4056,55 @@ void daRemotePlayer_c::shadowDraw() {
 int daRemotePlayer_c::draw() {
     if (!mHasPose) {
         return 1;
+    }
+
+    /* ★★ HANG 4. This is the fix, and it is the whole of it.
+     *
+     * A J3DModel may be ENTERED into the draw list at most once per pass. Enter it twice and the
+     * mat packet's shape chain is made to point at itself (J3DJoint::entryIn's setShapePacket,
+     * J3DJoint.cpp:164-180), and the renderer then walks that list forever — which is what the
+     * Aurora FIFO guard catches as "command stream reached 268435456 bytes".
+     *
+     * With frame interpolation on, every actor is legitimately drawn TWICE per presentation frame
+     * (m_Do_main.cpp:298-322): once inside fapGm_Execute with frame_interp::is_sim_frame() true,
+     * and once from fpcM_DrawIterater with it false. That is safe, because mDoExt_modelEntryDL
+     * early-outs to J3DModel::diff() on the second (m_Do_ext.cpp) and never re-enters.
+     *
+     * The puppet was getting TWO draws with is_sim_frame() TRUE, both on the SAME sim tick. It is
+     * measured rather than reasoned — the two ends of one run, at the puppet's first draw:
+     *
+     *   host  : simFrame YES simTickSeq 725 / simFrame YES simTickSeq 725   -> FATAL, every time
+     *   guest : simFrame YES simTickSeq 554 / simFrame YES simTickSeq 555   -> healthy, every time
+     *
+     * That is the whole of the host/guest asymmetry that made this look intermittent for two
+     * sessions: whether the puppet's two entry-draws land inside one sim tick or straddle two is a
+     * matter of exactly when in the frame the network layer got the actor created, which is why it
+     * came and went with timing and never with code.
+     *
+     * So: one entry per sim tick, enforced here. The second call is a DUPLICATE, not an
+     * interpolated frame, and skipping it is the correct handling rather than a mitigation — the
+     * model is already in the list, and shadowDraw() would otherwise burn a second of the eight
+     * global real-shadow slots on the same puppet. Interpolated frames (is_sim_frame() false) are
+     * never skipped: they carry the diff() that makes the puppet move between sim ticks.
+     *
+     * Deliberately fixed HERE and not in the actor framework. The framework drawing a
+     * just-created actor twice may well be general, but every other actor in the game is created
+     * during a scene load rather than from a network event mid-session, and this is Dusk-authored
+     * code that cannot affect the local player. If it turns out to bite a stock actor too, the
+     * framework is the place — see 00-status.md. */
+    if (dusk::frame_interp::is_sim_frame()) {
+        const u64 simTick = dusk::frame_interp::sim_tick_seq();
+        if (mHasDrawnSimTick && mDrawnSimTick == simTick) {
+            if (!mLoggedDoubleDraw) {
+                mLoggedDoubleDraw = true;
+                Log.debug("Puppet {} skipped a SECOND entry-draw on sim tick {} — this is Hang 4's "
+                          "cycle, caught",
+                    mPlayerId, simTick);
+            }
+            return 1;
+        }
+        mDrawnSimTick = simTick;
+        mHasDrawnSimTick = true;
     }
 
     // 10 is the light type daAlink_c uses for human Link (d_a_alink.cpp:19470), so the puppet is

@@ -621,6 +621,16 @@ private:
     u8 mNetEquip;
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
+
+    /* Hang 4's guard. The sim tick this puppet last ENTERED the draw list on, and whether it ever
+     * has. A J3DModel may be entered once per pass; a second entry builds a self-referential shape
+     * chain and the renderer never terminates. See draw() for the measurement that pinned it. */
+    u64 mDrawnSimTick;
+    bool mHasDrawnSimTick;
+    /// Latches the one-shot "a second entry-draw was skipped" line. Its ABSENCE from a session log
+    /// is meaningful: it means the double draw did not happen in that session, not that the guard
+    /// is broken.
+    bool mLoggedDoubleDraw;
 };
 
 /**
