@@ -818,6 +818,7 @@ int daRemotePlayer_c::createHeap() {
     setupFaceAnimation();
 
     setupHeadSway();
+    setupFootIk();
 
     /* Hands, and the one body shape this outfit is built with hidden. Both are the tail of
      * daAlink_c::setLinkModel (d_a_alink_wolf.inc:471-498) and both were missing; see setDrawHand()
@@ -2095,27 +2096,6 @@ void daRemotePlayer_c::setupHeadSway() {
 }
 
 /**
- * Rotate one joint's world matrix about the puppet's yaw frame, in place.
- *
- * daAlink_c::setMatrixWorldAxisRot (d_a_alink.cpp:2098-2120) with the magne-boot frame dropped —
- * a puppet never wears the iron boots, and concatMagneBootMtx is daAlink_c state. Deliberately
- * does NOT write J3DSys::mCurrentMtx, matching the param_4 == 0 form the hair uses: each hair
- * strand is rotated on its own and must not drag the rest of the head with it.
- */
-void daRemotePlayer_c::setJointWorldAxisRot(MtxP i_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ) {
-    cXyz jointPos;
-    mDoMtx_multVecZero(i_mtx, &jointPos);
-
-    mDoMtx_stack_c::transS(jointPos);
-    mDoMtx_stack_c::YrotM(shape_angle.y);
-    mDoMtx_stack_c::ZXYrotM(i_rotX, i_rotY, i_rotZ);
-    mDoMtx_stack_c::YrotM(-shape_angle.y);
-    mDoMtx_stack_c::transM(-jointPos.x, -jointPos.y, -jointPos.z);
-    mDoMtx_stack_c::concat(i_mtx);
-    mDoMtx_copy(mDoMtx_stack_c::get(), i_mtx);
-}
-
-/**
  * Apply this tick's sway to one joint of the head model, during that model's calc().
  *
  * Transcribed from daAlink_c::headModelCallBack (d_a_alink.cpp:2477-2496), keeping only the branch
@@ -2157,8 +2137,11 @@ int daRemotePlayer_c::headModelCallBack(int i_jointNo) {
          * nothing between the two lines can yield. */
         const s16 bodyYaw = shape_angle.y;
         shape_angle.y = mHeadYaw;
-        setJointWorldAxisRot(
-            mpHeadModel->getAnmMtx(i_jointNo), mSwayAngleX[i_jointNo], 0, mSwayAngleY[i_jointNo]);
+        /* No pivot: a hair strand turns about its own root, and rewriting only its own matrix is
+         * what keeps the strands independent of one another (the param_4 == 0 form of the
+         * original). The foot IK is the caller that passes one. */
+        setMatrixWorldAxisRot(mpHeadModel->getAnmMtx(i_jointNo), mSwayAngleX[i_jointNo], 0,
+            mSwayAngleY[i_jointNo], NULL);
         shape_angle.y = bodyYaw;
     }
 
@@ -2940,6 +2923,100 @@ void daRemotePlayer_c::setHatAngle() {
  * the wolf's are different and the puppet has no wolf model. */
 const u16 l_legRootJointNo[2] = {0x12, 0x17};
 
+/* Where setFootMatrix is applied from, and it is NOT an arbitrary hook point.
+ *
+ * daAlink_c calls it from joint 26 (d_a_alink.cpp:2430-2433) and 26 is 0x1A — the second leg's toe,
+ * i.e. the LAST joint the solve writes. J3DJoint::recursiveCalc fires the pass-0 callback after
+ * that joint's own matrix is built and before it descends (J3DJoint.cpp:218-221), so by the time
+ * this runs, all eight leg joints are final and none of the joints above them have been touched. */
+const u16 l_footIkCallBackJointNo = 26;
+
+/**
+ * J3D calls this for every hooked joint of the BODY model, twice per joint. Same shape as
+ * daRemotePlayer_headModelCallBack, and the same reasons: first pass only, actor resolved from the
+ * model rather than a global.
+ */
+static int daRemotePlayer_bodyModelCallBack(J3DJoint* i_joint, int i_pass) {
+    if (i_pass != 0) {
+        return 1;
+    }
+
+    J3DModel* model = j3dSys.getModel();
+    if (model == NULL || i_joint == NULL) {
+        return 1;
+    }
+
+    daRemotePlayer_c* puppet = reinterpret_cast<daRemotePlayer_c*>(model->getUserArea());
+    if (puppet == NULL) {
+        return 1;
+    }
+
+    return puppet->bodyModelCallBack(i_joint->getJntNo());
+}
+
+int daRemotePlayer_c::bodyModelCallBack(int i_jointNo) {
+    if (i_jointNo == l_footIkCallBackJointNo) {
+        setFootMatrix();
+    }
+
+    return 1;
+}
+
+/**
+ * Hook the foot IK onto the body model's joint 26. Once, at createHeap time.
+ *
+ * ★ This is the fix for the first attempt, which called setFootMatrix() straight after
+ * model->calc() and produced a solve that was correct in the logs and invisible on screen.
+ * J3DModel::calc() runs calcAnmMtx() and then calcWeightEnvelopeMtx()
+ * (J3DModel.cpp:452-453): the second builds the skinning matrices FROM the joint matrices the
+ * first left. Posing a leg after calc() returns writes into buffers that have already been consumed
+ * — and on top of that, the TARGET_PC block at the end of calc() records the joint matrices for
+ * frame interpolation (J3DModel.cpp:463-471), so every interpolated frame would redraw the
+ * un-IK'd pose regardless. A joint callback is upstream of both. The legs are envelope-skinned, so
+ * nothing at all reached the screen.
+ *
+ * The reasoning that produced the bug is worth keeping: every leg joint is numbered below 26, so
+ * post-calc looked equivalent. That answers "are the joints final?" — the question is "has anything
+ * read them yet?"
+ *
+ * Same archive precondition as setupHeadSway(): setCallBack lives on the model DATA, so this is
+ * only safe because the puppet mounts its own copy. Against a shared tree this would install puppet
+ * code on the joints the LOCAL PLAYER's body is drawn from. The private mount is the precondition,
+ * not an optimisation — the same one that makes the blend matrix calculators safe to install.
+ */
+void daRemotePlayer_c::setupFootIk() {
+    J3DModelData* modelData = model->getModelData();
+    if (modelData == NULL) {
+        return;
+    }
+
+    /* Guarded because an outfit with a shorter skeleton would index off the end of the joint array,
+     * and the failure mode of getting this wrong is silence: the hook never fires and the feet look
+     * exactly like they did before the IK existed. Logged either way for that reason. */
+    const u16 jointNum = modelData->getJointNum();
+    if (jointNum <= l_footIkCallBackJointNo) {
+        Log.warn("Puppet body model has only {} joints; no foot IK (needs joint {})", jointNum,
+            l_footIkCallBackJointNo);
+        return;
+    }
+
+    model->setUserArea((uintptr_t)this);
+    modelData->getJointNodePointer(l_footIkCallBackJointNo)
+        ->setCallBack(daRemotePlayer_bodyModelCallBack);
+
+    /* The envelope count is logged because it is the measurement that the callback is NEEDED, not
+     * merely tidier. calcWeightEnvelopeMtx() does nothing at all when it is zero (J3DModel.cpp:406),
+     * and on such a model the old post-calc write would have been visible — a count of zero here
+     * would mean the invisible-IK diagnosis was wrong and the fault lay somewhere else entirely. */
+    Log.info("Puppet foot IK attached to body joint {} of {} ({} envelope matrices)",
+        l_footIkCallBackJointNo, jointNum, modelData->getWEvlpMtxNum());
+
+    /* Useful property of hanging it here: mFootDataValid is set by setFootMatrix and nothing else,
+     * and footBgCheck refuses to run until it is true. So a callback that is attached but never
+     * fires shows up as the "foot IK probing" line never appearing at all — the two failure modes
+     * stay distinguishable in the log instead of both reading as flat ground. */
+}
+
 /* Where on each foot the floor is probed, in that joint's own space (d_a_alink.cpp:3846-3849). The
  * ankle point sits behind and to the side, the toe point ahead — the pair is averaged, so the probe
  * follows the middle of the foot rather than either end of it. */
@@ -2992,7 +3069,11 @@ static s16 ground_angle(const cBgS_PolyInfo& i_polyInfo, s16 i_angle) {
  *
  * daAlink_c::setMatrixWorldAxisRot (d_a_alink.cpp:2098-2120), minus two things it does not need
  * here: the magne-boot matrices, which are identity unless Link is walking on a ceiling, and the
- * copy into J3DSys::mCurrentMtx, which setFootMatrix's calls never ask for.
+ * copy into J3DSys::mCurrentMtx, which neither caller asks for.
+ *
+ * Both callers are here: the foot IK walks down each leg passing the end of the bone above as the
+ * pivot, and the hair passes none, which pivots each strand on itself. A null pivot is the
+ * original's own param_5 == 0 case, not a puppet-side shortcut — one transcription, two uses.
  *
  * The Y rotations either side of the axis rotation are what make it a WORLD-axis rotation: the
  * joint is turned back into the model's facing, rotated about the model's own X, then turned out
@@ -3335,10 +3416,13 @@ void daRemotePlayer_c::footBgCheck() {
 /**
  * Write this tick's leg angles onto the skeleton, and save the pose they were solved against.
  *
- * daAlink_c::setFootMatrix (d_a_alink.cpp:3625-3682). He runs it from his joint callback at joint
- * 26; the puppet runs it straight after calc() instead, which is equivalent — every joint the two
- * legs own is numbered below 26, so they are all final by then, and this function re-poses all four
- * of each leg's joints itself rather than relying on J3D to propagate down the chain.
+ * daAlink_c::setFootMatrix (d_a_alink.cpp:3625-3682), run from the same place he runs it: the joint
+ * callback at joint 26, i.e. from INSIDE the body's calc. See setupFootIk() for why anywhere else
+ * is a solve nothing draws.
+ *
+ * It re-poses all four joints of each leg itself rather than relying on J3D to propagate down the
+ * chain — the children of these joints were calc'd before the callback fired, so nothing is going
+ * to inherit these rotations for it.
  *
  * The save has to come FIRST. field_0x14 is the un-IK'd pose, and next tick's solve starts from it;
  * capturing it after the rotations were applied would feed each tick's answer back into the next
@@ -3403,11 +3487,9 @@ void daRemotePlayer_c::setMatrix() {
      * animation (animePlay() does that now, from execute(), for every slot on both halves), it
      * re-installed itself as joint 0's calculator every single frame (setupAnimation() installs the
      * two blend calculators once, and nothing removes them), and then it calc'd the model. */
+    /* setFootMatrix() lands DURING this call, from the joint callback setupFootIk() installed on
+     * joint 26 — not after it. calc() consumes the joint matrices before it returns. */
     model->calc();
-
-    // After calc, and before anything reads a leg joint: this is where the IK actually lands on the
-    // skeleton. See the comment on setFootMatrix for why it is safe outside a joint callback.
-    setFootMatrix();
 
     /* Sub-models ride the body's joints, so they must be posed AFTER the body's calc. The head and
      * face take the head joint's matrix as their whole base transform; the hands take the body's

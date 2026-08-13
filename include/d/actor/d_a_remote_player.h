@@ -153,20 +153,29 @@ private:
      * the animation was authored against. Transcribed from daAlink_c; see the block comment above
      * footBgCheck() in the .cpp for the ordering, which is the part that is easy to get wrong.
      *
-     * The three run in this order inside setMatrix(), around the body's calc:
-     *   footBgCheck()   — BEFORE calc. Probes the floor under each foot, integrates the joint
-     *                     angles, and sinks the whole body to the lower foot.
+     * The three run in this order around the body's calc:
+     *   footBgCheck()   — BEFORE calc, from setMatrix(). Probes the floor under each foot,
+     *                     integrates the joint angles, and sinks the whole body to the lower foot.
      *   model->calc()
-     *   setFootMatrix() — AFTER calc. Saves the un-IK'd leg matrices for the next tick, then
-     *                     rewrites the four joints of each leg with this tick's angles.
+     *   setFootMatrix() — INSIDE calc, from the joint callback on joint 26. Saves the un-IK'd leg
+     *                     matrices for the next tick, then rewrites the four joints of each leg
+     *                     with this tick's angles.
+     *
+     * ★ "Inside calc" is the whole of it, and it is not a detail. J3DModel::calc() builds the
+     * SKINNING matrices from the joint matrices before it returns, so a leg posed after calc() is
+     * posed into buffers nothing reads again. See setupFootIk().
      */
     void footBgCheck();
     void setFootMatrix();
+    /// Hook setFootMatrix onto the body model's joint 26. Once, at createHeap time.
+    void setupFootIk();
     /// Solve one leg for a height delta. daAlink_c::setLegAngle (d_a_alink.cpp:3699), the
     /// param_4 != 0 branch — the other branch is the arms, which the puppet does not IK.
     bool setLegAngle(
         f32 i_heightDelta, daRemotePlayer_footData_c& io_foot, s16* o_hipAngle, s16* o_kneeAngle);
     /// Rotate one joint about a world axis, in place. daAlink_c::setMatrixWorldAxisRot (:2098).
+    /// Used by the foot IK (with a pivot, walking down the leg) and by the hair (without one, which
+    /// pivots on the joint itself) — one transcription of the original, not two.
     void setMatrixWorldAxisRot(
         MtxP io_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ, const cXyz* i_pivot);
     /// Sink the whole model by an offset, smoothed. daAlink_c::setMatrixOffset (:3684) for
@@ -199,14 +208,14 @@ private:
     f32 checkWindWallRate(const cXyz& i_windDir);
     void setHairAngle(cXyz* i_apparentWind, f32 i_sinYaw, f32 i_cosYaw);
     void calcHairAngle(s16* o_angle);
-    /// Rotate a joint's world matrix about the actor's yaw frame. daAlink_c::setMatrixWorldAxisRot
-    /// (d_a_alink.cpp:2098) minus the magne-boot frame, which a puppet never wears.
-    void setJointWorldAxisRot(MtxP i_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ);
 
 public:
     /// Applies the sway to one head-model joint. Public only because the static J3D callback
     /// trampoline has to reach it; nothing else should call it.
     int headModelCallBack(int i_jointNo);
+    /// Applies the foot IK during the BODY model's calc. Public for the same reason, and for
+    /// nothing else.
+    int bodyModelCallBack(int i_jointNo);
 
 private:
     /// This puppet's OWN random stream — deliberately not cM_rnd(). See the .cpp for why.
