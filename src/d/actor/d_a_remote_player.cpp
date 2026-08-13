@@ -451,9 +451,36 @@ void log_tex_mtx_layout(J3DModelData* i_modelData, const char* i_what) {
             continue;
         }
 
+        /* ★ The ALPHA COMPARE, and it is the reason this dump exists in its current form.
+         *
+         * Stuart's 2026-08-14 description was not a shimmer: *"fading away top to bottom when i
+         * walk UP the stairs… when i walk DOWN the sword and sheath warp in as i move DOWN, bottom
+         * to top. i can also stand in the middle of the stairs and half remains"*. Half a model
+         * present and half absent, with a moving boundary, is fragments being DISCARDED — an alpha
+         * test — not a mis-shaded reflection. So the question stopped being "is the dissolve stage
+         * counted" and became "is there a live discard on this material, and what feeds its alpha".
+         *
+         * addWarpMaterial writes {GX_GREATER, 128, AND, GX_LEQUAL, 255} into the alpha compare of
+         * EVERY material of every BMWR model and sets ZCompLoc to 0 (d_resorce.cpp:134, :174-177).
+         * Neither is ever undone: offWarpMaterial only decrements the stage and texgen counts
+         * (:197-210). So the discard outlives the dissolve it was installed for, and any material
+         * whose last stage feeds alpha from a texture is one wrong texture matrix away from having
+         * geometry deleted rather than merely shaded oddly. Printed rather than assumed. */
+        J3DPEBlock* peBlock = material->getPEBlock();
+        J3DAlphaComp* alphaComp = peBlock != NULL ? peBlock->getAlphaComp() : NULL;
+
         Log.debug("Puppet texmtx layout {} material {}: slots 0x{:02x} | texgens {} | stages {} | "
-                  "last stage samples texmap {}",
-            i_what, mat, occupancy, texGen->getTexGenNum(), stageNum, lastTexMap);
+                  "last stage samples texmap {} | alphaComp {} | zCompLoc {}",
+            i_what, mat, occupancy, texGen->getTexGenNum(), stageNum, lastTexMap,
+            alphaComp != NULL ? fmt::format("comp0 {} ref0 {} op {} comp1 {} ref1 {}{}",
+                                    alphaComp->getComp0(), alphaComp->getRef0(), alphaComp->getOp(),
+                                    alphaComp->getComp1(), alphaComp->getRef1(),
+                                    // GX_GREATER == 4. The signature addWarpMaterial leaves behind.
+                                    alphaComp->getComp0() == 4 && alphaComp->getRef0() == 0x80 ?
+                                        "  <<< DISCARDS ALPHA <= 128" :
+                                        "") :
+                                std::string("<none>"),
+            peBlock != NULL ? peBlock->getZCompLoc() : 0xFF);
     }
 }
 
