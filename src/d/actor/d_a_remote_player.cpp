@@ -115,6 +115,13 @@ const u16 l_headJointNo = 4;
 /* How many grip comparison lines to print per puppet, and daAlink_c's "the sword is in hand" value
  * for mEquipItem (dItemNo_SWORD_e). Both used by setDrawHand's grip series. */
 const u16 l_gripLogMax = 12;
+/* The two hand poses daAlink_c shows for a drawn sword and a raised shield. Not "neutral grips
+ * picked to look right": 0 is what setSwordModel puts in field_0x2f94 (d_a_alink_cut.inc:144) and
+ * setDrawHand hands straight through (d_a_alink.cpp:18980); 6 is the arm setDrawHand reaches when
+ * field_0x2e44's 0xF pass flag is clear (:19000), which the shield-in-hand branch clears (:5934).
+ */
+const u8 l_swordGripHandIdx = 0;
+const u8 l_shieldGripHandIdx = 6;
 const u16 l_swordInHandEquipItem = 0x103;
 const u16 l_leftHandJointNo = 9;
 const u16 l_rightHandJointNo = 0xE;
@@ -453,6 +460,32 @@ const daAlink_BckData& anm_bck_data(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
     }
 
     return anm_data(i_anm).m_bckData;
+}
+
+/**
+ * Which hand-model material a shown J3DShape came from, or -1 for "not one of them".
+ *
+ * Used to read the local player's ACTUAL hand pose back out of him. He stores the two shapes he is
+ * showing (field_0x06d0 / field_0x06d4) rather than the indices they came from, and the index is
+ * the only form that can be compared against the puppet's. -1 means the body's own hand — his
+ * 0xFE answer — which is a meaningful result, not a failure.
+ */
+int resolve_hand_shape(J3DModel* i_handModel, J3DShape* i_shown) {
+    if (i_handModel == NULL || i_shown == NULL) {
+        return -1;
+    }
+
+    J3DModelData* handData = i_handModel->getModelData();
+    if (handData == NULL) {
+        return -1;
+    }
+
+    for (u16 i = 0; i < handData->getMaterialNum(); i++) {
+        if (handData->getMaterialNodePointer(i)->getShape() == i_shown) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
@@ -1890,6 +1923,13 @@ const daRemotePlayer_anm_c& daRemotePlayer_c::runAnm() const {
  * (d_a_alink.cpp:18936-18946). Hence a puppet walking around clenched around a sword and shield
  * that were not there.
  *
+ * ★ CORRECTION, 2026-08-13: "ONLY on the pause-menu branch" was wrong, and it is worth striking
+ * rather than quietly deleting because it is what delayed the grip fix. 0 and 6 are ALSO the poses
+ * he shows for a genuinely drawn sword and a genuinely raised shield — 0 through field_0x2f94,
+ * which setSwordModel writes, and 6 through field_0x2e44's pass flag, which the shield block
+ * writes. The old bug was showing them UNCONDITIONALLY, not showing them at all; see the override
+ * block below.
+ *
  * ★ The pose is a property of the ANIMATION, not of the actor, and that is the whole fix: the hand
  * indices sit in m_anmDataTable next to the BCK id (m_handIndexL/R, d_a_alink.h:212-213). Walking,
  * running and standing all ask for 4 and 10 (d_a_alink.cpp:301, :302, :308); the skid asks for
@@ -1910,7 +1950,48 @@ void daRemotePlayer_c::setDrawHand() {
     }
 
     const daAlink_AnmData& anmData = anm_data(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm));
-    const u8 handIdx[2] = {anmData.m_handIndexL, anmData.m_handIndexR};
+    u8 handIdx[2] = {anmData.m_handIndexL, anmData.m_handIndexR};
+
+    /* ★ daAlink_c's item hand overrides, for the two items a puppet can be holding. These beat the
+     * animation's own pair, which is the order he applies them in (d_a_alink.cpp:18957-19005), and
+     * they are the whole of Stuart's "the puppet doesnt grip the sword with his hands": with a
+     * drawn sword and a raised shield he shows 0 and 6 where the animation row says 4 and 10.
+     *
+     * MEASURED, both instances, after a first attempt that read the wrong end of the chain:
+     *
+     *   local player proc 4 shows L=0 R=6 (his raw table pair 4/10, overrides 0/255/255/255)
+     *
+     * mLeftHandIndex/mRightHandIndex are the INPUT to his resolution chain, not its result, and
+     * comparing those said "identical, so the hand index is not the problem" while the fingers were
+     * visibly open. What has to be compared is field_0x06d0/0x06d4 — the shapes he is actually
+     * showing — resolved back through his hand model. See the grip series at the end of this
+     * function, which is why that log prints both.
+     *
+     * Neither number is chosen here and neither needs a protocol change:
+     *
+     *   LEFT = 0. setSwordModel sets mEquipItem = 0x103 and field_0x2f94 = 0 in the same two lines
+     *   (d_a_alink_cut.inc:141-144) — drawing the sword IS both — and setDrawHand's default arm
+     *   takes var_r30 = field_0x2f94 (:18980). kPlayerEquipSwordInHand is that same mEquipItem
+     *   test, so the bit already on the wire carries it.
+     *
+     *   RIGHT = 6. setDrawHand reaches var_r29 = 6 through !field_0x2e44.checkPassNum(0xF)
+     *   (:19000), and offPassNum(0xF) is set in exactly one place: the shield-in-hand branch, in
+     *   its checkShieldGet() half (:5931-5935). kPlayerEquipShieldInHand is the sender's answer to
+     *   that same seven-term disjunction plus checkShieldGet, transcribed in player_bridge.cpp.
+     *
+     * The specials in his chain are all states a puppet cannot be in — 0x67 the bow, 0x65 the
+     * canoe, PROC_SWORD_UNEQUIP_SP, horse riding and ANM_SWIM_DIE — so the default arm is not a
+     * simplification, it is the only arm reachable from what is replicated.
+     *
+     * ⚠ The right hand will grip an invisible shield until D1b draws one. That is deliberate: it
+     * matches the sender, and gating it on a model that does not exist yet would be a divergence
+     * invented to hide a missing feature. */
+    if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
+        handIdx[0] = l_swordGripHandIdx;
+    }
+    if ((mNetEquip & dusk::mp::kPlayerEquipShieldInHand) != 0) {
+        handIdx[1] = l_shieldGripHandIdx;
+    }
 
     J3DModelData* handData = mpHandModel != NULL ? mpHandModel->getModelData() : NULL;
     for (int i = 0; i < 2; i++) {
@@ -1969,15 +2050,28 @@ void daRemotePlayer_c::setDrawHand() {
              * m_anmDataTable belongs to a CUT* animation) against a puppet that was running. Two
              * actors in unrelated states compare to nothing. Sampling on CHANGE, capped, covers
              * standing, running and swinging in one run, and his proc id says which is which. */
-            const u32 state = ((u32)link->mProcID << 16) | ((u32)link->mLeftHandIndex << 8) |
-                              (u32)link->mRightHandIndex;
+            /* ★ What is compared is the SHAPE HE IS ACTUALLY SHOWING, resolved back to an index —
+             * not mLeftHandIndex/mRightHandIndex. Those are the INPUT to setDrawHand's resolution
+             * chain, and the chain rewrites them: field_0x2f96/0x2f94 override outright, and an
+             * mLeftHandIndex of 0x64 resolves to 2. Reading the input and calling it the answer is
+             * how the first version of this measurement concluded "identical, so the hand index is
+             * not the problem" while Stuart was looking at open fingers. field_0x06d0/0x06d4 are
+             * the two shapes he has shown (d_a_alink.cpp:19017-19045); resolving them through his
+             * own hand model gives the number that can be put next to the puppet's. */
+            const int linkShown[2] = {
+                resolve_hand_shape(link->mpLinkHandModel, link->field_0x06d0),
+                resolve_hand_shape(link->mpLinkHandModel, link->field_0x06d4),
+            };
+            const u32 state = ((u32)link->mProcID << 16) | ((u32)(linkShown[0] & 0xFF) << 8) |
+                              (u32)(linkShown[1] & 0xFF);
             if (state != mLastGripState) {
                 mLastGripState = state;
                 mLoggedGrip++;
-                Log.debug("Puppet {} grip: puppet anim {} asks L={} R={} | local player proc {} "
-                          "shows L={} R={}",
-                    mPlayerId, mCurrentAnm, handIdx[0], handIdx[1], link->mProcID,
-                    link->mLeftHandIndex, link->mRightHandIndex);
+                Log.debug("Puppet {} grip: puppet anim {} shows L={} R={} | local player proc {} "
+                          "shows L={} R={} (his raw table pair {}/{}, overrides {}/{}/{}/{})",
+                    mPlayerId, mCurrentAnm, handIdx[0], handIdx[1], link->mProcID, linkShown[0],
+                    linkShown[1], link->mLeftHandIndex, link->mRightHandIndex, link->field_0x2f94,
+                    link->field_0x2f95, link->field_0x2f96, link->field_0x2f97);
             }
         }
     }
