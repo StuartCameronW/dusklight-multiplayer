@@ -265,29 +265,73 @@ const u8 l_defaultHandIdx = 0xFE;
  *
  * So this now fingerprints every occupied slot, and the caller points it at the SWORD.
  *
- * Returns a bitmask of which slots were read; 0 means the model has no texture matrix at all.
+ * ★ CORRECTED AGAIN 2026-08-14, and this is the correction that made the fix cover the reported
+ * case. Both of the above still read MATERIAL 0 ALONE, and on a sheathed master sword material 0 is
+ * the blade — which daAlink_c::offSwordModel hides (d_a_alink_cut.inc:156) and drawEquip()
+ * faithfully reproduces. So the bracket was carefully protecting the one piece of sword geometry
+ * that is not being drawn, in exactly the state Stuart reported the effect in: *"the sword is gone,
+ * when you spawn in, its already gone"*, with the sword on the back. `sword master` material 1 —
+ * measured as carrying the same env signature, slots 0x07 / texgens 2 / last stage on texmap 1 — is
+ * what is on screen then, and nothing was borrowing it.
+ *
+ * Hence the unit here is now the J3DTexMtx OBJECT, gathered across every material of the model.
  */
-u8 read_tex_mtx(J3DModelData* i_modelData, Mtx* o_matrices, u32 i_slotNum) {
-    if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
+u32 collect_tex_mtx(J3DModelData* i_modelData, J3DTexMtx** o_list, u32 i_max) {
+    if (i_modelData == NULL) {
         return 0;
     }
 
-    J3DTexGenBlock* texGen = i_modelData->getMaterialNodePointer(0)->getTexGenBlock();
-    if (texGen == NULL) {
-        return 0;
-    }
-
-    u8 read = 0;
-    for (u32 slot = 0; slot < i_slotNum; slot++) {
-        J3DTexMtx* texMtx = texGen->getTexMtx(slot);
-        if (texMtx == NULL) {
+    u32 num = 0;
+    for (u16 mat = 0; mat < i_modelData->getMaterialNum(); mat++) {
+        J3DTexGenBlock* texGen = i_modelData->getMaterialNodePointer(mat)->getTexGenBlock();
+        if (texGen == NULL) {
             continue;
         }
-        MTXCopy(texMtx->getMtx(), o_matrices[slot]);
-        read |= static_cast<u8>(1 << slot);
+
+        for (u32 slot = 0; slot < daRemotePlayer_texMtxSlotsWatched; slot++) {
+            J3DTexMtx* texMtx = texGen->getTexMtx(slot);
+            if (texMtx == NULL) {
+                continue;
+            }
+
+            /* ★ Distinct, and this loop is a correctness requirement rather than a saving. One
+             * J3DTexMtx can be referenced by several materials of the same model — addWarpMaterial
+             * installs a single shared object across all of them (d_resorce.cpp:143-158). Borrow
+             * such an object twice and the second pass reads back the value the FIRST pass just
+             * wrote, records our own matrix as "theirs", and hands it to the local player at
+             * restore. That converts a borrow into a permanent theft pointed the other way. */
+            bool seen = false;
+            for (u32 i = 0; i < num; i++) {
+                if (o_list[i] == texMtx) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+
+            if (num == i_max) {
+                return num;
+            }
+            o_list[num++] = texMtx;
+        }
     }
 
-    return read;
+    return num;
+}
+
+/// Copy out every distinct texture matrix this model currently holds. Returns how many there were.
+u32 read_tex_mtx(J3DModelData* i_modelData, Mtx* o_matrices, u32 i_max) {
+    J3DTexMtx* list[daRemotePlayer_texMtxWatched];
+    const u32 cap = i_max < daRemotePlayer_texMtxWatched ? i_max : daRemotePlayer_texMtxWatched;
+    const u32 num = collect_tex_mtx(i_modelData, list, cap);
+
+    for (u32 i = 0; i < num; i++) {
+        MTXCopy(list[i]->getMtx(), o_matrices[i]);
+    }
+
+    return num;
 }
 
 /// Whether two of these matrices differ at all. Every element, not a sampled pair — sampling two
@@ -334,30 +378,33 @@ bool tex_mtx_differs(const Mtx& a, const Mtx& b) {
  *
  * Restoring is not optional tidiness. Skip it and the local player draws with the puppet's matrix,
  * which is the identical bug pointed the other way.
+ *
+ * ★ SCOPE, corrected 2026-08-14 after Stuart reported the effect still present with the sword ON
+ * THE BACK. This walks every material of the model and the caller applies it to the SHEATH as well
+ * as the sword, because the first version did neither: material 0 of a sheathed master sword is the
+ * hidden blade, and PODM — shared, env-mapped, and on screen the whole time the sword is stowed —
+ * had no bracket at all. The mechanism was right and it was aimed at the wrong geometry.
+ *
+ * The pointers are re-collected here rather than cached from the calc-time read. Caching them would
+ * be faster and would hold J3DTexMtx pointers into a shared archive across frames, which is a
+ * lifetime bet this actor does not need to make; collection is a handful of loads over two
+ * materials. Collection order is deterministic, so index i means the same object in both calls.
  */
-void swap_in_tex_mtx(J3DModelData* i_modelData, const Mtx* i_ours, Mtx* o_theirs, u8 i_slots) {
-    if (i_modelData == NULL || i_slots == 0 || i_modelData->getMaterialNum() == 0) {
+void swap_in_tex_mtx(J3DModelData* i_modelData, const Mtx* i_ours, Mtx* o_theirs, u32 i_num) {
+    if (i_modelData == NULL || i_num == 0) {
         return;
     }
 
-    J3DTexGenBlock* texGen = i_modelData->getMaterialNodePointer(0)->getTexGenBlock();
-    if (texGen == NULL) {
-        return;
-    }
+    J3DTexMtx* list[daRemotePlayer_texMtxWatched];
+    const u32 collected = collect_tex_mtx(i_modelData, list, daRemotePlayer_texMtxWatched);
+    const u32 num = collected < i_num ? collected : i_num;
 
-    for (u32 slot = 0; slot < daRemotePlayer_texMtxSlotsWatched; slot++) {
-        if ((i_slots & (1 << slot)) == 0) {
-            continue;
-        }
-        J3DTexMtx* texMtx = texGen->getTexMtx(slot);
-        if (texMtx == NULL) {
-            continue;
-        }
+    for (u32 i = 0; i < num; i++) {
         if (o_theirs != NULL) {
-            MTXCopy(texMtx->getMtx(), o_theirs[slot]);
+            MTXCopy(list[i]->getMtx(), o_theirs[i]);
         }
         if (i_ours != NULL) {
-            MTXCopy(const_cast<f32(*)[4]>(i_ours[slot]), texMtx->getMtx());
+            MTXCopy(const_cast<f32(*)[4]>(i_ours[i]), list[i]->getMtx());
         }
     }
 }
@@ -3565,11 +3612,20 @@ void daRemotePlayer_c::checkMaterialDrift() {
         if (signature != mMaterialSig[i]) {
             const u16 previous = mMaterialSig[i];
             mMaterialSig[i] = signature;
+            const u8 texMap = (u8)(signature & 0xFF);
             if (previous != 0xFFFF) {  // First sample is the baseline, not a change.
-                const u8 texMap = (u8)(signature & 0xFF);
                 Log.warn("Puppet {} {} material CHANGED: stages {}->{}, lastTexMap {}->{}{}",
                     mPlayerId, names[i], previous >> 8, signature >> 8, (u8)(previous & 0xFF),
                     texMap, texMap == 3 ? "  <<< TWILIGHT DISSOLVE JUST TURNED ON" : "");
+            } else if (texMap == 3) {
+                /* ★ The baseline is not always "healthy", and treating it as one is a blind spot
+                 * that cost a round of this bug. Stuart's report on 2026-08-14 was "the sword is
+                 * gone, when you spawn in it's already gone" — a dissolve that is ON at the FIRST
+                 * sample, which the change test above is structurally incapable of reporting. A
+                 * baseline that is already dissolving is a finding, not a starting point. */
+                Log.warn("Puppet {} {} is ALREADY DISSOLVING at its first sample: stages {}, "
+                         "lastTexMap 3  <<< TWILIGHT DISSOLVE WAS ON BEFORE WE LOOKED",
+                    mPlayerId, names[i], signature >> 8);
             }
         }
 
@@ -3586,6 +3642,13 @@ void daRemotePlayer_c::checkMaterialDrift() {
             if (previous != 0xFFFF) {
                 Log.warn("Puppet {} {} DISSOLVING MATERIALS {}->{} of {}", mPlayerId, names[i],
                     previous, dissolving, models[i] != NULL ? models[i]->getMaterialNum() : 0);
+            } else if (dissolving != 0) {
+                // Same blind spot as above, and the one that actually answers "what is on screen":
+                // material 0 can be clean while every other material of the model dissolves.
+                Log.warn("Puppet {} {} has {} of {} materials ALREADY DISSOLVING at its first "
+                         "sample",
+                    mPlayerId, names[i], dissolving,
+                    models[i] != NULL ? models[i]->getMaterialNum() : 0);
             }
         }
     }
@@ -5086,6 +5149,10 @@ void daRemotePlayer_c::setEquipMatrix() {
         if (sheath != NULL) {
             sheath->setBaseTRMtx(model->getAnmMtx(l_backJointNo));
             sheath->calc();
+            // Same borrow as the sword below, and for the model that is on screen the WHOLE time
+            // the sword is stowed. See swap_in_tex_mtx().
+            mSheathTexMtxNum = read_tex_mtx(
+                sheath->getModelData(), mSheathTexMtxOurs, daRemotePlayer_texMtxWatched);
         }
 
         if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
@@ -5103,8 +5170,8 @@ void daRemotePlayer_c::setEquipMatrix() {
          * puppet's own position — and by the time this model is entered for drawing the local
          * player will have overwritten them on the shared model data with his. drawEquip() puts
          * these back for the duration of our entry. See swap_in_tex_mtx(). */
-        mSwordTexMtxSlots = read_tex_mtx(
-            sword->getModelData(), mSwordTexMtxOurs, daRemotePlayer_texMtxSlotsWatched);
+        mSwordTexMtxNum =
+            read_tex_mtx(sword->getModelData(), mSwordTexMtxOurs, daRemotePlayer_texMtxWatched);
     }
 
     /* The shield — the second half of his setItemMatrix (d_a_alink.cpp:5921-5965).
@@ -5216,15 +5283,13 @@ void daRemotePlayer_c::drawEquip() {
         /* Borrow the shared env texture matrices for the length of our entry, then give them back.
          * See swap_in_tex_mtx() for the measurement that made this necessary and for why the two
          * obvious alternatives both fail. */
-        Mtx theirs[daRemotePlayer_texMtxSlotsWatched];
-        swap_in_tex_mtx(swordData, mSwordTexMtxOurs, theirs, mSwordTexMtxSlots);
+        Mtx theirs[daRemotePlayer_texMtxWatched];
+        swap_in_tex_mtx(swordData, mSwordTexMtxOurs, theirs, mSwordTexMtxNum);
 
         {
             bool wasStolen = false;
-            for (u32 slot = 0; slot < daRemotePlayer_texMtxSlotsWatched; slot++) {
-                if ((mSwordTexMtxSlots & (1 << slot)) != 0 &&
-                    tex_mtx_differs(theirs[slot], mSwordTexMtxOurs[slot]))
-                {
+            for (u32 i = 0; i < mSwordTexMtxNum; i++) {
+                if (tex_mtx_differs(theirs[i], mSwordTexMtxOurs[i])) {
                     wasStolen = true;
                 }
             }
@@ -5235,13 +5300,14 @@ void daRemotePlayer_c::drawEquip() {
             if (!mLoggedSwordTexMtx || wasStolen != mLoggedSwordTexMtxChanged) {
                 mLoggedSwordTexMtx = true;
                 mLoggedSwordTexMtxChanged = wasStolen;
-                Log.debug("Puppet {} sword env texture matrix: {} (slots 0x{:02x})", mPlayerId,
-                    mSwordTexMtxSlots == 0 ?
-                        "NO SLOTS CAPTURED AT CALC — the bracket is doing nothing" :
+                Log.debug("Puppet {} sword env texture matrix: {} ({} matrices, sheath {})",
+                    mPlayerId,
+                    mSwordTexMtxNum == 0 ?
+                        "NO MATRICES CAPTURED AT CALC — the bracket is doing nothing" :
                         (wasStolen ?
                                 "the local player's was in place, ours swapped in for the entry" :
                                 "already ours, swap was a no-op"),
-                    mSwordTexMtxSlots);
+                    mSwordTexMtxNum, mSheathTexMtxNum);
             }
         }
 
@@ -5249,7 +5315,7 @@ void daRemotePlayer_c::drawEquip() {
 
         // Put the local player's back before he draws with it. Skipping this is the same bug
         // pointed the other way.
-        swap_in_tex_mtx(swordData, theirs, NULL, mSwordTexMtxSlots);
+        swap_in_tex_mtx(swordData, theirs, NULL, mSwordTexMtxNum);
 
         /* ★ The wooden sword has NO sheath on screen, and this line is the fix for a puppet that
          * walked around Ordon wearing the master sword's scabbard.
@@ -5276,7 +5342,16 @@ void daRemotePlayer_c::drawEquip() {
              * happens. Reported once per distinct outcome rather than per frame: the question is
              * "does this ever happen", and 30 identical lines a second answers it no better while
              * making the log useless for everything else. */
+            /* ★ The sheath gets the SAME borrow as the sword, and its absence here was half the
+             * reason the first fix did not clear Stuart's report. PODM is shared with daAlink_c,
+             * environment-mapped, and — unlike the blade, which is hidden while stowed — it is on
+             * screen for the entire time the sword is on the back. It was the most visible model in
+             * the group with no protection on it at all. */
+            Mtx sheathTheirs[daRemotePlayer_texMtxWatched];
+            J3DModelData* sheathData = sheath != NULL ? sheath->getModelData() : NULL;
+            swap_in_tex_mtx(sheathData, mSheathTexMtxOurs, sheathTheirs, mSheathTexMtxNum);
             drawModel(sheath);
+            swap_in_tex_mtx(sheathData, sheathTheirs, NULL, mSheathTexMtxNum);
         }
 
         if (blade != NULL) {

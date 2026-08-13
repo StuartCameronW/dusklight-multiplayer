@@ -52,6 +52,25 @@ const int daRemotePlayer_anmSlotNum = 3;
 const u32 daRemotePlayer_texMtxSlotsWatched = 3;
 
 /**
+ * How many DISTINCT J3DTexMtx objects one shared equipment model can hand us.
+ *
+ * ★ The unit that matters is the J3DTexMtx OBJECT, not the (material, slot) coordinate, and getting
+ * that wrong is what left the first version of this fix covering a quarter of the problem. It
+ * borrowed material 0's matrices only — and on a sheathed master sword material 0 is the BLADE,
+ * which daAlink_c::offSwordModel hides (d_a_alink_cut.inc:156). So the bracket was correcting the
+ * one piece of geometry that is not on screen while the sword is on the back, which is the state
+ * Stuart reported the effect in.
+ *
+ * Eight covers `sword master`'s two materials at three slots each with room spare, and the
+ * collector stops at this bound rather than running off the end. Distinct is load-bearing: several
+ * materials of one model can point at the SAME J3DTexMtx (addWarpMaterial installs one shared
+ * object across every material, d_resorce.cpp:143-158), and borrowing such an object twice would
+ * capture our own value as "theirs" on the second pass and hand the local player OUR matrix at
+ * restore — turning a borrow into a theft in the opposite direction.
+ */
+const u32 daRemotePlayer_texMtxWatched = 8;
+
+/**
  * Per-leg state for the foot IK. daAlink_c::daAlink_footData_c (d_a_alink.h:181), with its
  * field_0xNN names resolved to what the code actually does with them.
  *
@@ -819,12 +838,18 @@ private:
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
 
-    /// The env texture matrices this puppet's own calc produced for its SWORD, plus the mask of
-    /// which slots exist. Swapped into the shared J3DModelData for the length of this puppet's
-    /// entry and swapped straight back out, because the local player shares that data and would
-    /// otherwise have us drawing his — measured, not assumed. See swap_in_tex_mtx() in the .cpp.
-    Mtx mSwordTexMtxOurs[daRemotePlayer_texMtxSlotsWatched];
-    u8 mSwordTexMtxSlots;
+    /// The env texture matrices this puppet's own calc produced for its SWORD, and how many of them
+    /// there were. Swapped into the shared J3DModelData for the length of this puppet's entry and
+    /// swapped straight back out, because the local player shares that data and would otherwise
+    /// have us drawing his — measured, not assumed. See swap_in_tex_mtx() in the .cpp.
+    Mtx mSwordTexMtxOurs[daRemotePlayer_texMtxWatched];
+    u32 mSwordTexMtxNum;
+    /// And the same for the SHEATH, which needs its own because it is a different J3DModelData.
+    /// Its absence was the other half of the bug: PODM is shared, environment-mapped, and — unlike
+    /// the blade — is on screen the entire time the sword is on the back, so it was the most
+    /// visible model in the game with no bracket at all on it.
+    Mtx mSheathTexMtxOurs[daRemotePlayer_texMtxWatched];
+    u32 mSheathTexMtxNum;
     /// Latches the comparison's answer, so it logs on the first frame and again only when the
     /// answer FLIPS — the question is "does this ever happen", not "how many frames did it happen
     /// on".
