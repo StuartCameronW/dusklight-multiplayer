@@ -484,25 +484,15 @@ void log_tex_mtx_layout(J3DModelData* i_modelData, const char* i_what) {
     }
 }
 
-bool has_warp_material(J3DModelData* i_modelData) {
-    if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
-        return false;
-    }
-
-    J3DTevBlock* tevBlock = i_modelData->getMaterialNodePointer(0)->getTevBlock();
-    const u8 stageNum = tevBlock->getTevStageNum();
-    return stageNum > 0 && tevBlock->getTevOrder(stageNum - 1)->getTexMap() == 3;
-}
-
 /**
  * How many of a model's materials are drawing the dissolve RIGHT NOW — all of them, not material 0.
  *
- * ★ has_warp_material() above reads material 0 alone, and that is correct for what it is used for:
- * onWarpMaterial and offWarpMaterial both BREAK on the first material already in the target state
- * (d_resorce.cpp:181-211), so material 0 gates the whole loop and asking it is asking what the
- * bracket will do. It is NOT a correct answer to "is this model dissolving", and reading it as one
- * is a measurement error I made on 2026-08-13: material 0 of the master sword's sheath is off, I
- * reported the model as clean, and Stuart could still see the effect on it.
+ * ★ Material 0 alone answers a different question: onWarpMaterial and offWarpMaterial both BREAK on
+ * the first material already in the target state (d_resorce.cpp:181-211), so material 0 gates the
+ * whole loop and asking it is asking what the bracket will DO. It is NOT a correct answer to "is
+ * this model dissolving", and reading it as one is a measurement error I made on 2026-08-13:
+ * material 0 of the master sword's sheath is off, I reported the model as clean, and Stuart could
+ * still see the effect on it.
  *
  * addWarpMaterial installs the stage on EVERY material of a BMWR model (:145-178), so a model whose
  * material 0 disagrees with its material 5 is a model something has half-toggled. This counts them.
@@ -608,7 +598,48 @@ void log_material_state(const char* i_who, const char* i_what, J3DModelData* i_m
  * from the model data afterwards, because the trailing offWarpMaterial restores exactly what the
  * leading test read. Without a line saying which models took it, "is the sheath the one answering
  * wrong" is unanswerable from a log, and answering it by reasoning is what produced the last two
- * wrong predictions about this material.
+ * wrong predictions about this material. It is also what finally SOLVED it — see below.
+ *
+ * ★ THE PREDICATE IS STRUCTURAL, NOT STATEFUL, AND THAT DISTINCTION IS THE WHOLE SWORD BUG.
+ *
+ * This used to ask "is the dissolve counted ON right now" (has_warp_material). For the puppet's
+ * PRIVATELY mounted models that happens to be right, because they come straight out of the loader
+ * with addWarpMaterial having raised the counts, so the answer is yes and the bracket runs. For the
+ * four models SHARED with daAlink_c — swa/swm/poda/podm — it is wrong, and wrong in a way that
+ * depends on nothing but who reached the data first. He always does: his initModel already ran its
+ * own bracket and left the shared data with the dissolve OFF. So the puppet asked, got "off", and
+ * built those four models down a DIFFERENT PATH than the local player built his.
+ *
+ * Measured, from the run of 2026-08-14 (host log, castle-town-stairs.txt):
+ *
+ *   Puppet init_model body:         warp bracket TAKEN     | built from 0x0203 -> restored 0x0100
+ *   Puppet init_model sword master: warp bracket not taken | built from 0x0201 -> restored 0x0201
+ *   Puppet init_model sheath PODM:  warp bracket not taken | built from 0x0201 -> restored 0x0201
+ *
+ * The models Stuart reported FIXED are exactly the ones that took it; the sword and sheath he still
+ * reported broken are exactly the two that did not. He told me twice that the body once did the
+ * same thing the sword still does, and he was right both times: it is one bug with one cause.
+ *
+ * What the bracket actually buys is the diff flag, and this is the part I had wrong for three
+ * rounds. 0x2000400 sets the TexGenNum field of the diff flags to 4 (J3D_DIFF_TEXGENNUM,
+ * J3DPacket.h:37); J3DTexGenBlockPatched::diff() checks getDiffFlag_TexGenNum() and, only if it is
+ * non-zero, calls diffTexMtx() to re-emit the model's texture matrices (J3DMatBlock.cpp:545-561).
+ * The base flags 0x11000084 carry a TexGenNum field of ZERO. So a model built without the bracket
+ * EMITS NO TEXTURE MATRIX AT ALL and renders with whatever the GX pipeline was last left holding.
+ *
+ * The J3DTexMtx objects live on the shared model data and are scratch: every model recomputes them
+ * for itself in calcMaterial() and immediately emits them in diff() (mDoExt_modelDiff,
+ * m_Do_ext.cpp:308-313). Sharing them is fine — PROVIDED each model emits. The puppet's sword did
+ * not, so it drew with the local player's env matrix, still loaded from his own draw. Combine that
+ * with the alpha compare addWarpMaterial leaves on these materials forever — GX_GREATER 128, never
+ * undone (d_resorce.cpp:174-177) — and wrong sample coordinates do not mis-shade the sword, they
+ * DELETE it, along a boundary that sweeps as the LOCAL PLAYER moves. Which is precisely the report:
+ * *"fading away top to bottom when i walk UP the stairs... i can also stand in the middle of the
+ * stairs and half remains"*. The boundary tracked his movement because the matrix was his.
+ *
+ * So the question the bracket has to ask is daAlink_c::initModel's question — "does this model
+ * carry the dissolve at all", a property of the mesh — and never "is it on", a property of whoever
+ * touched it last. warp_texture_installed() is that question, and it is order-independent.
  */
 J3DModel* init_model_common(
     J3DModelData* i_modelData, u32 i_mdlFlags, u32 i_diffFlags, const char* i_what) {
@@ -616,7 +647,7 @@ J3DModel* init_model_common(
         return NULL;
     }
 
-    const bool warpMaterial = has_warp_material(i_modelData);
+    const bool warpMaterial = warp_texture_installed(i_modelData);
     const u16 sigBefore = material_signature(i_modelData);
 
     if (warpMaterial) {
