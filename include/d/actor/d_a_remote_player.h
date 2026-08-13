@@ -1,6 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
+#include "d/actor/d_a_player.h"
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
 #include "d/d_resorce.h"
@@ -9,6 +10,36 @@
 
 class daNpcF_MatAnm_c;
 class J3DShape;
+
+/**
+ * One animation as the puppet holds it: the two BCKs daAlink_c's table row for it names.
+ *
+ * ★ Link's body plays TWO animations at once. The root and the legs take an "under" animation while
+ * the torso, arms and head take an "upper" one, and every row of daAlink_c::m_anmDataTable carries
+ * both ids (daAlink_BckData::m_underID / m_upperID, d_a_alink.h:200-206).
+ *
+ * mpUpper is NULL when a row names the same resource twice. That is daAlink_c's own convention for
+ * "this animation has no separate upper half" (getUnderUpperAnime, d_a_alink.cpp:6987-6994), and it
+ * is load-bearing rather than an optimisation: a J3DAnmTransform holds its own current frame, so
+ * one object cannot be at two frames at once. Both halves then point at the same object and only
+ * one frame controller may step it — exactly the test allAnimePlay makes (d_a_alink.cpp:7274-7280).
+ */
+struct daRemotePlayer_anm_c {
+    J3DAnmTransform* mpUnder;
+    J3DAnmTransform* mpUpper;
+};
+
+/**
+ * How many animations may be blended onto each half of the body at once — daAlink_c's own three
+ * (d_a_alink.cpp:4277-4283), kept the same so the machinery below is his machinery.
+ *
+ * Slot 0 is the animation currently playing. Slot 1 is the one it is cross-fading with, which is
+ * how daAlink_c blends walk into run (commonDoubleAnime / setDoubleAnimeBlendRatio); the puppet
+ * does not drive it yet and still quantises to one gait. Slot 2 is daAlink_c's upper-body OVERLAY —
+ * drawing, equipping and putting away items play into UPPER_2 over whatever the legs are doing —
+ * which the puppet has no path to until equipment is replicated.
+ */
+const int daRemotePlayer_anmSlotNum = 3;
 
 /**
  * Remote player puppet — a Dusk-only actor, not part of the original game.
@@ -63,6 +94,15 @@ public:
 
 private:
     void setMatrix();
+    /// Build the two-halves animation rig on the body model. Once, at createHeap time.
+    bool setupAnimation(J3DModelData* i_modelData);
+    /// Put one animation on both halves of the body, cross-fading out of whatever was playing.
+    /// daAlink_c::commonSingleAnime + the morf half of setSingleAnime (d_a_alink.cpp:7149-7245).
+    void setAnm(const daRemotePlayer_anm_c& i_anm, u8 i_attr, f32 i_morf, f32 i_rate, f32 i_startF,
+        s16 i_endF);
+    /// Step every frame controller and push its frame into the animation it drives. Must run every
+    /// tick, BEFORE the body's calc. daAlink_c::allAnimePlay (d_a_alink.cpp:7262-7290).
+    void animePlay();
     void selectAnimation();
     /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
     /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
@@ -160,6 +200,10 @@ private:
     bool mLoggedShadow;
     /// Same for the first hand pose actually taken off the hands model; see setDrawHand().
     bool mLoggedHands;
+    /// And for the first tick the body's two animation halves are actually running SEPARATE
+    /// animations, which is the only observable that separates the split rig from the single one it
+    /// replaced. Everything else about it — the model, the joints, the morf — looks identical.
+    bool mLoggedSplitAnm;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
@@ -192,13 +236,46 @@ private:
      * ~dRes_info_c unmounts and frees everything when the actor dies, with no teardown ordering to
      * get wrong. */
     dRes_info_c mOwnRes;
-    mDoExt_McaMorfSO* mpModelMorf;
-    J3DAnmTransform* mpIdleAnm;
-    J3DAnmTransform* mpWalkAnm;
-    J3DAnmTransform* mpRunAnm;
-    /* The skid. Deliberately OPTIONAL — NULL just costs the turn pose, it does not fail createHeap,
-     * because a createHeap failure puts the puppet into a permanent full-speed respawn loop. */
-    J3DAnmTransform* mpSlipAnm;
+
+    /* --- The body's animation rig. This is daAlink_c's own mechanism, member for member
+     * (d_a_alink.cpp:4271-4283); see setupAnimation() in the .cpp for why mDoExt_McaMorfSO, which
+     * used to own the body here, cannot do this job.
+     *
+     * Nothing here is released by hand. Every pointer is allocated inside the actor's solid heap,
+     * which the framework frees wholesale when the actor dies — the same reason the McaMorfSO
+     * before it was never deleted either. */
+    /* One ratio pack per half. The matrix calculators hold pointers INTO these arrays, so they must
+     * outlive the calcs; being plain members of the actor is what guarantees that. */
+    mDoExt_AnmRatioPack mAnmPackUnder[daRemotePlayer_anmSlotNum];
+    mDoExt_AnmRatioPack mAnmPackUpper[daRemotePlayer_anmSlotNum];
+    /* One frame controller per slot per half. daPy_frameCtrl_c rather than a bare J3DFrameCtrl
+     * because that is what daAlink_c steps (animePlay, d_a_alink.cpp:7255-7260) and it carries the
+     * end-of-animation flags a later action-state pass will want. */
+    daPy_frameCtrl_c mUnderFrameCtrl[daRemotePlayer_anmSlotNum];
+    daPy_frameCtrl_c mUpperFrameCtrl[daRemotePlayer_anmSlotNum];
+    /* The two calculators themselves, installed on the body's joints in setupAnimation(). */
+    mDoExt_MtxCalcAnmBlendTblOld* mpUnderCalc;
+    mDoExt_MtxCalcAnmBlendTblOld* mpUpperCalc;
+    /* ★ The cross-fade Link uses when an animation is REPLACED, as opposed to the ratio blend
+     * between two animations playing together. It works by keeping the previous frame's pose for
+     * every joint and lerping out of it over a few frames, which is why it needs one array of each
+     * per joint. Shared by both calculators exactly as daAlink_c shares his (:4271-4283) — that is
+     * what keeps the two halves morfing in step instead of at their own rates. */
+    mDoExt_MtxCalcOldFrame* mpOldFrame;
+    J3DTransformInfo* mpOldTransInfo;
+    Quaternion* mpOldQuat;
+    /* Joints on the body model, read from the model rather than assumed to be Link's 35. The morf
+     * range is expressed in joints, and mDoExt_MtxCalcAnmBlendTblOld::calc does its per-frame
+     * bookkeeping when it reaches the LAST one (m_Do_ext.cpp:1194-1206). */
+    u16 mBodyJointNum;
+
+    daRemotePlayer_anm_c mIdleAnm;
+    daRemotePlayer_anm_c mWalkAnm;
+    daRemotePlayer_anm_c mRunAnm;
+    /* The skid. Deliberately OPTIONAL — a NULL mpUnder just costs the turn pose, it does not fail
+     * createHeap, because a createHeap failure puts the puppet into a permanent full-speed respawn
+     * loop. */
+    daRemotePlayer_anm_c mSlipAnm;
 
     /* Link is four models. The body is the one the animation drives; these three are posed off its
      * joints every frame in setMatrix(). Any of them may be NULL — a puppet missing a head is a

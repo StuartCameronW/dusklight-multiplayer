@@ -94,6 +94,23 @@ const u16 l_headJointNo = 4;
 const u16 l_leftHandJointNo = 9;
 const u16 l_rightHandJointNo = 0xE;
 
+/* Where Link's body is split between its two animation halves, straight out of
+ * daAlink_c::changeModelDataDirect (d_a_alink_swindow.inc:167-169): joint 0 and joint 16 take the
+ * UNDER animation, joint 1 takes the UPPER one.
+ *
+ * Three assignments cover all thirty-five joints because a joint with no calculator of its own
+ * inherits the nearest ancestor's — J3DJoint::recursiveCalc installs a joint's calculator as the
+ * current one, walks its children, then puts the previous one back (J3DJoint.cpp:195-235). So joint
+ * 1 hands the upper animation to the whole torso-and-arms subtree, and joint 16 takes the legs back
+ * off it.
+ *
+ * These are the same three numbers for every human outfit: changeModelDataDirect runs on whichever
+ * body is currently mounted and does not branch on which one it is.
+ */
+const u16 l_underRootJointNo = 0;
+const u16 l_upperRootJointNo = 1;
+const u16 l_underLegJointNo = 16;
+
 /* How many alternative hand poses the hands model holds, as separate shapes 0..10. Exactly the
  * bound daAlink_c::setLinkModel hides at build time (d_a_alink_wolf.inc:495-498) before setDrawHand
  * starts showing one of them per hand. */
@@ -253,8 +270,17 @@ J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
  */
 const daAlink_c::daAlink_ANM l_idleAnm = daAlink_c::ANM_WAIT;
 const daAlink_c::daAlink_ANM l_walkAnm = daAlink_c::ANM_WALK;
-/* Pairs with ANM_WALK in m_anmDataTable (d_a_alink.cpp:301-302) — its own DASHS cycle, so this is
- * what the local player runs on, not a faster playback of the walk.
+/* Pairs with ANM_WALK in m_anmDataTable (d_a_alink.cpp:301-302) — its own cycle, so this is what
+ * the local player runs on, not a faster playback of the walk.
+ *
+ * ★ It is also the ONE animation of these four whose two halves differ: {DASHS, DASHA}, where the
+ * other three name a single resource twice. That matters because it is the bug Stuart reported —
+ * "the running animation on the puppet is for link when he holds a sword and shield (but he has
+ * nothing equipped)" — and the table says exactly that in his favour. With a sword equipped
+ * daAlink_c does not take this row at all: getMainBckData redirects ANM_RUN to m_mainBckSword[3],
+ * which is {DASHS, DASHS} (d_a_alink.cpp:246, :6939-6942). So DASHS *is* the sword-carrying dash
+ * and DASHA is the empty-handed one, and a puppet that played only the under half was playing the
+ * sword-carrying arms on a character holding nothing. Source-derived, not an eyeball.
  */
 const daAlink_c::daAlink_ANM l_runAnm = daAlink_c::ANM_RUN;
 /* The sharp turn: the skid Link plants when the stick is flicked back at speed. This is ANM_SLIP's
@@ -280,10 +306,21 @@ const daAlink_AnmData& anm_data(daAlink_c::daAlink_ANM i_anm) {
     return daAlink_c::m_anmDataTable[i_anm];
 }
 
-/* The BCK resource index to stream for an animation. daAlink_c reads the same field through
- * getMainBckData (d_a_alink.cpp:6948). */
+/* The BCK resource indices to stream for an animation — one per half of the body.
+ *
+ * ★ daAlink_c does NOT read this row directly; he goes through getMainBckData
+ * (d_a_alink.cpp:6918-6947), which substitutes a different pair when he is holding something. The
+ * puppet reads the row itself because it is not holding anything: nothing draws a sword, a shield
+ * or a sheath on it yet, so the empty-handed row is the one that matches what is on screen. When
+ * equipment starts arriving on the wire, this is the function that has to grow getMainBckData's
+ * branches — see .claude/plan/10-animation-fidelity.md, job D.
+ */
 u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm) {
     return anm_data(i_anm).m_bckData.m_underID;
+}
+
+u16 anm_bck_upper_idx(daAlink_c::daAlink_ANM i_anm) {
+    return anm_data(i_anm).m_bckData.m_upperID;
 }
 
 /* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
@@ -459,6 +496,12 @@ const f32 l_idleSpeedThreshold = 0.5f;
  */
 const f32 l_gaitHysteresis = 0.05f;
 
+/* Frames to cross-fade over when the gait changes outright. Not one of daAlink_c's numbers, because
+ * he has no equivalent moment: he blends walk and run continuously and never swaps one for the
+ * other. It stands in for that blend, which is why it is longer than the 3.0f he uses for an
+ * ordinary animation change (setSingleAnimeBase, d_a_alink.cpp:7207-7209). Job B retires it. */
+const f32 l_gaitMorf = 5.0f;
+
 /**
  * Which outfit archive the LOCAL player is wearing, as an index into l_outfits.
  *
@@ -600,6 +643,65 @@ J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family) {
     return NULL;
 }
 
+/**
+ * Load both halves of one animation row into the puppet's own heap.
+ *
+ * Returns false only if the UNDER half is missing — an animation with no legs is not an animation.
+ * A missing upper half degrades to "both halves play the under BCK", which is what a row that names
+ * one resource twice means anyway, so the puppet keeps moving with slightly wrong arms.
+ *
+ * ★ The second load happens only when the row names two different resources, and that test is not
+ * an optimisation. It is what daAlink_c does (getUnderUpperAnime, d_a_alink.cpp:6987-6994) and the
+ * reason is that a J3DAnmTransform carries its own current frame: two halves sharing one object
+ * must share one frame, so exactly one frame controller may step it.
+ */
+bool load_gait_anm(daRemotePlayer_anm_c* o_anm, daAlink_c::daAlink_ANM i_anmID) {
+    o_anm->mpUnder =
+        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(i_anmID), ANM_FAMILY_TRANSFORM));
+    o_anm->mpUpper = NULL;
+
+    if (o_anm->mpUnder == NULL) {
+        return false;
+    }
+
+    if (anm_bck_upper_idx(i_anmID) != anm_bck_idx(i_anmID)) {
+        o_anm->mpUpper = static_cast<J3DAnmTransform*>(
+            load_aram_anm(anm_bck_upper_idx(i_anmID), ANM_FAMILY_TRANSFORM));
+        if (o_anm->mpUpper == NULL) {
+            Log.warn("Animation {} has no upper half ({}); its arms will play the lower body's",
+                static_cast<int>(i_anmID), anm_bck_upper_idx(i_anmID));
+        }
+    }
+
+    return true;
+}
+
+/* Aim one frame controller at one animation. daAlink_c::commonSingleAnime's per-half half
+ * (d_a_alink.cpp:7154-7200), minus the water and Zora speed scaling, which needs equipment state a
+ * puppet does not have.
+ *
+ * The animation is wound to the starting frame here as well as in the controller: the blend
+ * calculators read the pose straight off the J3DAnmTransform, so an animation that has been swapped
+ * in but not wound would draw one frame of wherever it was left last time. */
+void set_gait_frame_ctrl(daPy_frameCtrl_c* o_ctrl, J3DAnmTransform* i_anm, u8 i_attr, f32 i_rate,
+    f32 i_startF, s16 i_endF) {
+    const s16 endFrame = i_endF < 0 ? i_anm->getFrameMax() : i_endF;
+    const f32 frame = i_rate < 0.0f ? static_cast<f32>(endFrame) : i_startF;
+
+    o_ctrl->setFrameCtrl(i_attr, static_cast<s16>(i_startF), endFrame, i_rate, frame);
+    i_anm->setFrame(frame);
+}
+
+/* One animation stepped by one frame controller. daAlink_c::animePlay (d_a_alink.cpp:7255-7260),
+ * verbatim — the frame lives on the animation object, so advancing the controller is only half of
+ * it and forgetting the second half leaves the pose frozen with no other symptom. */
+void gait_anime_play(J3DAnmTransform* i_anm, daPy_frameCtrl_c* i_frameCtrl) {
+    if (i_anm != NULL) {
+        i_frameCtrl->updateFrame();
+        i_anm->setFrame(i_frameCtrl->getFrame());
+    }
+}
+
 }  // namespace
 
 int daRemotePlayer_c::createHeap() {
@@ -609,13 +711,9 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
-    mpIdleAnm =
-        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_idleAnm), ANM_FAMILY_TRANSFORM));
-    mpWalkAnm =
-        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_walkAnm), ANM_FAMILY_TRANSFORM));
-    mpRunAnm =
-        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_runAnm), ANM_FAMILY_TRANSFORM));
-    if (mpIdleAnm == NULL || mpWalkAnm == NULL || mpRunAnm == NULL) {
+    if (!load_gait_anm(&mIdleAnm, l_idleAnm) || !load_gait_anm(&mWalkAnm, l_walkAnm) ||
+        !load_gait_anm(&mRunAnm, l_runAnm))
+    {
         return 0;
     }
 
@@ -627,59 +725,33 @@ int daRemotePlayer_c::createHeap() {
      * is a puppet with one animation missing; a puppet that fails createHeap is deleted and
      * respawned every couple of ticks forever, mounting an archive each time. Trading the first
      * failure for the second would be a bad bargain, so this one degrades to the gait instead. */
-    mpSlipAnm =
-        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(l_slipAnm), ANM_FAMILY_TRANSFORM));
-    if (mpSlipAnm == NULL) {
+    if (!load_gait_anm(&mSlipAnm, l_slipAnm)) {
         Log.warn("Puppet has no sharp-turn animation; turns will play the gait instead");
     }
 
-    /* ★ The last two arguments are the model flag and the deferred-display-list flag, and they must
-     * match what every other Link model is built with. They were 0, 0 — which made the BODY the
-     * only model in the scene created as mDoExt_J3DModel__create(data, 0, 0), while its own head,
-     * hands and face go through init_model at (0x80000, 0x11000084), and so does every one of
-     * daAlink_c's models (initModel, d_a_alink_wolf.inc:364-366). A body shaded on different terms
-     * from the head bolted onto it is exactly the seam Stuart reported at the neck: "the puppet's
-     * body is a few shades darker, noticeable by the head, the skin colour to the neck is a bit
-     * different."
+    /* The body model, built on exactly the terms the other three sub-models are — init_model
+     * applies the warp-material bracket and the (0x80000, 0x11000084) pair that daAlink_c's own
+     * initModel uses (d_a_alink_wolf.inc:364-366).
      *
-     * 0x80000 also matters on its own: mDoExt_McaMorfSO::create calls mDoExt_changeMaterial for any
-     * model flag OTHER than 0x80000 (m_Do_ext.cpp:1579-1581), so the old value put the body through
-     * a material rewrite the other three never saw.
+     * ★ This used to be a mDoExt_McaMorfSO, which owned the model AND drove the animation. It
+     * cannot stay, and the reason is structural rather than a matter of taste: McaMorfSO holds
+     * exactly ONE J3DAnmTransform, and every modelCalc() re-installs itself as joint 0's matrix
+     * calculator (m_Do_ext.cpp:1797-1805). There is no seam in it where a second animation could be
+     * given to the torso. See setupAnimation() below for what replaces it.
      *
-     * For reference, no actor in the tree passes 0 for the deferred flag: 43 McaMorfSO
-     * constructions use 0x80000 with a 0x1100xxxx deferred flag, of which 0x11000084 — the value
-     * init_model uses — is the most common. */
-    /* ★ The body needs the SAME warp-material bracketing the other three models get, and until now
-     * it was the one model that did not. daAlink_c builds his body with initModel like everything
-     * else (d_a_alink_wolf.inc:364), and al.bmd is a BMWR resource (Kmdl.h) — so dRes_info_c's
-     * loader has already run addWarpMaterial over it, appending a fourth TEV stage, a fourth texgen
-     * and the shared warp texture, and permanently replacing the alpha compare with "discard
-     * anything at or below 0x80" (d_resorce.cpp:127-178, :291-293).
-     *
-     * ★ And the bracket's trailing half is the one that matters: BMWR models come out of the loader
-     * with the dissolve already ENABLED, so `offWarpMaterial` is what switches it off. Skipping the
-     * bracket does not leave the body slightly mis-sized — it leaves the body **drawing the
-     * twilight dissolve**, which is the A5 bug. See has_warp_material() for the full account.
-     *
-     * The leading half still earns its place: it makes mDoExt_J3DModel__create size the model's own
-     * copies of the TEV and texgen blocks to hold the extra stage, which is what 0x2000400 asks
-     * for, matching what daAlink_c's body gets from initModel (d_a_alink_wolf.inc:364). */
-    const bool bodyWarpMaterial = has_warp_material(modelData);
-
-    u32 bodyDiffFlags = 0x11000084;
-    if (bodyWarpMaterial) {
-        dRes_info_c::onWarpMaterial(modelData);
-        bodyDiffFlags |= 0x2000400;
+     * The two flags are unchanged by that swap. They matter and are worth keeping written down: the
+     * body was once created as (data, 0, 0) while its own head, hands and face went through
+     * init_model, and a body shaded on different terms from the head bolted onto it is exactly the
+     * seam Stuart reported at the neck. The warp bracket matters even more — al.bmd is a BMWR
+     * resource, so dRes_info_c's loader hands it over with the twilight dissolve already ENABLED,
+     * and it is offWarpMaterial that switches it back off (d_resorce.cpp:127-178, :291-293). Both
+     * of those live inside init_model now, which is the point of routing through it. */
+    model = init_model(modelData, 0);
+    if (model == NULL) {
+        return 0;
     }
 
-    mpModelMorf = JKR_NEW mDoExt_McaMorfSO(modelData, NULL, NULL, mpIdleAnm,
-        J3DFrameCtrl::EMode_LOOP, 1.0f, 0, -1, NULL, 0x80000, bodyDiffFlags);
-
-    if (bodyWarpMaterial) {
-        dRes_info_c::offWarpMaterial(modelData);
-    }
-
-    if (mpModelMorf == NULL || mpModelMorf->getModel() == NULL) {
+    if (!setupAnimation(modelData)) {
         return 0;
     }
 
@@ -784,7 +856,7 @@ int daRemotePlayer_c::createHeap() {
     const daAlink_c* link = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
 
     Log.debug("Puppet {} material state:", mPlayerId);
-    log_material_state("puppet", "body", mpModelMorf->getModel()->getModelData());
+    log_material_state("puppet", "body", model->getModelData());
     log_material_state("puppet", "head", mpHeadModel != NULL ? mpHeadModel->getModelData() : NULL);
     log_material_state("puppet", "hands", mpHandModel != NULL ? mpHandModel->getModelData() : NULL);
     log_material_state("puppet", "face", mpFaceModel != NULL ? mpFaceModel->getModelData() : NULL);
@@ -804,10 +876,11 @@ int daRemotePlayer_c::createHeap() {
             link->mpLinkFaceModel != NULL ? link->mpLinkFaceModel->getModelData() : NULL);
     }
 
-    // What is LEFT, not what was asked for. Adding the run animation grew the animation footprint
-    // from ~20 KB to ~35 KB inside a fixed 0x20000 solid heap, and a heap that is merely nearly
-    // full does not announce itself: every allocation here still succeeds and the damage, if any,
-    // shows up later and somewhere else. One line makes the margin a number instead of a guess.
+    // What is LEFT, not what was asked for. A heap that is merely nearly full does not announce
+    // itself: every allocation here still succeeds and the damage, if any, shows up later and
+    // somewhere else. One line makes the margin a number instead of a guess — and it earned its
+    // keep, because the guess it replaced was wrong. Before DASHA was added this read 112528 free
+    // of 0x20000 (131072), i.e. ~18 KB used, against a comment here that claimed ~35 KB.
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
         Log.info("Puppet heap after setup: {} bytes free, largest block {}", heap->getFreeSize(),
@@ -819,6 +892,190 @@ int daRemotePlayer_c::createHeap() {
 
 static int daRemotePlayer_createHeap(fopAc_ac_c* i_this) {
     return static_cast<daRemotePlayer_c*>(i_this)->createHeap();
+}
+
+/**
+ * Give the body the two-animations-at-once rig Link's body has.
+ *
+ * ★ This is the fix for what Stuart reported as the puppet running "the animation for link when he
+ * holds a sword and shield". Link's body is driven by TWO animations simultaneously, not one: the
+ * root and legs by an "under" BCK, the torso and arms by an "upper" one. Of the four animations the
+ * puppet can be in, ANM_RUN is the only row whose halves differ — {DASHS, DASHA} — and a puppet
+ * playing only the under half was therefore wearing DASHS's arms. That is not a near-miss: with a
+ * sword equipped, daAlink_c plays m_mainBckSword[3] = {DASHS, DASHS} (d_a_alink.cpp:246), so
+ * DASHS's arms ARE the sword-carrying arms. The puppet was playing the armed run while holding
+ * nothing.
+ *
+ * The mechanism is daAlink_c's own (d_a_alink.cpp:4271-4283 and d_a_alink_swindow.inc:167-169), and
+ * it is deliberately not a simpler stand-in:
+ *
+ *   - Two mDoExt_MtxCalcAnmBlendTblOld, one per half, each reading a small table of
+ *     (animation, ratio) pairs. Blending a table rather than a single animation is what will make
+ *     the walk/run cross-fade fall out for free later; today only slot 0 is filled.
+ *   - Installed on joints 0, 1 and 16 — the two calculators between them cover thirty-five joints
+ *     because J3D propagates a joint's calculator down its subtree until another one replaces it.
+ *   - Both share ONE mDoExt_MtxCalcOldFrame. That object is what makes an animation CHANGE
+ *     cross-fade instead of snap, by keeping the previous frame's pose per joint and lerping out of
+ *     it, and sharing it is what keeps the arms and legs morfing in step. It also explains the two
+ *     per-joint arrays: they are that stored pose.
+ *
+ * Returns false on any allocation failure, which fails createHeap. That is the right call here even
+ * though a failing createHeap is expensive (the puppet is deleted and respawned): a body with no
+ * matrix calculator installed does not degrade, it draws in the bind pose forever.
+ */
+bool daRemotePlayer_c::setupAnimation(J3DModelData* i_modelData) {
+    mBodyJointNum = i_modelData->getJointNum();
+
+    /* The upper half's root has to exist for the split to mean anything. Link's body has 35 joints;
+     * this is checked rather than assumed because the count comes out of a binary asset. */
+    if (mBodyJointNum <= l_upperRootJointNo) {
+        Log.warn("Puppet body has only {} joints — no torso to animate separately", mBodyJointNum);
+        return false;
+    }
+
+    mpOldTransInfo = JKR_NEW_ARRAY(J3DTransformInfo, mBodyJointNum);
+    mpOldQuat = JKR_NEW_ARRAY(Quaternion, mBodyJointNum);
+    if (mpOldTransInfo == NULL || mpOldQuat == NULL) {
+        return false;
+    }
+
+    /* Zeroed for the same reason daAlink_c zeroes his (d_a_alink.cpp:4265-4269, under TARGET_PC):
+     * the very first calc lerps OUT of whatever is in here, so garbage would be a garbage pose. */
+    std::memset(mpOldTransInfo, 0, sizeof(J3DTransformInfo) * mBodyJointNum);
+    std::memset(mpOldQuat, 0, sizeof(Quaternion) * mBodyJointNum);
+
+    mpOldFrame = JKR_NEW mDoExt_MtxCalcOldFrame(mpOldTransInfo, mpOldQuat);
+    if (mpOldFrame == NULL) {
+        return false;
+    }
+
+    mpUnderCalc =
+        JKR_NEW mDoExt_MtxCalcAnmBlendTblOld(mpOldFrame, daRemotePlayer_anmSlotNum, mAnmPackUnder);
+    mpUpperCalc =
+        JKR_NEW mDoExt_MtxCalcAnmBlendTblOld(mpOldFrame, daRemotePlayer_anmSlotNum, mAnmPackUpper);
+    if (mpUnderCalc == NULL || mpUpperCalc == NULL) {
+        return false;
+    }
+
+    /* Slot 0 has to be filled before anything calcs — the calculators dereference it without a null
+     * check (m_Do_ext.cpp:1157). Nothing calcs before the first network pose arrives, but the pose
+     * to start from is still the idle one rather than the bind pose. A negative morf means "do not
+     * cross-fade into this", which is right for the first animation there is nothing to fade from.
+     */
+    setAnm(
+        mIdleAnm, J3DFrameCtrl::EMode_LOOP, -1.0f, daAlinkHIO_move_c0::m.mWaitAnmSpeed, 0.0f, -1);
+
+    i_modelData->getJointNodePointer(l_underRootJointNo)->setMtxCalc(mpUnderCalc);
+    i_modelData->getJointNodePointer(l_upperRootJointNo)->setMtxCalc(mpUpperCalc);
+    if (l_underLegJointNo < mBodyJointNum) {
+        i_modelData->getJointNodePointer(l_underLegJointNo)->setMtxCalc(mpUnderCalc);
+    } else {
+        // Not fatal — the legs would simply follow the torso's animation — but it means this is not
+        // the skeleton the joint numbers were read off, and every pose will be subtly wrong.
+        Log.warn("Puppet body has {} joints; no joint {} to hand the legs back to", mBodyJointNum,
+            l_underLegJointNo);
+    }
+
+    return true;
+}
+
+/**
+ * Put one animation on both halves of the body.
+ *
+ * daAlink_c::commonSingleAnime (d_a_alink.cpp:7149-7206) plus the morf that setSingleAnime does
+ * after it (:7238-7240). "Single" is his word for one animation across both halves as opposed to
+ * two blended together — it still sets up two frame controllers when the row names two BCKs.
+ */
+void daRemotePlayer_c::setAnm(const daRemotePlayer_anm_c& i_anm, u8 i_attr, f32 i_morf, f32 i_rate,
+    f32 i_startF, s16 i_endF) {
+    if (i_anm.mpUnder == NULL) {
+        return;
+    }
+
+    /* Clear every other slot. Only slot 0 is driven today, but leaving a stale pointer in slot 1
+     * would keep blending a previous animation into the pose forever, at whatever ratio it was last
+     * given — a bug with no symptom other than a body that looks slightly wrong. */
+    for (int i = 1; i < daRemotePlayer_anmSlotNum; i++) {
+        mAnmPackUnder[i].setAnmTransform(NULL);
+        mAnmPackUpper[i].setAnmTransform(NULL);
+        mAnmPackUnder[i].setRatio(0.0f);
+        mAnmPackUpper[i].setRatio(0.0f);
+    }
+    mAnmPackUnder[0].setRatio(1.0f);
+    mAnmPackUpper[0].setRatio(1.0f);
+
+    mAnmPackUnder[0].setAnmTransform(i_anm.mpUnder);
+    set_gait_frame_ctrl(&mUnderFrameCtrl[0], i_anm.mpUnder, i_attr, i_rate, i_startF, i_endF);
+
+    if (i_anm.mpUpper != NULL) {
+        mAnmPackUpper[0].setAnmTransform(i_anm.mpUpper);
+        set_gait_frame_ctrl(&mUpperFrameCtrl[0], i_anm.mpUpper, i_attr, i_rate, i_startF, i_endF);
+    } else {
+        /* One resource on both halves, pointed at by both packs — daAlink_c's own answer
+         * (d_a_alink.cpp:7202-7204). animePlay() then steps it once, through the under controller
+         * only, because the frame lives on the shared object. */
+        mAnmPackUpper[0].setAnmTransform(i_anm.mpUnder);
+    }
+
+    if (i_morf >= 0.0f) {
+        // Whole skeleton, as daAlink_c does with his literal 35 (d_a_alink.cpp:7239).
+        mpOldFrame->initOldFrameMorf(i_morf, 0, mBodyJointNum);
+    }
+}
+
+/* See the header. daAlink_c::allAnimePlay (d_a_alink.cpp:7262-7290) with everything the puppet has
+ * no path to removed — the wolf voice, the demo hand animations and the sub-animations behind
+ * FLG1_UNK_10. What is kept exactly is the guard on the upper half. */
+void daRemotePlayer_c::animePlay() {
+    for (int i = 0; i < daRemotePlayer_anmSlotNum; i++) {
+        gait_anime_play(mAnmPackUnder[i].getAnmTransform(), &mUnderFrameCtrl[i]);
+    }
+
+    for (int i = 0; i < daRemotePlayer_anmSlotNum; i++) {
+        J3DAnmTransform* upper = mAnmPackUpper[i].getAnmTransform();
+        /* Pointer comparison, not a null check, and it is the whole reason this loop is separate:
+         * an animation with no distinct upper half has BOTH packs pointing at one object, and
+         * stepping it twice would advance it at double speed. */
+        if (upper != mAnmPackUnder[i].getAnmTransform()) {
+            gait_anime_play(upper, &mUpperFrameCtrl[i]);
+        }
+    }
+
+    /* ★ Latched and permanent. A split rig and the single-animation one it replaced look the same
+     * from everywhere else — same model, same joints, same morf, same trace columns — so without
+     * this line "the torso is running its own animation now" is unfalsifiable from a log. It fires
+     * only on ANM_RUN, the one row of the puppet's four whose halves differ.
+     *
+     * What it prints is chosen carefully, because the obvious thing to print proves nothing: the two
+     * FRAME NUMBERS are supposed to be equal. DASHS and DASHA are the two halves of one run cycle
+     * and have to stay in phase, so equal frames is the correct answer, not evidence of anything.
+     * The two things that do discriminate are the two BCK ids — different resources, so different
+     * arms — and the calculator actually sitting on joint 1 when the model is read back. That last
+     * one is the whole split: if it is not mpUpperCalc, joint 1's subtree inherited joint 0's and
+     * the torso is back on the under animation with nothing else looking wrong. */
+    if (!mLoggedSplitAnm && mAnmPackUpper[0].getAnmTransform() != NULL &&
+        mAnmPackUpper[0].getAnmTransform() != mAnmPackUnder[0].getAnmTransform())
+    {
+        mLoggedSplitAnm = true;
+
+        J3DModelData* bodyData = model->getModelData();
+        const J3DMtxCalc* onUnderRoot =
+            bodyData->getJointNodePointer(l_underRootJointNo)->getMtxCalc();
+        const J3DMtxCalc* onUpperRoot =
+            bodyData->getJointNodePointer(l_upperRootJointNo)->getMtxCalc();
+        const J3DMtxCalc* onLegs = l_underLegJointNo < mBodyJointNum ?
+            bodyData->getJointNodePointer(l_underLegJointNo)->getMtxCalc() :
+            NULL;
+
+        Log.debug("Puppet {} body split live: anim {} under bck {} / upper bck {} (frames {:.1f} / "
+                  "{:.1f}, equal is correct) | joints {}/{}/{} -> {}/{}/{}",
+            mPlayerId, mCurrentAnm, anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm)),
+            anm_bck_upper_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm)),
+            mUnderFrameCtrl[0].getFrame(), mUpperFrameCtrl[0].getFrame(), l_underRootJointNo,
+            l_upperRootJointNo, l_underLegJointNo, onUnderRoot == mpUnderCalc ? "under" : "WRONG",
+            onUpperRoot == mpUpperCalc ? "UPPER" : "WRONG",
+            onLegs == mpUnderCalc ? "under" : "WRONG");
+    }
 }
 
 /* --- The outfit seam. These two are the only way the network layer touches l_outfits; the table
@@ -941,8 +1198,9 @@ int daRemotePlayer_c::create() {
         return cPhs_ERROR_e;
     }
 
+    // `model` itself was set by createHeap, which is where it is built; setupAnimation() has
+    // already put the idle animation on it.
     mCurrentAnm = static_cast<u16>(l_idleAnm);
-    model = mpModelMorf->getModel();
 
     /* Seeded from the player id, so two puppets standing side by side do not blink in unison — the
      * giveaway that would make them read as copies of one puppet rather than two people. Odd
@@ -1003,12 +1261,16 @@ void daRemotePlayer_c::setNetworkPose(
  * Those numbers are read from daAlinkHIO_move_c0::m rather than copied, so the puppet cannot drift
  * out of step with the player if the table is ever corrected.
  *
- * ★ What we do NOT reproduce is the blend. daAlink_c drives two animations at once through
- * daPy_frameCtrl_c pairs (commonDoubleAnime, m_Do_ext.cpp has the same idea in mDoExt_McaMorf2) and
- * cross-fades by weight; mDoExt_McaMorfSO holds a single animation, so we quantise to whichever
- * side of the blend is dominant and morf across the switch. Visible difference is confined to the
- * walk/run transition; the endpoints match the player exactly. Proper blending is M3, alongside
- * real action states.
+ * ★ What we do NOT reproduce is the blend. daAlink_c plays walk and run TOGETHER across the
+ * crossover band and cross-fades them by weight (commonDoubleAnime / setDoubleAnimeBlendRatio,
+ * d_a_alink.cpp:7002-7008); the puppet quantises to whichever side is dominant and morfs across the
+ * switch. Visible difference is confined to the walk/run transition; the endpoints match the player
+ * exactly.
+ *
+ * That is now a gap in this function alone rather than in the machinery underneath it: the rig
+ * setupAnimation() builds IS the ratio-blend rig, with slot 1 sitting empty. Filling it is job B in
+ * .claude/plan/10-animation-fidelity.md — write the second gait into slot 1 and drive both ratios
+ * off `fraction` instead of picking a side.
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
@@ -1033,11 +1295,11 @@ void daRemotePlayer_c::selectAnimation() {
      * lagging puppet would skid on the spot over and over, which reads as a bug rather than as the
      * lag it is. Holding the final frame degrades to a puppet frozen mid-skid, which reads as lag.
      */
-    if (mNetSharpTurn && mpSlipAnm != NULL) {
+    if (mNetSharpTurn && mSlipAnm.mpUnder != NULL) {
         if (mCurrentAnm != l_slipAnm) {
             const daAlinkHIO_anm_c& slide = hio.mSlideAnm;
-            mpModelMorf->setAnm(mpSlipAnm, J3DFrameCtrl::EMode_NONE, slide.mInterpolation,
-                slide.mSpeed, slide.mStartFrame, static_cast<f32>(slide.mEndFrame));
+            setAnm(mSlipAnm, J3DFrameCtrl::EMode_NONE, slide.mInterpolation, slide.mSpeed,
+                slide.mStartFrame, slide.mEndFrame);
             mCurrentAnm = static_cast<u16>(l_slipAnm);
         }
         // The idle-frame probe below counts consecutive IDLE ticks; a skid is not one of them.
@@ -1058,16 +1320,16 @@ void daRemotePlayer_c::selectAnimation() {
         wanted = fraction > runFraction + l_gaitHysteresis ? l_runAnm : l_walkAnm;
     }
 
-    J3DAnmTransform* anm;
+    const daRemotePlayer_anm_c* anm;
     f32 rate;
     if (wanted == l_runAnm) {
-        anm = mpRunAnm;
+        anm = &mRunAnm;
         rate = hio.mRunAnmSpeed;
     } else if (wanted == l_walkAnm) {
-        anm = mpWalkAnm;
+        anm = &mWalkAnm;
         rate = hio.mWalkAnmSpeed;
     } else {
-        anm = mpIdleAnm;
+        anm = &mIdleAnm;
         rate = hio.mWaitAnmSpeed;
     }
 
@@ -1086,8 +1348,9 @@ void daRemotePlayer_c::selectAnimation() {
             Log.debug(
                 "Puppet {} idle body anim after {} ticks: frame {:.1f} of {:.1f}, rate {:.2f}, "
                 "mode {}",
-                mPlayerId, mIdleTicks, mpModelMorf->getFrame(), mpModelMorf->getEndFrame(),
-                mpModelMorf->getPlaySpeed(), mpModelMorf->getPlayMode());
+                mPlayerId, mIdleTicks, mUnderFrameCtrl[0].getFrame(),
+                static_cast<f32>(mUnderFrameCtrl[0].getEnd()), mUnderFrameCtrl[0].getRate(),
+                static_cast<int>(mUnderFrameCtrl[0].getAttribute()));
         }
     } else {
         mIdleTicks = 0;
@@ -1096,10 +1359,13 @@ void daRemotePlayer_c::selectAnimation() {
     if (wanted != mCurrentAnm) {
         // A short morf, so changing gait doesn't pop. This is the one place we are standing in for
         // the player's cross-fade, so it is doing more work here than a plain animation change.
-        mpModelMorf->setAnm(anm, J3DFrameCtrl::EMode_LOOP, 5.0f, rate, 0.0f, -1.0f);
+        setAnm(*anm, J3DFrameCtrl::EMode_LOOP, l_gaitMorf, rate, 0.0f, -1);
         mCurrentAnm = static_cast<u16>(wanted);
     } else {
-        mpModelMorf->setPlaySpeed(rate);
+        /* Both halves, or the run's arms would keep the previous gait's rate. They are separate
+         * controllers precisely because they can be stepping separate animations. */
+        mUnderFrameCtrl[0].setRate(rate);
+        mUpperFrameCtrl[0].setRate(rate);
     }
 }
 
@@ -1870,9 +2136,7 @@ f32 daRemotePlayer_c::checkWindWallRate(const cXyz& i_windDir) {
  */
 void daRemotePlayer_c::checkMaterialDrift() {
     J3DModelData* models[l_watchedModelNum] = {
-        mpModelMorf != NULL && mpModelMorf->getModel() != NULL ?
-            mpModelMorf->getModel()->getModelData() :
-            NULL,
+        model != NULL ? model->getModelData() : NULL,
         mpHeadModel != NULL ? mpHeadModel->getModelData() : NULL,
         mpHandModel != NULL ? mpHandModel->getModelData() : NULL,
         mpFaceModel != NULL ? mpFaceModel->getModelData() : NULL,
@@ -2450,7 +2714,12 @@ void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
     mDoMtx_stack_c::YrotM(shape_angle.y);
     model->setBaseTRMtx(mDoMtx_stack_c::get());
-    mpModelMorf->modelCalc();
+    /* Plain J3DModel::calc(), where this used to be mDoExt_McaMorfSO::modelCalc(). That call did
+     * three things and only one of them is gone: it pushed the frame controller's frame into the
+     * animation (animePlay() does that now, from execute(), for every slot on both halves), it
+     * re-installed itself as joint 0's calculator every single frame (setupAnimation() installs the
+     * two blend calculators once, and nothing removes them), and then it calc'd the model. */
+    model->calc();
 
     /* Sub-models ride the body's joints, so they must be posed AFTER the body's calc. The head and
      * face take the head joint's matrix as their whole base transform; the hands take the body's
@@ -2551,15 +2820,17 @@ int daRemotePlayer_c::execute() {
         // which pointer was wrong. One line before the first calc() makes that diagnosable from a
         // log alone. The two animations are both J3DAnmTransformKey, so their vtable pointers must
         // match each other and must look like an address in the executable.
-        Log.debug("Puppet {} first calc: morf={:#x} model={:#x} idle={:#x}/{:#x} walk={:#x}/{:#x} "
-                  "run={:#x}/{:#x}",
-            mPlayerId, reinterpret_cast<uintptr_t>(mpModelMorf), reinterpret_cast<uintptr_t>(model),
-            reinterpret_cast<uintptr_t>(mpIdleAnm),
-            mpIdleAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpIdleAnm) : 0,
-            reinterpret_cast<uintptr_t>(mpWalkAnm),
-            mpWalkAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpWalkAnm) : 0,
-            reinterpret_cast<uintptr_t>(mpRunAnm),
-            mpRunAnm != NULL ? *reinterpret_cast<const uintptr_t*>(mpRunAnm) : 0);
+        Log.debug("Puppet {} first calc: model={:#x} under/upper calc={:#x}/{:#x} idle={:#x}/{:#x} "
+                  "walk={:#x}/{:#x} run={:#x}/{:#x} runUpper={:#x}/{:#x}",
+            mPlayerId, reinterpret_cast<uintptr_t>(model), reinterpret_cast<uintptr_t>(mpUnderCalc),
+            reinterpret_cast<uintptr_t>(mpUpperCalc), reinterpret_cast<uintptr_t>(mIdleAnm.mpUnder),
+            mIdleAnm.mpUnder != NULL ? *reinterpret_cast<const uintptr_t*>(mIdleAnm.mpUnder) : 0,
+            reinterpret_cast<uintptr_t>(mWalkAnm.mpUnder),
+            mWalkAnm.mpUnder != NULL ? *reinterpret_cast<const uintptr_t*>(mWalkAnm.mpUnder) : 0,
+            reinterpret_cast<uintptr_t>(mRunAnm.mpUnder),
+            mRunAnm.mpUnder != NULL ? *reinterpret_cast<const uintptr_t*>(mRunAnm.mpUnder) : 0,
+            reinterpret_cast<uintptr_t>(mRunAnm.mpUpper),
+            mRunAnm.mpUpper != NULL ? *reinterpret_cast<const uintptr_t*>(mRunAnm.mpUpper) : 0);
     }
 
     // No guard against the local player owning this model data, and none needed: the puppet's
@@ -2571,8 +2842,8 @@ int daRemotePlayer_c::execute() {
     // row, so it can only be right once the animation for this tick has been chosen.
     traceCalc("setDrawHand");
     setDrawHand();
-    traceCalc("morf play");
-    mpModelMorf->play(0, 0);
+    traceCalc("animePlay");
+    animePlay();
     // Independent of the body: the puppet blinks while standing still as much as while running,
     // which is the whole point — a face frozen mid-stare is what reads as "not a real player".
     traceCalc("playFaceTextureAnime");
