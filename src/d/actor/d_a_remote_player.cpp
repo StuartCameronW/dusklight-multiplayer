@@ -3443,6 +3443,22 @@ const u16 l_legRootJointNo[2] = {0x12, 0x17};
  * this runs, all eight leg joints are final and none of the joints above them have been touched. */
 const u16 l_footIkCallBackJointNo = 26;
 
+/* Two more joints that take the foot IK's HIP angle, one per leg, and they are NOT part of either
+ * leg chain — the chains are the four consecutive joints from l_legRootJointNo, i.e. 18-21 and
+ * 23-26, and these sit past the end of both.
+ *
+ * daAlink_c applies them from jointControll rather than from setFootMatrix
+ * (d_a_alink.cpp:2228-2231):
+ *
+ *     else if (i_jointNo == 27) setMatrixWorldAxisRot(getAnmMtx(27), mFootData1[0].field_0x6, ...);
+ *     else if (i_jointNo == 29) setMatrixWorldAxisRot(getAnmMtx(29), mFootData1[1].field_0x6, ...);
+ *
+ * field_0x6 is the hip angle (mHipAngle here), [0] is the left leg and [1] the right, matching the
+ * order l_legRootJointNo and mFootData are already in. So 27 follows the left hip and 29 the right,
+ * and the effect of leaving them out is a thigh that pitches onto the slope while whatever hangs
+ * over it stays put — the visible half of that being the tunic skirt riding through the leg. */
+const u16 l_hipFollowJointNo[2] = {27, 29};
+
 /**
  * J3D calls this for every hooked joint of the BODY model, twice per joint. Same shape as
  * daRemotePlayer_headModelCallBack, and the same reasons: first pass only, actor resolved from the
@@ -3469,13 +3485,46 @@ static int daRemotePlayer_bodyModelCallBack(J3DJoint* i_joint, int i_pass) {
 int daRemotePlayer_c::bodyModelCallBack(int i_jointNo) {
     if (i_jointNo == l_footIkCallBackJointNo) {
         setFootMatrix();
+    } else if (i_jointNo == l_hipFollowJointNo[0] || i_jointNo == l_hipFollowJointNo[1]) {
+        /* daAlink_c::jointControll's joint-27 and joint-29 arms (d_a_alink.cpp:2228-2231), and the
+         * only two arms of that function a puppet is currently able to reproduce — see
+         * setupFootIk() for the four that need state which is not on the wire.
+         *
+         * No mFootDataValid guard, matching him: mHipAngle is zero until the first solve (the actor
+         * is zero-initialised by fopAcM_ct) and a zero rotation is a no-op, so the untested path
+         * and the guarded one do the same thing. Its value is also settled by now whichever order
+         * the callbacks fire in — footBgCheck() integrates it BEFORE model->calc() (setMatrix()),
+         * so this reads a finished number rather than racing joint 26. */
+        const int leg = i_jointNo == l_hipFollowJointNo[0] ? 0 : 1;
+        setMatrixWorldAxisRot(model->getAnmMtx(i_jointNo), mFootData[leg].mHipAngle, 0, 0, NULL);
+
+        /* ★ This line IS daAlink_c's `param_4 = 1` (:2229, :2231), open-coded because the puppet's
+         * setMatrixWorldAxisRot dropped that parameter — its two existing callers both pass 0
+         * (setFootMatrix at :3662-3674, the hat at :2490), so there was nothing to carry it for
+         * until now. Identical by construction: his param_4 branch is exactly
+         * `mDoMtx_copy(mDoMtx_stack_c::get(), J3DSys::mCurrentMtx)` (:2117-2119), the stack still
+         * holds the matrix that was just written into the joint, and nothing between the two calls
+         * touches it.
+         *
+         * It is not optional. J3DSys::mCurrentMtx is what a joint's CHILDREN inherit as their
+         * parent transform — J3DJoint::recursiveCalc descends immediately after the pass-0 callback
+         * and restores the saved copy only afterwards (J3DJoint.cpp:217-226) — so writing the joint
+         * matrix alone would rotate joint 27 and leave everything hanging off it behind. Writing it
+         * on a childless joint is harmless for the same reason: the restore overwrites it.
+         *
+         * The head sway's callback already uses this exact idiom for the same reason
+         * (headModelCallBack). It is the established form here, not a new one. */
+        mDoMtx_copy(mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
     }
 
     return 1;
 }
 
 /**
- * Hook the foot IK onto the body model's joint 26. Once, at createHeap time.
+ * Hook the body-model joint callback onto joints 26, 27 and 29. Once, at createHeap time.
+ *
+ * Joint 26 is the foot IK itself; 27 and 29 are the two joints that follow each hip. The block over
+ * their registration has the reasoning for both the split and everything left unhooked.
  *
  * ★ This is the fix for the first attempt, which called setFootMatrix() straight after
  * model->calc() and produced a solve that was correct in the logs and invisible on screen.
@@ -3515,6 +3564,47 @@ void daRemotePlayer_c::setupFootIk() {
     model->setUserArea((uintptr_t)this);
     modelData->getJointNodePointer(l_footIkCallBackJointNo)
         ->setCallBack(daRemotePlayer_bodyModelCallBack);
+
+    /* ★ THREE joints, not one, and the other two are a separate guard on purpose.
+     *
+     * daAlink_c hangs daAlink_modelCallBack on ALL 35 body joints in one loop
+     * (d_a_alink_swindow.inc:171-173) and lets jointControll's if-chain sort them out. The puppet
+     * hooks only the joints it can actually act on, because a callback that fires 35 times a frame
+     * to do nothing 32 of them is cost with no answer attached.
+     *
+     * Guarded separately from the foot IK above rather than folded into that check: a shorter
+     * skeleton that still has joint 26 gets working feet and silently loses only this, which is a
+     * better failure than losing the IK entirely over two follow joints. */
+    if (jointNum > l_hipFollowJointNo[1]) {
+        modelData->getJointNodePointer(l_hipFollowJointNo[0])
+            ->setCallBack(daRemotePlayer_bodyModelCallBack);
+        modelData->getJointNodePointer(l_hipFollowJointNo[1])
+            ->setCallBack(daRemotePlayer_bodyModelCallBack);
+    } else {
+        Log.warn("Puppet body model has only {} joints; the hip-follow joints {} and {} are absent",
+            jointNum, l_hipFollowJointNo[0], l_hipFollowJointNo[1]);
+    }
+
+    /* ★ STILL UNIMPLEMENTED, and deliberately so: jointControll's other arms.
+     *
+     *   joint 1  — body lean and twist (d_a_alink.cpp:2186-2195). Needs mBodyAngle.x/.z and
+     *              field_0x30c8, i.e. the upper-body aim daAlink_c derives from what he is looking
+     *              at, what he is holding and which analogue direction is being pushed.
+     *   joint 2  — the second half of the same twist (:2196-2199), same field_0x30c8.
+     *   joint 4  — hat/shoulder blend rates via changeBlendRate (:2437-2441), keyed on
+     * field_0x2fb6, which is an animation-blend MODE rather than a pose. joint 16 — the matrix
+     * calculator swap at :168-170, not a jointControll arm at all.
+     *
+     * Every one of them wants replicated state that does not exist on the wire — aim angles, a
+     * blend mode — and there is no honest local substitute: a puppet cannot re-derive where another
+     * player is looking from a position and an animation ID. Faking them would produce a puppet
+     * that leans confidently in the wrong direction, which is worse than one that does not lean at
+     * all. The hip follow above is implementable precisely BECAUSE its input, mHipAngle, is solved
+     * locally by this actor's own foot IK and needs nothing from the sender.
+     *
+     * When aim state does go on the wire, joints 1 and 2 are the two arms to add here, and they
+     * will need the same mDoMtx_copy into J3DSys::mCurrentMtx that the hip follow does — daAlink_c
+     * passes param_4 = 1 at :2194 and :2198 as well. */
 
     /* The envelope count is logged because it is the measurement that the callback is NEEDED, not
      * merely tidier. calcWeightEnvelopeMtx() does nothing at all when it is zero
@@ -4069,6 +4159,25 @@ J3DModel* daRemotePlayer_c::currentShield() const {
 }
 
 /**
+ * daPy_py_c::checkWoodSwordEquip(), answered from the wire instead of from the item tables.
+ *
+ * The sender computes exactly this predicate and puts the answer in the kind bits — fill_equip
+ * tests `daPy_py_c::checkWoodSwordEquip()` FIRST and only then the master sword
+ * (player_bridge.cpp:329-334) — so `kind == kPlayerEquipSwordWood` on this end is that call's
+ * result, not an approximation of it.
+ *
+ * ★ Deliberately does NOT consult the local player. daPy_py_c::checkWoodSwordEquip is a STATIC that
+ * reads the local save's equipped item, so calling it here would answer for whoever is at the
+ * controller — the puppet would lose its sheath because WE picked up a wooden sword. Appearance is
+ * owned by the wearer; the wire is the only admissible source.
+ */
+bool daRemotePlayer_c::checkWoodSwordEquip() const {
+    const u8 kind = static_cast<u8>(
+        (mNetEquip & dusk::mp::kPlayerEquipSwordKindMask) >> dusk::mp::kPlayerEquipSwordKindShift);
+    return kind == dusk::mp::kPlayerEquipSwordWood;
+}
+
+/**
  * Build every sword, sheath and shield the puppet might need, once, at createHeap time.
  *
  * ★ The ordon and master swords and both sheaths come from the "Alink" archive, which the puppet
@@ -4235,6 +4344,23 @@ void daRemotePlayer_c::setEquipMatrix() {
     J3DModel* sword = currentSword(&sheath);
 
     if (sword != NULL) {
+        /* Posed UNCONDITIONALLY, including for the wooden sword whose sheath is never drawn
+         * (drawEquip() and shadowDraw() both suppress it — see checkWoodSwordEquip()). That is
+         * daAlink_c's own shape: his setItemMatrix places and calcs mSheathModel on its very first
+         * two lines with no test whatsoever (d_a_alink.cpp:5884-5885), and only the two DRAW sites
+         * carry the wooden-sword gate (:19725, :19256).
+         *
+         * Matching him was the choice, over the tempting "why pose what nobody draws":
+         *  - It costs one setBaseTRMtx and one calc on a two-joint model, once a tick, and only
+         *    while a wooden sword is drawn — i.e. the first hour of the game and never again.
+         *  - The saving would be real only if the model were otherwise untouched, and this one is
+         *    not: mpSheathModel[Wood] and mpSheathModel[Master] are the SAME J3DModel (PODM,
+         *    setupEquipModels()). Leaving it un-calc'd while the wooden sword is out means the tick
+         *    the player draws the master sword finds a sheath still holding whatever matrices it
+         * had when the wooden sword came out — a sheath that pops into place a frame late, from a
+         *    stale pose. Posing it always is what makes that switch seamless.
+         *  - And it keeps the divergence in ONE place. A reader chasing "why is there no sheath"
+         * has two draw sites to look at and nothing else. */
         if (sheath != NULL) {
             sheath->setBaseTRMtx(model->getAnmMtx(l_backJointNo));
             sheath->calc();
@@ -4349,7 +4475,24 @@ void daRemotePlayer_c::drawEquip() {
         }
 
         drawModel(sword);
-        drawModel(sheath);
+
+        /* ★ The wooden sword has NO sheath on screen, and this line is the fix for a puppet that
+         * walked around Ordon wearing the master sword's scabbard.
+         *
+         * It is not that the wooden sword lacks a sheath model — setupEquipModels() hands it PODM,
+         * the master sword's, because that is literally what daAlink_c does (d_a_alink.cpp:4356).
+         * He then suppresses the DRAW: `if (!checkWoodSwordEquip()) { modelDraw(mSheathModel, ...)
+         * }`
+         * (:19725-19727), with the same gate on the shadow (:19256-19258). So the assignment and
+         * the draw disagree on purpose in the original, and reproducing only the assignment is how
+         * the scabbard appeared.
+         *
+         * Gated on the WIRE's kind bits rather than on `sheath == mpSheathModel[Master]`, which
+         * would be the same test today by accident: the two kinds share one J3DModel, so a pointer
+         * comparison could not tell a wooden sword from a master sword at all. */
+        if (!checkWoodSwordEquip()) {
+            drawModel(sheath);
+        }
 
         if (blade != NULL) {
             if (bladeWasVisible) {
@@ -4361,11 +4504,17 @@ void daRemotePlayer_c::drawEquip() {
 
         if (!mLoggedEquip) {
             mLoggedEquip = true;
+            // The sheath field reports what was DRAWN, not what was selected: "suppressed" is the
+            // correct and expected reading for a wooden sword, and seeing "drawn" there with kind 2
+            // would mean this fix had regressed.
             Log.debug(
                 "Puppet {} drawing equipment: sword kind {} {} (blade material {} {}), sheath "
                 "{} | equip byte 0x{:02x}",
                 mPlayerId, kind, inHand ? "in hand" : "on the back", bladeMatNo,
-                bladeVisible ? "shown" : "hidden", sheath != NULL ? "yes" : "no", mNetEquip);
+                bladeVisible ? "shown" : "hidden",
+                checkWoodSwordEquip() ? "suppressed (wooden sword)" :
+                                        (sheath != NULL ? "drawn" : "none"),
+                mNetEquip);
         }
     }
 
@@ -4713,16 +4862,44 @@ void daRemotePlayer_c::shadowDraw() {
         dComIfGd_addRealShadow(mShadowKey, mpHeadModel);
         dComIfGd_addRealShadow(mShadowKey, mpFaceModel);
         dComIfGd_addRealShadow(mShadowKey, mpHandModel);
-        /* The shield casts too, under the same predicate and in the same place daAlink_c adds his
-         * (d_a_alink.cpp:19261-19263). It is not decoration: a shield on the back is a large part
-         * of the silhouette and its absence is visible from behind, which is exactly the angle a
-         * player following another one is looking from. NULL-tolerant by the API's own contract —
-         * dDlst_shadowReal_c::add returns false for a NULL model (d_drawlist.cpp:1355-1357) — so
-         * currentShield()'s "no shield" answer needs no guard of its own here.
+
+        /* The equipment casts too — sword, sheath and shield, each under the predicate daAlink_c
+         * gates it on (d_a_alink.cpp:19250-19263). Not decoration: a sword and a shield on the back
+         * are a large part of the silhouette from behind, which is exactly the angle a player
+         * following another one is looking from, and a shadow that has hands and a head but no
+         * equipment reads as a subtly wrong shape rather than as a missing detail.
          *
-         * The sword and sheath are still absent from this list where daAlink_c adds them
-         * (:19251-19259). Left alone deliberately: this change is the shield alone, so a shadow
-         * regression has one candidate cause. */
+         * Every one of these is NULL-tolerant by the API's own contract — dDlst_shadowReal_c::add
+         * returns false for a NULL model (d_drawlist.cpp:1355-1357) — so "no sword" and "no shield"
+         * need no guard of their own here.
+         *
+         * ★ ORDER. daAlink_c adds the three equipment models BEFORE the face/hat/hand ones
+         * (:19251-19263 against :19277-19279); here they come after. Immaterial, and checked rather
+         * than assumed: `add` does nothing but append to `mpModels[]` (d_drawlist.cpp:1352-1362)
+         * and the projection walks that array as a set. Keeping the equipment contiguous is worth
+         * more to a reader than an order that means nothing to the renderer. Depth is not at stake
+         * either: seven of the thirty-eight slots are in use (d_drawlist.h:284), and `add` has no
+         * bounds check of its own, so the headroom is worth stating.
+         *
+         * ★ The sword carries only HALF of daAlink_c's predicate. His is
+         * `checkSwordDraw() && !checkNoResetFlg3(FLG3_UNK_80000000)`; currentSword() is the first
+         * half exactly — it returns NULL unless kPlayerEquipSwordDraw is set, and the sender sets
+         * that bit from `alink->checkSwordDraw()` (player_bridge.cpp:338-340). The second half is
+         * a no-reset flag that is not on the wire and has no puppet-side equivalent, so a puppet in
+         * whatever state sets FLG3_UNK_80000000 would cast a sword shadow where Link casts none.
+         * One bit when someone wants it; called out rather than left to be discovered. */
+        J3DModel* shadowSheath = NULL;
+        J3DModel* shadowSword = currentSword(&shadowSheath);
+        dComIfGd_addRealShadow(mShadowKey, shadowSword);
+
+        /* The same wooden-sword gate the draw carries (:19256-19258 is :19725-19727 again), and it
+         * has to be here as well as in drawEquip(): the real shadow PROJECTS THE MODEL, so a sheath
+         * that is merely not entered into the draw list still casts a scabbard-shaped shadow off
+         * Link's back. Note the pose deliberately survives both gates — see setEquipMatrix(). */
+        if (!checkWoodSwordEquip()) {
+            dComIfGd_addRealShadow(mShadowKey, shadowSheath);
+        }
+
         dComIfGd_addRealShadow(mShadowKey, currentShield());
     }
 }

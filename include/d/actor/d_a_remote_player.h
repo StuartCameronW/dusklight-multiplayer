@@ -173,7 +173,10 @@ private:
      */
     void footBgCheck();
     void setFootMatrix();
-    /// Hook setFootMatrix onto the body model's joint 26. Once, at createHeap time.
+    /// Hook the body-model joint callback onto joints 26, 27 and 29. Once, at createHeap time.
+    /// 26 runs setFootMatrix; 27 and 29 apply each leg's hip angle to the joint that follows it,
+    /// which is daAlink_c::jointControll's only two arms a puppet can currently reproduce. See the
+    /// .cpp for the four it cannot and why.
     void setupFootIk();
     /// Solve one leg for a height delta. daAlink_c::setLegAngle (d_a_alink.cpp:3699), the
     /// param_4 != 0 branch — the other branch is the arms, which the puppet does not IK.
@@ -226,6 +229,17 @@ private:
     /// currentSword() rather than a second out-parameter on it, because the two selections are
     /// genuinely independent and pairing them is how one ends up gating the other.
     J3DModel* currentShield() const;
+    /// Whether the WIRE says the wooden sword is equipped — this puppet's
+    /// daPy_py_c::checkWoodSwordEquip(), and named after it so the two read alike at the call sites
+    /// that use it: the sheath's draw and the sheath's shadow, which are the two places daAlink_c
+    /// spells `!checkWoodSwordEquip()` (d_a_alink.cpp:19725, :19256). A function rather than a
+    /// third and fourth open-coded mask/shift, because the two must never be allowed to disagree —
+    /// a sheath drawn but not shadowed, or the reverse, is a worse artefact than either bug alone.
+    /// (drawEquip's blade-material lines test the same kind value inline; they have already decoded
+    /// `kind` for the material number, and re-deriving it through here would read as if it were a
+    /// different question.)
+    /// Defined in the .cpp because this header deliberately does not include the wire layout.
+    bool checkWoodSwordEquip() const;
     /// Report any change to the puppet's material state. Diagnostic for A5; must run every tick.
     void checkMaterialDrift();
     /* ★ TEMPORARY — Hang 4 bisection. One line per step of the first few calcs, so the last line in
