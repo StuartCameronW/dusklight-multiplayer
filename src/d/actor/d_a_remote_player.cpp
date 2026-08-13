@@ -1600,53 +1600,91 @@ u8 daRemotePlayer_localOutfitToWire() {
  */
 int daRemotePlayer_c::mountOwnArchive() {
     if (!mResRequested) {
+        /* Latched BEFORE the set() calls, not after them. A set() that fails used to leave this
+         * false with one to three commands already issued, so a re-entered create() would call
+         * set() again on a dRes_info_c that already holds a live mDoDvdThd_mountArchive_c and
+         * overwrite the pointer — losing the command outright. Nothing re-enters create() after a
+         * cPhs_ERROR_e today, so that was latent rather than live, but the ordering costs nothing.
+         */
+        mResRequested = true;
+
         if (!mOwnRes.set(
                 l_outfits[mOutfit].arcName, l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL))
         {
+            /* ★ Falls THROUGH to the poll below instead of returning cPhs_ERROR_e here. Nothing is
+             * in flight for THIS one — set() can only fail before it has a command — but the same
+             * shape applies to the shield loop below, where a failure part way through must not
+             * abandon the siblings that already have commands out. Written the same way in both
+             * places so there is one rule rather than two. A dRes_info_c whose set() failed reports
+             * -1 from setRes() for ever (d_resorce.cpp:586-590), which is how the poll notices. */
             Log.warn("Puppet could not start a private mount of '{}'", l_outfits[mOutfit].arcName);
-            return cPhs_ERROR_e;
-        }
-
-        for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
-            if (!mShieldRes[i].set(
-                    l_shieldArcName[i], l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL))
-            {
-                Log.warn("Puppet could not start a private mount of shield archive '{}'",
-                    l_shieldArcName[i]);
-                return cPhs_ERROR_e;
+        } else {
+            /* Only started when the outfit mount started. If the outfit could not be requested the
+             * puppet is already doomed, and three more mounts to drain before saying so is pure
+             * cost — the shields' own set() failures are handled inside the loop instead. */
+            for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
+                if (!mShieldRes[i].set(
+                        l_shieldArcName[i], l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL))
+                {
+                    Log.warn("Puppet could not start a private mount of shield archive '{}'",
+                        l_shieldArcName[i]);
+                    // Deliberately no break: the remaining set() calls are cheap, and stopping here
+                    // would only shift which archives the poll below reports as -1.
+                }
             }
         }
-
-        mResRequested = true;
     }
 
     /* Every mount is polled every tick and COMPLEATE is reported only once none of them is still
      * loading. Written as a flag rather than as an early `return cPhs_LOADING_e` on the first one
      * that is busy, because that would stop polling the others and let a genuine mount ERROR sit
-     * undetected behind a slower sibling. */
+     * undetected behind a slower sibling.
+     *
+     * ★ A failure is recorded the same way and reported only once nothing is in flight any more.
+     * This used to `return cPhs_ERROR_e` from the middle of the poll, and that return is a
+     * use-after-free: create() hands the error to the framework, which cancels the create request
+     * and runs the actor's Delete on the spot, and ~dRes_info_c then destroys any sibling's still
+     * live DVD command without cancelling it (see readyForDelete()). Draining first makes the
+     * error path safe on its own rather than leaning on the Delete-side wait to rescue it. */
     bool loading = false;
+    bool failed = false;
+    const char* firstFailure = NULL;
 
     const int outfitState = mOwnRes.setRes();
     if (outfitState < 0) {
-        Log.warn("Puppet's private mount of '{}' failed", l_outfits[mOutfit].arcName);
-        return cPhs_ERROR_e;
-    }
-    if (outfitState > 0) {
+        failed = true;
+        firstFailure = l_outfits[mOutfit].arcName;
+    } else if (outfitState > 0) {
         loading = true;
     }
 
     for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
         const int shieldState = mShieldRes[i].setRes();
         if (shieldState < 0) {
-            Log.warn("Puppet's private mount of shield archive '{}' failed", l_shieldArcName[i]);
-            return cPhs_ERROR_e;
-        }
-        if (shieldState > 0) {
+            failed = true;
+            if (firstFailure == NULL) {
+                firstFailure = l_shieldArcName[i];
+            }
+        } else if (shieldState > 0) {
             loading = true;
         }
     }
 
-    return loading ? cPhs_LOADING_e : cPhs_COMPLEATE_e;
+    if (loading) {
+        // Even when something has already failed: see above. The failure is not going anywhere.
+        return cPhs_LOADING_e;
+    }
+
+    if (failed) {
+        /* One line, once — create() returns this straight to the framework, which cancels the
+         * request, so this is not re-entered. */
+        Log.warn("Puppet for player {}: a private archive mount failed (first was '{}'); no mount "
+                 "is still in flight, so failing creation here is safe",
+            mPlayerId, firstFailure);
+        return cPhs_ERROR_e;
+    }
+
+    return cPhs_COMPLEATE_e;
 }
 
 /* Read and cleared by the network layer's spawn backoff; see d_a_remote_player.h. */
@@ -1756,9 +1794,125 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
+    //
+    // It is only a clean unmount for a mount that has FINISHED, though. Getting here with a DVD
+    // command still live is the one teardown ordering this actor has to get right, and
+    // readyForDelete() below is where it is got right — not here, because a destructor cannot
+    // decline to run.
+}
+
+/**
+ * How many Delete attempts a puppet may spend waiting for its own in-flight archive mounts before
+ * it destructs anyway. Both halves of this number are measured rather than chosen:
+ *
+ *  - What it has to cover. In the recorded two-instance sessions under .claude/mp-run, every puppet
+ *    that came up logged "resolved after 1 tick" — 20 out of 20 spawns, one per log across ten
+ *    host/guest pairs. That counter is the bridge's own, so its resolution is a whole sim tick and
+ *    the honest reading is "all four private mounts land within a tick or two on this machine",
+ *    which is what a DVD thread reading a local disc image rather than an optical drive should do.
+ *    60 is therefore tens of times the whole observed mount, not tens of times a guess.
+ *
+ *  - What it must not exceed. A Delete that keeps returning 0 keeps its process on the framework's
+ *    delete queue, and fpcNdRq_phase_IsDeleted blocks on fpcDt_IsComplete() — which is GLOBAL
+ *    (f_pc_node_req.cpp:69-83, f_pc_deletor.cpp:15-17). So a puppet that refuses to die does not
+ *    merely leak: it stalls every room and stage change in the game. 60 attempts is also exactly
+ * the framework's own patience for this — fpcDt_ToQueue arms delete_tag.unk_0x1c at 60 and DEBUG
+ *    builds report the delete as stuck once it runs out (f_pc_deletor.cpp:54-56). A refused delete
+ *    re-arms its tag with timer = 1 (f_pc_delete_tag.cpp:20-22), so an attempt costs one or two
+ *    handler passes: 60 attempts is 2-4 s at 30 Hz, against the 10 s kCreateStuckTicks already uses
+ *    to call a mount abnormal (player_bridge.cpp:65). Deliberately the tighter of the two, because
+ *    this end is the one that freezes a door.
+ *
+ * ★ daAlink_c has no equivalent because he does not need one: his wait is bounded by his own
+ * clothes/shield timer counting down, not by another thread finishing (d_a_alink.cpp:19906-19919).
+ */
+const u16 l_deleteMountWaitMax = 60;
+
+bool daRemotePlayer_c::readyForDelete() {
+    /* setRes() is both the poll and the completion, and that is why it is the right call here even
+     * though we are throwing the result away.
+     *
+     * The tempting alternative — getDMCommand()->sync() — answers only "is the command safe to
+     * destroy". It is not enough: with the command finished but not COLLECTED, mArchive still lives
+     * on the command rather than in the dRes_info_c, so ~dRes_info_c takes its first branch,
+     * destroys the command and leaves the JKRMemArchive the DVD thread mounted with no owner at all
+     * (d_resorce.cpp:37-51). setRes() moves the archive across, destroys the finished command
+     * itself and builds the data heap, which puts the dRes_info_c into the one state its destructor
+     * actually cleans up. The cost is a solid heap built moments before it is freed. That is a real
+     * cost and it is the right trade: the alternative leaks the archive for the rest of the
+     * session.
+     *
+     * Every state other than "> 0" is safe to destruct on. -1 means the command was never issued or
+     * has already been destroyed by setRes() itself; 0 means the mount landed. Only "still loading"
+     * has a live command behind it. */
+    int pending = 0;
+
+    if (mOwnRes.setRes() > 0) {
+        pending++;
+    }
+
+    for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
+        if (mShieldRes[i].setRes() > 0) {
+            pending++;
+        }
+    }
+
+    if (pending == 0) {
+        if (mDeleteWaitTicks != 0) {
+            Log.info("Puppet for player {}: its in-flight archive mount(s) finished after {} "
+                     "delete attempt(s); destructing now",
+                mPlayerId, mDeleteWaitTicks);
+        }
+        return true;
+    }
+
+    /* One line per puppet, and its ABSENCE from a session log is the meaningful reading: it means
+     * no puppet was ever deleted mid-mount in that session, not that the wait is broken. Without it
+     * this whole fix is invisible — the bug it prevents is a silent free of a node another thread
+     * is about to walk, which shows up (if at all) as an unrelated crash minutes later. */
+    if (!mLoggedDeleteWait) {
+        mLoggedDeleteWait = true;
+        Log.warn("Puppet for player {} is being deleted with {} private archive mount(s) still in "
+                 "flight. Holding its destructor off until the DVD thread is finished with them — "
+                 "~dRes_info_c would destroy the live command instead of cancelling it. Cap is {} "
+                 "attempt(s).",
+            mPlayerId, pending, l_deleteMountWaitMax);
+    }
+
+    if (mDeleteWaitTicks >= l_deleteMountWaitMax) {
+        Log.error(
+            "Puppet for player {}: {} archive mount(s) STILL in flight after {} delete "
+            "attempts. Destructing anyway. This may leak an archive and may destroy a command "
+            "the DVD thread still owns — but a delete that never completes blocks the "
+            "framework's global delete queue, and with it every room and stage change, which "
+            "is worse. If this line is ever seen, the DVD thread is stuck: investigate that, "
+            "not this cap.",
+            mPlayerId, pending, mDeleteWaitTicks);
+        return true;
+    }
+
+    mDeleteWaitTicks++;
+    return false;
 }
 
 static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
+    /* ★ daAlink_Delete's shape, for daAlink_Delete's reason: a Delete method that returns 0 means
+     * "not yet", and the framework re-drives it. Verified rather than assumed, because the whole
+     * fix rests on it and the cancelled-create-request path is the one that matters:
+     *
+     *   fpcCtRq_Cancel -> fpcDt_Delete -> fpcDt_ToDeleteQ puts the PROCESS on g_fpcDtTg_Queue
+     *   (f_pc_deletor.cpp:45-61) and does NOT call the Delete method itself. fpcDt_Handler drains
+     *   that queue once per frame from fpcM_Management (f_pc_manager.cpp:75), and fpcDtTg_Do
+     *   re-queues any tag whose method returned 0 (f_pc_delete_tag.cpp:29-51). Returning 0 leaves
+     *   the process allocated and un-freed — fpcBs_Delete only frees it when the method returns 1
+     *   (f_pc_base.cpp:102-111) — so nothing leaks by waiting and nothing is dropped on the floor.
+     *   The re-drive does not depend on the create request, which is freed either way.
+     *
+     * The one thing it is NOT is unbounded: see l_deleteMountWaitMax. */
+    if (!i_this->readyForDelete()) {
+        return 0;
+    }
+
     i_this->~daRemotePlayer_c();
     return 1;
 }

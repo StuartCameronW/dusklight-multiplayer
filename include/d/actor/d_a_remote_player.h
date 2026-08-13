@@ -282,6 +282,22 @@ public:
     /// nothing else.
     int bodyModelCallBack(int i_jointNo);
 
+    /* Poll this puppet's private archive mounts and report whether it is safe to run the
+     * destructor. Public only because the profile's file-static Delete method has to reach it;
+     * nothing else should call it.
+     *
+     * ★ This exists because ~dRes_info_c does NOT cancel an in-flight mount. With a DVD command
+     * still queued or executing it takes its FIRST branch and calls mDMCommand->destroy(), which is
+     * JKR_DELETE on a node the DVD thread still owns (d_resorce.cpp:37-51); ~mDoDvdThd_command_c
+     * only prints "a catastrophe will surely occur" and there is no abort API — the command exposes
+     * sync() and destroy() and nothing else (m_Do_dvd_thread.h:19-29, m_Do_dvd_thread.cpp:114-118).
+     * A puppet mounts FOUR archives at once, and a create request cancelled by a room teardown
+     * reaches the destructor with all four potentially still in flight. So the Delete method holds
+     * the destructor off, exactly as daAlink_Delete holds his off while a clothes or shield change
+     * is loading (d_a_alink.cpp:19906-19919) — but with a tick cap he does not need, because his
+     * wait is bounded by a timer and this one is bounded by a DVD thread. */
+    bool readyForDelete();
+
 private:
     /// This puppet's OWN random stream — deliberately not cM_rnd(). See the .cpp for why.
     f32 ownRnd();
@@ -371,6 +387,13 @@ private:
     bool mLoggedSwordRun;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
+    /* How many times the Delete method has already refused to destruct because a private mount was
+     * still in flight, and the latch for the one-shot report that it happened at all. See
+     * readyForDelete(); zero at spawn via fpcBs_Create's sBs_ClearArea of the whole process
+     * (f_pc_base.cpp:158), which is what makes them safe to read on a puppet whose create() was
+     * cancelled before it ever ran. */
+    u16 mDeleteWaitTicks;
+    bool mLoggedDeleteWait;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
     bool mLoggedFirstCalc;
     /* Same idea for the first blink — the one observable that separates "attached and running" from
@@ -398,8 +421,13 @@ private:
      * name-keyed table that dComIfG_resLoad uses. It has to be private because the local player
      * frees his own outfit archive's heap wholesale on a clothes change, without consulting the
      * reference count (d_a_alink_swindow.inc:80-87). Being a plain member is the point:
-     * ~dRes_info_c unmounts and frees everything when the actor dies, with no teardown ordering to
-     * get wrong. */
+     * ~dRes_info_c unmounts and frees everything when the actor dies.
+     *
+     * ★ There is EXACTLY ONE teardown ordering to get wrong, and this comment used to claim there
+     * was none. ~dRes_info_c is only a clean unmount for a mount that has FINISHED: while the DVD
+     * command is still live it takes the other branch and destroys the command instead, without
+     * cancelling it and without unmounting anything. The actor must therefore not be destructed
+     * while this is loading — see readyForDelete(), which is what enforces it. */
     dRes_info_c mOwnRes;
 
     /* --- The body's animation rig. This is daAlink_c's own mechanism, member for member
@@ -525,7 +553,12 @@ private:
 
     /* This puppet's PRIVATE mounts of the three shield archives — CWShd, SWShd and HyShd, one BMD
      * each at index 3. Plain members for exactly the reason mOwnRes is one: ~dRes_info_c unmounts
-     * and frees each of them when the actor dies, with no teardown ordering to get wrong. */
+     * and frees each of them when the actor dies.
+     *
+     * ★ And subject to exactly the same one ordering rule, three more times over. These three are
+     * what turned a one-command hazard into a four-command one: they are started on the SAME tick
+     * as the outfit mount, so a puppet deleted mid-spawn has up to four commands in flight at once.
+     * readyForDelete() waits for all four. */
     dRes_info_c mShieldRes[3];
 
     /* The blink. BTP swaps the eyelid texture, BTK slides the texture matrix; they are played in
