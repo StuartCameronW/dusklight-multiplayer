@@ -501,9 +501,9 @@ private:
      * never-running cap would report peaks of 0 and read as a measured "his does not swing either".
      */
     bool mLinkSampled;
-    /* Last-seen material signature per watched model, in the order body/head/hands/face. 0xFFFF
-     * until the first sample. See checkMaterialDrift(). */
-    u16 mMaterialSig[4];
+    /* Last-seen material signature per watched model, in the order body/head/hands/face and then
+     * the three swords and two sheaths. 0xFFFF until the first sample. See checkMaterialDrift(). */
+    u16 mMaterialSig[9];
     /* ★ TEMPORARY — Hang 4. How many calcs have been step-traced so far. See traceCalc(). */
     u16 mCalcTraced;
 

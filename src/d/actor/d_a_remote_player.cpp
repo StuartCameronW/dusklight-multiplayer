@@ -255,25 +255,53 @@ void log_material_state(const char* i_who, const char* i_what, J3DModelData* i_m
         lastTexMap == 3 ? "  <<< WARP MATERIAL IS ON" : "");
 }
 
-J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
+/**
+ * The one place a puppet turns model data into a model, for BOTH mdlFlags values.
+ *
+ * ★ The warp bracket is the whole reason this is shared rather than written out twice. It is
+ * subtle, it has already produced one visible bug, and the two entry points below differ ONLY in
+ * the mdlFlags they pass — so a second copy of the bracket is a second chance to get it wrong.
+ *
+ * i_what names the model in the log line. It is not decoration: the bracket's effect is invisible
+ * from the model data afterwards, because the trailing offWarpMaterial restores exactly what the
+ * leading test read. Without a line saying which models took it, "is the sheath the one answering
+ * wrong" is unanswerable from a log, and answering it by reasoning is what produced the last two
+ * wrong predictions about this material.
+ */
+J3DModel* init_model_common(
+    J3DModelData* i_modelData, u32 i_mdlFlags, u32 i_diffFlags, const char* i_what) {
     if (i_modelData == NULL) {
         return NULL;
     }
 
     const bool warpMaterial = has_warp_material(i_modelData);
+    const u16 sigBefore = material_signature(i_modelData);
 
     if (warpMaterial) {
         dRes_info_c::onWarpMaterial(i_modelData);
         i_diffFlags |= 0x2000400;
     }
 
-    J3DModel* model = mDoExt_J3DModel__create(i_modelData, 0x80000, i_diffFlags | 0x11000084);
+    J3DModel* model = mDoExt_J3DModel__create(i_modelData, i_mdlFlags, i_diffFlags | 0x11000084);
+    const u16 sigAtCreate = material_signature(i_modelData);
 
     if (warpMaterial) {
         dRes_info_c::offWarpMaterial(i_modelData);
     }
 
+    /* sigAtCreate is the one that matters: it is the material state the model was BUILT from, and
+     * with 0x2000400 the model keeps its own copy of it. sigBefore says what the shared data
+     * happened to be in when we got here, which depends on who created a model from it first. */
+    Log.debug("Puppet init_model {}: warp bracket {} | data sig 0x{:04x} -> built from 0x{:04x} "
+              "-> restored 0x{:04x}",
+        i_what, warpMaterial ? "TAKEN" : "not taken", sigBefore, sigAtCreate,
+        material_signature(i_modelData));
+
     return model;
+}
+
+J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags, const char* i_what) {
+    return init_model_common(i_modelData, 0x80000, i_diffFlags, i_what);
 }
 
 /**
@@ -284,25 +312,8 @@ J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
  * flags it is given. Kept as a separate entry point with the original's name so the call sites read
  * as a diff against his.
  */
-J3DModel* init_model_env(J3DModelData* i_modelData, u32 i_diffFlags) {
-    if (i_modelData == NULL) {
-        return NULL;
-    }
-
-    const bool warpMaterial = has_warp_material(i_modelData);
-
-    if (warpMaterial) {
-        dRes_info_c::onWarpMaterial(i_modelData);
-        i_diffFlags |= 0x2000400;
-    }
-
-    J3DModel* model = mDoExt_J3DModel__create(i_modelData, 0, i_diffFlags | 0x11000084);
-
-    if (warpMaterial) {
-        dRes_info_c::offWarpMaterial(i_modelData);
-    }
-
-    return model;
+J3DModel* init_model_env(J3DModelData* i_modelData, u32 i_diffFlags, const char* i_what) {
+    return init_model_common(i_modelData, 0, i_diffFlags, i_what);
 }
 
 /* The four of daAlink_c's animations the puppet can be in.
@@ -550,8 +561,19 @@ const u16 l_idleFrameLogTick = 200;
  * short because a puppet's life in a scripted run is only a few hundred in-world ticks — an earlier
  * period of 150 yielded exactly one sample.
  */
-/* Models watched by checkMaterialDrift(), in the order body / head / hands / face. */
-const int l_watchedModelNum = 4;
+/* Models watched by checkMaterialDrift(), in the order body / head / hands / face, then the three
+ * swords and the two sheaths.
+ *
+ * ★ The equipment half is not symmetry for its own sake — it is the only way to see the one hazard
+ * the body half does not have. The body, head, hands and face are PRIVATE copies out of the
+ * puppet's own archive mount, so nothing but this actor can change their material state. The
+ * swords and sheaths from "Alink" are the SAME J3DModelData the local player draws, and
+ * daAlink_c::changeWarpMaterial (d_a_alink.cpp:14998-15007) toggles the twilight dissolve straight
+ * onto that shared data for his sword, shield and sheath. When he warps, the puppet's blade and
+ * scabbard go with him — and the puppet drives none of the UVs that make the effect look like
+ * anything (d_resorce.cpp:212-225 needs setWarpSRT every frame). This watch is what turns "the
+ * sheath has a strange particle effect" into a timestamped line saying which model and when. */
+const int l_watchedModelNum = 9;
 const u16 l_capComparePeriod = 60;
 const u16 l_capCompareCount = 8;
 /* The wind breakdown samples on its own schedule, and only while there is wind, because unlike the
@@ -905,7 +927,7 @@ int daRemotePlayer_c::createHeap() {
      * resource, so dRes_info_c's loader hands it over with the twilight dissolve already ENABLED,
      * and it is offWarpMaterial that switches it back off (d_resorce.cpp:127-178, :291-293). Both
      * of those live inside init_model now, which is the point of routing through it. */
-    model = init_model(modelData, 0);
+    model = init_model(modelData, 0, "body");
     if (model == NULL) {
         return 0;
     }
@@ -924,12 +946,12 @@ int daRemotePlayer_c::createHeap() {
      * name was missing. */
     const OutfitArc& outfit = l_outfits[mOutfit];
 
-    mpHeadModel =
-        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0);
-    mpHandModel =
-        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0);
+    mpHeadModel = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.headResName)), 0, "head");
+    mpHandModel = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.handsResName)), 0, "hands");
     mpFaceModel = init_model(
-        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)), 0x20200);
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, outfit.faceResName)), 0x20200, "face");
 
     /* Dusk already fixes Link's eyes vanishing on PC by clamping maxLOD on three face textures
      * (d_a_alink_wolf.inc:379-395). That fix is applied to the local player's face model data, and
@@ -2539,8 +2561,14 @@ void daRemotePlayer_c::checkMaterialDrift() {
         mpHeadModel != NULL ? mpHeadModel->getModelData() : NULL,
         mpHandModel != NULL ? mpHandModel->getModelData() : NULL,
         mpFaceModel != NULL ? mpFaceModel->getModelData() : NULL,
+        mpSwordModel[0] != NULL ? mpSwordModel[0]->getModelData() : NULL,
+        mpSwordModel[1] != NULL ? mpSwordModel[1]->getModelData() : NULL,
+        mpSwordModel[2] != NULL ? mpSwordModel[2]->getModelData() : NULL,
+        mpSheathModel[0] != NULL ? mpSheathModel[0]->getModelData() : NULL,
+        mpSheathModel[1] != NULL ? mpSheathModel[1]->getModelData() : NULL,
     };
-    static const char* const names[l_watchedModelNum] = {"body", "head", "hands", "face"};
+    static const char* const names[l_watchedModelNum] = {"body", "head", "hands", "face",
+        "sword ordon", "sword master", "sword wood", "sheath PODA", "sheath PODM"};
 
     for (int i = 0; i < l_watchedModelNum; i++) {
         const u16 signature = material_signature(models[i]);
@@ -3752,14 +3780,15 @@ void daRemotePlayer_c::setupEquipModels() {
     J3DModelData* podmData = static_cast<J3DModelData*>(
         dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_PODM_e));
 
-    mpSwordModel[dusk::mp::kPlayerEquipSwordOrdon] = init_model(swaData, 0x200);
-    mpSwordModel[dusk::mp::kPlayerEquipSwordMaster] = init_model_env(swmData, 0x1000200);
-    mpSwordModel[dusk::mp::kPlayerEquipSwordWood] =
-        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_woodSwordResName)), 0);
+    mpSwordModel[dusk::mp::kPlayerEquipSwordOrdon] = init_model(swaData, 0x200, "sword ordon");
+    mpSwordModel[dusk::mp::kPlayerEquipSwordMaster] =
+        init_model_env(swmData, 0x1000200, "sword master");
+    mpSwordModel[dusk::mp::kPlayerEquipSwordWood] = init_model(
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_woodSwordResName)), 0, "sword wood");
 
     // Two sheaths, three swords: the wooden sword carries the master sword's (d_a_alink.cpp:4356).
-    J3DModel* podaModel = init_model(podaData, 0);
-    J3DModel* podmModel = init_model_env(podmData, 0);
+    J3DModel* podaModel = init_model(podaData, 0, "sheath PODA");
+    J3DModel* podmModel = init_model_env(podmData, 0, "sheath PODM");
     mpSheathModel[dusk::mp::kPlayerEquipSwordOrdon] = podaModel;
     mpSheathModel[dusk::mp::kPlayerEquipSwordMaster] = podmModel;
     mpSheathModel[dusk::mp::kPlayerEquipSwordWood] = podmModel;
