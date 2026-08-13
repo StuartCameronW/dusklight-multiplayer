@@ -29,10 +29,12 @@ bool canAutoSave() {
         return false;
     }
 
-    // Never serialise a game state that another player authored into this machine's own card.
-    // Returns false unconditionally today — see save_guard.hpp for what it will mean, and for why
-    // this line currently protects nothing. It is here so the flag-replication work cannot ship
-    // without tripping over it.
+    // Never serialise a game state that another player authored into this machine's own card. True
+    // for the rest of the run once this process has joined a co-op session as a guest — the host
+    // owns the save (save_guard.hpp). This is the silent early-out; the write itself is refused at
+    // the choke point in mDoMemCd_Ctrl_c::save, which is also what covers the in-game save prompt.
+    // Silent matters here: autosave fires on every stage entry and every shutter door, and a toast
+    // per door would be worse than useless.
     if (dusk::mp::save_would_be_contaminated()) {
         return false;
     }

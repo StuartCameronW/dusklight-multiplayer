@@ -1566,6 +1566,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/replication_manager.hpp
         src/dusk/multiplayer/session/network_manager.cpp
         src/dusk/multiplayer/session/network_manager.hpp
+        src/dusk/multiplayer/session/save_guard.cpp
+        src/dusk/multiplayer/session/save_guard.hpp
         src/dusk/multiplayer/session/trace.cpp
         src/dusk/multiplayer/session/trace.hpp
         src/dusk/multiplayer/bindings/hooks.cpp

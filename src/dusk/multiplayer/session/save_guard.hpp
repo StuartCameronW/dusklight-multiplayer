@@ -3,68 +3,97 @@
 /**
  * The one question every save path must ask multiplayer before it writes bytes to a memory card.
  *
- * Lives next to the session state (network_manager.hpp) on purpose: when this grows a real body it
- * will read that state, and it must not have to move files to do so.
+ * ★ THE OWNERSHIP RULE (Stuart's call, 2026-08-13). **The host owns the save.** A guest plays in
+ * the host's world — v1 policy is that rupees, inventory, equipment, ammo, magic and quest flags
+ * are all Shared with the host authoritative (.claude/plan/04-architecture.md, "Player-state / save
+ * split"; health is the one per-player exception) — and a guest therefore **never writes its own
+ * memory card for the rest of the process's life**. Nothing is transferred, copied or pushed
+ * between machines: "the guest takes the host's save" means the guest plays the host's world in
+ * memory and its own .gci is simply left alone. The host's save stays an ordinary single-player
+ * save; hosting changes nothing about what the host writes.
  *
- * Header-only for now because giving it a .cpp would mean editing files.cmake; the moment it needs
- * a real implementation it becomes a declaration here and a definition in a new
- * session/save_guard.cpp added to files.cmake alongside network_manager.cpp.
+ * ★ WHY THE FLAG IS STICKY, AND WHY IT IS NOT CLEARED ON DISCONNECT. This is the whole point of
+ * the design. Once host-authored state has been applied into this process's g_dComIfG_gameInfo,
+ * that object is the host's world wearing the client's filename, and it stays that way after the
+ * socket closes. A predicate that merely asked "am I in a session right now" would return false
+ * the moment the guest quit to the file screen — and then autosave, which fires on every stage
+ * entry (d_s_play.cpp:750) and every shutter door (d_a_door_shutter.cpp:575), would serialise
+ * someone else's game over their single-player progress. That is exactly the failure the Dolphin
+ * mod is infamous for (.claude/plan/08-tpmp-reference.md), reached by a different route. So the
+ * flag is set when this process joins a session and is cleared only by a fresh load from card,
+ * which in practice today means: not until the program is restarted.
+ *
+ * The cost of being conservative is that a player who joins a friend, leaves, and keeps playing
+ * solo cannot save until they restart — and they are told so by a toast rather than finding out
+ * later. The cost of being permissive is a destroyed save file. This is not a close call.
+ *
+ * ★ WHERE THE GUARD LIVES, AND WHERE IT MUST NOT. The funnel to disk is
+ * mDoMemCd_Ctrl_c::save() (src/m_Do/m_Do_MemCard.cpp), the single entry to COMM_STORE_e, with
+ * exactly two callers program-wide: src/dusk/autosave.cpp and d_menu_save.cpp:2888 (the in-game
+ * save prompt). Guarding there covers both. canAutoSave() also asks, purely so autosave skips the
+ * pointless work silently — an autosave firing on every door must not raise a toast.
+ *
+ * Do NOT put a guard on dComIfGs_putSave. An earlier draft of this comment said to, and it was
+ * wrong in a way that would have been expensive: dComIfGs_putSave (include/d/d_com_inf_game.h:2367)
+ * resolves to dSv_info_c::putSave (d_save.cpp:1546), which is pure in-memory bookkeeping — it folds
+ * the current stage's temp switches and chests into the persistent table — and d_stage.cpp:2781
+ * calls it on ordinary stage teardown with nothing written to a card. Guarding it would break
+ * normal play and would not stop a single byte reaching disk.
+ *
+ * (src/dusk/imgui/ImGuiSaveEditor.cpp writes game state too, but it is a developer tool the player
+ * drives deliberately, not a path a session can trigger.)
+ *
+ * See .claude/plan/13-save-safety.md for the full audit this implements one item of.
  */
 
 namespace dusk::mp {
 
 /**
- * True when the in-memory game state has been contaminated by another player's authority, and
- * therefore must NOT be serialised into this machine's own save file.
+ * True when this machine's in-memory game state has been contaminated by another player's
+ * authority, and therefore must NOT be serialised into this machine's own save file.
  *
- * WHAT IT WILL MEAN. The v1 replication design (.claude/plan/04-architecture.md, "Player-state /
- * save split") has the host broadcast flag flips, rupee and item changes, and clients apply them
- * through the same named setters — onEventBit / onSwitch / onTbox / dSv_player_c mutators — into
- * their OWN g_dComIfG_gameInfo. From that first applied packet onward, a client's
- * g_dComIfG_gameInfo is no longer a record of what that player did; it is the host's world wearing
- * the client's filename. Writing it to the client's card overwrites their single-player progress
- * with someone else's. That is precisely the failure the Dolphin-era mod is infamous for
- * (.claude/plan/ 08-tpmp-reference.md) reached by a different route, so the predicate has to
- * become: "has any host-authored state been applied into this process's g_dComIfG_gameInfo since it
- * was loaded from disk, and is that state not separated out into session storage?" A sticky
- * per-session flag set by the replication apply path, cleared only by a fresh load from card, is
- * the expected shape.
- *
- * IT IS A DELIBERATE NO-OP TODAY. It returns false unconditionally, and the compiler will fold the
- * call away entirely. That is correct rather than lazy: as of today the multiplayer subsystem
- * writes nothing at all into g_dComIfG_gameInfo (grep src/dusk/multiplayer for dSv_/gameInfo — no
- * hits), so a save taken during a session is exactly as valid as a single-player save, and
- * returning is_active() instead would block autosave in every session for no safety gained. This
- * must NOT be changed to is_active() as a "safe default" — it would be a behaviour regression that
- * also breaks the two-instance harness, and it would be the wrong question anyway: contamination is
- * about what was applied, not about whether a socket is open.
- *
- * WHY IT EXISTS AT ALL. It costs nothing and it protects nothing yet. Its entire value is that the
- * call site already exists, so the person who writes the first flag-replication apply path finds an
- * empty function with their name on it instead of having to remember, at that moment, that autosave
- * is running behind them. Do not cite this function as evidence that save safety is handled. It is
- * a placeholder with a docstring.
- *
- * KNOWN GAP. The call site this ships with is canAutoSave() (src/dusk/autosave.cpp) only, and
- * autosave is not the only save path.
- *
- * ★ Do NOT put the second guard on dComIfGs_putSave. An earlier draft of this comment said to, and
- * it was wrong in a way that would have been expensive: dComIfGs_putSave
- * (include/d/d_com_inf_game.h:2367) resolves to dSv_info_c::putSave (d_save.cpp:1546), which is
- * pure in-memory bookkeeping — it folds the current stage's temp switches and chests into the
- * persistent table — and d_stage.cpp:2781 calls it on ordinary stage teardown with nothing written
- * to a card. Guarding it would break normal play and would not stop a single byte reaching disk.
- *
- * The actual funnel to disk is mDoMemCd_Ctrl_c::save() (src/m_Do/m_Do_MemCard.cpp:258), the single
- * entry to COMM_STORE_e, with exactly two callers program-wide: src/dusk/autosave.cpp and
- * d_menu_save.cpp:2888 (the in-game save prompt). So the one path still uncovered is a contaminated
- * client walking up to a save point. (src/dusk/imgui/ImGuiSaveEditor.cpp writes game state too, but
- * it is a developer tool the player drives deliberately, not a path a session can trigger.)
- *
- * See .claude/plan/13-save-safety.md.
+ * Pure query, no side effects — safe to call from a predicate like canAutoSave().
  */
-inline bool save_would_be_contaminated() {
-    return false;
-}
+bool save_would_be_contaminated();
+
+/**
+ * Latch the contamination flag. Called when this process joins a session as a guest, and the place
+ * for the first flag-replication apply path to call when it lands. Idempotent; only the first call
+ * logs. @p i_reason is recorded in the log so the cause is visible after the fact.
+ */
+void mark_save_contaminated(const char* i_reason);
+
+/**
+ * The refuse-a-card-write decision, for the one choke point that reaches disk. Returns true when
+ * the caller must drop the write on the floor, having already told the player why (a toast, rate
+ * limited so a stuck save loop cannot spam it) and logged it.
+ *
+ * Separate from save_would_be_contaminated() because it is NOT a pure query, and because it keeps
+ * the toast and the logging on the Dusk side of the fence — the decomp call site stays a two-line
+ * TARGET_PC bracket with no UI knowledge in it.
+ */
+bool refuse_card_write();
+
+/**
+ * ★ Consumed by mDoMemCd_Ctrl_c::SaveSync so a refused write COMPLETES instead of hanging.
+ *
+ * This is not optional politeness — without it the in-game save prompt softlocks. dMenu_save_c sits
+ * in PROC_MEMCARD_DATA_SAVE_WAIT calling SaveSync() every frame until it returns non-zero
+ * (d_menu_save.cpp:1375), and SaveSync only returns non-zero once the card thread has finished the
+ * command it was handed. Refuse the write by simply returning and that command never exists, so the
+ * menu waits forever. Worse than the bug it was meant to prevent.
+ *
+ * So the refusal is modelled as what it actually is from the game's point of view — a card write
+ * that did not happen — and reported through the path the game already has for that: SaveSync
+ * returns 2, dMenu_save_c::memCardDataSaveWait2 (:1408) plays the error sound and shows message
+ * 0x3CD, *"An error might have occurred when saving."* The player gets the game's own honest
+ * failure plus our toast saying why, rather than a cheerful "Saved." over a write we dropped.
+ *
+ * Deliberately a Dusk-side latch rather than a new member on mDoMemCd_Ctrl_c: it keeps the decomp
+ * class layout untouched and leaves mCardState alone, so nothing about loading is disturbed.
+ *
+ * Returns true exactly once per refused write, and clears itself.
+ */
+bool consume_refused_card_write();
 
 }  // namespace dusk::mp

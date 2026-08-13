@@ -7,7 +7,10 @@
 
 #include <array>
 #include <chrono>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -528,10 +531,10 @@ bool validate_writable_data_path(const std::filesystem::path& path, std::string*
         io::FileStream::WriteAllText(probePath, "dusk");
     } catch (const std::exception& e) {
 #if defined(__ANDROID__)
-        set_error(errorOut,
-            fmt::format("{} could not write to the selected folder. On Android, allow "
-                        "\"All files access\" for Dusklight and try again.",
-                AppName));
+        set_error(
+            errorOut, fmt::format("{} could not write to the selected folder. On Android, allow "
+                                  "\"All files access\" for Dusklight and try again.",
+                          AppName));
 #else
         set_error(errorOut, fmt::format("{} could not write to the selected folder.", AppName));
 #endif
@@ -890,6 +893,200 @@ void ensure_data_directory(const std::filesystem::path& dataPath) {
     }
 }
 
+/// Where rolling memory card backups live, relative to the data directory.
+constexpr std::string_view kSaveBackupDirName = "save-backups";
+
+/// How many backups to keep per card file. 32 KB each, so ten of them cost a third of a megabyte.
+constexpr std::size_t kSaveBackupsKept = 10;
+
+bool files_have_same_contents(const std::filesystem::path& a, const std::filesystem::path& b) {
+    std::error_code ec;
+    const auto sizeA = std::filesystem::file_size(a, ec);
+    if (ec) {
+        return false;
+    }
+    const auto sizeB = std::filesystem::file_size(b, ec);
+    if (ec || sizeA != sizeB) {
+        return false;
+    }
+
+    std::ifstream streamA(a, std::ios::binary);
+    std::ifstream streamB(b, std::ios::binary);
+    if (!streamA || !streamB) {
+        return false;
+    }
+
+    std::array<char, 4096> bufferA{};
+    std::array<char, 4096> bufferB{};
+    while (streamA && streamB) {
+        streamA.read(bufferA.data(), bufferA.size());
+        streamB.read(bufferB.data(), bufferB.size());
+        const auto readA = streamA.gcount();
+        if (readA != streamB.gcount()) {
+            return false;
+        }
+        if (std::memcmp(bufferA.data(), bufferB.data(), static_cast<std::size_t>(readA)) != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Collect the memory cards under a data directory.
+ *
+ * Deliberately NOT a recursive_directory_iterator over the whole tree: in --data-dir mode the data
+ * directory also holds caches and logs, and walking those to find a 32 KB file would be paying a
+ * lot for nothing. Aurora lays cards out as <dataPath>/<region>/Card A (lib/dolphin/card.cpp:57),
+ * so this walks exactly two levels and matches the "Card" prefix rather than hardcoding a region
+ * list — a new region then needs no change here.
+ */
+std::vector<std::filesystem::path> find_memory_cards(const std::filesystem::path& dataPath) {
+    std::vector<std::filesystem::path> cards;
+    std::error_code ec;
+
+    for (const auto& regionEntry : std::filesystem::directory_iterator(dataPath, ec)) {
+        if (ec || !regionEntry.is_directory()) {
+            continue;
+        }
+        if (regionEntry.path().filename() == kSaveBackupDirName) {
+            continue;
+        }
+
+        std::error_code slotEc;
+        for (const auto& slotEntry :
+            std::filesystem::directory_iterator(regionEntry.path(), slotEc))
+        {
+            if (slotEc || !slotEntry.is_directory()) {
+                continue;
+            }
+            if (!slotEntry.path().filename().string().starts_with("Card")) {
+                continue;
+            }
+
+            std::error_code fileEc;
+            for (const auto& fileEntry :
+                std::filesystem::directory_iterator(slotEntry.path(), fileEc))
+            {
+                if (fileEc || !fileEntry.is_regular_file()) {
+                    continue;
+                }
+                if (fileEntry.path().extension() == ".gci") {
+                    cards.push_back(fileEntry.path());
+                }
+            }
+        }
+    }
+
+    return cards;
+}
+
+void prune_save_backups(const std::filesystem::path& backupDir, const std::string& stem) {
+    std::vector<std::filesystem::path> existing;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(backupDir, ec)) {
+        if (ec || !entry.is_regular_file()) {
+            continue;
+        }
+        const auto name = entry.path().filename().string();
+        if (name.starts_with(stem + ".") && entry.path().extension() == ".gci") {
+            existing.push_back(entry.path());
+        }
+    }
+
+    if (existing.size() <= kSaveBackupsKept) {
+        return;
+    }
+
+    // Names carry a sortable timestamp, so lexicographic order is chronological order. Cheaper and
+    // steadier than asking the filesystem for mtimes, which a copy or a sync client can rewrite.
+    std::sort(existing.begin(), existing.end());
+    for (std::size_t i = 0; i + kSaveBackupsKept < existing.size(); ++i) {
+        std::error_code removeEc;
+        std::filesystem::remove(existing[i], removeEc);
+    }
+}
+
+/**
+ * ★ Rolling memory card backup, taken once at startup before the game can write anything.
+ *
+ * Every failure mode in .claude/plan/13-save-safety.md — a torn write from two processes on one
+ * data directory (P0), a crash midway through the five open/seek/write/close cycles a single save
+ * costs (P1), a read-back verify that reports success when it failed (P4) — has the same
+ * consequence without this: the file is gone. With it, the consequence is losing one session. That
+ * asymmetry is why this is worth more than its size, and why it runs unconditionally rather than
+ * behind a setting.
+ *
+ * Best-effort by construction. Every error is swallowed with at most a warning: a backup that
+ * cannot be written must never be a reason the game will not start, which is the same principle
+ * that makes the P0 lock a harder call than this one.
+ */
+void backup_memory_cards(const std::filesystem::path& dataPath) {
+    const auto cards = find_memory_cards(dataPath);
+    if (cards.empty()) {
+        return;
+    }
+
+    const auto backupDir = dataPath / kSaveBackupDirName;
+    std::error_code ec;
+    std::filesystem::create_directories(backupDir, ec);
+    if (ec) {
+        Log.warn("Could not create save backup directory '{}': {} — continuing without backups",
+            io::fs_path_to_string(backupDir), ec.message());
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    std::array<char, 32> stamp{};
+    if (std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local) == 0) {
+        return;
+    }
+
+    for (const auto& card : cards) {
+        const auto stem = card.stem().string();
+
+        // Skip a launch that changed nothing: without this, ten backups of an untouched save push
+        // the one backup that mattered out of the window.
+        bool alreadyHaveIt = false;
+        std::error_code scanEc;
+        for (const auto& entry : std::filesystem::directory_iterator(backupDir, scanEc)) {
+            if (scanEc || !entry.is_regular_file()) {
+                continue;
+            }
+            if (entry.path().filename().string().starts_with(stem + ".") &&
+                files_have_same_contents(card, entry.path()))
+            {
+                alreadyHaveIt = true;
+                break;
+            }
+        }
+        if (alreadyHaveIt) {
+            continue;
+        }
+
+        const auto target = backupDir / (stem + "." + stamp.data() + ".gci");
+        std::error_code copyEc;
+        std::filesystem::copy_file(
+            card, target, std::filesystem::copy_options::overwrite_existing, copyEc);
+        if (copyEc) {
+            Log.warn("Could not back up memory card '{}': {}", io::fs_path_to_string(card),
+                copyEc.message());
+            continue;
+        }
+
+        Log.info("Backed up memory card '{}' to '{}'", io::fs_path_to_string(card),
+            io::fs_path_to_string(target));
+        prune_save_backups(backupDir, stem);
+    }
+}
+
 }  // namespace
 
 bool open_data_path() {
@@ -998,6 +1195,7 @@ Paths initialize_data() {
         sConfiguredDataPath = *sDataPathOverride;
         sActiveDescriptorPath.reset();
         ensure_data_directory(*sDataPathOverride);
+        backup_memory_cards(*sDataPathOverride);
 
         return Paths{
             .userPath = *sDataPathOverride,
@@ -1023,6 +1221,9 @@ Paths initialize_data() {
     migrate_data(prefPath, dataPath, descriptor ? &descriptor->descriptor : nullptr);
     ensure_data_directory(dataPath);
     ensure_data_directory(prefPath);
+    // After the directory exists and any migration has landed, and before the game can write a
+    // card.
+    backup_memory_cards(dataPath);
 
     return Paths{
         .userPath = dataPath,

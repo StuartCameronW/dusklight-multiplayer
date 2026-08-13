@@ -13,6 +13,9 @@
 #include "dusk/os.h"
 #include "dusk/main.h"
 #include "dusk/version.hpp"
+#if TARGET_PC
+#include "dusk/multiplayer/session/save_guard.hpp"
+#endif
 
 #if PLATFORM_WII || PLATFORM_SHIELD
 #include <revolution/nand.h>
@@ -256,6 +259,17 @@ s32 mDoMemCd_Ctrl_c::LoadSync(void* i_buffer, u32 i_size, u32 i_position) {
 }
 
 void mDoMemCd_Ctrl_c::save(void* i_buffer, u32 i_size, u32 i_position) {
+#if TARGET_PC
+    // Dusk (multiplayer): the single funnel to disk, and therefore the only place that covers both
+    // save paths — autosave and the in-game save prompt. A guest plays the host's world, so writing
+    // it into the guest's own memory card would overwrite their single-player progress with someone
+    // else's. Refusing here tells the player why and drops the write; nothing else is disturbed.
+    // See src/dusk/multiplayer/session/save_guard.hpp.
+    if (dusk::mp::refuse_card_write()) {
+        return;
+    }
+#endif
+
     if (OSTryLockMutex(&mMutex)) {
         memcpy(&mData[i_position], i_buffer, i_size);
         field_0x1fc8 = 0;
@@ -309,6 +323,16 @@ void mDoMemCd_Ctrl_c::store() {
 
 s32 mDoMemCd_Ctrl_c::SaveSync() {
     int ret = 0;
+
+#if TARGET_PC
+    // Dusk (multiplayer): a write refused above never became a card command, so the caller's wait
+    // for one would never end — dMenu_save_c polls this every frame until it is non-zero. Report it
+    // as the failed write it is; the menu then shows the game's own "An error might have occurred
+    // when saving." No card state is touched. See save_guard.hpp.
+    if (dusk::mp::consume_refused_card_write()) {
+        return 2;
+    }
+#endif
 
     if (field_0x1fc8 == 0) {
         return 0;

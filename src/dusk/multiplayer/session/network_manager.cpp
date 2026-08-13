@@ -10,6 +10,7 @@
 #include "../replication/player_state.hpp"
 #include "../replication/replication_manager.hpp"
 #include "dusk/logging.h"
+#include "save_guard.hpp"
 #include "trace.hpp"
 
 namespace dusk::mp {
@@ -189,6 +190,11 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
     mRole = Role::Client;
     mRateWindowStart = std::chrono::steady_clock::now();
     mRateWindowStartTick = mSimTick;
+    // The host owns the save. Latch it here, at the moment we become a guest, rather than at the
+    // first applied packet: v1 policy makes the host authoritative over inventory, rupees and quest
+    // flags, so by the time any of that has arrived it is already too late to decide. Sticky for
+    // the life of the process on purpose — see save_guard.hpp.
+    mark_save_contaminated("joined a co-op session as a guest");
     Log.info("Session started as CLIENT (protocol v{})", kProtocolVersion);
     return true;
 }
