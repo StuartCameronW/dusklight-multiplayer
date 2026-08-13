@@ -233,6 +233,47 @@ const u8 l_defaultHandIdx = 0xFE;
  * decide what to do (`:187`, `:203`), it is what actually governs rendering, and it cannot be
  * defeated by a pointer that means something different on PC than it did on GameCube.
  */
+/**
+ * Read the first texture matrix off a model's material 0, if it has one.
+ *
+ * ★ For the ONE measurement that settles the sword effect. The dissolve has now been ruled out
+ * three separate ways — no equipment model carries a counted dissolve stage, zero material changes
+ * over a 150 s run on both instances, and every model logs "materials dissolving 0 of N" at build
+ * time — and the mechanism left standing is the env-mapped texture matrix on the SHARED
+ * J3DModelData.
+ *
+ * That mechanism is certain from the code rather than guessed: J3DTexGenBlockPatched::diff calls
+ * diffTexMtx, which re-emits `mTexMtx[i]` (J3DMatBlock.cpp:555-559) — and those J3DTexMtx objects
+ * hang off the model DATA, which the puppet shares with the local player. So re-emitting does not
+ * give a model its own matrix; it re-sends whoever calc'd last. What is NOT yet measured is whether
+ * that actually happens between the puppet's calc and the puppet's entry in a real frame, which is
+ * the difference between a mechanism and a cause. Two previous rounds on this bug were lost to
+ * reasoning about it instead.
+ *
+ * Returns false when the model has no texture matrix at all, which is most models.
+ */
+bool read_tex_mtx(J3DModelData* i_modelData, f32* o_first, f32* o_second) {
+    if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
+        return false;
+    }
+
+    J3DTexGenBlock* texGen = i_modelData->getMaterialNodePointer(0)->getTexGenBlock();
+    if (texGen == NULL) {
+        return false;
+    }
+
+    J3DTexMtx* texMtx = texGen->getTexMtx(0);
+    if (texMtx == NULL) {
+        return false;
+    }
+
+    // Two elements are enough to tell "changed" from "did not"; the whole matrix in a log line per
+    // frame would be unreadable and would bury the answer it exists to give.
+    *o_first = texMtx->getMtx()[0][0];
+    *o_second = texMtx->getMtx()[1][3];
+    return true;
+}
+
 bool has_warp_material(J3DModelData* i_modelData) {
     if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
         return false;
@@ -4902,6 +4943,10 @@ void daRemotePlayer_c::setEquipMatrix() {
         if (sheath != NULL) {
             sheath->setBaseTRMtx(model->getAnmMtx(l_backJointNo));
             sheath->calc();
+            // Snapshot the env texture matrix the moment WE produced it. Compared against the value
+            // present at our entry in drawEquip(); see read_tex_mtx().
+            mHaveSheathTexMtx = read_tex_mtx(
+                sheath->getModelData(), &mSheathTexMtxAtCalc[0], &mSheathTexMtxAtCalc[1]);
         }
 
         if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
@@ -5029,6 +5074,32 @@ void daRemotePlayer_c::drawEquip() {
          * would be the same test today by accident: the two kinds share one J3DModel, so a pointer
          * comparison could not tell a wooden sword from a master sword at all. */
         if (!checkWoodSwordEquip()) {
+            /* ★ THE MEASUREMENT that settles the sword effect, taken at the only moment that can
+             * answer it: immediately before this model is entered for drawing.
+             *
+             * If the env texture matrix here differs from the one our own calc produced during
+             * execute(), then something else — the local player, who shares this J3DModelData —
+             * calc'd in between, and the puppet is about to draw the sheath with HIS matrix. That
+             * is the mechanism the code says is possible (see read_tex_mtx); this says whether it
+             * happens. Reported once per distinct outcome rather than per frame: the question is
+             * "does this ever happen", and 30 identical lines a second answers it no better while
+             * making the log useless for everything else. */
+            if (mHaveSheathTexMtx) {
+                f32 atEntry[2] = {0.0f, 0.0f};
+                if (read_tex_mtx(sheath->getModelData(), &atEntry[0], &atEntry[1])) {
+                    const bool changed = atEntry[0] != mSheathTexMtxAtCalc[0] ||
+                                         atEntry[1] != mSheathTexMtxAtCalc[1];
+                    if (changed != mLoggedSheathTexMtxChanged || !mLoggedSheathTexMtx) {
+                        mLoggedSheathTexMtx = true;
+                        mLoggedSheathTexMtxChanged = changed;
+                        Log.debug("Puppet {} sheath env texture matrix at entry: {} — ours was "
+                                  "({:.4f}, {:.4f}), drawing with ({:.4f}, {:.4f})",
+                            mPlayerId,
+                            changed ? "STOLEN, someone else calc'd after us" : "still ours",
+                            mSheathTexMtxAtCalc[0], mSheathTexMtxAtCalc[1], atEntry[0], atEntry[1]);
+                    }
+                }
+            }
             drawModel(sheath);
         }
 

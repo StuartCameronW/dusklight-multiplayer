@@ -808,6 +808,17 @@ private:
     bool mLoggedServiceWait;
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
+
+    /// The env texture matrix this puppet's own calc produced for its sheath, and whether there is
+    /// one. Compared against the value present at entry to find out whether the local player, who
+    /// shares that J3DModelData, calc'd in between. See read_tex_mtx() in the .cpp.
+    f32 mSheathTexMtxAtCalc[2];
+    bool mHaveSheathTexMtx;
+    /// Latches the comparison's answer, so it logs on the first frame and again only when the
+    /// answer FLIPS — the question is "does this ever happen", not "how many frames did it happen
+    /// on".
+    bool mLoggedSheathTexMtx;
+    bool mLoggedSheathTexMtxChanged;
     /// And the same for the shield, which needs its OWN latch rather than sharing mLoggedEquip: the
     /// two halves of the equipment byte are drawn independently, so a session in which the sword
     /// line appears and the shield line does not is a real and interesting state. Zero at spawn via
