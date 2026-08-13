@@ -22,6 +22,15 @@
 #include <SDL3/SDL_misc.h>
 #include <SDL3/SDL_stdinc.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 #include "nlohmann/json.hpp"
 
 namespace dusk::data {
@@ -893,6 +902,214 @@ void ensure_data_directory(const std::filesystem::path& dataPath) {
     }
 }
 
+/**
+ * ★ THE SINGLE-INSTANCE DATA DIRECTORY LOCK (13-save-safety.md, P0).
+ *
+ * The problem: nothing stopped two Dusklight processes pointing at the same data directory, and a
+ * single save is at least five independent open/seek/write/close cycles on one .gci with no lock,
+ * no temp-file-and-rename and no fsync (13 §2). Two of those interleaving lands a torn save in both
+ * the primary sector and its mirror. The accident that actually happens is mundane: double-clicking
+ * the exe twice, or launching the installed build while a dev build is running.
+ *
+ * ★ WHAT IT DOES ON CONFLICT IS STUART'S CALL, 2026-08-13, and it is better than either option that
+ * was put to him (refuse to launch / run with saving disabled): *"give it a separate folder, cant
+ * you just rename it, so it doesnt overwrite my save files?"* So a second instance is **moved to a
+ * numbered directory of its own**, seeded with a COPY of the first one's memory cards and config.
+ * Nobody is refused a launch, nobody plays a crippled session, and the original .gci is never
+ * opened by two processes. It is the same shape the two-instance test harness has used successfully
+ * all along (`.claude/mp-test.ps1` seeds each instance from a copy), promoted from a script into
+ * the program.
+ *
+ * ★ THE COST, NAMED. The second instance's progress goes somewhere else, and a player who does not
+ * notice will look for it in the wrong place later. That is why is_secondary_instance() exists and
+ * why the overlay raises a toast rather than this being a log line nobody reads.
+ *
+ * FAILURE MODES, all deliberately biased towards booting:
+ *   - The lock is an OS lock on an OPEN HANDLE, never a pidfile. The OS releases it however the
+ *     process dies, so a crash cannot leave the game permanently unstartable. Dusklight crashes are
+ *     a first-class scenario (crash_handler.cpp exists), so the pidfile form was never an option.
+ *   - "Could not create or open the lock file at all" counts as PERMITTED TO RUN. Network and
+ *     cloud-synced data directories report locking unreliably in both directions, and an I/O error
+ *     must never become a refusal to boot.
+ *   - Only "someone else holds it" is treated as a conflict.
+ *   - An explicit --data-dir is never redirected. The caller said exactly where to put things, and
+ *     silently moving them would break the harness in the confusing direction. It warns instead.
+ */
+constexpr std::string_view kDataLockFileName = ".dusklight.lock";
+
+/// Give up after this many numbered directories rather than looping. Eight simultaneous copies of
+/// Dusklight is far past any real use, and past it the honest answer is to run unlocked.
+constexpr int kMaxInstanceDirectories = 8;
+
+bool sIsSecondaryInstance = false;
+std::filesystem::path sSecondaryInstancePath;
+
+#if defined(_WIN32)
+
+/// Held for the life of the process. Never closed on purpose — the OS closes it, including on a
+/// crash, which is the entire argument for a handle lock over a pidfile.
+void* sDataLockHandle = nullptr;
+
+/// Returns true when this process now owns the directory. `o_conflict` distinguishes "someone else
+/// has it" (try the next directory) from "could not lock for any other reason" (run anyway).
+bool try_lock_data_directory(const std::filesystem::path& dataPath, bool& o_conflict) {
+    o_conflict = false;
+    const auto lockPath = dataPath / kDataLockFileName;
+
+    HANDLE handle = CreateFileW(lockPath.wstring().c_str(), GENERIC_READ | GENERIC_WRITE,
+        0 /* no sharing: this IS the lock */, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+
+    if (handle != INVALID_HANDLE_VALUE) {
+        sDataLockHandle = handle;
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION ||
+        error == ERROR_ACCESS_DENIED)
+    {
+        // ERROR_ACCESS_DENIED is included deliberately even though it is ambiguous — it is what an
+        // antivirus or indexer holding the handle looks like, and treating it as a conflict costs a
+        // numbered directory where treating it as success costs a shared memory card.
+        o_conflict = true;
+        return false;
+    }
+
+    return false;
+}
+
+#else
+
+int sDataLockFd = -1;
+
+bool try_lock_data_directory(const std::filesystem::path& dataPath, bool& o_conflict) {
+    o_conflict = false;
+    const auto lockPath = dataPath / kDataLockFileName;
+
+    const int fd = ::open(lockPath.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        return false;
+    }
+
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        sDataLockFd = fd;
+        return true;
+    }
+
+    const int error = errno;
+    ::close(fd);
+    if (error == EWOULDBLOCK) {
+        o_conflict = true;
+    }
+    return false;
+}
+
+#endif
+
+/// Where the Nth instance's data lives: the same directory with a numbered suffix, so it sits
+/// beside the original and is obvious in a file manager rather than hidden somewhere else.
+std::filesystem::path instance_directory(const std::filesystem::path& dataPath, int index) {
+    auto normalized = dataPath;
+    if (normalized.filename().empty()) {
+        normalized = normalized.parent_path();
+    }
+    return normalized.parent_path() /
+           (normalized.filename().string() + "-" + std::to_string(index));
+}
+
+/**
+ * Give a freshly-created instance directory the first one's saves and settings.
+ *
+ * Copies, never moves or links: the whole point is that the original .gci is not touched. Only done
+ * when the target does not already exist, so a second instance that has been used before continues
+ * from where IT left off rather than being reset to the primary's progress every launch.
+ */
+void seed_instance_directory(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::error_code ec;
+
+    const auto configSrc = from / "config.json";
+    if (std::filesystem::exists(configSrc, ec)) {
+        std::filesystem::copy_file(
+            configSrc, to / "config.json", std::filesystem::copy_options::skip_existing, ec);
+        if (ec) {
+            Log.warn(
+                "Could not copy config into '{}': {}", io::fs_path_to_string(to), ec.message());
+            ec.clear();
+        }
+    }
+
+    // Memory cards only — deliberately NOT kUserDataDirectories, which also lists
+    // texture_replacements. That can be gigabytes, and duplicating it per instance would turn a
+    // safety measure into a disk-filling one.
+    for (const std::string_view region : {"USA", "EUR", "JAP"}) {
+        const auto src = from / region;
+        if (!std::filesystem::is_directory(src, ec)) {
+            continue;
+        }
+        std::filesystem::copy(src, to / region,
+            std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing,
+            ec);
+        if (ec) {
+            Log.warn("Could not copy '{}' into '{}': {}", region, io::fs_path_to_string(to),
+                ec.message());
+            ec.clear();
+        }
+    }
+}
+
+/**
+ * Take the lock, or move this process to a directory of its own. Returns the directory to actually
+ * use, which is @p dataPath in the overwhelmingly common single-instance case.
+ */
+std::filesystem::path lock_or_relocate_data_directory(const std::filesystem::path& dataPath) {
+    bool conflict = false;
+    if (try_lock_data_directory(dataPath, conflict)) {
+        return dataPath;
+    }
+
+    if (!conflict) {
+        // Could not lock, and not because anyone else holds it. Run in the normal directory rather
+        // than inventing a problem: an unlockable filesystem is not evidence of a second instance.
+        Log.warn("Could not lock the data directory '{}' — continuing without a single-instance "
+                 "guard. This is expected on some network and cloud-synced folders.",
+            io::fs_path_to_string(dataPath));
+        return dataPath;
+    }
+
+    for (int index = 2; index < 2 + kMaxInstanceDirectories; ++index) {
+        const auto candidate = instance_directory(dataPath, index);
+
+        std::error_code ec;
+        const bool existed = std::filesystem::exists(candidate, ec);
+        ensure_data_directory(candidate);
+
+        bool candidateConflict = false;
+        if (!try_lock_data_directory(candidate, candidateConflict)) {
+            if (candidateConflict) {
+                continue;  // A third instance already has this one.
+            }
+            Log.warn("Could not lock '{}' either — continuing there unguarded.",
+                io::fs_path_to_string(candidate));
+        }
+
+        if (!existed) {
+            seed_instance_directory(dataPath, candidate);
+        }
+
+        sIsSecondaryInstance = true;
+        sSecondaryInstancePath = candidate;
+        Log.warn("Another Dusklight is already using '{}', so this one is using '{}' instead. Its "
+                 "saves were {} and anything saved from now on goes THERE, not to the original.",
+            io::fs_path_to_string(dataPath), io::fs_path_to_string(candidate),
+            existed ? "already there from a previous run" : "copied from the original");
+        return candidate;
+    }
+
+    Log.warn("Every instance directory up to {} is in use — continuing in '{}' unguarded.",
+        kMaxInstanceDirectories + 1, io::fs_path_to_string(dataPath));
+    return dataPath;
+}
+
 /// Where rolling memory card backups live, relative to the data directory.
 constexpr std::string_view kSaveBackupDirName = "save-backups";
 
@@ -1179,6 +1396,14 @@ std::filesystem::path cache_path() {
     return active_pref_path();
 }
 
+bool is_secondary_instance() {
+    return sIsSecondaryInstance;
+}
+
+std::filesystem::path secondary_instance_path() {
+    return sSecondaryInstancePath;
+}
+
 bool is_data_path_restart_pending() {
     if (ConfigPath.empty()) {
         return false;
@@ -1195,6 +1420,18 @@ Paths initialize_data() {
         sConfiguredDataPath = *sDataPathOverride;
         sActiveDescriptorPath.reset();
         ensure_data_directory(*sDataPathOverride);
+        // Locked but never relocated: --data-dir is an explicit instruction about where things go,
+        // and silently moving them would break the two-instance harness in the most confusing
+        // possible direction. A conflict here means someone pointed two processes at one sandbox,
+        // which is worth a warning and is their business.
+        {
+            bool conflict = false;
+            if (!try_lock_data_directory(*sDataPathOverride, conflict) && conflict) {
+                Log.warn("Another Dusklight already holds '{}'. Honouring --data-dir anyway, but "
+                         "the two processes now share one memory card and can corrupt it.",
+                    io::fs_path_to_string(*sDataPathOverride));
+            }
+        }
         backup_memory_cards(*sDataPathOverride);
 
         return Paths{
@@ -1221,12 +1458,20 @@ Paths initialize_data() {
     migrate_data(prefPath, dataPath, descriptor ? &descriptor->descriptor : nullptr);
     ensure_data_directory(dataPath);
     ensure_data_directory(prefPath);
+    // ★ Claim the directory, or move to one of our own. AFTER the directory exists and any
+    // migration has landed (there is nothing to lock or copy before that), and BEFORE the backup
+    // and the first card write, so a second instance never opens the first one's .gci at all.
+    const auto activePath = lock_or_relocate_data_directory(dataPath);
+    if (activePath != dataPath) {
+        sConfiguredDataPath = activePath;
+    }
+
     // After the directory exists and any migration has landed, and before the game can write a
     // card.
-    backup_memory_cards(dataPath);
+    backup_memory_cards(activePath);
 
     return Paths{
-        .userPath = dataPath,
+        .userPath = activePath,
         .cachePath = prefPath,
     };
 }

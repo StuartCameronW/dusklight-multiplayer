@@ -36,6 +36,8 @@ private:
     uint32_t mPipelineBatchCreatedBase = 0;
     uint32_t mLastQueuedPipelines = 0;
     bool mPipelineProgressActive = false;
+    /// One toast per run telling the player their saves were relocated. See overlay.cpp.
+    bool mWarnedSecondaryInstance = false;
 };
 
 }  // namespace dusk::ui

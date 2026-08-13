@@ -44,4 +44,16 @@ bool reset_data_path();
 bool is_default_data_path();
 bool is_data_path_restart_pending();
 
+/**
+ * True when another Dusklight was already using the normal data directory, so this process was
+ * moved to a numbered one of its own.
+ *
+ * ★ This MUST be surfaced to the player, not just logged. Silently sending someone's saves
+ * somewhere else is the failure this whole mechanism exists to prevent, in a new costume: they play
+ * for two hours, quit, relaunch, and their progress is not there. `secondary_instance_path()` is
+ * the folder their saves actually went to.
+ */
+bool is_secondary_instance();
+std::filesystem::path secondary_instance_path();
+
 }  // namespace dusk::data

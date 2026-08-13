@@ -4,6 +4,7 @@
 #include "controller_config.hpp"
 #include "dusk/achievements.h"
 #include "dusk/action_bindings.h"
+#include "dusk/data.hpp"
 #include "dusk/livesplit.h"
 #include "dusk/settings.h"
 #include "dusk/speedrun.h"
@@ -270,6 +271,32 @@ void Overlay::update() {
     }
 
     update_pipeline_progress();
+
+    /* ★ Tell the player, once, that this instance's saves are going somewhere else.
+     *
+     * Raised here rather than where the decision is made because that happens in initialize_data(),
+     * long before there is a UI to raise it in. It has to reach the screen and not just the log: a
+     * player who does not notice will play for hours, quit, relaunch, and find their progress
+     * missing from the folder they expect. Silently relocating someone's saves would be the same
+     * class of failure this whole mechanism exists to prevent. See data.cpp's lock comment. */
+    if (!mWarnedSecondaryInstance && data::is_secondary_instance()) {
+        mWarnedSecondaryInstance = true;
+        // ★ Also logged HERE rather than only at the point of decision. initialize_data() runs
+        // before file logging exists (measured: "File logging initialized" is the first line in the
+        // file, and the config path is loaded after it), so the warning written there reaches the
+        // console and nothing else. Without this line a relocated session leaves no record at all
+        // in the log a player would send us.
+        Log.warn(
+            "This process is a second instance: its data directory is '{}', not the usual one.",
+            data::secondary_instance_path().string());
+        push_toast({
+            .title = "Second copy of Dusklight",
+            .content = "Another one is already running, so this one saves to " +
+                       data::secondary_instance_path().filename().string() +
+                       " instead. Your original saves are untouched.",
+            .duration = std::chrono::seconds(12),
+        });
+    }
 
 #if !(defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IOS && !TARGET_OS_MACCATALYST))
     if (getSettings().game.speedrunMode && getSettings().game.liveSplitEnabled) {
