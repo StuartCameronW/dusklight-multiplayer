@@ -74,6 +74,33 @@ enum PlayerStateFlags : std::uint8_t {
      * takes `flags` whole from the newer sample rather than blending them.
      */
     kPlayerStateZeroSpeed = 1 << 3,
+    /**
+     * The sender's `checkModeFlg(MODE_IDLE)` on its own — he is at rest, as his state machine sees
+     * it, not merely as his speed sees it.
+     *
+     * Sent alongside kPlayerStateZeroSpeed rather than folded into it because the two are used for
+     * different jobs and the OR is only correct for one of them. `setBlendMoveAnime` wants the OR
+     * (d_a_alink.cpp:7656); `footBgCheck` (:3883, :3931, :3970) wants MODE_IDLE alone, and it uses
+     * it three separate times — to freeze the floor probe, to sink the body onto the lower foot,
+     * and to pitch each foot onto its slope. Handing those the OR would run all three for the tick
+     * or two at the end of every stop where Link's speed has reached zero but his mode flag has not
+     * yet been set, which reads as the body dipping as he halts.
+     */
+    kPlayerStateModeIdle = 1 << 4,
+    /**
+     * The sender is in a state where he does no foot IK at all — `d_a_alink.cpp:3872`: not touching
+     * the ground, wearing magne boots, sinking into sand, or in any of jumping / climbing /
+     * swimming / rope-walking / riding / no-collision.
+     *
+     * ★ Replicated rather than derived, and this is the case where deriving is most tempting: the
+     * plan for this feature originally said the receiver could test its own ground height against a
+     * tolerance. That answers a different question. The puppet's position is interpolated between
+     * two samples and delivered two ticks late, so a height test tells you where the puppet's
+     * REPLAY is, not what the sender was doing — and it cannot distinguish "swimming at floor
+     * level" or "riding" from "standing" at any tolerance. One bit gets all of it, exactly, on the
+     * sender's own timeline, which is the timeline the puppet is replaying.
+     */
+    kPlayerStateNoFootIk = 1 << 5,
 };
 
 /// 20 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
@@ -117,6 +144,8 @@ struct PlayerState {
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
+    bool mode_idle() const { return (flags & kPlayerStateModeIdle) != 0; }
+    bool no_foot_ik() const { return (flags & kPlayerStateNoFootIk) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);

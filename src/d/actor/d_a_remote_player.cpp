@@ -1345,8 +1345,8 @@ static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
     return 1;
 }
 
-void daRemotePlayer_c::setNetworkPose(
-    const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn, bool i_zeroSpeed) {
+void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_moveRate,
+    bool i_sharpTurn, bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff) {
     current.pos = i_pos;
     shape_angle.y = i_angleY;
     // The logical angle is kept in step so anything that reads current.angle (audio, effects) sees
@@ -1357,6 +1357,8 @@ void daRemotePlayer_c::setNetworkPose(
     // until mHasPose, which is set right below — so these need no separate initialisation.
     mNetSharpTurn = i_sharpTurn;
     mNetZeroSpeed = i_zeroSpeed;
+    mNetModeIdle = i_modeIdle;
+    mNetFootIkOff = i_footIkOff;
     mHasPose = true;
 }
 
@@ -2929,16 +2931,483 @@ void daRemotePlayer_c::setHatAngle() {
     setHairAngle(&apparentWind, sinYaw, cosYaw);
 }
 
+/* --- Foot IK ------------------------------------------------------------------------------- */
+
+/* Both legs, joint by joint. daAlink_c's footJointTable (d_a_alink.cpp:3626) is {0x12, 0x17} and
+ * each leg is FOUR consecutive joints from there: hip, knee, ankle, toe. The probe points come off
+ * the ankle and the toe, which is why 0x14/0x15 and 0x19/0x1A appear separately in footBgCheck —
+ * they are hip+2 and hip+3 for each leg, not a second table. Same numbers for every human outfit;
+ * the wolf's are different and the puppet has no wolf model. */
+const u16 l_legRootJointNo[2] = {0x12, 0x17};
+
+/* Where on each foot the floor is probed, in that joint's own space (d_a_alink.cpp:3846-3849). The
+ * ankle point sits behind and to the side, the toe point ahead — the pair is averaged, so the probe
+ * follows the middle of the foot rather than either end of it. */
+const Vec l_localFootOffset[2] = {{-3.0f, 13.0f, 0.0f}, {-3.0f, -13.0f, 0.0f}};
+const Vec l_localToeOffset[2] = {{10.0f, 5.0f, 0.0f}, {10.0f, -5.0f, 0.0f}};
+
+/* Bone lengths, from setFootMatrix (d_a_alink.cpp:3627-3629). These are the model's, not a guess:
+ * the solver walks the chain by them to find where each joint ends up. */
+const Vec l_thighVec = {30.0f, 0.0f, 0.0f};
+const Vec l_shinVec = {39.363499f, 0.0f, 0.0f};
+const Vec l_footVec = {14.18f, 0.0f, 0.0f};
+
+/* How far above the actor's origin the floor probe starts, and how far below it may find a floor.
+ *
+ * ★ daAlink_c keeps these in file-static `l_autoUpHeight`/`l_autoDownHeight` (d_a_alink.cpp:1468),
+ * which are not reachable from here — but they are not constants either. They are ASSIGNED from the
+ * HIO table when Link becomes human (`mpHIO->mWallHang.m.auto_walk_height + 0.01f`,
+ * d_a_alink_wolf.inc:532), so the table is the source and the static is the cache. Read the table.
+ * The 30.01 the static is initialised with is only what it holds before that assignment runs.
+ *
+ * The down height is the negation of the up height, exactly as :533 sets it. */
+static f32 foot_ik_up_height() {
+    return daAlinkHIO_wallHang_c0::m.auto_walk_height + 0.01f;
+}
+
+/**
+ * The slope angle of the polygon a check object last hit, relative to a facing.
+ *
+ * daAlink_c::getGroundAngle (d_a_alink.cpp:8466-8477). Transcribed rather than called because it is
+ * a member of daAlink_c, and it is four lines. The two rejections matter and are not decoration: an
+ * unsafe polygon index means the collision entry has been recycled since the query, and a normal
+ * that fails cBgW_CheckBGround is a wall or a ceiling, which has an "angle" that would tip a foot
+ * straight over.
+ */
+static s16 ground_angle(const cBgS_PolyInfo& i_polyInfo, s16 i_angle) {
+    if (!dComIfG_Bgsp().ChkPolySafe(i_polyInfo)) {
+        return 0;
+    }
+
+    cM3dGPla plane;
+    if (!dComIfG_Bgsp().GetTriPla(i_polyInfo, &plane) || !cBgW_CheckBGround(plane.mNormal.y)) {
+        return 0;
+    }
+
+    return fopAcM_getPolygonAngle(&plane, i_angle);
+}
+
+/**
+ * Rotate one joint's world matrix about an axis through a pivot, in place.
+ *
+ * daAlink_c::setMatrixWorldAxisRot (d_a_alink.cpp:2098-2120), minus two things it does not need
+ * here: the magne-boot matrices, which are identity unless Link is walking on a ceiling, and the
+ * copy into J3DSys::mCurrentMtx, which setFootMatrix's calls never ask for.
+ *
+ * The Y rotations either side of the axis rotation are what make it a WORLD-axis rotation: the
+ * joint is turned back into the model's facing, rotated about the model's own X, then turned out
+ * again.
+ */
+void daRemotePlayer_c::setMatrixWorldAxisRot(
+    MtxP io_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ, const cXyz* i_pivot) {
+    cXyz jointPos;
+    mDoMtx_multVecZero(io_mtx, &jointPos);
+    if (i_pivot != NULL) {
+        mDoMtx_stack_c::transS(*i_pivot);
+    } else {
+        mDoMtx_stack_c::transS(jointPos);
+    }
+
+    mDoMtx_stack_c::YrotM(shape_angle.y);
+    mDoMtx_stack_c::ZXYrotM(i_rotX, i_rotY, i_rotZ);
+    mDoMtx_stack_c::YrotM(-shape_angle.y);
+    mDoMtx_stack_c::transM(-jointPos.x, -jointPos.y, -jointPos.z);
+    mDoMtx_stack_c::concat(io_mtx);
+    mDoMtx_copy(mDoMtx_stack_c::get(), io_mtx);
+}
+
+/**
+ * Lower (or raise) the whole model, smoothed, and keep the two derived matrices in step.
+ *
+ * daAlink_c::setMatrixOffset (d_a_alink.cpp:3684-3697) for its field_0x2b94 caller — the leg-length
+ * one. His other caller passes &mSinkShapeOffset and skips the smoothing; the puppet does not sink
+ * into sand, so only this branch exists here.
+ *
+ * The three writes go together. Moving the base matrix without moving mInvMtx would leave
+ * setLegAngle solving in a space offset from the one the legs are drawn in, and the legs would
+ * chase the body by exactly the sink each tick.
+ */
+void daRemotePlayer_c::setBodySinkOffset(f32 i_target) {
+    cLib_addCalc(&mBodySinkOffset, i_target, 0.5f, 7.5f, 2.5f);
+
+    model->getBaseTRMtx()[1][3] += mBodySinkOffset;
+    mInvMtx[1][3] -= mBodySinkOffset;
+
+    mDoMtx_stack_c::XrotS(shape_angle.x);
+    mDoMtx_stack_c::concat(mInvMtx);
+    mDoMtx_copy(mDoMtx_stack_c::get(), mFootLocalMtx);
+}
+
+/**
+ * Two-bone IK for one leg: how much to pitch the hip and bend the knee so the ankle moves by
+ * i_heightDelta.
+ *
+ * daAlink_c::setLegAngle (d_a_alink.cpp:3699-3843), the `param_4 != 0` branch. The other branch
+ * solves in a different plane for the ARMS (handBgCheck), which the puppet does not do, and the
+ * wolf and dismount special cases inside this branch are gone for the same reason.
+ *
+ * It is the standard circle-intersection solve: place the knee on the circle where the two bone
+ * spheres meet, then report each joint's rotation as the angle between its old bone and its new
+ * one. The three early rejections are all real cases, not paranoia — a target the leg cannot reach
+ * (`thigh + shin <= distance`) would otherwise produce a NaN, and a target ABOVE the hip means the
+ * floor came out over Link's waist, which is a bad probe rather than a leg pose.
+ *
+ * Returns false when it declines to solve; every caller must then leave the angles at zero rather
+ * than reusing the previous ones.
+ */
+bool daRemotePlayer_c::setLegAngle(
+    f32 i_heightDelta, daRemotePlayer_footData_c& io_foot, s16* o_hipAngle, s16* o_kneeAngle) {
+    if (fabsf(i_heightDelta) < 0.1f) {
+        return false;
+    }
+
+    /* The three joints in MODEL space, taken from last tick's un-IK'd matrices. X is flattened
+     * because the solve is two-dimensional: the leg swings in the model's YZ plane and letting the
+     * sideways component in would tip the knee outward. */
+    cXyz hipPos;
+    cXyz kneePos;
+    cXyz anklePos;
+    cMtx_concat(mFootLocalMtx, io_foot.mJointMtx[0], mDoMtx_stack_c::get());
+    mDoMtx_stack_c::multVecZero(&hipPos);
+    cMtx_concat(mFootLocalMtx, io_foot.mJointMtx[1], mDoMtx_stack_c::get());
+    mDoMtx_stack_c::multVecZero(&kneePos);
+    cMtx_concat(mFootLocalMtx, io_foot.mJointMtx[2], mDoMtx_stack_c::get());
+    mDoMtx_stack_c::multVecZero(&anklePos);
+    hipPos.x = 0.0f;
+    kneePos.x = 0.0f;
+    anklePos.x = 0.0f;
+
+    const cXyz thigh = kneePos - hipPos;
+    const cXyz shin = anklePos - kneePos;
+
+    cXyz target(anklePos);
+    target.y += i_heightDelta;
+    if (target.y >= hipPos.y) {
+        return false;
+    }
+
+    const cXyz toTarget = target - hipPos;
+    const f32 distSq = toTarget.abs2();
+    if (cM3d_IsZero(distSq)) {
+        return false;
+    }
+
+    const f32 thighSq = thigh.abs2();
+    const f32 shinSq = shin.abs2();
+    if (JMAFastSqrt(thighSq) + JMAFastSqrt(shinSq) <= JMAFastSqrt(distSq)) {
+        return false;
+    }
+
+    // Along the hip→target line, where the plane of the intersection circle sits; then how far off
+    // that line the knee has to be.
+    const f32 along = ((distSq + thighSq) - shinSq) / (2.0f * distSq);
+    const cXyz mid = hipPos + (toTarget * along);
+
+    f32 offset = thighSq - (along * (distSq * along));
+    if (offset < 0.0f) {
+        offset = 0.0f;
+    }
+    offset = JMAFastSqrt(offset);
+
+    // Perpendicular to hip→target, in the solve plane, on the side the knee bends towards.
+    cXyz perp;
+    perp.set(0.0f, toTarget.z, -toTarget.y);
+    f32 perpLen = perp.abs();
+    if (cM3d_IsZero(perpLen)) {
+        return false;
+    }
+    perpLen = offset / perpLen;
+
+    const cXyz newKnee = mid + (perp * perpLen);
+    const cXyz newThigh = newKnee - hipPos;
+    const cXyz newShin = target - newKnee;
+
+    const s16 hipDir = cM_atan2s(newThigh.y, newThigh.z);
+    s16 kneeDir = cM_atan2s(newShin.y, newShin.z);
+
+    /* Clamp the knee to bending one way only, and no further than 0x7000. A knee is a hinge; the
+     * solve has no opinion about which of the two circle intersections is anatomically possible, so
+     * this is what stops the leg folding backwards on an awkward floor. */
+    const s16 bend = kneeDir - hipDir;
+    if (bend > 0) {
+        kneeDir = hipDir;
+    } else if (bend < -0x7000) {
+        kneeDir = hipDir - 0x7000;
+    }
+
+    *o_hipAngle = cM_atan2s(thigh.y, thigh.z) - hipDir;
+    *o_kneeAngle = cM_atan2s(shin.y, shin.z) - kneeDir;
+    return true;
+}
+
+/**
+ * Find the floor under each foot and work out what the legs have to do about it.
+ *
+ * daAlink_c::footBgCheck (d_a_alink.cpp:3845-3977). Runs BEFORE the body's calc, on the joint
+ * matrices the PREVIOUS calc left behind — which is the same one-frame lag the local player has,
+ * and is why nothing here needs the model to be calc'd twice.
+ *
+ * What the puppet leaves out, and why each is safe:
+ *   - `setSandShapeOffset` / `mSinkShapeOffset` / `setSandDownBgCheckWallH` — sinking into sand and
+ *     snow. That is a whole system the puppet does not have; the sender's part of it is folded into
+ *     the replicated "no foot IK" bit, so a sender sinking in sand simply switches the IK off here.
+ *   - `mProcID == PROC_SERVICE_WAIT` and friends — the puppet has no state machine, and the states
+ *     concerned are demos and the Ganon fight.
+ *   - `mGroundCode != 8` on the foot pitch — a floor property the puppet does not read. Code 8 is
+ *     the one getMoveGroundAngleSpeedRate also refuses to take an angle from, so the effect of
+ *     leaving it out is a foot that pitches on a surface Link's would keep flat.
+ */
+void daRemotePlayer_c::footBgCheck() {
+    /* Nothing to solve against until the model has been calc'd at least once and setFootMatrix has
+     * captured a set of joint matrices. Before then getAnmMtx returns whatever the model was
+     * allocated with, and the probe points would be taken from a skeleton that has never been
+     * posed — a floor query at the world origin, on the first tick of every puppet's life. */
+    if (!mFootDataValid) {
+        return;
+    }
+
+    const f32 upHeight = foot_ik_up_height();
+    const f32 downHeight = -upHeight;
+
+    /* Both gates come off the wire. See kPlayerStateNoFootIk and kPlayerStateModeIdle — deriving
+     * either from the puppet's own interpolated position answers a different question. */
+    const bool ikOff = mNetFootIkOff;
+    const bool modeIdle = mNetModeIdle;
+
+    cXyz anklePos[2];
+    cXyz toePos[2];
+    f32 footGroundY[2];
+    s16 footGroundAngle[2];
+    for (int i = 0; i < 2; i++) {
+        mDoMtx_multVec(
+            model->getAnmMtx(l_legRootJointNo[i] + 2), &l_localFootOffset[i], &anklePos[i]);
+        mDoMtx_multVec(model->getAnmMtx(l_legRootJointNo[i] + 3), &l_localToeOffset[i], &toePos[i]);
+        footGroundAngle[i] = 0;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        daRemotePlayer_footData_c& foot = mFootData[i];
+        cXyz sample = (toePos[i] + anklePos[i]) * 0.5f;
+
+        /* The anti-buzz latch, and it is load-bearing rather than a refinement. A standing foot
+         * still moves a hair every tick (breathing, the idle cycle), and two neighbouring polygons
+         * can differ in height; without this the foot flickers between them forever. Five ticks of
+         * "has barely moved" and the probe point freezes where it was. Only while standing —
+         * a walking foot must follow the ground it is walking onto. */
+        if (ikOff) {
+            foot.mFreezeTicks = 5;
+        } else {
+            const cXyz moved = sample - foot.mLastSample;
+            if (moved.abs2XZ() < 100.0f && modeIdle) {
+                if (foot.mFreezeTicks != 0) {
+                    foot.mFreezeTicks--;
+                } else {
+                    sample = foot.mLastSample;
+                }
+            } else {
+                foot.mFreezeTicks = 5;
+            }
+        }
+        foot.mLastSample = sample;
+
+        /* Raised to the actor's origin plus the up height before probing DOWN — the same
+         * strictly-below trap the puppet's shadow hit. A query started at the foot's own height is
+         * already level with the floor it is standing on and finds nothing at all. */
+        cXyz probe(sample.x, current.pos.y + upHeight, sample.z);
+        mFootGndChk.SetPos(&probe);
+
+        const f32 groundY = dComIfG_Bgsp().GroundCross(&mFootGndChk);
+        cM3dGPla plane;
+        if (groundY != -G_CM3D_F_INF) {
+            dComIfG_Bgsp().GetTriPla(mFootGndChk, &plane);
+        }
+
+        if (groundY != -G_CM3D_F_INF && cBgW_CheckBGround(plane.mNormal.y) &&
+            probe.y - groundY < upHeight - downHeight)
+        {
+            footGroundY[i] = groundY;
+            foot.mOnGround = 1;
+            footGroundAngle[i] = ground_angle(mFootGndChk, shape_angle.y);
+        } else {
+            // No usable floor under this foot: fall back to the actor's own height, which leaves
+            // the leg where the animation put it.
+            footGroundY[i] = current.pos.y;
+            foot.mOnGround = 0;
+        }
+    }
+
+    /* Which foot the body hangs from: the one on the LOWER floor. Standing across a step, that is
+     * the foot on the tread below, and the whole model sinks to it so the upper leg bends instead
+     * of the lower one stretching. 2 means neither. */
+    int plantedFoot;
+    f32 sink = 0.0f;
+    if (ikOff) {
+        plantedFoot = 2;
+    } else {
+        plantedFoot = footGroundY[1] > footGroundY[0] ? 0 : 1;
+        sink = footGroundY[plantedFoot];
+    }
+
+    if (ikOff || !modeIdle) {
+        sink = 0.0f;
+    } else {
+        sink -= current.pos.y;
+    }
+    setBodySinkOffset(sink);
+
+    const f32 bodyY = model->getBaseTRMtx()[1][3];
+    for (int i = 0; i < 2; i++) {
+        daRemotePlayer_footData_c& foot = mFootData[i];
+
+        s16 hipAngle = 0;
+        s16 kneeAngle = 0;
+        if (!ikOff) {
+            f32 delta = footGroundY[i] - bodyY;
+            if (delta > upHeight) {
+                delta = upHeight;
+            }
+
+            /* While MOVING, only the planted foot is pulled DOWN — the other leg is in the air and
+             * belongs to the animation. Standing, both legs solve. */
+            if ((plantedFoot != i && !(delta > 0.0f) && !modeIdle) ||
+                !setLegAngle(delta, foot, &hipAngle, &kneeAngle))
+            {
+                hipAngle = 0;
+                kneeAngle = 0;
+            }
+        }
+
+        /* Unwrap before smoothing. Two angles of opposite sign that are more than half a turn apart
+         * are actually adjacent across the seam, and interpolating between them the short way round
+         * would swing the hip through the body. */
+        if ((hipAngle * foot.mHipAngle) < 0 && abs(hipAngle - foot.mHipAngle) >= 0x8000) {
+            if (hipAngle >= 0) {
+                ANGLE_SUB(hipAngle, 0x4000);
+            } else {
+                ANGLE_ADD(hipAngle, 0x4000);
+            }
+        }
+
+        // Eased in, never applied raw: the target jumps whenever a probe crosses a polygon edge.
+        cLib_addCalcAngleS(&foot.mHipAngle, hipAngle, 2, 0x1800, 0x10);
+        cLib_addCalcAngleS(&foot.mKneeAngle, kneeAngle, 2, 0x1800, 0x10);
+
+        // Pitching the foot ONTO the slope, so a standing puppet's sole lies flat on a ramp rather
+        // than meeting it at an angle. Standing only — a walking foot keeps the animation's pitch.
+        s16 ankleAngle = 0;
+        if (plantedFoot != 2 && foot.mOnGround != 0 && modeIdle) {
+            ankleAngle += footGroundAngle[i];
+        }
+        cLib_addCalcAngleS(&foot.mAnkleAngle, ankleAngle, 2, 0x1800, 0x10);
+    }
+
+    /* ★ TWO latched lines, and the pair is the point. On flat ground the correct output of all of
+     * the above is ZERO — both feet find the same floor, the height delta is under setLegAngle's
+     * 0.1 threshold, and it declines. That is indistinguishable from the IK not existing, so the
+     * first line records that the code RAN and what it saw, and the second that it actually bent a
+     * leg. A log with the first and not the second says "ran, ground was flat"; a log with neither
+     * says the feature never executed, which is a different bug entirely. */
+    if (!mLoggedFootProbe && !ikOff) {
+        mLoggedFootProbe = true;
+        Log.debug("Puppet {} foot IK probing: floors {:.1f}/{:.1f} (hit {}/{}) vs body {:.1f}, "
+                  "deltas {:.2f}/{:.2f} | up height {:.2f} | sender standing {}",
+            mPlayerId, footGroundY[0], footGroundY[1], mFootData[0].mOnGround,
+            mFootData[1].mOnGround, bodyY, footGroundY[0] - bodyY, footGroundY[1] - bodyY, upHeight,
+            modeIdle ? "yes" : "no");
+    }
+
+    /* The second one: a genuinely bent leg — a hip angle worth more than a degree or so, 0x0100
+     * being about 1.4 degrees. Zero angles on flat ground are the right answer and prove nothing.
+     */
+    if (!mLoggedFootIk &&
+        (abs(mFootData[0].mHipAngle) > 0x0100 || abs(mFootData[1].mHipAngle) > 0x0100))
+    {
+        mLoggedFootIk = true;
+        Log.debug("Puppet {} foot IK live: hip {}/{} knee {}/{} ankle {}/{} | floors {:.1f}/{:.1f} "
+                  "vs body {:.1f} | planted {} sink {:.2f} | sender standing {} ik off {}",
+            mPlayerId, mFootData[0].mHipAngle, mFootData[1].mHipAngle, mFootData[0].mKneeAngle,
+            mFootData[1].mKneeAngle, mFootData[0].mAnkleAngle, mFootData[1].mAnkleAngle,
+            footGroundY[0], footGroundY[1], bodyY, plantedFoot, mBodySinkOffset,
+            modeIdle ? "yes" : "no", ikOff ? "yes" : "no");
+    }
+}
+
+/**
+ * Write this tick's leg angles onto the skeleton, and save the pose they were solved against.
+ *
+ * daAlink_c::setFootMatrix (d_a_alink.cpp:3625-3682). He runs it from his joint callback at joint
+ * 26; the puppet runs it straight after calc() instead, which is equivalent — every joint the two
+ * legs own is numbered below 26, so they are all final by then, and this function re-poses all four
+ * of each leg's joints itself rather than relying on J3D to propagate down the chain.
+ *
+ * The save has to come FIRST. field_0x14 is the un-IK'd pose, and next tick's solve starts from it;
+ * capturing it after the rotations were applied would feed each tick's answer back into the next
+ * one and the legs would wind up.
+ */
+void daRemotePlayer_c::setFootMatrix() {
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 3; j++) {
+            cMtx_copy(model->getAnmMtx(j + l_legRootJointNo[i]), mFootData[i].mJointMtx[j]);
+        }
+    }
+
+    // Only now is there something for footBgCheck to solve against.
+    mFootDataValid = true;
+
+    for (int i = 0; i < 2; i++) {
+        const daRemotePlayer_footData_c& foot = mFootData[i];
+        u16 joint = l_legRootJointNo[i];
+        cXyz pivot;
+
+        /* Down the chain, each joint rotated about the END of the bone above it. The pivot comes
+         * out of the matrix stack that setMatrixWorldAxisRot leaves behind, so these four calls are
+         * a sequence and cannot be reordered.
+         *
+         * The ankle angle is applied TWICE, to the ankle and to the toe. That is not a copy/paste
+         * slip in the original: pitching the ankle alone would leave the toe hinged, and the foot
+         * has to stay rigid as it lies down on the slope. */
+        setMatrixWorldAxisRot(model->getAnmMtx(joint), foot.mHipAngle, 0, 0, NULL);
+        mDoMtx_stack_c::multVec(&l_thighVec, &pivot);
+        joint++;
+
+        setMatrixWorldAxisRot(model->getAnmMtx(joint), foot.mKneeAngle, 0, 0, &pivot);
+        mDoMtx_stack_c::multVec(&l_shinVec, &pivot);
+        joint++;
+
+        setMatrixWorldAxisRot(model->getAnmMtx(joint), foot.mAnkleAngle, 0, 0, &pivot);
+        mDoMtx_stack_c::multVec(&l_footVec, &pivot);
+        joint++;
+
+        setMatrixWorldAxisRot(model->getAnmMtx(joint), foot.mAnkleAngle, 0, 0, &pivot);
+    }
+}
+
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
     mDoMtx_stack_c::YrotM(shape_angle.y);
     model->setBaseTRMtx(mDoMtx_stack_c::get());
+
+    /* The world→model matrices the foot IK solves in, built here for the same reason daAlink_c
+     * builds his in the same place (d_a_alink.cpp:5781-5785): they are derived from the base
+     * transform and would go stale the moment it changed. setBodySinkOffset then keeps all three in
+     * step when it lowers the body. */
+    mDoMtx_inverse(mDoMtx_stack_c::get(), mInvMtx);
+    mDoMtx_stack_c::XrotS(shape_angle.x);
+    mDoMtx_stack_c::concat(mInvMtx);
+    mDoMtx_copy(mDoMtx_stack_c::get(), mFootLocalMtx);
+
+    // Before calc: it reads the PREVIOUS calc's joint matrices and it moves the base transform.
+    footBgCheck();
     /* Plain J3DModel::calc(), where this used to be mDoExt_McaMorfSO::modelCalc(). That call did
      * three things and only one of them is gone: it pushed the frame controller's frame into the
      * animation (animePlay() does that now, from execute(), for every slot on both halves), it
      * re-installed itself as joint 0's calculator every single frame (setupAnimation() installs the
      * two blend calculators once, and nothing removes them), and then it calc'd the model. */
     model->calc();
+
+    // After calc, and before anything reads a leg joint: this is where the IK actually lands on the
+    // skeleton. See the comment on setFootMatrix for why it is safe outside a joint callback.
+    setFootMatrix();
 
     /* Sub-models ride the body's joints, so they must be posed AFTER the body's calc. The head and
      * face take the head joint's matrix as their whole base transform; the hands take the body's

@@ -420,6 +420,31 @@ bool capture_local_player(PlayerState& out) {
         out.flags |= kPlayerStateZeroSpeed;
     }
 
+    /* MODE_IDLE on its own, for the foot IK — see kPlayerStateModeIdle for why it is not the OR
+     * above. A null alink sends it clear: with no daAlink_c there is nothing standing. */
+    if (alink != nullptr && alink->checkModeFlg(daAlink_c::MODE_IDLE)) {
+        out.flags |= kPlayerStateModeIdle;
+    }
+
+    /* daAlink_c's own foot-IK gate, transcribed term for term from footBgCheck
+     * (d_a_alink.cpp:3872) rather than summarised, so a reader can diff the two lines:
+     *
+     *   !ChkGroundHit() || magne boots || (ChkGroundHit() && sinking) || any of 0x78C52
+     *
+     * The middle term is redundant with the first (`!G || (G && S)` is `!G || S`) and is kept
+     * anyway — the point of this line is that it matches the original, not that it is minimal.
+     *
+     * 0x78C52 is MODE_JUMP | MODE_CLIMB | MODE_NO_COLLISION | MODE_RIDING | MODE_UNK_800 |
+     * MODE_UNK_8000 | MODE_VINE_CLIMB | MODE_ROPE_WALK | MODE_SWIMMING. Written as the literal the
+     * game uses because two of those flags have no confirmed name, and inventing names for them in
+     * a comparison that has to stay identical to the original is how the two drift apart. */
+    if (alink == nullptr || !alink->mLinkAcch.ChkGroundHit() || alink->checkMagneBootsOn() ||
+        (alink->mLinkAcch.ChkGroundHit() && alink->mSinkShapeOffset < 0.0f) ||
+        alink->checkModeFlg(0x78C52))
+    {
+        out.flags |= kPlayerStateNoFootIk;
+    }
+
     return true;
 }
 
@@ -579,8 +604,8 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     }
 
     cXyz pos(state.posX, state.posY, state.posZ);
-    puppet->setNetworkPose(
-        pos, state.angleY, state.moveRate, state.sharp_turn(), state.zero_speed());
+    puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
+        state.zero_speed(), state.mode_idle(), state.no_foot_ik());
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {

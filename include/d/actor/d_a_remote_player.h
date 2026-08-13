@@ -42,6 +42,34 @@ struct daRemotePlayer_anm_c {
 const int daRemotePlayer_anmSlotNum = 3;
 
 /**
+ * Per-leg state for the foot IK. daAlink_c::daAlink_footData_c (d_a_alink.h:181), with its
+ * field_0xNN names resolved to what the code actually does with them.
+ *
+ * Held here rather than reusing daAlink_footData_c so this header does not have to pull in
+ * d_a_alink.h — the same reason mCurrentAnm is a u16. The layout does not have to match; nothing
+ * passes one of these to the game.
+ */
+struct daRemotePlayer_footData_c {
+    /// The floor probe under this foot hit something usable this tick (field_0x0).
+    u8 mOnGround;
+    /// Counts down 5 → 0 while a standing foot stays put; at 0 the probe point FREEZES (field_0x1).
+    /// This is what stops a standing puppet's feet buzzing between two neighbouring polygons.
+    u8 mFreezeTicks;
+    /// Ankle pitch, toward the slope the foot is standing on (field_0x2). Applied to two joints.
+    s16 mAnkleAngle;
+    /// Knee bend (field_0x4).
+    s16 mKneeAngle;
+    /// Hip pitch (field_0x6).
+    s16 mHipAngle;
+    /// Last accepted probe point, in world space (field_0x8). The freeze above re-uses it.
+    cXyz mLastSample;
+    /// The hip/knee/ankle joint matrices as the animation produced them, BEFORE this tick's IK was
+    /// written over them (field_0x14). Captured in setFootMatrix and read by setLegAngle on the
+    /// NEXT tick — solving against already-solved matrices would compound the rotation every frame.
+    Mtx mJointMtx[3];
+};
+
+/**
  * Remote player puppet — a Dusk-only actor, not part of the original game.
  *
  * One of these stands in for each other player in a multiplayer session. It is deliberately NOT a
@@ -64,8 +92,8 @@ public:
     int draw();
 
     /// Push an interpolated pose in from the network layer, before the actor pass runs.
-    void setNetworkPose(
-        const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn, bool i_zeroSpeed);
+    void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn,
+        bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff);
 
     u32 getPlayerId() const { return mPlayerId; }
     /* Index into the outfit table of the archive this puppet ACTUALLY mounted, which is not
@@ -120,6 +148,30 @@ private:
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
     void groundCheck();
     void setRoomInfo();
+
+    /* Foot IK — planting the feet on the floor they are actually over, instead of on the flat plane
+     * the animation was authored against. Transcribed from daAlink_c; see the block comment above
+     * footBgCheck() in the .cpp for the ordering, which is the part that is easy to get wrong.
+     *
+     * The three run in this order inside setMatrix(), around the body's calc:
+     *   footBgCheck()   — BEFORE calc. Probes the floor under each foot, integrates the joint
+     *                     angles, and sinks the whole body to the lower foot.
+     *   model->calc()
+     *   setFootMatrix() — AFTER calc. Saves the un-IK'd leg matrices for the next tick, then
+     *                     rewrites the four joints of each leg with this tick's angles.
+     */
+    void footBgCheck();
+    void setFootMatrix();
+    /// Solve one leg for a height delta. daAlink_c::setLegAngle (d_a_alink.cpp:3699), the
+    /// param_4 != 0 branch — the other branch is the arms, which the puppet does not IK.
+    bool setLegAngle(
+        f32 i_heightDelta, daRemotePlayer_footData_c& io_foot, s16* o_hipAngle, s16* o_kneeAngle);
+    /// Rotate one joint about a world axis, in place. daAlink_c::setMatrixWorldAxisRot (:2098).
+    void setMatrixWorldAxisRot(
+        MtxP io_mtx, s16 i_rotX, s16 i_rotY, s16 i_rotZ, const cXyz* i_pivot);
+    /// Sink the whole model by an offset, smoothed. daAlink_c::setMatrixOffset (:3684) for
+    /// field_0x2b94 — the leg-length branch, not the sand branch.
+    void setBodySinkOffset(f32 i_target);
     /// Attach the blink texture animations to the face's eye materials. Once, at createHeap time.
     bool setupFaceAnimation();
     /// Advance (or start) a blink. Must run every tick.
@@ -486,6 +538,43 @@ private:
      * Distinct from "we failed to ask properly", which is what the old code could not tell apart.
      */
     bool mGroundValid;
+
+    /* --- Foot IK --------------------------------------------------------------------------- */
+
+    daRemotePlayer_footData_c mFootData[2];  // [0] left, [1] right, as daAlink_c orders them.
+    /* A SECOND check object, and it has to be. mGndChk above is queried once per tick and then read
+     * again by the shadow in draw() without being re-queried — deliberately, see its comment — so
+     * running two more probes through it would hand the shadow whichever foot asked last. */
+    dBgS_ObjGndChk mFootGndChk;
+    /* Inverse of the body's base transform, and that transform composed into model space
+     * (daAlink_c::mInvMtx and field_0x2be8, built in his setMatrix at d_a_alink.cpp:5781-5785).
+     * setLegAngle works in model space, so it needs the world→local matrix; the body sink then
+     * has to update BOTH of these and the base matrix together or the two disagree by the offset.
+     */
+    Mtx mInvMtx;
+    Mtx mFootLocalMtx;
+    /* How far the whole model is currently lowered so the lower foot can reach its floor
+     * (field_0x2b94). Smoothed by cLib_addCalc, so it eases rather than snapping when the floor
+     * under a foot changes. Without it, IK'd legs stretch instead of the body settling. */
+    f32 mBodySinkOffset;
+    /* True once setFootMatrix has run at least once, i.e. once mFootData[].mJointMtx holds real
+     * joint matrices. Everything IK is skipped until then: on the first tick those matrices are
+     * zeroed and the probe points would be taken from a model that has never been calc'd. */
+    bool mFootDataValid;
+    /* The SENDER's daAlink_c::checkModeFlg(MODE_IDLE). Three separate things in footBgCheck turn on
+     * it — the probe freeze, the body sink, and pitching the foot to the slope — and all three are
+     * "is he standing", which no amount of looking at an interpolated position can answer. */
+    bool mNetModeIdle;
+    /* The SENDER's own "no foot IK this tick" test — not grounded, magne boots, sinking in sand,
+     * jumping, climbing, swimming, riding (d_a_alink.cpp:3872). Replicated whole rather than
+     * approximated by a local height tolerance, which would have to re-derive every one of those
+     * states from a position that arrives interpolated and two ticks late. */
+    bool mNetFootIkOff;
+    /// Latches the one-shot "the IK ran and here is what it saw" line; see footBgCheck().
+    bool mLoggedFootProbe;
+    /// And the one-shot "it actually bent a leg". Both are needed — on flat ground the first fires
+    /// and the second correctly does not, and only the pair separates that from never running.
+    bool mLoggedFootIk;
 };
 
 /**

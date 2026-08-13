@@ -31,8 +31,13 @@ namespace dusk::mp {
  * flag bit 3 carries his "standing" predicate. Still 20 bytes, so once again a v5 peer would parse
  * it perfectly: it would read a number between 0 and 1 as a speed in engine units, decide every
  * remote player is standing still, and never animate one again. Rejecting the handshake turns a
- * silent, total misbehaviour into one line. */
-inline constexpr std::uint32_t kProtocolVersion = 6;
+ * silent, total misbehaviour into one line.
+ *
+ * 7: flag bits 4 and 5, for the foot IK — the sender's MODE_IDLE and his own "no foot IK this
+ * tick" test. Same 20 bytes again. A v6 peer would leave both clear, which is the safe reading
+ * ("moving, IK allowed") but the wrong one half the time: standing puppets would not settle onto
+ * the lower foot and airborne ones would try to plant their feet on the floor below them. */
+inline constexpr std::uint32_t kProtocolVersion = 7;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
