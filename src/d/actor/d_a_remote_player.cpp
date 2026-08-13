@@ -5219,7 +5219,7 @@ void daRemotePlayer_c::drawEquip() {
         Mtx theirs[daRemotePlayer_texMtxSlotsWatched];
         swap_in_tex_mtx(swordData, mSwordTexMtxOurs, theirs, mSwordTexMtxSlots);
 
-        if (mSwordTexMtxSlots != 0) {
+        {
             bool wasStolen = false;
             for (u32 slot = 0; slot < daRemotePlayer_texMtxSlotsWatched; slot++) {
                 if ((mSwordTexMtxSlots & (1 << slot)) != 0 &&
@@ -5236,8 +5236,11 @@ void daRemotePlayer_c::drawEquip() {
                 mLoggedSwordTexMtx = true;
                 mLoggedSwordTexMtxChanged = wasStolen;
                 Log.debug("Puppet {} sword env texture matrix: {} (slots 0x{:02x})", mPlayerId,
-                    wasStolen ? "the local player's was in place, ours swapped in for the entry" :
-                                "already ours, swap was a no-op",
+                    mSwordTexMtxSlots == 0 ?
+                        "NO SLOTS CAPTURED AT CALC — the bracket is doing nothing" :
+                        (wasStolen ?
+                                "the local player's was in place, ours swapped in for the entry" :
+                                "already ours, swap was a no-op"),
                     mSwordTexMtxSlots);
             }
         }
