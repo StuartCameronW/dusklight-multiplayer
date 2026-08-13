@@ -33,11 +33,11 @@ struct daRemotePlayer_anm_c {
  * How many animations may be blended onto each half of the body at once — daAlink_c's own three
  * (d_a_alink.cpp:4277-4283), kept the same so the machinery below is his machinery.
  *
- * Slot 0 is the animation currently playing. Slot 1 is the one it is cross-fading with, which is
- * how daAlink_c blends walk into run (commonDoubleAnime / setDoubleAnimeBlendRatio); the puppet
- * does not drive it yet and still quantises to one gait. Slot 2 is daAlink_c's upper-body OVERLAY —
- * drawing, equipping and putting away items play into UPPER_2 over whatever the legs are doing —
- * which the puppet has no path to until equipment is replicated.
+ * Slot 0 is the animation currently playing and slot 1 the one it is cross-fading with — together
+ * they are the gait blend, wait into walk into run (commonDoubleAnime / setDoubleAnimeBlendRatio).
+ * Slot 2 is daAlink_c's upper-body OVERLAY: drawing, equipping and putting away items play into
+ * UPPER_2 over whatever the legs are doing. The puppet has no path to that one until equipment is
+ * replicated, and it is left in place rather than trimmed because that is where it will go.
  */
 const int daRemotePlayer_anmSlotNum = 3;
 
@@ -100,6 +100,10 @@ private:
     /// daAlink_c::commonSingleAnime + the morf half of setSingleAnime (d_a_alink.cpp:7149-7245).
     void setAnm(const daRemotePlayer_anm_c& i_anm, u8 i_attr, f32 i_morf, f32 i_rate, f32 i_startF,
         s16 i_endF);
+    /// Play two animations at once and cross-fade them by weight — the gait blend the local player
+    /// moves on. daAlink_c::commonDoubleAnime (d_a_alink.cpp:7009-7066).
+    void setDoubleAnm(const daRemotePlayer_anm_c& i_anmA, const daRemotePlayer_anm_c& i_anmB,
+        f32 i_blendRatio, f32 i_speedA, f32 i_speedB, f32 i_morf);
     /// Step every frame controller and push its frame into the animation it drives. Must run every
     /// tick, BEFORE the body's calc. daAlink_c::allAnimePlay (d_a_alink.cpp:7262-7290).
     void animePlay();
@@ -204,6 +208,10 @@ private:
     /// animations, which is the only observable that separates the split rig from the single one it
     /// replaced. Everything else about it — the model, the joints, the morf — looks identical.
     bool mLoggedSplitAnm;
+    /// And for the first tick two DIFFERENT gaits are actually blended together at a weight that is
+    /// neither end of the band. A blend that never leaves 0 or 1 is the outright switch it
+    /// replaced.
+    bool mLoggedBlend;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
@@ -264,6 +272,11 @@ private:
     mDoExt_MtxCalcOldFrame* mpOldFrame;
     J3DTransformInfo* mpOldTransInfo;
     Quaternion* mpOldQuat;
+    /* True when the last thing put on the body was a blended PAIR rather than a single animation.
+     * Two jobs, both daAlink_c's field_0x2f8c (d_a_alink.cpp:7016-7021, :7065): it says whether
+     * there is a stride phase worth carrying into the next pair, and whether the next pair needs a
+     * cross-fade to get out of what is playing. */
+    bool mDoubleAnmSet;
     /* Joints on the body model, read from the model rather than assumed to be Link's 35. The morf
      * range is expressed in joints, and mDoExt_MtxCalcAnmBlendTblOld::calc does its per-frame
      * bookkeeping when it reaches the LAST one (m_Do_ext.cpp:1194-1206). */

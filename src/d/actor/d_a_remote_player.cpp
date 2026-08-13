@@ -490,16 +490,18 @@ const u16 l_windLogCount = 40;
  */
 const f32 l_idleSpeedThreshold = 0.5f;
 
-/* Widens the walk/run crossover into a dead band. daAlink_c does not need this because it blends
- * the two cycles continuously; we switch outright, and mNetSpeed is an interpolated value that
- * jitters, so without hysteresis a puppet held near the crossover flips gait every tick.
+/* Dead band on the REPORTED gait, and on nothing else. What the puppet draws is a continuous blend
+ * of two animations now, so there is no longer a moment where it switches; but mCurrentAnm still
+ * names one of them, for the hand poses and for --mp-trace, and mNetSpeed is an interpolated value
+ * that jitters. Without this a puppet held near a band's midpoint would flip the reported gait
+ * every tick and make the trace unreadable while looking identical on screen.
  */
 const f32 l_gaitHysteresis = 0.05f;
 
-/* Frames to cross-fade over when the gait changes outright. Not one of daAlink_c's numbers, because
- * he has no equivalent moment: he blends walk and run continuously and never swaps one for the
- * other. It stands in for that blend, which is why it is longer than the 3.0f he uses for an
- * ordinary animation change (setSingleAnimeBase, d_a_alink.cpp:7207-7209). Job B retires it. */
+/* Frames to cross-fade over when leaving the skid and rejoining the gait blend. Not one of
+ * daAlink_c's numbers — his equivalent is whatever setSingleAnime was given — and it is the one
+ * place the puppet still needs an explicit morf, because the skid is a single animation and the
+ * blend cannot fade out of something it is not part of. */
 const f32 l_gaitMorf = 5.0f;
 
 /**
@@ -690,6 +692,28 @@ void set_gait_frame_ctrl(daPy_frameCtrl_c* o_ctrl, J3DAnmTransform* i_anm, u8 i_
 
     o_ctrl->setFrameCtrl(i_attr, static_cast<s16>(i_startF), endFrame, i_rate, frame);
     i_anm->setFrame(frame);
+}
+
+/**
+ * Aim one frame controller at one animation of a BLENDED pair.
+ *
+ * daAlink_c::commonDoubleAnime's per-animation half (d_a_alink.cpp:7025-7057), and the two things
+ * it does that are easy to leave out are the two that matter:
+ *
+ *  - Every cycle is wound to the same NORMALISED phase (i_phase, 0..1) rather than the same frame
+ *    number. Walk and run are different lengths, so equal frame numbers would put them at different
+ *    points in the stride.
+ *  - The rate is given per unit of phase and multiplied back up by each animation's own length, so
+ *    a long cycle and a short one still complete together. Feed both their authored rates instead
+ *    and they drift apart, which is a blend of two feet in different places.
+ */
+void set_blend_frame_ctrl(
+    daPy_frameCtrl_c* o_ctrl, J3DAnmTransform* i_anm, f32 i_phaseRate, f32 i_phase) {
+    const f32 frameMax = i_anm->getFrameMax();
+
+    o_ctrl->setFrameCtrl(i_anm->getAttribute(), 0, static_cast<s16>(frameMax),
+        i_phaseRate * frameMax, i_phase * frameMax);
+    i_anm->setFrame(o_ctrl->getFrame());
 }
 
 /* One animation stepped by one frame controller. daAlink_c::animePlay (d_a_alink.cpp:7255-7260),
@@ -1021,6 +1045,95 @@ void daRemotePlayer_c::setAnm(const daRemotePlayer_anm_c& i_anm, u8 i_attr, f32 
         // Whole skeleton, as daAlink_c does with his literal 35 (d_a_alink.cpp:7239).
         mpOldFrame->initOldFrameMorf(i_morf, 0, mBodyJointNum);
     }
+
+    mDoubleAnmSet = false;
+}
+
+/**
+ * Play TWO animations at once and cross-fade between them by weight.
+ *
+ * This is how the local player's gait actually works, and it is why a puppet that switched outright
+ * never quite read as another player: daAlink_c never swaps walk for run, he runs both and slides
+ * the weight across the band (commonDoubleAnime, d_a_alink.cpp:7009-7066). The rig for it was
+ * already here — the ratio packs setupAnimation() builds are exactly this — with slot 1 empty.
+ *
+ * Called every tick rather than on a change, as daAlink_c calls it, because the ratio has to track
+ * the speed continuously. Passing i_morf < 0 means "no cross-fade", which is the normal case: there
+ * is nothing to fade when the pair is unchanged and only the weight moved.
+ *
+ * ★ One case daAlink_c does not have to handle and this does: the two animations being the SAME
+ * object. Above the run threshold he calls this with ANM_RUN on both sides, which is harmless for
+ * him because getUnderUpperAnime loads each slot out of its own heap and he gets two separate
+ * copies of DASHS. The puppet holds one copy of each animation, and two frame controllers stepping
+ * one object would advance it at double speed — a run cycle at 2x with no other symptom. So an
+ * identical pair collapses to the single-animation case instead.
+ */
+void daRemotePlayer_c::setDoubleAnm(const daRemotePlayer_anm_c& i_anmA,
+    const daRemotePlayer_anm_c& i_anmB, f32 i_blendRatio, f32 i_speedA, f32 i_speedB, f32 i_morf) {
+    if (i_anmA.mpUnder == NULL || i_anmB.mpUnder == NULL) {
+        return;
+    }
+
+    const bool onePair = i_anmA.mpUnder == i_anmB.mpUnder;
+
+    /* Where in the stride we are, 0..1, carried over from the pair that was playing. Without this a
+     * band change would restart both cycles at frame 0 and the feet would jump — and it is read
+     * BEFORE mDoubleAnmSet is updated, because after a single animation (the skid) there is no
+     * blended phase to carry and daAlink_c restarts from 0 there too (his field_0x2f8c,
+     * d_a_alink.cpp:7016-7021). */
+    f32 phase = 0.0f;
+    if (mDoubleAnmSet && mUnderFrameCtrl[0].getEnd() != 0) {
+        phase = mUnderFrameCtrl[0].getFrame() / mUnderFrameCtrl[0].getEnd();
+    }
+
+    if (onePair) {
+        i_blendRatio = 0.0f;
+    }
+
+    mAnmPackUnder[0].setRatio(1.0f - i_blendRatio);
+    mAnmPackUpper[0].setRatio(1.0f - i_blendRatio);
+    mAnmPackUnder[1].setRatio(i_blendRatio);
+    mAnmPackUpper[1].setRatio(i_blendRatio);
+
+    /* The blended rate, expressed per unit of phase. daAlink_c writes it on animation A's timeline
+     * and divides through by A's length for the others (:7028-7033); dividing once here says the
+     * same thing and makes the four calls below identical. */
+    const f32 maxA = i_anmA.mpUnder->getFrameMax();
+    const f32 maxB = i_anmB.mpUnder->getFrameMax();
+    const f32 rateA = maxA != 0.0f ? i_speedA / maxA : 0.0f;
+    const f32 rateB = maxB != 0.0f ? i_speedB / maxB : 0.0f;
+    const f32 phaseRate = rateA + i_blendRatio * (rateB - rateA);
+
+    mAnmPackUnder[0].setAnmTransform(i_anmA.mpUnder);
+    set_blend_frame_ctrl(&mUnderFrameCtrl[0], i_anmA.mpUnder, phaseRate, phase);
+
+    if (i_anmA.mpUpper != NULL) {
+        mAnmPackUpper[0].setAnmTransform(i_anmA.mpUpper);
+        set_blend_frame_ctrl(&mUpperFrameCtrl[0], i_anmA.mpUpper, phaseRate, phase);
+    } else {
+        mAnmPackUpper[0].setAnmTransform(i_anmA.mpUnder);
+    }
+
+    if (onePair) {
+        mAnmPackUnder[1].setAnmTransform(NULL);
+        mAnmPackUpper[1].setAnmTransform(NULL);
+    } else {
+        mAnmPackUnder[1].setAnmTransform(i_anmB.mpUnder);
+        set_blend_frame_ctrl(&mUnderFrameCtrl[1], i_anmB.mpUnder, phaseRate, phase);
+
+        if (i_anmB.mpUpper != NULL) {
+            mAnmPackUpper[1].setAnmTransform(i_anmB.mpUpper);
+            set_blend_frame_ctrl(&mUpperFrameCtrl[1], i_anmB.mpUpper, phaseRate, phase);
+        } else {
+            mAnmPackUpper[1].setAnmTransform(i_anmB.mpUnder);
+        }
+    }
+
+    if (i_morf >= 0.0f) {
+        mpOldFrame->initOldFrameMorf(i_morf, 0, mBodyJointNum);
+    }
+
+    mDoubleAnmSet = true;
 }
 
 /* See the header. daAlink_c::allAnimePlay (d_a_alink.cpp:7262-7290) with everything the puppet has
@@ -1046,13 +1159,13 @@ void daRemotePlayer_c::animePlay() {
      * this line "the torso is running its own animation now" is unfalsifiable from a log. It fires
      * only on ANM_RUN, the one row of the puppet's four whose halves differ.
      *
-     * What it prints is chosen carefully, because the obvious thing to print proves nothing: the two
-     * FRAME NUMBERS are supposed to be equal. DASHS and DASHA are the two halves of one run cycle
-     * and have to stay in phase, so equal frames is the correct answer, not evidence of anything.
-     * The two things that do discriminate are the two BCK ids — different resources, so different
-     * arms — and the calculator actually sitting on joint 1 when the model is read back. That last
-     * one is the whole split: if it is not mpUpperCalc, joint 1's subtree inherited joint 0's and
-     * the torso is back on the under animation with nothing else looking wrong. */
+     * What it prints is chosen carefully, because the obvious thing to print proves nothing: the
+     * two FRAME NUMBERS are supposed to be equal. DASHS and DASHA are the two halves of one run
+     * cycle and have to stay in phase, so equal frames is the correct answer, not evidence of
+     * anything. The two things that do discriminate are the two BCK ids — different resources, so
+     * different arms — and the calculator actually sitting on joint 1 when the model is read back.
+     * That last one is the whole split: if it is not mpUpperCalc, joint 1's subtree inherited joint
+     * 0's and the torso is back on the under animation with nothing else looking wrong. */
     if (!mLoggedSplitAnm && mAnmPackUpper[0].getAnmTransform() != NULL &&
         mAnmPackUpper[0].getAnmTransform() != mAnmPackUnder[0].getAnmTransform())
     {
@@ -1063,9 +1176,10 @@ void daRemotePlayer_c::animePlay() {
             bodyData->getJointNodePointer(l_underRootJointNo)->getMtxCalc();
         const J3DMtxCalc* onUpperRoot =
             bodyData->getJointNodePointer(l_upperRootJointNo)->getMtxCalc();
-        const J3DMtxCalc* onLegs = l_underLegJointNo < mBodyJointNum ?
-            bodyData->getJointNodePointer(l_underLegJointNo)->getMtxCalc() :
-            NULL;
+        const J3DMtxCalc* onLegs =
+            l_underLegJointNo < mBodyJointNum ?
+                bodyData->getJointNodePointer(l_underLegJointNo)->getMtxCalc() :
+                NULL;
 
         Log.debug("Puppet {} body split live: anim {} under bck {} / upper bck {} (frames {:.1f} / "
                   "{:.1f}, equal is correct) | joints {}/{}/{} -> {}/{}/{}",
@@ -1261,16 +1375,17 @@ void daRemotePlayer_c::setNetworkPose(
  * Those numbers are read from daAlinkHIO_move_c0::m rather than copied, so the puppet cannot drift
  * out of step with the player if the table is ever corrected.
  *
- * ★ What we do NOT reproduce is the blend. daAlink_c plays walk and run TOGETHER across the
- * crossover band and cross-fades them by weight (commonDoubleAnime / setDoubleAnimeBlendRatio,
- * d_a_alink.cpp:7002-7008); the puppet quantises to whichever side is dominant and morfs across the
- * switch. Visible difference is confined to the walk/run transition; the endpoints match the player
- * exactly.
+ * ★ The blend is the point, and it used to be missing. daAlink_c never swaps one gait for another:
+ * he plays BOTH sides of a band at once and slides the weight across it. The puppet quantised to
+ * whichever side was dominant and morfed over the switch, which is the wrong shape of behaviour
+ * rather than a slightly worse version of the same one — a real player crossing from a walk into a
+ * run passes through every mixture between them, and the puppet stepped over that in one frame.
  *
- * That is now a gap in this function alone rather than in the machinery underneath it: the rig
- * setupAnimation() builds IS the ratio-blend rig, with slot 1 sitting empty. Filling it is job B in
- * .claude/plan/10-animation-fidelity.md — write the second gait into slot 1 and drive both ratios
- * off `fraction` instead of picking a side.
+ * ★ One difference that remains, and is a knowing one: daAlink_c scales the fraction by the cosine
+ * of the ground angle (getMoveGroundAngleSpeedRate, d_a_alink.cpp:7546-7556), so climbing a slope
+ * shifts him toward the slower gait at the same speed. The puppet uses the flat fraction. It has
+ * the floor under it — mGndChk is refreshed every tick — so this is fixable, and it belongs with
+ * the foot-IK work that needs the same ground normal rather than on its own.
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
@@ -1307,30 +1422,66 @@ void daRemotePlayer_c::selectAnimation() {
         return;
     }
 
-    // Midpoint of the band daAlink_c cross-fades over, i.e. where its blend weight passes 0.5.
-    const f32 runFraction = 0.5f * (hio.mWalkChangeRate + hio.mRunChangeRate);
+    /* The three bands daAlink_c crosses over in, and the pair he blends inside each
+     * (setBlendMoveAnime, d_a_alink.cpp:7749-7800). Below mWalkChangeRate he mixes wait into walk,
+     * below mRunChangeRate walk into run, and above it runs alone. The thresholds come from
+     * daAlinkHIO_move_c0::m rather than being copied, so the puppet cannot drift out of step with
+     * the player if the table is ever corrected. */
     const f32 fraction = mNetSpeed / hio.mMaxSpeed;
 
-    daAlink_c::daAlink_ANM wanted;
-    if (mNetSpeed <= l_idleSpeedThreshold) {
-        wanted = l_idleAnm;
-    } else if (mCurrentAnm == l_runAnm) {
-        wanted = fraction < runFraction - l_gaitHysteresis ? l_walkAnm : l_runAnm;
+    const daRemotePlayer_anm_c* anmA;
+    const daRemotePlayer_anm_c* anmB;
+    daAlink_c::daAlink_ANM idA;
+    daAlink_c::daAlink_ANM idB;
+    f32 speedA;
+    f32 speedB;
+    f32 blend;
+
+    if (fraction < hio.mWalkChangeRate) {
+        blend = fraction / hio.mWalkChangeRate;
+        anmA = &mIdleAnm;
+        anmB = &mWalkAnm;
+        idA = l_idleAnm;
+        idB = l_walkAnm;
+        speedA = hio.mWaitAnmSpeed;
+        speedB = hio.mWalkAnmSpeed;
+    } else if (fraction < hio.mRunChangeRate) {
+        blend = (fraction - hio.mWalkChangeRate) / (hio.mRunChangeRate - hio.mWalkChangeRate);
+        anmA = &mWalkAnm;
+        anmB = &mRunAnm;
+        idA = l_walkAnm;
+        idB = l_runAnm;
+        speedA = hio.mWalkAnmSpeed;
+        speedB = hio.mRunAnmSpeed;
     } else {
-        wanted = fraction > runFraction + l_gaitHysteresis ? l_runAnm : l_walkAnm;
+        /* daAlink_c passes ANM_RUN on both sides here with a weight of 1; setDoubleAnm() collapses
+         * an identical pair rather than stepping one animation object twice. */
+        blend = 1.0f;
+        anmA = &mRunAnm;
+        anmB = &mRunAnm;
+        idA = l_runAnm;
+        idB = l_runAnm;
+        speedA = hio.mRunAnmSpeed;
+        speedB = hio.mRunAnmSpeed;
     }
 
-    const daRemotePlayer_anm_c* anm;
-    f32 rate;
-    if (wanted == l_runAnm) {
-        anm = &mRunAnm;
-        rate = hio.mRunAnmSpeed;
-    } else if (wanted == l_walkAnm) {
-        anm = &mWalkAnm;
-        rate = hio.mWalkAnmSpeed;
+    /* Standing still is pinned to pure idle rather than left to a very small blend weight. The
+     * replicated speed is an interpolated value and does not settle to exactly zero, so without
+     * this a stationary puppet carries a few percent of walk forever — a visible shuffle on a
+     * character that is not moving. */
+    if (mNetSpeed <= l_idleSpeedThreshold) {
+        blend = 0.0f;
+    }
+
+    /* Which gait the puppet is mostly in. This no longer decides what is drawn — the blend does —
+     * but it is still the animation the hand poses are read from and the value --mp-trace reports,
+     * so it keeps the hysteresis: a puppet held near a band's midpoint would otherwise flip the
+     * REPORTED gait every tick and make the trace unreadable. */
+    daAlink_c::daAlink_ANM wanted;
+    if (mCurrentAnm == static_cast<u16>(idB)) {
+        wanted = blend > 0.5f - l_gaitHysteresis ? idB : idA;
     } else {
-        anm = &mIdleAnm;
-        rate = hio.mWaitAnmSpeed;
+        wanted = blend > 0.5f + l_gaitHysteresis ? idB : idA;
     }
 
     /* Stuart reported the puppet as having "no idle body animation". The animation it plays IS the
@@ -1356,16 +1507,30 @@ void daRemotePlayer_c::selectAnimation() {
         mIdleTicks = 0;
     }
 
-    if (wanted != mCurrentAnm) {
-        // A short morf, so changing gait doesn't pop. This is the one place we are standing in for
-        // the player's cross-fade, so it is doing more work here than a plain animation change.
-        setAnm(*anm, J3DFrameCtrl::EMode_LOOP, l_gaitMorf, rate, 0.0f, -1);
-        mCurrentAnm = static_cast<u16>(wanted);
-    } else {
-        /* Both halves, or the run's arms would keep the previous gait's rate. They are separate
-         * controllers precisely because they can be stepping separate animations. */
-        mUnderFrameCtrl[0].setRate(rate);
-        mUpperFrameCtrl[0].setRate(rate);
+    mCurrentAnm = static_cast<u16>(wanted);
+
+    /* No morf between gaits — the blend IS the transition, and asking for one on top would fade
+     * from a pose to itself. The only thing there is to fade out of is the skid, which is a single
+     * animation, and mDoubleAnmSet is exactly "the last thing set was a blended pair". */
+    setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, mDoubleAnmSet ? -1.0f : l_gaitMorf);
+
+    /* ★ Latched and permanent, for the same reason every other one-shot in this file is: a blend
+     * that never leaves 0 or 1 is indistinguishable from the outright switch it replaced, from
+     * everywhere except someone's eyes. The condition is deliberately strict — two DIFFERENT
+     * animations, both actually carrying weight — because either half alone is the old behaviour.
+     *
+     * The two frame numbers being different is expected and is NOT the claim: these are cycles of
+     * different lengths held at the same normalised phase, which is the whole job of
+     * set_blend_frame_ctrl(). The check worth making by eye on this line is that frame/end comes
+     * out about equal for both; if it does not, the two halves of the stride have drifted apart. */
+    if (!mLoggedBlend && idA != idB && blend > 0.05f && blend < 0.95f) {
+        mLoggedBlend = true;
+        Log.debug("Puppet {} gait blend live: {:.2f} from anim {} bck {} (frame {:.1f} of {}) into "
+                  "anim {} bck {} (frame {:.1f} of {}) at speed {:.1f}",
+            mPlayerId, blend, static_cast<int>(idA), anm_bck_idx(idA),
+            mUnderFrameCtrl[0].getFrame(), mUnderFrameCtrl[0].getEnd(), static_cast<int>(idB),
+            anm_bck_idx(idB), mUnderFrameCtrl[1].getFrame(), mUnderFrameCtrl[1].getEnd(),
+            mNetSpeed);
     }
 }
 
