@@ -145,6 +145,9 @@ private:
     /// tick, BEFORE the body's calc. daAlink_c::allAnimePlay (d_a_alink.cpp:7262-7290).
     void animePlay();
     void selectAnimation();
+    /// Which run animation the puppet is entitled to — the armed one when the wire says a sword is
+    /// in hand, which is getMainBckData's own test (d_a_alink.cpp:6939). Out of line.
+    const daRemotePlayer_anm_c& runAnm() const;
     /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
     /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
     void setDrawHand();
@@ -312,6 +315,10 @@ private:
     /// using the raw ratio and one using the floor both "walk"; the difference between them is the
     /// whole gliding report, and it is not visible in a screenshot.
     bool mLoggedWalkFloor;
+    /// And for the first tick the puppet runs with a sword drawn. The armed run and the plain one
+    /// share their legs, so the animation id, the frames and the blend are the same either way; the
+    /// upper pack's pointer is the only thing that separates them.
+    bool mLoggedSwordRun;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
@@ -377,6 +384,10 @@ private:
      * there is a stride phase worth carrying into the next pair, and whether the next pair needs a
      * cross-fade to get out of what is playing. */
     bool mDoubleAnmSet;
+    /* Whether selectAnimation() has ever run. mCurrentAnm carries create()'s seed until it has, and
+     * the network layer can resolve this puppet during that window — so getCurrentAnm() reports the
+     * no-data sentinel rather than a gait nobody chose. See getCurrentAnm() for the measurement. */
+    bool mAnmChosen;
     /* Joints on the body model, read from the model rather than assumed to be Link's 35. The morf
      * range is expressed in joints, and mDoExt_MtxCalcAnmBlendTblOld::calc does its per-frame
      * bookkeeping when it reaches the LAST one (m_Do_ext.cpp:1194-1206). */
@@ -385,6 +396,12 @@ private:
     daRemotePlayer_anm_c mIdleAnm;
     daRemotePlayer_anm_c mWalkAnm;
     daRemotePlayer_anm_c mRunAnm;
+    /* The run with a sword drawn. getMainBckData substitutes m_mainBckSword's row for ANM_RUN when
+     * mEquipItem == 0x103 (d_a_alink.cpp:6939-6942), and that row is {DASHS, DASHS} where the
+     * empty-handed one is {DASHS, DASHA} — the same legs, sword-carrying arms. So this SHARES
+     * mRunAnm.mpUnder and holds no second resource; see load_gait_anm_sword for why sharing is safe
+     * and why it is written as a general path rather than as that one aliasing. */
+    daRemotePlayer_anm_c mRunSwordAnm;
     /* The skid. Deliberately OPTIONAL — a NULL mpUnder just costs the turn pose, it does not fail
      * createHeap, because a createHeap failure puts the puppet into a permanent full-speed respawn
      * loop. */

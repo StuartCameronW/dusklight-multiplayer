@@ -356,21 +356,47 @@ const daAlink_AnmData& anm_data(daAlink_c::daAlink_ANM i_anm) {
     return daAlink_c::m_anmDataTable[i_anm];
 }
 
-/* The BCK resource indices to stream for an animation — one per half of the body.
+/**
+ * The pair of BCK resources to stream for an animation, given what the sender is holding.
  *
- * ★ daAlink_c does NOT read this row directly; he goes through getMainBckData
- * (d_a_alink.cpp:6918-6947), which substitutes a different pair when he is holding something. The
- * puppet reads the row itself because it is not holding anything: nothing draws a sword, a shield
- * or a sheath on it yet, so the empty-handed row is the one that matches what is on screen. When
- * equipment starts arriving on the wire, this is the function that has to grow getMainBckData's
- * branches — see .claude/plan/10-animation-fidelity.md, job D.
+ * ★ daAlink_c does NOT read m_anmDataTable's row directly; he goes through getMainBckData
+ * (d_a_alink.cpp:6918-6947), which substitutes a different pair when he is holding something. This
+ * is that function, restricted to the substitution a puppet can currently be subject to, and the
+ * restriction is stated rather than assumed:
+ *
+ *   - The sword branch (:6939-6942) fires on `mEquipItem == 0x103` over the id range
+ *     ANM_ATN_WAIT_LEFT..ANM_SWIM_WAIT. `mEquipItem == 0x103` is precisely what the sender puts in
+ *     kPlayerEquipSwordInHand (player_bridge.cpp), so this is his answer, not a guess at it.
+ *   - The kandelaar, shield-guard and fishing-rod branches are all keyed on state that is not on
+ *     the wire, so they cannot fire here yet. Each is a separate byte away, not a redesign.
+ *
+ * Of the four animations a puppet can be in, exactly ONE row differs between the two tables:
+ *
+ *     ANM_WAIT  0x19  outside the sword range entirely
+ *     ANM_WALK  0x12  {WALKS, WALKS} in both  (d_a_alink.cpp:696 and :245)
+ *     ANM_RUN   0x13  {DASHS, DASHA} plain -> {DASHS, DASHS} armed  (:697 and :246)
+ *     ANM_SLIP  0x28  outside the sword range entirely
+ *
+ * So the whole of the visible fix is ANM_RUN's UPPER half. That is exactly the thing Stuart could
+ * see — "the puppet ... [isn't] using the sword running animation" — because the under half, the
+ * legs, was already DASHS either way and only the arms were wrong.
  */
-u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm) {
-    return anm_data(i_anm).m_bckData.m_underID;
+const daAlink_BckData& anm_bck_data(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
+    if ((i_equip & dusk::mp::kPlayerEquipSwordInHand) != 0 &&
+        i_anm >= daAlink_c::ANM_ATN_WAIT_LEFT && i_anm < daAlink_c::ANM_STEP_TURN)
+    {
+        return daAlink_c::m_mainBckSword[i_anm - daAlink_c::ANM_ATN_WAIT_LEFT];
+    }
+
+    return anm_data(i_anm).m_bckData;
 }
 
-u16 anm_bck_upper_idx(daAlink_c::daAlink_ANM i_anm) {
-    return anm_data(i_anm).m_bckData.m_upperID;
+u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
+    return anm_bck_data(i_anm, i_equip).m_underID;
+}
+
+u16 anm_bck_upper_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
+    return anm_bck_data(i_anm, i_equip).m_upperID;
 }
 
 /* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
@@ -702,21 +728,76 @@ J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family) {
  * reason is that a J3DAnmTransform carries its own current frame: two halves sharing one object
  * must share one frame, so exactly one frame controller may step it.
  */
-bool load_gait_anm(daRemotePlayer_anm_c* o_anm, daAlink_c::daAlink_ANM i_anmID) {
+bool load_gait_anm(daRemotePlayer_anm_c* o_anm, daAlink_c::daAlink_ANM i_anmID, u8 i_equip) {
+    const daAlink_BckData& bck = anm_bck_data(i_anmID, i_equip);
+
     o_anm->mpUnder =
-        static_cast<J3DAnmTransform*>(load_aram_anm(anm_bck_idx(i_anmID), ANM_FAMILY_TRANSFORM));
+        static_cast<J3DAnmTransform*>(load_aram_anm(bck.m_underID, ANM_FAMILY_TRANSFORM));
     o_anm->mpUpper = NULL;
 
     if (o_anm->mpUnder == NULL) {
         return false;
     }
 
-    if (anm_bck_upper_idx(i_anmID) != anm_bck_idx(i_anmID)) {
-        o_anm->mpUpper = static_cast<J3DAnmTransform*>(
-            load_aram_anm(anm_bck_upper_idx(i_anmID), ANM_FAMILY_TRANSFORM));
+    if (bck.m_upperID != bck.m_underID) {
+        o_anm->mpUpper =
+            static_cast<J3DAnmTransform*>(load_aram_anm(bck.m_upperID, ANM_FAMILY_TRANSFORM));
         if (o_anm->mpUpper == NULL) {
             Log.warn("Animation {} has no upper half ({}); its arms will play the lower body's",
-                static_cast<int>(i_anmID), anm_bck_upper_idx(i_anmID));
+                static_cast<int>(i_anmID), bck.m_upperID);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * The sword-drawn variant of a gait, reusing whatever the empty-handed one already loaded.
+ *
+ * daAlink_c does not need this: getUnderUpperAnime loads each half out of its own animation heap
+ * every time the pair changes (d_a_alink.cpp:6960-6999), so a sword being drawn simply streams a
+ * different BCK. The puppet holds its animations open for its whole life instead — it has no
+ * proc-driven moment at which to reload, and a puppet whose animation is streamed on the frame the
+ * wire says "sword out" would stall on the ARAM read in the middle of a run. So both variants are
+ * resident and the choice is a pointer swap.
+ *
+ * ★ Reuse is not an optimisation here, it is a correctness rule. Two frame controllers stepping ONE
+ * J3DAnmTransform advance it at double speed, because the frame lives on the animation object
+ * (animePlay's pointer comparison is the guard for the same hazard). Reusing i_plain.mpUnder is
+ * safe only because a gait and its sword variant are never both in the ratio packs at once —
+ * selectAnimation picks one of the two and passes it to both slots when the pair collapses.
+ *
+ * For today's tables this loads NOTHING: ANM_RUN's two rows share DASHS as the under half, and the
+ * armed upper half IS that same DASHS, which is the mpUpper == NULL case meaning "one resource on
+ * both halves". The general path is written out anyway because the shield and kandelaar rows will
+ * take it, and getting it wrong there would be a silent double-speed animation.
+ */
+bool load_gait_anm_sword(daRemotePlayer_anm_c* o_anm, const daRemotePlayer_anm_c& i_plain,
+    daAlink_c::daAlink_ANM i_anmID) {
+    const daAlink_BckData& plain = anm_bck_data(i_anmID, 0);
+    const daAlink_BckData& sword = anm_bck_data(i_anmID, dusk::mp::kPlayerEquipSwordInHand);
+
+    if (sword.m_underID == plain.m_underID && sword.m_upperID == plain.m_upperID) {
+        // ANM_WAIT, ANM_WALK and ANM_SLIP: the two tables agree, so there is no second variant.
+        *o_anm = i_plain;
+        return true;
+    }
+
+    if (sword.m_underID != plain.m_underID) {
+        // Nothing to share — both halves are somebody else's resources.
+        return load_gait_anm(o_anm, i_anmID, dusk::mp::kPlayerEquipSwordInHand);
+    }
+
+    o_anm->mpUnder = i_plain.mpUnder;
+    o_anm->mpUpper = NULL;
+
+    if (sword.m_upperID != sword.m_underID) {
+        o_anm->mpUpper =
+            static_cast<J3DAnmTransform*>(load_aram_anm(sword.m_upperID, ANM_FAMILY_TRANSFORM));
+        if (o_anm->mpUpper == NULL) {
+            Log.warn("Armed animation {} has no upper half ({}); its arms will play the lower "
+                     "body's",
+                static_cast<int>(i_anmID), sword.m_upperID);
         }
     }
 
@@ -780,9 +861,18 @@ int daRemotePlayer_c::createHeap() {
         return 0;
     }
 
-    if (!load_gait_anm(&mIdleAnm, l_idleAnm) || !load_gait_anm(&mWalkAnm, l_walkAnm) ||
-        !load_gait_anm(&mRunAnm, l_runAnm))
+    if (!load_gait_anm(&mIdleAnm, l_idleAnm, 0) || !load_gait_anm(&mWalkAnm, l_walkAnm, 0) ||
+        !load_gait_anm(&mRunAnm, l_runAnm, 0))
     {
+        return 0;
+    }
+
+    /* The armed run. Fatal on failure alongside the three above, because it is not an extra
+     * animation the puppet could do without: for today's tables it loads nothing at all and simply
+     * aliases mRunAnm's DASHS onto both halves, so a failure here means anm_bck_data disagrees with
+     * daAlink_c's tables about which resources exist — which would make every armed gait wrong, not
+     * just this one. */
+    if (!load_gait_anm_sword(&mRunSwordAnm, mRunAnm, l_runAnm)) {
         return 0;
     }
 
@@ -794,7 +884,7 @@ int daRemotePlayer_c::createHeap() {
      * is a puppet with one animation missing; a puppet that fails createHeap is deleted and
      * respawned every couple of ticks forever, mounting an archive each time. Trading the first
      * failure for the second would be a bad bargain, so this one degrades to the gait instead. */
-    if (!load_gait_anm(&mSlipAnm, l_slipAnm)) {
+    if (!load_gait_anm(&mSlipAnm, l_slipAnm, 0)) {
         Log.warn("Puppet has no sharp-turn animation; turns will play the gait instead");
     }
 
@@ -1230,8 +1320,9 @@ void daRemotePlayer_c::animePlay() {
 
         Log.debug("Puppet {} body split live: anim {} under bck {} / upper bck {} (frames {:.1f} / "
                   "{:.1f}, equal is correct) | joints {}/{}/{} -> {}/{}/{}",
-            mPlayerId, mCurrentAnm, anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm)),
-            anm_bck_upper_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm)),
+            mPlayerId, mCurrentAnm,
+            anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm), mNetEquip),
+            anm_bck_upper_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm), mNetEquip),
             mUnderFrameCtrl[0].getFrame(), mUpperFrameCtrl[0].getFrame(), l_underRootJointNo,
             l_upperRootJointNo, l_underLegJointNo, onUnderRoot == mpUnderCalc ? "under" : "WRONG",
             onUpperRoot == mpUpperCalc ? "UPPER" : "WRONG",
@@ -1446,11 +1537,17 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_mov
  *
  * ★ What remains is equipment, and it is job D: getMainBckData swaps the whole animation pair for a
  * drawn sword, a raised shield, the kandelaar or the fishing rod, and heavy boots or the iron ball
- * pin the rate into band 1 outright (d_a_alink.cpp:7620-7641). None of that is on the wire yet, so
- * a puppet always uses the empty-handed table.
+ * pin the rate into band 1 outright (d_a_alink.cpp:7620-7641). The SWORD half of that is done — see
+ * anm_bck_data() and runAnm(), which follow his own `mEquipItem == 0x103` test off the wire. The
+ * other three are each one more byte of replicated state away, and none of them changes the band
+ * arithmetic below; they only change which pair of resources the chosen band plays.
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
+
+    /* First thing, and before either return path below: from here on mCurrentAnm is a choice rather
+     * than create()'s seed, which is what getCurrentAnm() reports on. */
+    mAnmChosen = true;
 
     /* The sharp turn wins over the gait outright, exactly as it does for the local player:
      * PROC_SLIP is a proc of its own and setSingleAnimeParam replaces the move blend wholesale, it
@@ -1543,7 +1640,7 @@ void daRemotePlayer_c::selectAnimation() {
     } else if (fraction < hio.mRunChangeRate) {
         blend = (fraction - hio.mWalkChangeRate) / (hio.mRunChangeRate - hio.mWalkChangeRate);
         anmA = &mWalkAnm;
-        anmB = &mRunAnm;
+        anmB = &runAnm();
         idA = l_walkAnm;
         idB = l_runAnm;
         speedA = hio.mWalkAnmSpeed;
@@ -1552,8 +1649,8 @@ void daRemotePlayer_c::selectAnimation() {
         /* daAlink_c passes ANM_RUN on both sides here with a weight of 1; setDoubleAnm() collapses
          * an identical pair rather than stepping one animation object twice. */
         blend = 1.0f;
-        anmA = &mRunAnm;
-        anmB = &mRunAnm;
+        anmA = &runAnm();
+        anmB = &runAnm();
         idA = l_runAnm;
         idB = l_runAnm;
         speedA = hio.mRunAnmSpeed;
@@ -1606,6 +1703,29 @@ void daRemotePlayer_c::selectAnimation() {
      * animation, and mDoubleAnmSet is exactly "the last thing set was a blended pair". */
     setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, mDoubleAnmSet ? -1.0f : l_gaitMorf);
 
+    /* ★ Latched and permanent. The armed run and the empty-handed one share their LEGS — both are
+     * DASHS under — so the trace's animation id, the frame numbers and the blend are all identical
+     * between them and none of them can tell the two apart. The one value that can is the upper
+     * pack's animation POINTER: armed, both packs hold the same object (that is what "one resource
+     * on both halves" means and why animePlay must not step it twice); empty-handed, the upper pack
+     * holds DASHA and they differ. So this prints the pointer comparison and the two table rows it
+     * is supposed to follow from, and if they disagree the substitution did not take. */
+    if (!mLoggedSwordRun && wanted == l_runAnm &&
+        (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0)
+    {
+        mLoggedSwordRun = true;
+        Log.debug("Puppet {} armed run live: equip 0x{:02x} -> bck {}/{} (empty-handed row is "
+                  "{}/{}), packs {} -> arms are {}",
+            mPlayerId, mNetEquip, anm_bck_idx(l_runAnm, mNetEquip),
+            anm_bck_upper_idx(l_runAnm, mNetEquip), anm_bck_idx(l_runAnm, 0),
+            anm_bck_upper_idx(l_runAnm, 0),
+            mAnmPackUpper[0].getAnmTransform() == mAnmPackUnder[0].getAnmTransform() ? "shared" :
+                                                                                       "split",
+            mAnmPackUpper[0].getAnmTransform() == mAnmPackUnder[0].getAnmTransform() ?
+                "sword-carrying" :
+                "WRONG (empty-handed)");
+    }
+
     /* ★ Latched and permanent, for the same reason every other one-shot in this file is: a blend
      * that never leaves 0 or 1 is indistinguishable from the outright switch it replaced, from
      * everywhere except someone's eyes. The condition is deliberately strict — two DIFFERENT
@@ -1619,9 +1739,9 @@ void daRemotePlayer_c::selectAnimation() {
         mLoggedBlend = true;
         Log.debug("Puppet {} gait blend live: {:.2f} from anim {} bck {} (frame {:.1f} of {}) into "
                   "anim {} bck {} (frame {:.1f} of {}) at rate {:.3f}",
-            mPlayerId, blend, static_cast<int>(idA), anm_bck_idx(idA),
+            mPlayerId, blend, static_cast<int>(idA), anm_bck_idx(idA, mNetEquip),
             mUnderFrameCtrl[0].getFrame(), mUnderFrameCtrl[0].getEnd(), static_cast<int>(idB),
-            anm_bck_idx(idB), mUnderFrameCtrl[1].getFrame(), mUnderFrameCtrl[1].getEnd(),
+            anm_bck_idx(idB, mNetEquip), mUnderFrameCtrl[1].getFrame(), mUnderFrameCtrl[1].getEnd(),
             mNetMoveRate);
     }
 
@@ -1642,7 +1762,32 @@ void daRemotePlayer_c::selectAnimation() {
 
 /* See the header. Out of line so it can go through the same table everything else here does. */
 u16 daRemotePlayer_c::getCurrentAnm() const {
-    return anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm));
+    /* ★ 0 until selectAnimation has actually run once, and that is a correctness fix, not padding.
+     * create() seeds mCurrentAnm with ANM_WAIT so the hysteresis has a starting value, and there is
+     * a window between create() finishing and the actor joining the execute pass in which the
+     * network layer can already resolve this puppet and read that seed back. Reporting it says
+     * "standing" for a puppet that has not chosen anything yet.
+     *
+     * That window is normally invisible because both players spawn each other while standing still.
+     * Measured on sword-run.txt, where the guest loads its world while the host is already at full
+     * speed: eight consecutive actor rows claiming the idle animation against a rate ramping
+     * 0.66 -> 1.00, which mp_analyze correctly scored as OUT OF BAND. Nothing was wrong on screen —
+     * the first draw comes after the first execute, so the puppet was not being drawn at all — but
+     * an analyzer that reports a failure for a puppet that does not exist yet is an analyzer we
+     * learn to ignore.
+     *
+     * 0 is the sentinel the trace and mp_analyze already agree on: no BCK has index 0 and the
+     * analyzer filters those rows out. */
+    if (!mAnmChosen) {
+        return 0;
+    }
+    return anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm), mNetEquip);
+}
+
+/* See the header. Out of line so anm_bck_data's table read stays in one translation unit with the
+ * rest of the animation code. */
+const daRemotePlayer_anm_c& daRemotePlayer_c::runAnm() const {
+    return (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0 ? mRunSwordAnm : mRunAnm;
 }
 
 /**
