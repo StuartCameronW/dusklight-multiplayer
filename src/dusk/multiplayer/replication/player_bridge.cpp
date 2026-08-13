@@ -298,6 +298,87 @@ void note_create_failure(std::uint32_t playerId, PuppetRef& ref, const char* rea
         playerId, reason_text(ref), ref.consecutiveFailures, kMaxCreateFailures, delay);
 }
 
+/**
+ * Fill the equipment byte from the sender's own answers.
+ *
+ * Nothing here is a fact about the world that the receiver could look up; every one is a decision
+ * daAlink_c made this tick. See PlayerEquipFlags for why each is a wire bit rather than a
+ * derivation — the short version is that `checkSwordDraw()` folds in a change-over timer and two
+ * no-draw flags, and the shield's in-hand test is a seven-term disjunction over guard and demo
+ * state.
+ *
+ * ★ The KIND fields are reported even when the matching draw bit is clear, and that is not sloppy:
+ * daAlink_c does the same, because it must have a model and an archive selected before it can
+ * decide whether to draw them. A receiver that only mounted a shield archive when the shield was
+ * currently visible would have nothing loaded at the moment it became visible.
+ *
+ * The whole byte is filled from the first protocol version that carries it, including the shield
+ * half the puppet does not draw yet, so that finishing the shield costs no second bump.
+ */
+void fill_equip(daAlink_c* alink, PlayerState& out) {
+    out.equip = 0;
+    if (alink == nullptr) {
+        return;
+    }
+
+    /* Order copied from setSelectEquipItem (d_a_alink.cpp:4354-4366), wood first, because the tests
+     * are not mutually exclusive on their own — the wooden sword also answers "not the master
+     * sword", so testing for the master sword first would still be right but testing for the ordon
+     * sword first would claim every sword. */
+    std::uint8_t swordKind;
+    if (daPy_py_c::checkWoodSwordEquip()) {
+        swordKind = kPlayerEquipSwordWood;
+    } else if (daPy_py_c::checkMasterSwordEquip()) {
+        swordKind = kPlayerEquipSwordMaster;
+    } else {
+        swordKind = kPlayerEquipSwordOrdon;
+    }
+    out.equip |= static_cast<std::uint8_t>(swordKind << kPlayerEquipSwordKindShift);
+
+    if (alink->checkSwordDraw()) {
+        out.equip |= kPlayerEquipSwordDraw;
+    }
+    // 0x103 is dItemNo_SWORD_e; written as the literal daAlink_c compares against at :5894 and
+    // :4386 so the two read identically.
+    if (alink->mEquipItem == 0x103) {
+        out.equip |= kPlayerEquipSwordInHand;
+    }
+
+    // setShieldArcName's order, and its first branch really does fold "no shield at all" in with
+    // the carved wooden one (d_a_alink_swindow.inc:29-30).
+    std::uint8_t shieldKind;
+    if (daPy_py_c::checkCarvingWoodShieldEquip() || !daPy_py_c::checkShieldGet()) {
+        shieldKind = kPlayerEquipShieldCarvingWood;
+    } else if (daPy_py_c::checkShopWoodShieldEquip()) {
+        shieldKind = kPlayerEquipShieldShopWood;
+    } else {
+        shieldKind = kPlayerEquipShieldHylian;
+    }
+    out.equip |= static_cast<std::uint8_t>(shieldKind << kPlayerEquipShieldKindShift);
+
+    if (alink->checkShieldDraw()) {
+        out.equip |= kPlayerEquipShieldDraw;
+    }
+
+    /* The seven-term test from setItemMatrix (d_a_alink.cpp:5921-5930), transcribed rather than
+     * summarised. mShieldChangeWaitTimer != 0 is the outer gate there and means "leave the shield
+     * exactly where it was"; there is no such memory here, so it is folded in as "on the back",
+     * which is where the shield sits for all but the guarding frames anyway. */
+    if (alink->mShieldChangeWaitTimer == 0 &&
+        ((alink->checkPlayerGuardAndAttack() && alink->mEquipItem != dItemNo_IRONBALL_e &&
+             !alink->checkModeFlg(0x400)) ||
+            alink->checkNoResetFlg0(daPy_py_c::FLG0_UNK_2) ||
+            (alink->mProcID == daAlink_c::PROC_TOOL_DEMO && alink->mProcVar4.field_0x3010 != 0) ||
+            (alink->mProcID == daAlink_c::PROC_CUT_REVERSE && alink->mProcVar2.field_0x300c != 0) ||
+            alink->mProcID == daAlink_c::PROC_GUARD_BREAK ||
+            (alink->mEquipItem == 0x103 &&
+                !alink->checkEndResetFlg1(daPy_py_c::ERFLG1_SHIELD_BACKBONE) &&
+                !alink->checkModeFlg(0x400))))
+    {
+        out.equip |= kPlayerEquipShieldInHand;
+    }
+}
+
 }  // namespace
 
 /**
@@ -444,6 +525,8 @@ bool capture_local_player(PlayerState& out) {
     {
         out.flags |= kPlayerStateNoFootIk;
     }
+
+    fill_equip(alink, out);
 
     return true;
 }
@@ -604,8 +687,11 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     }
 
     cXyz pos(state.posX, state.posY, state.posZ);
+    /* The equipment byte goes over WHOLE rather than being decoded into six more arguments here.
+     * Its layout lives in dusk/player_equip.hpp precisely so both ends can read it without this
+     * function becoming the place that knows which bit pattern means the master sword. */
     puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
-        state.zero_speed(), state.mode_idle(), state.no_foot_ik());
+        state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -629,6 +715,10 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     if (puppet->getNetZeroSpeed()) {
         out.flags |= kPlayerStateZeroSpeed;
     }
+    // Read back off the puppet for the same reason, which makes it the both-ends check a wire
+    // change is required to pass: the trace can compare the byte the sender packed against the byte
+    // the receiver is actually drawing from.
+    out.equip = puppet->getNetEquip();
     return true;
 }
 

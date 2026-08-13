@@ -36,8 +36,15 @@ namespace dusk::mp {
  * 7: flag bits 4 and 5, for the foot IK — the sender's MODE_IDLE and his own "no foot IK this
  * tick" test. Same 20 bytes again. A v6 peer would leave both clear, which is the safe reading
  * ("moving, IK allowed") but the wrong one half the time: standing puppets would not settle onto
- * the lower foot and airborne ones would try to plant their feet on the floor below them. */
-inline constexpr std::uint32_t kProtocolVersion = 7;
+ * the lower foot and airborne ones would try to plant their feet on the floor below them.
+ *
+ * 8: PlayerState grew an equipment byte (20 -> 21) — which sword and shield, and whether each is in
+ * a hand or on the back. A SIZE change, so this is the mandatory kind of bump rather than the
+ * cautious kind: a v7 peer's read() under-runs on the new trailing byte and discards every pose
+ * packet, which looks like a session that connects and then shows nobody moving. The byte is filled
+ * completely from this version, including the shield half the puppet does not draw yet, so
+ * finishing the shield will not need a second bump. */
+inline constexpr std::uint32_t kProtocolVersion = 8;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

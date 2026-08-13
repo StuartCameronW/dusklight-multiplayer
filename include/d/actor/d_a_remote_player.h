@@ -93,7 +93,7 @@ public:
 
     /// Push an interpolated pose in from the network layer, before the actor pass runs.
     void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn,
-        bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff);
+        bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff, u8 i_equip);
 
     u32 getPlayerId() const { return mPlayerId; }
     /* Index into the outfit table of the archive this puppet ACTUALLY mounted, which is not
@@ -117,6 +117,9 @@ public:
      * check can be exact: the rate alone cannot distinguish standing from crawling, and the two
      * take different branches. */
     bool getNetZeroSpeed() const { return mNetZeroSpeed; }
+    /// The equipment byte as this puppet received it. Exposed for --mp-trace and for the
+    /// both-ends comparison a wire change has to pass; see PlayerEquipFlags for the layout.
+    u8 getNetEquip() const { return mNetEquip; }
     bool hasPose() const { return mHasPose; }
     /* BCK resource index of the gait currently playing. Exposed for --mp-trace: which animation a
      * puppet picked is otherwise only checkable by looking at the other player's screen.
@@ -193,6 +196,22 @@ private:
      * the same one-frame lag daAlink_c lives with (d_a_alink.cpp:18530-18538). */
     /// Hook the sway callback onto the head model's joints. Once, at createHeap time.
     void setupHeadSway();
+
+    /* Sword and sheath. daAlink_c draws them as separate models hung off body joints, so the puppet
+     * does too — a sword is not part of the body skeleton and cannot be animated onto it.
+     *
+     *   setupEquipModels() — once, at createHeap time. Builds all of them up front, as daAlink_c
+     *                        does, so a change of sword is a change of pointer rather than a load.
+     *   setEquipMatrix()   — every tick, AFTER the body's calc: both models hang off body joints,
+     *                        which are not final until then.
+     *   drawEquip()        — from draw(), inside the sword-blade bracket. See the .cpp.
+     */
+    void setupEquipModels();
+    void setEquipMatrix();
+    void drawEquip();
+    /// The sword model this tick's equipment byte selects, or NULL for none. Also reports which
+    /// sheath goes with it, since the pairing is not one-to-one.
+    J3DModel* currentSword(J3DModel** o_sheath) const;
     /// Report any change to the puppet's material state. Diagnostic for A5; must run every tick.
     void checkMaterialDrift();
     /* ★ TEMPORARY — Hang 4 bisection. One line per step of the first few calcs, so the last line in
@@ -377,6 +396,19 @@ private:
     J3DModel* mpHeadModel;
     J3DModel* mpHandModel;
     J3DModel* mpFaceModel;
+
+    /* Sword and sheath, one model per kind, indexed by the wire's PlayerEquipSword values. All
+     * built at createHeap time and selected per tick, exactly as daAlink_c holds mpSwAModel /
+     * mpSwMModel / mWoodSwordModel side by side (d_a_alink.cpp:4239-4253).
+     *
+     * Any of them may be NULL and that is survivable: currentSword() simply reports no sword, and
+     * the puppet appears unarmed rather than failing to spawn. Only the wooden one is at real risk
+     * — it lives in the outfit archive rather than the permanently-mounted Alink one. */
+    J3DModel* mpSwordModel[3];
+    /* Two sheaths for three swords: the wooden sword and the master sword share al_PODM, and only
+     * the ordon sword has its own (d_a_alink.cpp:4354-4366). Indexed by PlayerEquipSword too, with
+     * wood and master pointing at the same model, so the caller never has to know that. */
+    J3DModel* mpSheathModel[3];
 
     /* The blink. BTP swaps the eyelid texture, BTK slides the texture matrix; they are played in
      * lock-step on the same frame number. Both are this puppet's own copies out of the ARAM
@@ -584,6 +616,11 @@ private:
     /// And the one-shot "it actually bent a leg". Both are needed — on flat ground the first fires
     /// and the second correctly does not, and only the pair separates that from never running.
     bool mLoggedFootIk;
+    /* The SENDER's equipment byte, whole. Every field in it is an answer he computed rather than a
+     * fact about the world, so there is nothing here to re-derive; see PlayerEquipFlags. */
+    u8 mNetEquip;
+    /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
+    bool mLoggedEquip;
 };
 
 /**

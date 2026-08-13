@@ -19,7 +19,12 @@
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_bg_s.h"
 #include "dusk/logging.h"
+#include "dusk/player_equip.hpp"
 #include "f_op/f_op_actor_mng.h"
+// The sword and sheath resource indices. Safe to include even though the per-outfit headers are
+// not: Alink.h's joint enums are all prefixed by their own model (AL_SWA_JNT, AL_PODM_JNT), so
+// nothing in it collides the way AL_JNT in Kmdl.h collides with BL_JNT in Bmdl.h.
+#include "res/Object/Alink.h"
 // AlAnm.h (the animation indices) arrives via d_a_alink.h. The per-outfit headers are deliberately
 // NOT included: Bmdl.h and Kmdl.h define the same joint enums, so they cannot coexist in one
 // translation unit. The body model is resolved by name below instead, which sidesteps that
@@ -85,6 +90,21 @@ const int l_defaultOutfit = 1;
  * (d_resorce.h:96).
  */
 const char l_objectPath[] = "/res/Object/";
+
+/* Link's permanent archive — the swords and both sheaths live here. Mounted once at boot beside
+ * "Always" (d_s_logo.cpp:1484) and never freed while a scene exists, which is what makes it safe to
+ * read directly instead of mounting privately; see setupEquipModels() for the full argument.
+ *
+ * Spelled out rather than taken from daAlink_c::getArcName() because that returns the OUTFIT
+ * archive's name (d_a_alink.cpp:100-102) — a different string that happens to be reachable through
+ * a similarly-named accessor. */
+const char l_alinkArcName[] = "Alink";
+
+/* The wooden sword, which is the one piece of equipment that does NOT live in "Alink". daAlink_c
+ * loads it from the outfit archive (d_a_alink_wolf.inc:415), so the puppet takes it from its own
+ * private mount of that archive. By name, for the same reason the body is: the outfit headers
+ * cannot be included here. */
+const char l_woodSwordResName[] = "al_SWB.bmd";
 
 /* Body joints the sub-models hang off. daAlink_c uses these same three literals: the head and face
  * both ride joint 4 (d_a_alink.cpp:5968-5970) and the hands model's own joints 1 and 2 are
@@ -247,6 +267,35 @@ J3DModel* init_model(J3DModelData* i_modelData, u32 i_diffFlags) {
     }
 
     J3DModel* model = mDoExt_J3DModel__create(i_modelData, 0x80000, i_diffFlags | 0x11000084);
+
+    if (warpMaterial) {
+        dRes_info_c::offWarpMaterial(i_modelData);
+    }
+
+    return model;
+}
+
+/**
+ * init_model with mdlFlags 0 instead of 0x80000 — daAlink_c::initModelEnv (d_a_alink.h:3736).
+ *
+ * The difference is not cosmetic and the pairing is not free choice: he builds the master sword and
+ * its sheath this way and the ordon sword and sheath the other, and each model is authored for the
+ * flags it is given. Kept as a separate entry point with the original's name so the call sites read
+ * as a diff against his.
+ */
+J3DModel* init_model_env(J3DModelData* i_modelData, u32 i_diffFlags) {
+    if (i_modelData == NULL) {
+        return NULL;
+    }
+
+    const bool warpMaterial = has_warp_material(i_modelData);
+
+    if (warpMaterial) {
+        dRes_info_c::onWarpMaterial(i_modelData);
+        i_diffFlags |= 0x2000400;
+    }
+
+    J3DModel* model = mDoExt_J3DModel__create(i_modelData, 0, i_diffFlags | 0x11000084);
 
     if (warpMaterial) {
         dRes_info_c::offWarpMaterial(i_modelData);
@@ -819,6 +868,7 @@ int daRemotePlayer_c::createHeap() {
 
     setupHeadSway();
     setupFootIk();
+    setupEquipModels();
 
     /* Hands, and the one body shape this outfit is built with hidden. Both are the tail of
      * daAlink_c::setLinkModel (d_a_alink_wolf.inc:471-498) and both were missing; see setDrawHand()
@@ -1347,7 +1397,7 @@ static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
 }
 
 void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_moveRate,
-    bool i_sharpTurn, bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff) {
+    bool i_sharpTurn, bool i_zeroSpeed, bool i_modeIdle, bool i_footIkOff, u8 i_equip) {
     current.pos = i_pos;
     shape_angle.y = i_angleY;
     // The logical angle is kept in step so anything that reads current.angle (audio, effects) sees
@@ -1360,6 +1410,7 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_mov
     mNetZeroSpeed = i_zeroSpeed;
     mNetModeIdle = i_modeIdle;
     mNetFootIkOff = i_footIkOff;
+    mNetEquip = i_equip;
     mHasPose = true;
 }
 
@@ -3005,9 +3056,10 @@ void daRemotePlayer_c::setupFootIk() {
         ->setCallBack(daRemotePlayer_bodyModelCallBack);
 
     /* The envelope count is logged because it is the measurement that the callback is NEEDED, not
-     * merely tidier. calcWeightEnvelopeMtx() does nothing at all when it is zero (J3DModel.cpp:406),
-     * and on such a model the old post-calc write would have been visible — a count of zero here
-     * would mean the invisible-IK diagnosis was wrong and the fault lay somewhere else entirely. */
+     * merely tidier. calcWeightEnvelopeMtx() does nothing at all when it is zero
+     * (J3DModel.cpp:406), and on such a model the old post-calc write would have been visible — a
+     * count of zero here would mean the invisible-IK diagnosis was wrong and the fault lay
+     * somewhere else entirely. */
     Log.info("Puppet foot IK attached to body joint {} of {} ({} envelope matrices)",
         l_footIkCallBackJointNo, jointNum, modelData->getWEvlpMtxNum());
 
@@ -3466,6 +3518,226 @@ void daRemotePlayer_c::setFootMatrix() {
     }
 }
 
+/* --- Sword and sheath ------------------------------------------------------------------------ */
+
+/* Where each piece hangs, from daAlink_c's human branch (d_a_alink_wolf.inc:563-571). The puppet
+ * already uses 9 and 14 for the hand JOINTS; these are the ITEM joints, one further down each hand,
+ * and the back joint the sheath and the stowed sword ride.
+ *
+ * ★ These are daAlink_c MEMBERS there, not constants, because the wolf uses a different skeleton
+ * (19/24/2 at :277-285). A puppet is never a wolf — kPlayerStateWolf is reserved and always sent
+ * clear — so the human values are inlined here rather than replicated. When the wolf arrives, this
+ * is one of the places that has to grow a branch rather than a new number. */
+const u16 l_leftItemJointNo = 10;
+const u16 l_rightItemJointNo = 15;
+const u16 l_backJointNo = 5;
+
+/* Where the sheathed sword sits relative to the back joint, exactly as daAlink_c places it
+ * (d_a_alink.cpp:5898-5901). Read as: take the back joint's matrix, walk to the small of the back,
+ * and tip the hilt out so it clears the shoulder. */
+const f32 l_stowedSwordOffsetX = -18.5f;
+const f32 l_stowedSwordOffsetY = 0.14f;
+const f32 l_stowedSwordOffsetZ = 12.2f;
+const f32 l_stowedSwordYawDeg = 33.1f;
+
+/**
+ * Which sword model this tick's equipment byte selects, and the sheath that goes with it.
+ *
+ * Returns NULL for "none", which is the honest answer in two different cases and they are worth
+ * keeping apart in the reader's head: the sender is not drawing a sword at all (the usual one), or
+ * the model failed to load when the puppet was built (an outfit archive with no al_SWB in it). Both
+ * end as an unarmed puppet, which is the right failure.
+ */
+J3DModel* daRemotePlayer_c::currentSword(J3DModel** o_sheath) const {
+    *o_sheath = NULL;
+
+    if ((mNetEquip & dusk::mp::kPlayerEquipSwordDraw) == 0) {
+        return NULL;
+    }
+
+    const u8 kind = static_cast<u8>(
+        (mNetEquip & dusk::mp::kPlayerEquipSwordKindMask) >> dusk::mp::kPlayerEquipSwordKindShift);
+    if (kind >= dusk::mp::kPlayerEquipSwordKindNum) {
+        // The wire has a fourth value that means nothing. Unarmed rather than indexed off the end.
+        return NULL;
+    }
+
+    *o_sheath = mpSheathModel[kind];
+    return mpSwordModel[kind];
+}
+
+/**
+ * Build every sword and sheath the puppet might need, once, at createHeap time.
+ *
+ * ★ The ordon and master swords and both sheaths come from the "Alink" archive, which the puppet
+ * READS DIRECTLY rather than mounting privately — the one place it does that, and it needs its
+ * justification stated because mountOwnArchive() argues at length for the opposite.
+ *
+ * The argument there is about LIFETIME and about the JOINT TREE, and neither applies here:
+ *
+ *   - "Alink" is mounted once at boot, beside "Always" (d_s_logo.cpp:1478-1485), and is excluded
+ *     from the per-stage size accounting exactly as "Always" and "Midna" are
+ * (d_s_play.cpp:517-523). Nothing frees it while a scene exists. The OUTFIT archive is the opposite
+ * case — Link loads it into his own heap and calls freeAll() on a clothes change — which is what
+ * that comment is about.
+ *   - Sharing model DATA is only dangerous when something per-actor is written onto it: a joint
+ *     callback, a matrix calculator, a hidden shape. A sword has none of the first two. It does
+ * have the third, and that one is real — see drawEquip(), which brackets it.
+ *
+ * The wooden sword is the exception and comes from the puppet's OWN outfit archive, because that is
+ * where daAlink_c gets it (d_a_alink_wolf.inc:415, from mArcName rather than l_arcName).
+ *
+ * The flag pairs are daAlink_c's, verbatim (d_a_alink.cpp:4239-4253). They are not decorative:
+ * initModelEnv is mdlFlags 0 where init_model is 0x80000, and the master sword additionally carries
+ * 0x1000200. A sword built on the wrong terms is the neck seam bug again, one model further out.
+ */
+void daRemotePlayer_c::setupEquipModels() {
+    for (int i = 0; i < dusk::mp::kPlayerEquipSwordKindNum; i++) {
+        mpSwordModel[i] = NULL;
+        mpSheathModel[i] = NULL;
+    }
+
+    J3DModelData* swaData = static_cast<J3DModelData*>(
+        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_SWA_e));
+    J3DModelData* swmData = static_cast<J3DModelData*>(
+        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_SWM_e));
+    J3DModelData* podaData = static_cast<J3DModelData*>(
+        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_PODA_e));
+    J3DModelData* podmData = static_cast<J3DModelData*>(
+        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_PODM_e));
+
+    mpSwordModel[dusk::mp::kPlayerEquipSwordOrdon] = init_model(swaData, 0x200);
+    mpSwordModel[dusk::mp::kPlayerEquipSwordMaster] = init_model_env(swmData, 0x1000200);
+    mpSwordModel[dusk::mp::kPlayerEquipSwordWood] =
+        init_model(static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_woodSwordResName)), 0);
+
+    // Two sheaths, three swords: the wooden sword carries the master sword's (d_a_alink.cpp:4356).
+    J3DModel* podaModel = init_model(podaData, 0);
+    J3DModel* podmModel = init_model_env(podmData, 0);
+    mpSheathModel[dusk::mp::kPlayerEquipSwordOrdon] = podaModel;
+    mpSheathModel[dusk::mp::kPlayerEquipSwordMaster] = podmModel;
+    mpSheathModel[dusk::mp::kPlayerEquipSwordWood] = podmModel;
+
+    /* Not fatal, on the same terms as a missing head: an unarmed puppet is a far better failure
+     * than no puppet. Logged per kind, because "which one is missing" is the whole diagnosis — a
+     * missing wooden sword means the outfit archive, a missing ordon sword means "Alink" was not
+     * where it is supposed to be, which would be a much stranger thing to be true. */
+    for (int i = 0; i < dusk::mp::kPlayerEquipSwordKindNum; i++) {
+        if (mpSwordModel[i] == NULL || mpSheathModel[i] == NULL) {
+            Log.warn("Puppet has no sword model for kind {} (sword {}, sheath {}); it will appear "
+                     "unarmed while that one is equipped",
+                i, mpSwordModel[i] != NULL ? "ok" : "missing",
+                mpSheathModel[i] != NULL ? "ok" : "missing");
+        }
+    }
+}
+
+/**
+ * Hang the sword and its sheath off the body's joints. Every tick, AFTER the body's calc.
+ *
+ * daAlink_c::setItemMatrix (d_a_alink.cpp:5883-5906), keeping the two placements that exist for a
+ * player who is simply carrying a sword. What is left out is all one thing — his `param_0`, the
+ * status-window pose, which forces the sword into the hand for the pause menu's rotating model.
+ *
+ * The sheath is unconditional and the sword is not: the sheath rides the back whatever the sword is
+ * doing, which is what makes a drawn sword read as drawn.
+ */
+void daRemotePlayer_c::setEquipMatrix() {
+    J3DModel* sheath = NULL;
+    J3DModel* sword = currentSword(&sheath);
+    if (sword == NULL) {
+        return;
+    }
+
+    if (sheath != NULL) {
+        sheath->setBaseTRMtx(model->getAnmMtx(l_backJointNo));
+        sheath->calc();
+    }
+
+    if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
+        sword->setBaseTRMtx(model->getAnmMtx(l_leftItemJointNo));
+    } else {
+        mDoMtx_stack_c::copy(model->getAnmMtx(l_backJointNo));
+        mDoMtx_stack_c::transM(l_stowedSwordOffsetX, l_stowedSwordOffsetY, l_stowedSwordOffsetZ);
+        mDoMtx_stack_c::XYZrotM(0, cM_deg2s(l_stowedSwordYawDeg), 0);
+        sword->setBaseTRMtx(mDoMtx_stack_c::get());
+    }
+
+    sword->calc();
+}
+
+/**
+ * Draw the sword and its sheath.
+ *
+ * ★ The bracket around the blade is the whole reason this is its own function.
+ *
+ * daAlink_c hides part of the sword model when it is sheathed and shows it when it is drawn —
+ * material 0 for a real sword, material 1 for the wooden one (d_a_alink.cpp:4385-4395). He does it
+ * on the MODEL DATA, which the puppet shares with him for the two swords that come out of "Alink".
+ * So the flag is one variable serving two actors that can disagree about it, and a puppet with a
+ * sheathed sword standing next to a local player with a drawn one would otherwise fight over it
+ * every frame.
+ *
+ * Bracketing works because the flag is consumed at ENTRY time, not at draw time: J3DJoint::entryIn
+ * tests it as it builds the packet (J3DJoint.cpp:164-165), and mDoExt_modelEntryDL is what runs
+ * that. So setting it, entering, and putting it back leaves the local player's own state exactly as
+ * it was by the time he enters his.
+ *
+ * The wooden sword needs no bracket — it comes from the puppet's private outfit archive — but gets
+ * one anyway, because the alternative is a rule that is true for two of three cases.
+ */
+void daRemotePlayer_c::drawEquip() {
+    J3DModel* sheath = NULL;
+    J3DModel* sword = currentSword(&sheath);
+    if (sword == NULL) {
+        return;
+    }
+
+    const bool inHand = (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0;
+    const u8 kind = static_cast<u8>(
+        (mNetEquip & dusk::mp::kPlayerEquipSwordKindMask) >> dusk::mp::kPlayerEquipSwordKindShift);
+    /* The material differs by sword AND the sense is inverted between them: the wooden sword hides
+     * its material 1 when drawn, every other sword shows its material 0. Both are transcribed from
+     * the same four lines rather than unified, because unifying them is how the inversion gets
+     * lost. */
+    const u16 bladeMatNo = kind == dusk::mp::kPlayerEquipSwordWood ? 1 : 0;
+    const bool bladeVisible = kind == dusk::mp::kPlayerEquipSwordWood ? !inHand : inHand;
+
+    J3DModelData* swordData = sword->getModelData();
+    J3DShape* blade = NULL;
+    bool bladeWasVisible = false;
+    if (swordData != NULL && bladeMatNo < swordData->getMaterialNum()) {
+        blade = swordData->getMaterialNodePointer(bladeMatNo)->getShape();
+        // J3DShpFlag_Visible SET means hidden — hide() turns it on (J3DShape.h:171-172). Read the
+        // flag rather than remembering what we last wrote: the local player writes it too.
+        bladeWasVisible = !blade->checkFlag(J3DShpFlag_Visible);
+        if (bladeVisible) {
+            blade->show();
+        } else {
+            blade->hide();
+        }
+    }
+
+    drawModel(sword);
+    drawModel(sheath);
+
+    if (blade != NULL) {
+        if (bladeWasVisible) {
+            blade->show();
+        } else {
+            blade->hide();
+        }
+    }
+
+    if (!mLoggedEquip) {
+        mLoggedEquip = true;
+        Log.debug("Puppet {} drawing equipment: sword kind {} {} (blade material {} {}), sheath {} "
+                  "| equip byte 0x{:02x}",
+            mPlayerId, kind, inHand ? "in hand" : "on the back", bladeMatNo,
+            bladeVisible ? "shown" : "hidden", sheath != NULL ? "yes" : "no", mNetEquip);
+    }
+}
+
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
     mDoMtx_stack_c::YrotM(shape_angle.y);
@@ -3513,6 +3785,10 @@ void daRemotePlayer_c::setMatrix() {
         mpHandModel->setAnmMtx(1, model->getAnmMtx(l_leftHandJointNo));
         mpHandModel->setAnmMtx(2, model->getAnmMtx(l_rightHandJointNo));
     }
+
+    // Last, and after the body's calc for the same reason as the three above: the sword and sheath
+    // hang off body joints, which are not final until calc has run.
+    setEquipMatrix();
 }
 
 /// Keep the puppet lit by the floor and the room it is actually standing on.
@@ -3814,6 +4090,10 @@ int daRemotePlayer_c::draw() {
     drawModel(mpHeadModel);
     drawModel(mpFaceModel);
     drawModel(mpHandModel);
+    // After the body, exactly where daAlink_c draws them (d_a_alink.cpp:19610-19617): they are
+    // separate models rather than geometry on the body, and they read their own visibility.
+    traceCalc("draw: equipment");
+    drawEquip();
     // Last, exactly where daAlink_c puts it (d_a_alink.cpp:19849-19853): the shadow projects the
     // models, so it wants them posed and their tevStr settled, and it renders in its own later pass
     // rather than into the draw list we have just filled.

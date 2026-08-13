@@ -13,7 +13,7 @@
  *
  * Rows are long-format (one row per subject per tick) because the number of players varies:
  *
- *   tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,buffered,anm,flags
+ *   tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,buffered,anm,flags,equip
  *
  * `kind` is `local` for this instance's own Link, `applied` for the pose pushed onto a puppet, and
  * `actor` for the pose read back off the puppet actor afterwards. `applied` and `actor` disagreeing

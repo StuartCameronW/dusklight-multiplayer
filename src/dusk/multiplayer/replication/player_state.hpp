@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "dusk/player_equip.hpp"
+
 #include "../net/serializer.hpp"
 
 /**
@@ -103,7 +105,7 @@ enum PlayerStateFlags : std::uint8_t {
     kPlayerStateNoFootIk = 1 << 5,
 };
 
-/// 20 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
+/// 21 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -140,12 +142,30 @@ struct PlayerState {
     /// recognise — 0xFF "nobody reported one" included.
     std::uint8_t outfit = 0xFF;
     std::uint8_t flags = 0;
+    /// Sword and shield: which, and where. See PlayerEquipFlags for the bit layout.
+    ///
+    /// Discrete like `flags` and `outfit`, and taken whole from the newer sample for the same
+    /// reason — blending the two kind fields would name a model neither player is holding.
+    std::uint8_t equip = 0;
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
     bool mode_idle() const { return (flags & kPlayerStateModeIdle) != 0; }
     bool no_foot_ik() const { return (flags & kPlayerStateNoFootIk) != 0; }
+
+    bool sword_draw() const { return (equip & kPlayerEquipSwordDraw) != 0; }
+    bool sword_in_hand() const { return (equip & kPlayerEquipSwordInHand) != 0; }
+    std::uint8_t sword_kind() const {
+        return static_cast<std::uint8_t>(
+            (equip & kPlayerEquipSwordKindMask) >> kPlayerEquipSwordKindShift);
+    }
+    bool shield_draw() const { return (equip & kPlayerEquipShieldDraw) != 0; }
+    bool shield_in_hand() const { return (equip & kPlayerEquipShieldInHand) != 0; }
+    std::uint8_t shield_kind() const {
+        return static_cast<std::uint8_t>(
+            (equip & kPlayerEquipShieldKindMask) >> kPlayerEquipShieldKindShift);
+    }
 
     void write(Writer& w) const {
         w.write_f32(posX);
@@ -155,11 +175,12 @@ struct PlayerState {
         w.write_f32(moveRate);
         w.write_u8(outfit);
         w.write_u8(flags);
+        w.write_u8(equip);
     }
 
     bool read(Reader& r) {
         return r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
-               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags);
+               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip);
     }
 };
 
@@ -203,6 +224,7 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.outfit = b.outfit;
     // Flags are discrete: take the newer sample's, never a blend of two bitfields.
     out.flags = b.flags;
+    out.equip = b.equip;
     return out;
 }
 
