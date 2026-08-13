@@ -200,14 +200,21 @@ private:
     /// Hook the sway callback onto the head model's joints. Once, at createHeap time.
     void setupHeadSway();
 
-    /* Sword and sheath. daAlink_c draws them as separate models hung off body joints, so the puppet
-     * does too — a sword is not part of the body skeleton and cannot be animated onto it.
+    /* Sword, sheath and shield. daAlink_c draws them as separate models hung off body joints, so
+     * the puppet does too — none of them is part of the body skeleton and none can be animated onto
+     * it.
      *
      *   setupEquipModels() — once, at createHeap time. Builds all of them up front, as daAlink_c
      *                        does, so a change of sword is a change of pointer rather than a load.
-     *   setEquipMatrix()   — every tick, AFTER the body's calc: both models hang off body joints,
+     *   setEquipMatrix()   — every tick, AFTER the body's calc: every model hangs off body joints,
      *                        which are not final until then.
      *   drawEquip()        — from draw(), inside the sword-blade bracket. See the .cpp.
+     *
+     * ★ The sword half and the shield half are INDEPENDENT in all three, and that is a correction
+     * rather than a style: carrying a shield with no sword drawn is the ordinary state for most of
+     * the game, so the two early-outs that used to give up on "no sword" now branch instead. Gating
+     * the shield behind the sword makes a shield that appears only while a blade is out — which
+     * looks entirely correct in any screenshot taken with one.
      */
     void setupEquipModels();
     void setEquipMatrix();
@@ -215,6 +222,10 @@ private:
     /// The sword model this tick's equipment byte selects, or NULL for none. Also reports which
     /// sheath goes with it, since the pairing is not one-to-one.
     J3DModel* currentSword(J3DModel** o_sheath) const;
+    /// The shield model this tick's equipment byte selects, or NULL for none. Separate from
+    /// currentSword() rather than a second out-parameter on it, because the two selections are
+    /// genuinely independent and pairing them is how one ends up gating the other.
+    J3DModel* currentShield() const;
     /// Report any change to the puppet's material state. Diagnostic for A5; must run every tick.
     void checkMaterialDrift();
     /* ★ TEMPORARY — Hang 4 bisection. One line per step of the first few calcs, so the last line in
@@ -434,6 +445,28 @@ private:
      * wood and master pointing at the same model, so the caller never has to know that. */
     J3DModel* mpSheathModel[3];
 
+    /* One shield model per kind, indexed by the wire's PlayerEquipShield values.
+     *
+     * ★ These are the one piece of equipment that CANNOT borrow the local player's models, and the
+     * reason is the same refcount-blind wipe that mOwnRes exists for. daAlink_c loads his shield
+     * into a heap of his own (d_a_alink.cpp:4975-4981) and calls mpShieldArcHeap->freeAll() the
+     * moment the shield changes (d_a_alink_swindow.inc:141), which would free the J3DModelData out
+     * from under any puppet pointing into it. The swords escape this only because they live in
+     * "Alink", which is mounted at boot and never freed. So each shield comes from this puppet's
+     * OWN mount of that kind's archive, held below.
+     *
+     * All three are built up front, exactly as the swords are, so a shield change is a change of
+     * pointer rather than an archive load: the puppet has no proc-driven moment at which to run
+     * daAlink_c's four-tick reload (loadShieldModelDVD), and the NULL-model window in the middle of
+     * it would show as the shield blinking out. Any of them may be NULL and that costs a shield
+     * rather than a puppet, on the same terms as a missing head. */
+    J3DModel* mpShieldModel[3];
+
+    /* This puppet's PRIVATE mounts of the three shield archives — CWShd, SWShd and HyShd, one BMD
+     * each at index 3. Plain members for exactly the reason mOwnRes is one: ~dRes_info_c unmounts
+     * and frees each of them when the actor dies, with no teardown ordering to get wrong. */
+    dRes_info_c mShieldRes[3];
+
     /* The blink. BTP swaps the eyelid texture, BTK slides the texture matrix; they are played in
      * lock-step on the same frame number. Both are this puppet's own copies out of the ARAM
      * archive, so setting a frame here cannot disturb the local player's eyes. */
@@ -509,14 +542,19 @@ private:
      */
     bool mLinkSampled;
     /* Last-seen material signature per watched model, in the order body/head/hands/face and then
-     * the three swords and two sheaths. 0xFFFF until the first sample. See checkMaterialDrift(). */
-    u16 mMaterialSig[9];
+     * the three swords, two sheaths and three shields. 0xFFFF until the first sample. See
+     * checkMaterialDrift().
+     *
+     * ★ This length, l_watchedModelNum in the .cpp, and the names table beside it move TOGETHER.
+     * Widening the count without widening these two arrays is a silent overrun of the actor struct
+     * that the priming loop in createHeap() commits before anything is ever drawn. */
+    u16 mMaterialSig[12];
     /* Last-seen COUNT of materials drawing the dissolve, same model order. Watched separately from
      * the signature above because the signature is material 0's, and the warp toggles break on the
      * first material already in the target state — so a model can sit with material 0 clean and
      * every other material dissolving without the signature ever moving. 0xFFFF until first
-     * sampled. */
-    u16 mWarpMatCount[9];
+     * sampled. Same length and same model order as mMaterialSig above. */
+    u16 mWarpMatCount[12];
     /* ★ TEMPORARY — Hang 4. How many calcs have been step-traced so far. See traceCalc(). */
     u16 mCalcTraced;
 
@@ -651,6 +689,11 @@ private:
     u8 mNetEquip;
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
+    /// And the same for the shield, which needs its OWN latch rather than sharing mLoggedEquip: the
+    /// two halves of the equipment byte are drawn independently, so a session in which the sword
+    /// line appears and the shield line does not is a real and interesting state. Zero at spawn via
+    /// fopAcM_ct's zeroing of the actor, like every other latch here.
+    bool mLoggedShield;
 
     /* Hang 4's guard. The sim tick this puppet last ENTERED the draw list on, and whether it ever
      * has. A J3DModel may be entered once per pass; a second entry builds a self-referential shape

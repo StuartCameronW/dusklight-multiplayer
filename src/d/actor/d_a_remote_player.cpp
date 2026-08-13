@@ -107,6 +107,35 @@ const char l_alinkArcName[] = "Alink";
  * cannot be included here. */
 const char l_woodSwordResName[] = "al_SWB.bmd";
 
+/* The three shield archives, in PlayerEquipShield order — which is setShieldArcName's own order
+ * (d_a_alink_swindow.inc:28-36). Each is a separate ARCHIVE holding exactly ONE model, which is why
+ * there are three private mounts here where all four sword and sheath models needed none.
+ *
+ * ★ Kind 0 means "the carved wooden shield OR no shield at all": setShieldArcName's first branch
+ * folds those two together, so a player who owns nothing still names CWShd and the puppet still
+ * mounts it. Nothing is wasted by that — it is the draw bit, not the kind, that decides whether
+ * anything appears, and having the archive already mounted is the whole point of loading all three.
+ */
+const char* const l_shieldArcName[3] = {"CWShd", "SWShd", "HyShd"};
+/* The one BMD in each, by name rather than by the index 3 daAlink_c uses
+ * (d_a_alink_swindow.inc:128) — own_archive_res() is name-keyed, and the per-region resource
+ * headers cannot be included here for the same reason the outfit ones cannot. Verified identical
+ * across every region header in the tree (assets/<region>/res/Object/{CWShd,SWShd,HyShd}.h): one
+ * BMD, at index 3, one joint. */
+const char* const l_shieldResName[3] = {"al_SHB.bmd", "al_SHC.bmd", "al_SHA.bmd"};
+
+/* The two tables above and mpShieldModel/mShieldRes are all indexed by the wire's shield kind, so a
+ * fourth kind appearing on the wire has to grow them together. They are spelled as a bare 3 in the
+ * header for the same reason mpSwordModel[3] is — the actor header does not include the wire
+ * layout.
+ *
+ * ⚠ This assertion is a NO-OP on every build Dusk ships: STATIC_ASSERT only expands to anything
+ * under
+ * __MWERKS__ on the USA GameCube target (global.h:62-73). It is written down because it is the
+ * house idiom for this invariant and it would fire on that target, not because it protects this
+ * one. The real protection is the range check in currentShield(). */
+STATIC_ASSERT(dusk::mp::kPlayerEquipShieldKindNum == 3);
+
 /* Body joints the sub-models hang off. daAlink_c uses these same three literals: the head and face
  * both ride joint 4 (d_a_alink.cpp:5968-5970) and the hands model's own joints 1 and 2 are
  * overwritten with the body's hand joints after its calc (d_a_alink.cpp:19013-19014).
@@ -648,7 +677,7 @@ const u16 l_idleFrameLogTick = 200;
  * period of 150 yielded exactly one sample.
  */
 /* Models watched by checkMaterialDrift(), in the order body / head / hands / face, then the three
- * swords and the two sheaths.
+ * swords, the two sheaths and the three shields.
  *
  * ★ The equipment half is not symmetry for its own sake — it is the only way to see the one hazard
  * the body half does not have. The body, head, hands and face are PRIVATE copies out of the
@@ -658,8 +687,16 @@ const u16 l_idleFrameLogTick = 200;
  * onto that shared data for his sword, shield and sheath. When he warps, the puppet's blade and
  * scabbard go with him — and the puppet drives none of the UVs that make the effect look like
  * anything (d_resorce.cpp:212-225 needs setWarpSRT every frame). This watch is what turns "the
- * sheath has a strange particle effect" into a timestamped line saying which model and when. */
-const int l_watchedModelNum = 9;
+ * sheath has a strange particle effect" into a timestamped line saying which model and when.
+ *
+ * The three shields are watched even though they are private mounts, and that is deliberate: it is
+ * the CONTROL. His changeWarpMaterial reaches his shield too (:15003), so if a puppet's shield ever
+ * moves in step with his, the private mount is not doing what its whole existence rests on — and
+ * that is a fact worth a log line rather than an assumption. It should stay silent forever.
+ *
+ * ★ This count, mMaterialSig[] and mWarpMatCount[] in the header, and the names table in
+ * checkMaterialDrift() all move TOGETHER. */
+const int l_watchedModelNum = 12;
 const u16 l_capComparePeriod = 60;
 const u16 l_capCompareCount = 8;
 /* The wind breakdown samples on its own schedule, and only while there is wind, because unlike the
@@ -1457,7 +1494,7 @@ u8 daRemotePlayer_localOutfitToWire() {
 }
 
 /**
- * Mount this puppet's OWN copy of the outfit archive.
+ * Mount this puppet's OWN copies of the outfit archive and of all three shield archives.
  *
  * ★ Deliberately NOT dComIfG_resLoad. That registers against a global, name-keyed,
  * reference-counted table (dRes_control_c::setRes, d_resorce.cpp:793-816), so a puppet asking for
@@ -1482,6 +1519,24 @@ u8 daRemotePlayer_localOutfitToWire() {
  * Cost is one extra archive per remote player (Link budgets 0xA2800 for his, d_a_alink.cpp:4969).
  * Passing NULL for the heap puts it where the puppet's archive already went before this change: the
  * global archive heap, which nothing ever calls freeAll on.
+ *
+ * ★ The three SHIELD archives are mounted here on exactly the same argument, and it is not the
+ * lifetime argument by analogy — it is the same failure, one heap along. daAlink_c keeps his shield
+ * in a second private heap (mpShieldArcHeap, d_a_alink.cpp:4976) and calls freeAll() on it the
+ * moment the equipped shield changes (d_a_alink_swindow.inc:141), so a puppet reading
+ * dComIfG_getObjectRes("HyShd", 3) is holding a pointer that the local player can free by opening
+ * his menu. That is why the shields cannot follow the swords, which read "Alink" directly.
+ *
+ * All four mounts are STARTED on the same tick rather than chained. Each dRes_info_c owns its own
+ * mDoDvdThd_mountArchive_c (d_resorce.cpp:53-70), so they are independent; serialising them would
+ * add three more multi-frame waits to the slowest thing a joining player sees. Polling a mount that
+ * has already finished is free and safe — dRes_info_c::setRes()'s entire body sits inside
+ * `if (mArchive == NULL)` and it returns 0 for ever after (d_resorce.cpp:586-664).
+ *
+ * Cost of the shields is small and is NOT on the actor's solid heap: with a NULL heap the resources
+ * land in a solid heap carved out of the game heap and then trimmed to fit (d_resorce.cpp:626-643).
+ * Link budgets 0x7000 for one of these archives (d_a_alink.cpp:4976), against the 0xA2800 he
+ * budgets for the outfit archive the puppet already mounts.
  */
 int daRemotePlayer_c::mountOwnArchive() {
     if (!mResRequested) {
@@ -1491,19 +1546,47 @@ int daRemotePlayer_c::mountOwnArchive() {
             Log.warn("Puppet could not start a private mount of '{}'", l_outfits[mOutfit].arcName);
             return cPhs_ERROR_e;
         }
+
+        for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
+            if (!mShieldRes[i].set(
+                    l_shieldArcName[i], l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL))
+            {
+                Log.warn("Puppet could not start a private mount of shield archive '{}'",
+                    l_shieldArcName[i]);
+                return cPhs_ERROR_e;
+            }
+        }
+
         mResRequested = true;
     }
 
-    const int resState = mOwnRes.setRes();
-    if (resState > 0) {
-        return cPhs_LOADING_e;
-    }
-    if (resState < 0) {
+    /* Every mount is polled every tick and COMPLEATE is reported only once none of them is still
+     * loading. Written as a flag rather than as an early `return cPhs_LOADING_e` on the first one
+     * that is busy, because that would stop polling the others and let a genuine mount ERROR sit
+     * undetected behind a slower sibling. */
+    bool loading = false;
+
+    const int outfitState = mOwnRes.setRes();
+    if (outfitState < 0) {
         Log.warn("Puppet's private mount of '{}' failed", l_outfits[mOutfit].arcName);
         return cPhs_ERROR_e;
     }
+    if (outfitState > 0) {
+        loading = true;
+    }
 
-    return cPhs_COMPLEATE_e;
+    for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
+        const int shieldState = mShieldRes[i].setRes();
+        if (shieldState < 0) {
+            Log.warn("Puppet's private mount of shield archive '{}' failed", l_shieldArcName[i]);
+            return cPhs_ERROR_e;
+        }
+        if (shieldState > 0) {
+            loading = true;
+        }
+    }
+
+    return loading ? cPhs_LOADING_e : cPhs_COMPLEATE_e;
 }
 
 /* Read and cleared by the network layer's spawn backoff; see d_a_remote_player.h. */
@@ -1539,7 +1622,8 @@ int daRemotePlayer_c::create() {
          * legitimately takes many frames. Only the error step is worth recording. */
         if (mountPhase == cPhs_ERROR_e) {
             g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
-            g_daRemotePlayer_lastCreateFail.mReason = "the private archive mount failed";
+            g_daRemotePlayer_lastCreateFail.mReason = "one of the private archive mounts (the "
+                                                      "outfit, or one of the three shields) failed";
         }
         return mountPhase;
     }
@@ -2753,9 +2837,13 @@ void daRemotePlayer_c::checkMaterialDrift() {
         mpSwordModel[2] != NULL ? mpSwordModel[2]->getModelData() : NULL,
         mpSheathModel[0] != NULL ? mpSheathModel[0]->getModelData() : NULL,
         mpSheathModel[1] != NULL ? mpSheathModel[1]->getModelData() : NULL,
+        mpShieldModel[0] != NULL ? mpShieldModel[0]->getModelData() : NULL,
+        mpShieldModel[1] != NULL ? mpShieldModel[1]->getModelData() : NULL,
+        mpShieldModel[2] != NULL ? mpShieldModel[2]->getModelData() : NULL,
     };
     static const char* const names[l_watchedModelNum] = {"body", "head", "hands", "face",
-        "sword ordon", "sword master", "sword wood", "sheath PODA", "sheath PODM"};
+        "sword ordon", "sword master", "sword wood", "sheath PODA", "sheath PODM",
+        "shield carving wood", "shield shop wood", "shield hylian"};
 
     for (int i = 0; i < l_watchedModelNum; i++) {
         const u16 signature = material_signature(models[i]);
@@ -3891,11 +3979,11 @@ void daRemotePlayer_c::setFootMatrix() {
     }
 }
 
-/* --- Sword and sheath ------------------------------------------------------------------------ */
+/* --- Sword, sheath and shield ----------------------------------------------------------------- */
 
 /* Where each piece hangs, from daAlink_c's human branch (d_a_alink_wolf.inc:563-571). The puppet
  * already uses 9 and 14 for the hand JOINTS; these are the ITEM joints, one further down each hand,
- * and the back joint the sheath and the stowed sword ride.
+ * and the back joint the sheath, the stowed sword and the stowed shield all ride.
  *
  * ★ These are daAlink_c MEMBERS there, not constants, because the wolf uses a different skeleton
  * (19/24/2 at :277-285). A puppet is never a wolf — kPlayerStateWolf is reserved and always sent
@@ -3912,6 +4000,19 @@ const f32 l_stowedSwordOffsetX = -18.5f;
 const f32 l_stowedSwordOffsetY = 0.14f;
 const f32 l_stowedSwordOffsetZ = 12.2f;
 const f32 l_stowedSwordYawDeg = 33.1f;
+
+/* And where the shield sits on the same joint, from the same function (d_a_alink.cpp:5947-5950).
+ *
+ * ★ Three things ride body joint 5 — the sheath with no offset at all, the stowed sword out to the
+ * left, and this, centred and set back by 20 units. They clear each other because these numbers
+ * were authored against each other, so none of them may be rounded, tidied or "corrected" to look
+ * better in isolation. */
+const f32 l_stowedShieldOffsetX = 4.2f;
+const f32 l_stowedShieldOffsetY = -4.4f;
+const f32 l_stowedShieldOffsetZ = -20.0f;
+const f32 l_stowedShieldPitchDeg = 91.0f;
+const f32 l_stowedShieldYawDeg = 57.0f;
+const f32 l_stowedShieldRollDeg = 180.0f;
 
 /**
  * Which sword model this tick's equipment byte selects, and the sheath that goes with it.
@@ -3940,7 +4041,35 @@ J3DModel* daRemotePlayer_c::currentSword(J3DModel** o_sheath) const {
 }
 
 /**
- * Build every sword and sheath the puppet might need, once, at createHeap time.
+ * Which shield model this tick's equipment byte selects, or NULL for none.
+ *
+ * A separate function from currentSword() rather than a second out-parameter on it, because the two
+ * selections are genuinely independent: a player carrying a shield with no sword drawn is the
+ * ordinary state for most of the game, and the moment the two answers share a call they start
+ * sharing an early-out as well.
+ *
+ * NULL covers the same two cases the sword's does — the sender is not drawing a shield, or the
+ * model failed to load when the puppet was built — and both end as a shieldless puppet, which is
+ * the right failure. There is no "which sheath" question here: a shield has no scabbard.
+ */
+J3DModel* daRemotePlayer_c::currentShield() const {
+    if ((mNetEquip & dusk::mp::kPlayerEquipShieldDraw) == 0) {
+        return NULL;
+    }
+
+    const u8 kind = static_cast<u8>((mNetEquip & dusk::mp::kPlayerEquipShieldKindMask) >>
+                                    dusk::mp::kPlayerEquipShieldKindShift);
+    if (kind >= dusk::mp::kPlayerEquipShieldKindNum) {
+        // The wire has a fourth value that means nothing. Shieldless rather than indexed off the
+        // end.
+        return NULL;
+    }
+
+    return mpShieldModel[kind];
+}
+
+/**
+ * Build every sword, sheath and shield the puppet might need, once, at createHeap time.
  *
  * ★ The ordon and master swords and both sheaths come from the "Alink" archive, which the puppet
  * READS DIRECTLY rather than mounting privately — the one place it does that, and it needs its
@@ -3958,7 +4087,9 @@ J3DModel* daRemotePlayer_c::currentSword(J3DModel** o_sheath) const {
  * have the third, and that one is real — see drawEquip(), which brackets it.
  *
  * The wooden sword is the exception and comes from the puppet's OWN outfit archive, because that is
- * where daAlink_c gets it (d_a_alink_wolf.inc:415, from mArcName rather than l_arcName).
+ * where daAlink_c gets it (d_a_alink_wolf.inc:415, from mArcName rather than l_arcName). The three
+ * SHIELDS are the same kind of exception for a stronger reason; the block over their loop, at the
+ * end of this function, has it.
  *
  * The flag pairs are daAlink_c's, verbatim (d_a_alink.cpp:4239-4253). They are not decorative:
  * initModelEnv is mdlFlags 0 where init_model is 0x80000, and the master sword additionally carries
@@ -3968,6 +4099,10 @@ void daRemotePlayer_c::setupEquipModels() {
     for (int i = 0; i < dusk::mp::kPlayerEquipSwordKindNum; i++) {
         mpSwordModel[i] = NULL;
         mpSheathModel[i] = NULL;
+    }
+
+    for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
+        mpShieldModel[i] = NULL;
     }
 
     J3DModelData* swaData = static_cast<J3DModelData*>(
@@ -4031,44 +4166,129 @@ void daRemotePlayer_c::setupEquipModels() {
                 mpSheathModel[i] != NULL ? "ok" : "missing");
         }
     }
+
+    /* The three shields, each out of its own private mount.
+     *
+     * ★ diffFlags 0, NOT the 0x200 the two sheaths above carry, and the difference between those
+     * two lines is the whole argument rather than an inconsistency.
+     *
+     * 0x200 is J3D_DIFF_TEXGENNUM(2), and it is up there because the puppet SHARES one J3DModelData
+     * with the local player for everything that comes out of "Alink": the J3DTexMtx objects live on
+     * the data, so with texgen diff at zero the last actor to calc before an entry decides what
+     * BOTH of them draw. A shield is privately mounted. This data has exactly one writer — this
+     * actor — so there is no second calc to lose a race with, and passing 0 is daAlink_c's own
+     * value (setShieldModel, d_a_alink_swindow.inc:128). Copying him is right here precisely
+     * BECAUSE the condition that forced the sheaths off his value is absent, and adding 0x200
+     * anyway would be carrying a fix past the bug it was for.
+     *
+     * ⚠ The one thing that would refute this: if a stray reflection or warp look ever appears on a
+     * puppet's shield, the diff is against GX state rather than against the model's own data, and
+     * then 0x200 belongs here too. Do not pre-apply it — it would make that measurement impossible.
+     *
+     * init_model and NOT init_model_env, for all three. daAlink_c gives no shield the env path;
+     * only AL_SWM and AL_PODM get it (:4243, :4251), and his shield goes through plain initModel.
+     *
+     * The warp bracket inside init_model is load-bearing here and is the reason these do not call
+     * mDoExt_J3DModel__create directly. All three shield archives are BMWR, so addWarpMaterial ran
+     * on them and the loader hands them over with the twilight dissolve already ENABLED
+     * (d_resorce.cpp:145-178); it is the trailing offWarpMaterial that turns it off. A shield built
+     * outside the bracket would dissolve — the A5 bug, three models further out. */
+    static const char* const shieldWhat[3] = {
+        "shield carving wood", "shield shop wood", "shield hylian"};
+
+    for (int i = 0; i < dusk::mp::kPlayerEquipShieldKindNum; i++) {
+        mpShieldModel[i] = init_model(
+            static_cast<J3DModelData*>(own_archive_res(mShieldRes[i], l_shieldResName[i])), 0,
+            shieldWhat[i]);
+
+        /* Not fatal, exactly as above. Logged per kind and with the archive named, because which
+         * one is missing is again the whole diagnosis: one missing shield means that archive did
+         * not mount, three missing shields means mountOwnArchive() reported COMPLEATE for mounts
+         * that never happened, and those are very different bugs. */
+        if (mpShieldModel[i] == NULL) {
+            Log.warn("Puppet has no shield model for kind {} ('{}' / '{}'); it will appear "
+                     "shieldless while that one is equipped",
+                i, l_shieldArcName[i], l_shieldResName[i]);
+        }
+    }
 }
 
 /**
- * Hang the sword and its sheath off the body's joints. Every tick, AFTER the body's calc.
+ * Hang the sword, its sheath and the shield off the body's joints. Every tick, AFTER the body's
+ * calc.
  *
- * daAlink_c::setItemMatrix (d_a_alink.cpp:5883-5906), keeping the two placements that exist for a
- * player who is simply carrying a sword. What is left out is all one thing — his `param_0`, the
- * status-window pose, which forces the sword into the hand for the pause menu's rotating model.
+ * daAlink_c::setItemMatrix (d_a_alink.cpp:5883-5965), keeping the placements that exist for a
+ * player who is simply carrying his equipment. What is left out is all one thing — his `param_0`,
+ * the status-window pose, which forces the sword into the hand for the pause menu's rotating model.
  *
  * The sheath is unconditional and the sword is not: the sheath rides the back whatever the sword is
  * doing, which is what makes a drawn sword read as drawn.
+ *
+ * ★ The sword's "nothing to do" test is a BRANCH here, where it used to be an early return, and
+ * that is a fix rather than a refactor. Carrying a shield with no sword drawn is the ordinary state
+ * for most of the game, and returning on `sword == NULL` left the shield with no base transform at
+ * all — i.e. parked at the world origin. The two halves of the equipment byte are independent, so
+ * nothing in this function may gate one on the other.
  */
 void daRemotePlayer_c::setEquipMatrix() {
     J3DModel* sheath = NULL;
     J3DModel* sword = currentSword(&sheath);
-    if (sword == NULL) {
-        return;
+
+    if (sword != NULL) {
+        if (sheath != NULL) {
+            sheath->setBaseTRMtx(model->getAnmMtx(l_backJointNo));
+            sheath->calc();
+        }
+
+        if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
+            sword->setBaseTRMtx(model->getAnmMtx(l_leftItemJointNo));
+        } else {
+            mDoMtx_stack_c::copy(model->getAnmMtx(l_backJointNo));
+            mDoMtx_stack_c::transM(
+                l_stowedSwordOffsetX, l_stowedSwordOffsetY, l_stowedSwordOffsetZ);
+            mDoMtx_stack_c::XYZrotM(0, cM_deg2s(l_stowedSwordYawDeg), 0);
+            sword->setBaseTRMtx(mDoMtx_stack_c::get());
+        }
+
+        sword->calc();
     }
 
-    if (sheath != NULL) {
-        sheath->setBaseTRMtx(model->getAnmMtx(l_backJointNo));
-        sheath->calc();
-    }
+    /* The shield — the second half of his setItemMatrix (d_a_alink.cpp:5921-5965).
+     *
+     * ★ WHICH placement is not a decision this actor is allowed to make. His test is a seven-term
+     * disjunction over guard state, two demo procs, a guard-break proc, a no-reset flag and a
+     * shield-on-backbone end flag (:5922-5929), and every term of it is state a puppet has no
+     * access to whatsoever. The sender answers it and sends the bit (player_bridge.cpp:378-390);
+     * see kPlayerEquipShieldInHand for why this is the single most necessary bit in the byte.
+     *
+     * The hand really is the RIGHT item joint where the sword takes the left (:5931 against :5895);
+     * they are opposite hands and swapping them is a mistake that looks almost right.
+     *
+     * ★ Gated on the DRAW bit, where daAlink_c gates on mShieldChangeWaitTimer == 0 and poses the
+     * shield whether or not it is about to be drawn (:5921, :5965). A deliberate divergence with a
+     * reason on each side: we have no such timer — the sender folds it into checkShieldDraw — and
+     * his only consumer of an undrawn shield's matrix is getShieldMtx() for the guard front-range
+     * vector (d_a_alink.h:3642, used at :6840), which a puppet has no counterpart to. A model that
+     * is never entered does not need matrices. */
+    J3DModel* shield = currentShield();
+    if (shield != NULL) {
+        if ((mNetEquip & dusk::mp::kPlayerEquipShieldInHand) != 0) {
+            shield->setBaseTRMtx(model->getAnmMtx(l_rightItemJointNo));
+        } else {
+            mDoMtx_stack_c::copy(model->getAnmMtx(l_backJointNo));
+            mDoMtx_stack_c::transM(
+                l_stowedShieldOffsetX, l_stowedShieldOffsetY, l_stowedShieldOffsetZ);
+            mDoMtx_stack_c::XYZrotM(cM_deg2s(l_stowedShieldPitchDeg),
+                cM_deg2s(l_stowedShieldYawDeg), cM_deg2s(l_stowedShieldRollDeg));
+            shield->setBaseTRMtx(mDoMtx_stack_c::get());
+        }
 
-    if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0) {
-        sword->setBaseTRMtx(model->getAnmMtx(l_leftItemJointNo));
-    } else {
-        mDoMtx_stack_c::copy(model->getAnmMtx(l_backJointNo));
-        mDoMtx_stack_c::transM(l_stowedSwordOffsetX, l_stowedSwordOffsetY, l_stowedSwordOffsetZ);
-        mDoMtx_stack_c::XYZrotM(0, cM_deg2s(l_stowedSwordYawDeg), 0);
-        sword->setBaseTRMtx(mDoMtx_stack_c::get());
+        shield->calc();
     }
-
-    sword->calc();
 }
 
 /**
- * Draw the sword and its sheath.
+ * Draw the sword, its sheath and the shield.
  *
  * ★ The bracket around the blade is the whole reason this is its own function.
  *
@@ -4086,56 +4306,99 @@ void daRemotePlayer_c::setEquipMatrix() {
  *
  * The wooden sword needs no bracket — it comes from the puppet's private outfit archive — but gets
  * one anyway, because the alternative is a rule that is true for two of three cases.
+ *
+ * ★ Same structural point as setEquipMatrix(): the sword's "nothing to do" test is a branch, not an
+ * early return, because a shield is drawn independently of whether a blade is out. The old return
+ * would have produced a shield that appears only while a sword is drawn — which looks entirely
+ * correct in any screenshot taken with one, and is wrong for most of the game.
+ *
+ * ★ Everything here is called EXACTLY ONCE per pass, and that is Hang 4's rule rather than a
+ * stylistic preference: a J3DModel entered twice in one pass has its mat packet's shape chain made
+ * to point at itself (J3DJoint::entryIn, J3DJoint.cpp:164-180) and the renderer never terminates.
+ * draw() carries the per-sim-tick guard that protects everything it calls; nothing here may be
+ * entered from a second call site.
  */
 void daRemotePlayer_c::drawEquip() {
     J3DModel* sheath = NULL;
     J3DModel* sword = currentSword(&sheath);
-    if (sword == NULL) {
-        return;
-    }
 
-    const bool inHand = (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0;
-    const u8 kind = static_cast<u8>(
-        (mNetEquip & dusk::mp::kPlayerEquipSwordKindMask) >> dusk::mp::kPlayerEquipSwordKindShift);
-    /* The material differs by sword AND the sense is inverted between them: the wooden sword hides
-     * its material 1 when drawn, every other sword shows its material 0. Both are transcribed from
-     * the same four lines rather than unified, because unifying them is how the inversion gets
-     * lost. */
-    const u16 bladeMatNo = kind == dusk::mp::kPlayerEquipSwordWood ? 1 : 0;
-    const bool bladeVisible = kind == dusk::mp::kPlayerEquipSwordWood ? !inHand : inHand;
+    if (sword != NULL) {
+        const bool inHand = (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0;
+        const u8 kind = static_cast<u8>((mNetEquip & dusk::mp::kPlayerEquipSwordKindMask) >>
+                                        dusk::mp::kPlayerEquipSwordKindShift);
+        /* The material differs by sword AND the sense is inverted between them: the wooden sword
+         * hides its material 1 when drawn, every other sword shows its material 0. Both are
+         * transcribed from the same four lines rather than unified, because unifying them is how
+         * the inversion gets lost. */
+        const u16 bladeMatNo = kind == dusk::mp::kPlayerEquipSwordWood ? 1 : 0;
+        const bool bladeVisible = kind == dusk::mp::kPlayerEquipSwordWood ? !inHand : inHand;
 
-    J3DModelData* swordData = sword->getModelData();
-    J3DShape* blade = NULL;
-    bool bladeWasVisible = false;
-    if (swordData != NULL && bladeMatNo < swordData->getMaterialNum()) {
-        blade = swordData->getMaterialNodePointer(bladeMatNo)->getShape();
-        // J3DShpFlag_Visible SET means hidden — hide() turns it on (J3DShape.h:171-172). Read the
-        // flag rather than remembering what we last wrote: the local player writes it too.
-        bladeWasVisible = !blade->checkFlag(J3DShpFlag_Visible);
-        if (bladeVisible) {
-            blade->show();
-        } else {
-            blade->hide();
+        J3DModelData* swordData = sword->getModelData();
+        J3DShape* blade = NULL;
+        bool bladeWasVisible = false;
+        if (swordData != NULL && bladeMatNo < swordData->getMaterialNum()) {
+            blade = swordData->getMaterialNodePointer(bladeMatNo)->getShape();
+            // J3DShpFlag_Visible SET means hidden — hide() turns it on (J3DShape.h:171-172). Read
+            // the flag rather than remembering what we last wrote: the local player writes it too.
+            bladeWasVisible = !blade->checkFlag(J3DShpFlag_Visible);
+            if (bladeVisible) {
+                blade->show();
+            } else {
+                blade->hide();
+            }
+        }
+
+        drawModel(sword);
+        drawModel(sheath);
+
+        if (blade != NULL) {
+            if (bladeWasVisible) {
+                blade->show();
+            } else {
+                blade->hide();
+            }
+        }
+
+        if (!mLoggedEquip) {
+            mLoggedEquip = true;
+            Log.debug(
+                "Puppet {} drawing equipment: sword kind {} {} (blade material {} {}), sheath "
+                "{} | equip byte 0x{:02x}",
+                mPlayerId, kind, inHand ? "in hand" : "on the back", bladeMatNo,
+                bladeVisible ? "shown" : "hidden", sheath != NULL ? "yes" : "no", mNetEquip);
         }
     }
 
-    drawModel(sword);
-    drawModel(sheath);
+    /* The shield, AFTER the sword and its sheath — daAlink_c's own order
+     * (d_a_alink.cpp:19720-19747).
+     *
+     * ★ No visibility bracket, and its absence is a finding rather than an omission. The bracket
+     * above exists because daAlink_c hides a shape on model DATA the puppet SHARES with him
+     * (:4385-4395); he does no show/hide on the shield at all, and this data is private in any
+     * case, so there is no one flag serving two actors here for them to fight over.
+     *
+     * What is NOT reproduced is the burnt-wood tint (:19732-19739). It is driven by field_0x2fcb,
+     * the wooden-shield burn timer, which is not on the wire — so a puppet whose shield is on fire
+     * reads as un-tinted. One byte when someone wants it; called out rather than left to be
+     * discovered. */
+    J3DModel* shield = currentShield();
+    if (shield != NULL) {
+        drawModel(shield);
 
-    if (blade != NULL) {
-        if (bladeWasVisible) {
-            blade->show();
-        } else {
-            blade->hide();
+        /* Its OWN latch, not mLoggedEquip's. The two halves of the byte draw independently now, so
+         * a session in which the sword line appears and this one does not is a real and diagnosable
+         * state rather than a gap in the log. As with every latch here, ABSENCE is the signal: no
+         * line means this puppet never drew a shield for the whole session. */
+        if (!mLoggedShield) {
+            mLoggedShield = true;
+            const u8 shieldKind =
+                static_cast<u8>((mNetEquip & dusk::mp::kPlayerEquipShieldKindMask) >>
+                                dusk::mp::kPlayerEquipShieldKindShift);
+            Log.debug("Puppet {} drawing shield: kind {} ('{}') {} | equip byte 0x{:02x}",
+                mPlayerId, shieldKind, l_shieldArcName[shieldKind],
+                (mNetEquip & dusk::mp::kPlayerEquipShieldInHand) != 0 ? "in hand" : "on the back",
+                mNetEquip);
         }
-    }
-
-    if (!mLoggedEquip) {
-        mLoggedEquip = true;
-        Log.debug("Puppet {} drawing equipment: sword kind {} {} (blade material {} {}), sheath {} "
-                  "| equip byte 0x{:02x}",
-            mPlayerId, kind, inHand ? "in hand" : "on the back", bladeMatNo,
-            bladeVisible ? "shown" : "hidden", sheath != NULL ? "yes" : "no", mNetEquip);
     }
 }
 
@@ -4450,6 +4713,17 @@ void daRemotePlayer_c::shadowDraw() {
         dComIfGd_addRealShadow(mShadowKey, mpHeadModel);
         dComIfGd_addRealShadow(mShadowKey, mpFaceModel);
         dComIfGd_addRealShadow(mShadowKey, mpHandModel);
+        /* The shield casts too, under the same predicate and in the same place daAlink_c adds his
+         * (d_a_alink.cpp:19261-19263). It is not decoration: a shield on the back is a large part
+         * of the silhouette and its absence is visible from behind, which is exactly the angle a
+         * player following another one is looking from. NULL-tolerant by the API's own contract —
+         * dDlst_shadowReal_c::add returns false for a NULL model (d_drawlist.cpp:1355-1357) — so
+         * currentShield()'s "no shield" answer needs no guard of its own here.
+         *
+         * The sword and sheath are still absent from this list where daAlink_c adds them
+         * (:19251-19259). Left alone deliberately: this change is the shield alone, so a shadow
+         * regression has one candidate cause. */
+        dComIfGd_addRealShadow(mShadowKey, currentShield());
     }
 }
 
