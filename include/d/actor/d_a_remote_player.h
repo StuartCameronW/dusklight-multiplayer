@@ -169,8 +169,17 @@ private:
     /* Index into the outfit table in the .cpp. Latched once, so a clothes change on the local
      * player cannot make create() and createHeap() disagree about which body to load. */
     int mOutfit;
-    /* Horizontal speed from the network. Picks the gait, against the same thresholds daAlink_c
-     * uses; it does NOT rate-scale a single cycle. */
+    /* ★ The sender's daAlink_c::mNormalSpeed — his INTENDED speed, what the stick asked for — and
+     * deliberately not his speedF. Picks the gait, against the same thresholds daAlink_c uses.
+     *
+     * The distinction is not pedantry, it was a visible bug: speedF is root-motion blended, so
+     * while walking almost all of Link's translation comes from the walk cycle's own foot motion
+     * and speedF sits pinned near that cycle's natural speed however hard the stick is pushed. A
+     * receiver blending gaits off it saw almost no change across the whole walk band. See the long
+     * note at the sample site (player_bridge.cpp) for the arithmetic.
+     *
+     * May be NEGATIVE — mNormalSpeed is signed and goes negative moving backwards — so every read
+     * of it takes fabsf, as daAlink_c does (d_a_alink.cpp:7555). */
     f32 mNetSpeed;
     /* True on the ticks the SENDER was in daAlink_c::PROC_SLIP. Replicated rather than derived from
      * the yaw — see kPlayerStateSharpTurn in player_state.hpp for why deriving it inverts the

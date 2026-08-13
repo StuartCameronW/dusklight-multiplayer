@@ -1,5 +1,6 @@
 #include "player_bridge.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <unordered_map>
 
@@ -332,6 +333,10 @@ bool capture_local_player(PlayerState& out) {
     }
 
     fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    /* The same actor through the accessor that is documented to hold a daAlink_c — the one the rest
+     * of the puppet code reads Link from (d_a_remote_player.cpp:414). Null-checked at every use
+     * below; nothing here may assume a scene. */
+    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
 
     out.posX = link->current.pos.x;
     out.posY = link->current.pos.y;
@@ -339,7 +344,46 @@ bool capture_local_player(PlayerState& out) {
     // shape_angle is the visual facing that gets baked into the model matrix; current.angle is the
     // logical one and the two diverge while turning. The puppet is a visual, so mirror the visual.
     out.angleY = link->shape_angle.y;
-    out.speed = link->speedF;
+    /* ★ mNormalSpeed, NOT speedF, and the difference is the whole reason a puppet's legs ran slower
+     * than the player it was copying. Stuart, 2026-08-13: "the puppet glides a bit, its animation
+     * is always a tad bit slower... when MC walks, puppet walks very slowly. when MC does faster
+     * walk, puppet does normal walk", correct at a run.
+     *
+     * speedF is Link's TRANSLATION speed and it is root-motion blended:
+     *
+     *     speedF = mNormalSpeed * (1 - mSpeedModifier) + footSpeed * mSpeedModifier
+     *
+     * (d_a_alink.cpp:13028-13034, with footSpeed measured off the planted foot's joint matrices in
+     * setFootSpeed, :12959-12984). mSpeedModifier comes out of setBlendMoveAnime itself and is
+     * mFootPositionRatio — 0.99 — at a walk, tapering to 0 at a run (:7760, :7788, :7798). So while
+     * walking, essentially ALL of Link's movement comes from the walk cycle's own foot motion,
+     * which is exactly why his feet never slide; and speedF therefore sits pinned near that cycle's
+     * natural speed however hard the stick is pushed.
+     *
+     * mNormalSpeed is the INTENT — what the stick asked for — and it is what daAlink_c drives the
+     * gait blend from (getMoveGroundAngleSpeedRate, :7546-7556). Sending speedF meant the receiver
+     * saw almost no change across the whole walk band and held a low blend weight, and it explains
+     * the report band for band: the modifier is 0 at a run (correct), tapers to 0 approaching one
+     * (correct), and is at its largest exactly where he saw the worst of it.
+     *
+     * Nothing on the receiver wants the translation speed — position is replicated outright, and
+     * this value only picks the gait and feeds the trace. Checked before changing it. */
+    out.speed = alink != nullptr ? alink->mNormalSpeed : link->speedF;
+
+    /* Latched, permanent, and it exists to stop this being re-diagnosed. The two speeds AGREE at a
+     * run and diverge most at a walk, so a glance at the local player's numbers proves nothing
+     * unless it is taken while walking — which is exactly when nobody thinks to look. One line the
+     * first time they genuinely disagree records the size of the gap on the route that was actually
+     * walked. If anyone later "simplifies" this back to speedF, this line is the argument. */
+    static bool s_loggedSpeedGap = false;
+    if (!s_loggedSpeedGap && alink != nullptr && std::fabs(alink->mNormalSpeed) > 1.0f &&
+        std::fabs(link->speedF) < 0.8f * std::fabs(alink->mNormalSpeed))
+    {
+        s_loggedSpeedGap = true;
+        Log.debug("Local speed: intent (mNormalSpeed) {:.2f} vs translation (speedF) {:.2f} — "
+                  "{:.0f}% of intent. The wire carries the intent; see capture_local_player().",
+            alink->mNormalSpeed, link->speedF, 100.0f * link->speedF / alink->mNormalSpeed);
+    }
     // Sampled every tick rather than on a change event, because there is no change event to hook:
     // daAlink_c::setArcName just overwrites mArcName during the pause menu's model rebuild. Reading
     // it is a pointer compare against four names, so the cost of doing it per tick is nil and the
@@ -352,14 +396,12 @@ bool capture_local_player(PlayerState& out) {
      * procSlipInit enters PROC_SLIP and plays ANM_SLIP in the same two lines
      * (d_a_alink.cpp:16673-16675), so this bit is true for exactly the ticks Link is skidding.
      *
-     * Fetched through the LINK_PTR slot rather than reusing `link` above because that is the slot
-     * the rest of the puppet code reads Link from (d_a_remote_player.cpp:414), and it is the one
-     * that is documented to hold a daAlink_c. Null-checked anyway — nothing here may assume a
-     * scene. Wolf Link never reaches PROC_SLIP (he has his own PROC_WOLF_SLIP_TURN), so a wolf
-     * sender simply sends the bit clear, which is the right answer while the puppet has no wolf
-     * model to play it on.
+     * Read off `alink` — the LINK_PTR slot fetched at the top — rather than `link`, because that is
+     * the slot the rest of the puppet code reads Link from (d_a_remote_player.cpp:414) and the one
+     * documented to hold a daAlink_c. Wolf Link never reaches PROC_SLIP (he has his own
+     * PROC_WOLF_SLIP_TURN), so a wolf sender simply sends the bit clear, which is the right answer
+     * while the puppet has no wolf model to play it on.
      */
-    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
     if (alink != nullptr && alink->mProcID == daAlink_c::PROC_SLIP) {
         out.flags |= kPlayerStateSharpTurn;
     }

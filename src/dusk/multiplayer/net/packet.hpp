@@ -17,8 +17,15 @@ namespace dusk::mp {
 /* 4: PlayerState grew the sender's outfit byte (19 -> 20) and claimed flag bit 2 for the sharp
  * turn. The size change is the reason this MUST be bumped: a v3 peer's read() under-runs on the
  * trailing flags byte, returns false, and every pose packet is silently discarded — a session that
- * connects fine and then shows nobody moving. */
-inline constexpr std::uint32_t kProtocolVersion = 4;
+ * connects fine and then shows nobody moving.
+ *
+ * 5: PlayerState::speed changed MEANING — it is the sender's daAlink_c::mNormalSpeed now, his
+ * intended speed, where it used to be speedF, his root-motion-blended translation speed. Same size,
+ * same type, so a v4 peer would parse it perfectly and simply animate wrong: every remote player
+ * would walk visibly slower than the person driving them. Bumped anyway, deliberately. A rejected
+ * handshake says what is wrong in one line; "everyone's legs are a bit off" is the kind of thing
+ * that gets diagnosed twice and blamed on something else both times. */
+inline constexpr std::uint32_t kProtocolVersion = 5;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

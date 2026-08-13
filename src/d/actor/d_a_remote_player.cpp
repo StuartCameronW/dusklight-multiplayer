@@ -1427,7 +1427,12 @@ void daRemotePlayer_c::selectAnimation() {
      * below mRunChangeRate walk into run, and above it runs alone. The thresholds come from
      * daAlinkHIO_move_c0::m rather than being copied, so the puppet cannot drift out of step with
      * the player if the table is ever corrected. */
-    const f32 fraction = mNetSpeed / hio.mMaxSpeed;
+    /* fabsf, because the replicated value is daAlink_c's mNormalSpeed and that goes NEGATIVE when
+     * he moves backwards (d_a_alink.cpp:10156, :10183). getMoveGroundAngleSpeedRate takes the same
+     * absolute value (:7555); without it a backing-up puppet reads as below the idle threshold and
+     * stands perfectly still while sliding. */
+    const f32 speed = fabsf(mNetSpeed);
+    const f32 fraction = speed / hio.mMaxSpeed;
 
     const daRemotePlayer_anm_c* anmA;
     const daRemotePlayer_anm_c* anmB;
@@ -1469,7 +1474,7 @@ void daRemotePlayer_c::selectAnimation() {
      * replicated speed is an interpolated value and does not settle to exactly zero, so without
      * this a stationary puppet carries a few percent of walk forever — a visible shuffle on a
      * character that is not moving. */
-    if (mNetSpeed <= l_idleSpeedThreshold) {
+    if (speed <= l_idleSpeedThreshold) {
         blend = 0.0f;
     }
 
@@ -1852,7 +1857,7 @@ void daRemotePlayer_c::setEyeMove() {
         vertical = cLib_minMaxLimit<f32>(l_eyeAngleToOffset * angleX, -1.0f, 1.0f);
         horizontal = cLib_minMaxLimit<f32>(l_eyeAngleToOffset * angleY, -1.0f, 1.0f);
         eyesActive = true;
-    } else if (mNetSpeed < l_idleSpeedThreshold) {
+    } else if (fabsf(mNetSpeed) < l_idleSpeedThreshold) {
         /* Nobody worth watching and standing still, so look about. daAlink_c::setEyeMove's idle
          * branch (d_a_alink.cpp:3337-3358), which is what stops a waiting Link from staring dead
          * ahead. His version gates on mProcID == PROC_WAIT and friends; a puppet has no proc, and
