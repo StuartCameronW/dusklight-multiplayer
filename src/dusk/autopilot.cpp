@@ -371,6 +371,23 @@ void load_script(const std::filesystem::path& path) {
             ok = false;
         }
 
+        // Four argument positions are read above, and every verb uses at most four. A fifth token
+        // would otherwise be dropped in silence — and the shape of mistake that produces is
+        // `stick 0 1 60 R Z` for "guard while walking with Z held", where the correct form is
+        // `R+Z` and the silent version does something subtly different for the whole run.
+        //
+        // SAY is exempt, and not as a special case: it does not use the token stream at all. It
+        // re-reads the raw line so its message keeps its internal spacing, so for SAY the tokens
+        // above are just the first four words of prose and a fifth is expected.
+        if (ok && command.op != Op::Say) {
+            std::string extra;
+            if (tokens >> extra) {
+                Log.error(
+                    "Line {}: unexpected extra argument '{}' for '{}'", lineNumber, extra, verb);
+                ok = false;
+            }
+        }
+
         if (!ok) {
             Log.error("Line {}: bad arguments for '{}'", lineNumber, verb);
             sProgram.clear();

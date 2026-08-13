@@ -45,11 +45,22 @@ namespace dusk::mp {
  * is running behind them. Do not cite this function as evidence that save safety is handled. It is
  * a placeholder with a docstring.
  *
- * KNOWN GAP. The call site this ships with is canAutoSave() (src/dusk/autosave.cpp) only. Autosave
- * is not the only save path — d_menu_save.cpp:1355 (the in-game save prompt) and d_stage.cpp:2781
- * both reach dComIfGs_putSave without passing through here. The real choke point is
- * dComIfGs_putSave itself (include/d/d_com_inf_game.h:2367), which every path funnels through; the
- * guard belongs there, behind TARGET_PC, when someone is in a position to edit that header.
+ * KNOWN GAP. The call site this ships with is canAutoSave() (src/dusk/autosave.cpp) only, and
+ * autosave is not the only save path.
+ *
+ * ★ Do NOT put the second guard on dComIfGs_putSave. An earlier draft of this comment said to, and
+ * it was wrong in a way that would have been expensive: dComIfGs_putSave
+ * (include/d/d_com_inf_game.h:2367) resolves to dSv_info_c::putSave (d_save.cpp:1546), which is
+ * pure in-memory bookkeeping — it folds the current stage's temp switches and chests into the
+ * persistent table — and d_stage.cpp:2781 calls it on ordinary stage teardown with nothing written
+ * to a card. Guarding it would break normal play and would not stop a single byte reaching disk.
+ *
+ * The actual funnel to disk is mDoMemCd_Ctrl_c::save() (src/m_Do/m_Do_MemCard.cpp:258), the single
+ * entry to COMM_STORE_e, with exactly two callers program-wide: src/dusk/autosave.cpp and
+ * d_menu_save.cpp:2888 (the in-game save prompt). So the one path still uncovered is a contaminated
+ * client walking up to a save point. (src/dusk/imgui/ImGuiSaveEditor.cpp writes game state too, but
+ * it is a developer tool the player drives deliberately, not a path a session can trigger.)
+ *
  * See .claude/plan/13-save-safety.md.
  */
 inline bool save_would_be_contaminated() {
