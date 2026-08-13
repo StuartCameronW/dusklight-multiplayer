@@ -1564,6 +1564,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/player_bridge.hpp
         src/dusk/multiplayer/replication/replication_manager.cpp
         src/dusk/multiplayer/replication/replication_manager.hpp
+        src/dusk/multiplayer/replication/world_clock.cpp
+        src/dusk/multiplayer/replication/world_clock.hpp
         src/dusk/multiplayer/session/network_manager.cpp
         src/dusk/multiplayer/session/network_manager.hpp
         src/dusk/multiplayer/session/save_guard.cpp

@@ -22,6 +22,34 @@ enum class Ownership {
     Individual,
 };
 
+/**
+ * When the shared clock is allowed to ADVANCE, given that players can be in different places.
+ *
+ * Only matters when players are apart — with everyone in one room all three agree. This is about
+ * the passive tick only (`daytime += time_change_rate`, d_kankyo.cpp:1550); an explicit time SET,
+ * from a cutscene or a time-control tag, is a different thing entirely and is never gated by this.
+ *
+ * Vanilla decides per ROOM: `dComIfGp_roomControl_getTimePass()` reads a flag out of the stage's
+ * room data (d_stage.cpp:1511), and it is off in dungeons, houses and several towns.
+ */
+enum class TimeAdvanceRule {
+    /// Everyone must be somewhere time can pass. Stuart's call, 2026-08-13, and the most faithful
+    /// to
+    /// vanilla's "time does not move in here".
+    ///
+    /// ★ Known cost, stated because it was argued before it was chosen: one player idling indoors
+    /// stops the clock for everyone, so this is the only rule under which a player can be prevented
+    /// from ever reaching night. Players who are still loading do not count — otherwise a slow
+    /// stage transition on one machine would freeze the world for the rest.
+    AllPlayers,
+    /// One player outdoors is enough. Never stalls; the cost is that your sky can change while you
+    /// stand somewhere vanilla would have held it still.
+    AnyPlayer,
+    /// Guests simply mirror the host's clock and their own rooms are not consulted. Cheapest — no
+    /// per-player reporting at all — but the host alone decides, and can stall everyone.
+    HostRoom,
+};
+
 /// What happens when a player's hearts reach zero. Product decision, pending (see 00-status.md).
 enum class DeathRule {
     ReloadRoom,
@@ -38,6 +66,9 @@ struct MultiplayerPolicy {
     Ownership questFlags = Ownership::Shared;  ///< story flags, chests, switches, dungeon items
     Ownership sceneRoom = Ownership::Shared;   ///< everyone in the same stage/room (lockstep)
     Ownership timeOfDay = Ownership::Shared;
+
+    /// Only read when timeOfDay is Shared. See TimeAdvanceRule for what each one costs.
+    TimeAdvanceRule timeAdvance = TimeAdvanceRule::AllPlayers;
 
     /// The one v1 exception — each client keeps its own mLife/mMaxLife.
     Ownership health = Ownership::Individual;

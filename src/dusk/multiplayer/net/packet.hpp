@@ -52,8 +52,18 @@ namespace dusk::mp {
  * moves" failure as versions 4 and 8. It is an enumeration and not more flag bits because the
  * variants are mutually exclusive by construction (setBlendMoveAnime picks exactly one), and a byte
  * has room for all 256 of them where only eight are named so far — so the remaining idle variants,
- * and the rest of D3, cost no second bump. */
-inline constexpr std::uint32_t kProtocolVersion = 9;
+ * and the rest of D3, cost no second bump.
+ *
+ * 10: the shared world clock. Two changes at once, and only one of them would have been caught by a
+ * size check. WorldSnapshot grew a trailing [f32 daytime][u16 date] — a SIZE change, the mandatory
+ * kind of bump. PlayerState claimed flag bit 6 for "time can pass where I am" at NO size cost,
+ * which is the dangerous kind: a v9 peer parses the packet perfectly and simply leaves the bit
+ * clear, and under the AllPlayers rule a permanently-clear bit means the sun never moves again for
+ * anybody. Silent, total, and it would read as "time sync doesn't work" rather than as a version
+ * mismatch. Also adds TimeOverride (client -> host), which an older host would drop as an unknown
+ * id — so a guest's cutscene would set the time for itself and be quietly overwritten a tick later.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 10;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -91,7 +101,13 @@ enum class PacketId : std::uint8_t {
     /// Each entry carries its OWN originTick — the tick that player captured the pose on, in their
     /// own clock — rather than being described by the snapshot's hostTick. Poses only interpolate
     /// correctly on the clock they were produced on; re-stamping them on relay distorts speed.
+    ///
+    /// The trailing clock is the shared world time, host-authoritative. It rides here rather than
+    /// in its own periodic packet because it is small, because it is exactly the state the snapshot
+    /// already exists to fan out, and because sending it at the sim rate means a guest that misses
+    /// one is corrected on the next tick instead of drifting until a timer fires.
     /// [u64 hostTick][u8 count][{u32 playerId, u64 originTick, PlayerState} * count]
+    /// [f32 daytime][u16 date]
     WorldSnapshot = 6,
 
     /// Host -> client, reliable. The full roster at join time, so a client learns about players
@@ -102,6 +118,20 @@ enum class PacketId : std::uint8_t {
     PeerJoined = 8,
     /// Host -> clients, reliable. [u32 playerId]
     PeerLeft = 9,
+
+    /// Client -> host, reliable. "Something on my machine SET the clock — adopt it."
+    /// [f32 daytime][u16 date]
+    ///
+    /// ★ The point of this packet is that a shared clock must not be a one-way broadcast. Plenty of
+    /// the game sets the time outright rather than letting it tick: a cutscene
+    /// (`d_a_demo00.cpp:1198`), a stage's own entry time (`d_kankyo.cpp:1481`), sleeping
+    /// (`:9621-9625`). If the HOST does one of those it propagates for free, because the host's
+    /// absolute time is what everyone mirrors. If a GUEST does one, the very next snapshot would
+    /// stomp it — so "completing Arbiter's Grounds sets the time to night" would silently fail for
+    /// anyone but the host. This is the path back up.
+    ///
+    /// Reliable, because these are rare, discrete, and losing one loses the event's whole point.
+    TimeOverride = 10,
 };
 
 /// The host occupies a fixed player id so both ends can name it without a lookup.

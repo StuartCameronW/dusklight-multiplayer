@@ -9,6 +9,7 @@
 #include "../net/serializer.hpp"
 #include "../replication/player_state.hpp"
 #include "../replication/replication_manager.hpp"
+#include "../replication/world_clock.hpp"
 #include "dusk/logging.h"
 #include "save_guard.hpp"
 #include "trace.hpp"
@@ -205,6 +206,7 @@ void NetworkManager::shutdown() {
         mTransport.reset();
     }
     replication_manager().clear();
+    world_clock().clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
     mRole = Role::Inactive;
@@ -240,6 +242,7 @@ void NetworkManager::post_actor_tick() {
     // Captured after the actor pass, so the pose sent is the one this tick actually ended at.
     if (mRole == Role::Client) {
         send_local_state();
+        send_time_override();
     } else if (mRole == Role::Host) {
         broadcast_snapshot();
     }
@@ -275,6 +278,10 @@ void NetworkManager::handle_event(const TransportEvent& event) {
                 // Despawn locally and tell the remaining clients, otherwise a puppet stands frozen
                 // in the world forever — one of the ways tpmp sessions visibly rot.
                 replication_manager().remove_player(playerId);
+                // ★ And drop their vote on the world clock. Under the AllPlayers rule, someone who
+                // quits while standing in a dungeon would otherwise stop the sun for everyone left,
+                // permanently, with no way to see why.
+                world_clock().forget_peer(playerId);
                 broadcast_peer_left(playerId);
             } else if (mRole == Role::Client) {
                 // Lost the host: every puppet's authority is gone, so clear the whole world view.
@@ -474,6 +481,30 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // are per-player, so one only ever sees one sender's ticks, and playback is seeded relative
         // to the newest sample rather than to any absolute time.
         replication_manager().record_remote(it->second.playerId, senderTick, state);
+        // Under the AllPlayers rule this is the vote that decides whether the sun moves. Taken from
+        // the pose packet rather than asked for separately: it is one bit that was already free in
+        // the flags byte, and it arrives at the sim rate for the same cost as nothing.
+        world_clock().set_peer_time_can_pass(
+            it->second.playerId, state.time_can_pass(), state.in_world());
+        break;
+    }
+    case PacketId::TimeOverride: {
+        float daytime = 0.0f;
+        std::uint16_t date = 0;
+        if (!r.read_f32(daytime) || !r.read_u16(date) || !r.ok()) {
+            return;
+        }
+        const auto it = mPeers.find(peer);
+        if (it == mPeers.end() || !it->second.handshakeComplete) {
+            return;
+        }
+        if (mRole != Role::Host) {
+            // Only the host arbitrates. A client receiving one of these means someone is confused
+            // about who is authoritative, and adopting it would make the confusion contagious.
+            Log.warn("Ignoring a TimeOverride from peer {} — this process is not the host", peer);
+            return;
+        }
+        world_clock().receive_override(it->second.playerId, daytime, date);
         break;
     }
     case PacketId::WorldSnapshot: {
@@ -503,6 +534,14 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             // send time; using it for the poses inside would re-quantise them onto our arrival
             // pattern and distort their speed.
             replication_manager().record_remote(playerId, originTick, state);
+        }
+        {
+            // Read the clock BEFORE the ok() check so a truncated packet cannot half-apply it.
+            float daytime = 0.0f;
+            std::uint16_t date = 0;
+            if (r.read_f32(daytime) && r.read_u16(date) && r.ok()) {
+                world_clock().receive(daytime, date);
+            }
         }
         if (!r.ok()) {
             Log.warn("Truncated snapshot from peer {}", peer);
@@ -699,7 +738,28 @@ void NetworkManager::broadcast_snapshot() {
         ++written;
     }
 
+    // The shared world clock rides along at the sim rate. Small, and a client that misses one is
+    // corrected on the very next tick rather than drifting until some slower timer comes round.
+    w.write_f32(world_clock().daytime());
+    w.write_u16(world_clock().date());
+
     mTransport->broadcast(w.data().data(), w.size(), kChannelState, false);
+}
+
+void NetworkManager::send_time_override() {
+    float daytime = 0.0f;
+    std::uint16_t date = 0;
+    if (!world_clock().consume_pending_override(daytime, date)) {
+        return;
+    }
+
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::TimeOverride));
+    w.write_f32(daytime);
+    w.write_u16(date);
+    // Reliable: these are rare, discrete, and a dropped one loses the whole point of the event that
+    // produced it — the player would watch the sky snap back to whatever the host still thinks.
+    mTransport->broadcast(w.data().data(), w.size(), kChannelControl, true);
 }
 
 void NetworkManager::report_interpolation() {

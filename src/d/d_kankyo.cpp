@@ -34,6 +34,7 @@
 #include <cstring>
 #if TARGET_PC
 #include "dusk/imgui/ImGuiBloomWindow.hpp"
+#include "dusk/multiplayer/replication/world_clock.hpp"
 #include "dusk/settings.h"
 #include "dusk/frame_interpolation.h"
 #include "dusk/game_clock.h"
@@ -1542,7 +1543,22 @@ void dScnKy_env_light_c::setDaytime() {
                         temp_r29 = false;
                     }
 
-                    if (dComIfGp_roomControl_getTimePass() && !field_0x130a && temp_r29) {
+                    #if TARGET_PC
+                    /* Dusk (multiplayer): the world clock is SHARED and host-authoritative, so this
+                     * room's TimePass flag stops being the whole answer. A guest never ticks its own
+                     * clock at all (it mirrors the host's, applied below); a host ticks only when
+                     * the policy's TimeAdvanceRule is satisfied across the session. Outside a
+                     * session, and whenever time is Individual, should_advance returns its argument
+                     * unchanged, so single player is untouched.
+                     * See src/dusk/multiplayer/replication/world_clock.hpp. */
+                    const bool advanceTime = dusk::mp::world_clock().should_advance(
+                        dComIfGp_roomControl_getTimePass() && !field_0x130a && temp_r29);
+                    #else
+                    const bool advanceTime =
+                        dComIfGp_roomControl_getTimePass() && !field_0x130a && temp_r29;
+                    #endif
+
+                    if (advanceTime) {
                         #if TARGET_PC
                         f32 prev = daytime;
                         #endif
@@ -1647,6 +1663,16 @@ void dScnKy_env_light_c::setDaytime() {
     if (daytime >= 360.0f) {
         daytime = 0.0f;
     }
+
+    #if TARGET_PC
+    /* Dusk (multiplayer): reconcile with the shared clock immediately before the writeback, which is
+     * the one point where `daytime` holds this tick's final local answer. On a guest this normally
+     * replaces it with the host's; if something on this machine SET the time since the last tick — a
+     * cutscene, the stage's own entry time, sleeping — that is detected here instead and sent UP, so
+     * a guest completing a dungeon still turns the sky to night for everybody.
+     * See src/dusk/multiplayer/replication/world_clock.hpp. */
+    dusk::mp::world_clock().reconcile(daytime, mDate, using_time_control_tag);
+    #endif
 
     dComIfGs_setTime(daytime);
     #if DEBUG

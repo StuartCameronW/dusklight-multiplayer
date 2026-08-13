@@ -1,5 +1,7 @@
 #include "player_bridge.hpp"
 
+#include "world_clock.hpp"
+
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -617,6 +619,24 @@ bool capture_local_player(PlayerState& out) {
         alink->checkModeFlg(0x78C52))
     {
         out.flags |= kPlayerStateNoFootIk;
+    }
+
+    /* Whether the world's clock is allowed to run where this player is standing — the vote that
+     * decides the shared time of day under TimeAdvanceRule::AllPlayers (world_clock.hpp).
+     *
+     * The room's flag, from stage data (`d_stage.cpp:1511`), plus the two conditions that mean the
+     * local environment is deliberately holding time still: a time-control tag region
+     * (`d_a_kytag11.cpp:58`) and the twilight, which zeroes daytime outright
+     * (`d_kankyo.cpp:1592-1599`).
+     *
+     * ★ Deliberately NOT the whole of setDaytime's condition. That also folds in "an event is
+     * running" and "a message box is open" (`d_kankyo.cpp:1538-1545`) — transient, local, and
+     * nobody else's business. Sending those would mean one player reading a signpost stops the sun
+     * for everyone, which is a bug that would be very hard to recognise from the outside. */
+    if (dComIfGp_roomControl_getTimePass() && g_env_light.using_time_control_tag == 0 &&
+        !dKy_darkworld_check() && !test_time_blocked())
+    {
+        out.flags |= kPlayerStateTimeCanPass;
     }
 
     fill_idle_kind(alink, out);

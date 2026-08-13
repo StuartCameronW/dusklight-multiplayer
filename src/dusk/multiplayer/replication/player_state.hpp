@@ -104,6 +104,22 @@ enum PlayerStateFlags : std::uint8_t {
      * sender's own timeline, which is the timeline the puppet is replaying.
      */
     kPlayerStateNoFootIk = 1 << 5,
+    /**
+     * The sender is somewhere the world's clock is allowed to run — the room's TimePass flag
+     * (`dComIfGp_roomControl_getTimePass()`, set from stage data at `d_stage.cpp:1511`), with no
+     * time-control tag active and not in the twilight.
+     *
+     * ★ Deliberately the STAGE-level fact and not the whole of `setDaytime`'s condition. That
+     * condition also folds in "an event is running" and "a message box is open"
+     * (`d_kankyo.cpp:1538-1545`), and those are transient, local, and nobody else's business: under
+     * the AllPlayers rule, one player reading a signpost must not stop the sun for everyone. What
+     * this bit answers is "am I standing somewhere the world clock may run", which is the question
+     * the rule is actually about.
+     *
+     * Free on the wire — bits 6 and 7 of the flags byte were spare — and safe through lerp_state,
+     * which takes `flags` whole from the newer sample.
+     */
+    kPlayerStateTimeCanPass = 1 << 6,
 };
 
 /// 22 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
@@ -175,6 +191,7 @@ struct PlayerState {
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
     bool mode_idle() const { return (flags & kPlayerStateModeIdle) != 0; }
     bool no_foot_ik() const { return (flags & kPlayerStateNoFootIk) != 0; }
+    bool time_can_pass() const { return (flags & kPlayerStateTimeCanPass) != 0; }
 
     bool sword_draw() const { return (equip & kPlayerEquipSwordDraw) != 0; }
     bool sword_in_hand() const { return (equip & kPlayerEquipSwordInHand) != 0; }

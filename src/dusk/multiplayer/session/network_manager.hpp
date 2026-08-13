@@ -87,6 +87,10 @@ private:
     void send_local_state();
     void broadcast_snapshot();
 
+    /// Client: forward a locally-set world clock to the host, if there is one pending. See
+    /// replication/world_clock.hpp for why a shared clock cannot be a one-way broadcast.
+    void send_time_override();
+
     /// The pose to put on the wire this tick, which is a different question from "is there a Link
     /// to read". Never fails: see the definition for why silence is not an option.
     PlayerState wire_local_state();
