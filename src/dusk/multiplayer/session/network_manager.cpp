@@ -699,10 +699,10 @@ void NetworkManager::report_interpolation() {
     }
     const ReplicationManager::Diagnostics diag = replication.diagnostics();
     Log.info("Interp: {} remote player(s), buffer {:.1f} ticks, {} starvation(s), {} snap(s); "
-             "pose ({:.0f}, {:.0f}, {:.0f}) angleY {} speed {:.2f}",
+             "pose ({:.0f}, {:.0f}, {:.0f}) angleY {} gait rate {:.3f}",
         replication.players().size(), diag.worstDelayTicks, diag.totalStarvations, diag.totalSnaps,
         diag.samplePose.posX, diag.samplePose.posY, diag.samplePose.posZ, diag.samplePose.angleY,
-        diag.samplePose.speed);
+        diag.samplePose.moveRate);
 }
 
 void NetworkManager::send_heartbeats() {

@@ -7,9 +7,10 @@
 /**
  * The per-player pose that travels over the wire every sim tick.
  *
- * M1 replicates a COARSE pose deliberately (see 02/04): position, facing, and speed. The puppet
- * picks idle/walk/run from the speed rather than mirroring Link's animation ids, because driving
- * the real daAlink_PROC state machine is M3's job and would sink M1 in engine detail.
+ * M1 replicates a COARSE pose deliberately (see 02/04): position, facing, and gait rate. The puppet
+ * picks its blend of idle/walk/run from that rate rather than mirroring Link's animation ids,
+ * because driving the real daAlink_PROC state machine is M3's job and would sink M1 in engine
+ * detail.
  *
  * Engine-free by design so the protocol stays unit-testable headless (layering rule, 04).
  */
@@ -53,6 +54,26 @@ enum PlayerStateFlags : std::uint8_t {
      * is satisfied with no new interpolation code to get wrong.
      */
     kPlayerStateSharpTurn = 1 << 2,
+    /**
+     * The sender was STANDING — `checkModeFlg(MODE_IDLE) || checkZeroSpeedF()`, which is the exact
+     * predicate `setBlendMoveAnime` branches on (d_a_alink.cpp:7656).
+     *
+     * ★ This is a wire bit and not a threshold on `moveRate` for one reason: the branch it selects
+     * is a DISCONTINUITY, not a taper. On the false side Link's walk weight is remapped to start at
+     * mMinWalkRate — 0.7 — so he crosses from "no walk at all" to "seven tenths of a walk" in a
+     * single tick (:7759). A receiver testing a threshold of its own therefore does not merely
+     * round the answer, it picks the wrong side of a step, and it picks it wrong exactly where the
+     * value hovers: at the start and end of every walk. The old receiver-side constant was
+     * `speed <= 0.5f`, invented here rather than read from the game, and it was the second of two
+     * bugs in a row caused by re-deriving a decision daAlink_c had already made.
+     *
+     * MODE_IDLE is the other half and cannot be derived at all: it is a mode flag the state machine
+     * sets, and it is true in states that still carry speed.
+     *
+     * Free on the wire — the flags byte had five spare bits — and safe through lerp_state, which
+     * takes `flags` whole from the newer sample rather than blending them.
+     */
+    kPlayerStateZeroSpeed = 1 << 3,
 };
 
 /// 20 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
@@ -62,8 +83,26 @@ struct PlayerState {
     float posZ = 0.0f;
     /// Y rotation in the engine's s16 binary-angle units. Wraps — interpolate on the shortest arc.
     std::int16_t angleY = 0;
-    /// Horizontal speed in engine units per tick, used to choose the puppet's animation.
-    float speed = 0.0f;
+    /**
+     * The sender's own gait rate: `daAlink_c::getMoveGroundAngleSpeedRate()`, verbatim.
+     *
+     * ★ NOT a speed, despite occupying the four bytes one used to. It is the dimensionless value
+     * daAlink_c feeds his own gait blend — `fabsf(mNormalSpeed * cM_scos(groundAngle) /
+     * mMaxSpeed)`, roughly 0..1 — and it is sent instead of a speed so the receiver has nothing
+     * left to derive. Three separate divergences were arithmetic the receiver was doing for itself
+     * and getting subtly wrong:
+     *
+     *   - it divided by the HIO constant 23.0, but mMaxSpeed is a daAlink_c MEMBER and is the
+     *     lock-on maximum (or a flat 13.0) while targeting (d_a_alink.cpp:7867-7871);
+     *   - it ignored the ground-angle cosine, so a sender climbing a slope kept a flat walk when
+     *     Link himself had shifted toward the slower gait;
+     *   - it read speedF, Link's root-motion-blended TRANSLATION speed, which barely moves across
+     *     the whole walk band (that one was visible: every puppet's legs ran slow at a walk).
+     *
+     * Sending the answer instead of the inputs retires all three at once and costs no bytes. The
+     * value is already absolute — daAlink_c takes fabsf — so it is never negative.
+     */
+    float moveRate = 0.0f;
     /// Which outfit the SENDER is wearing, as an index into the puppet actor's outfit table.
     ///
     /// Appearance is owned by the wearer, so this travels with the pose rather than being guessed
@@ -77,20 +116,21 @@ struct PlayerState {
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
+    bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);
         w.write_f32(posY);
         w.write_f32(posZ);
         w.write_s16(angleY);
-        w.write_f32(speed);
+        w.write_f32(moveRate);
         w.write_u8(outfit);
         w.write_u8(flags);
     }
 
     bool read(Reader& r) {
         return r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
-               r.read_f32(speed) && r.read_u8(outfit) && r.read_u8(flags);
+               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags);
     }
 };
 
@@ -127,7 +167,7 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.posY = a.posY + (b.posY - a.posY) * t;
     out.posZ = a.posZ + (b.posZ - a.posZ) * t;
     out.angleY = lerp_angle(a.angleY, b.angleY, t);
-    out.speed = a.speed + (b.speed - a.speed) * t;
+    out.moveRate = a.moveRate + (b.moveRate - a.moveRate) * t;
     // The outfit is discrete for the same reason the flags are: it is an index, not a quantity.
     // Blending 1 and 3 would name outfit 2 — a third, unrelated archive — for as long as the
     // crossover lasted, so the newer sample is taken whole.

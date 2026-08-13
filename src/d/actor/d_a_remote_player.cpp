@@ -485,16 +485,11 @@ const u16 l_capCompareCount = 8;
 const u16 l_windLogPeriod = 120;
 const u16 l_windLogCount = 40;
 
-/* Below this the puppet is standing still. Link's speedF is in units per tick. Separate from the
- * HIO rates below: this one is about network noise, not about gait.
- */
-const f32 l_idleSpeedThreshold = 0.5f;
-
 /* Dead band on the REPORTED gait, and on nothing else. What the puppet draws is a continuous blend
  * of two animations now, so there is no longer a moment where it switches; but mCurrentAnm still
- * names one of them, for the hand poses and for --mp-trace, and mNetSpeed is an interpolated value
- * that jitters. Without this a puppet held near a band's midpoint would flip the reported gait
- * every tick and make the trace unreadable while looking identical on screen.
+ * names one of them, for the hand poses and for --mp-trace, and mNetMoveRate is an interpolated
+ * value that jitters. Without this a puppet held near a band's midpoint would flip the reported
+ * gait every tick and make the trace unreadable while looking identical on screen.
  */
 const f32 l_gaitHysteresis = 0.05f;
 
@@ -1351,29 +1346,36 @@ static int daRemotePlayer_Delete(daRemotePlayer_c* i_this) {
 }
 
 void daRemotePlayer_c::setNetworkPose(
-    const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn) {
+    const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn, bool i_zeroSpeed) {
     current.pos = i_pos;
     shape_angle.y = i_angleY;
     // The logical angle is kept in step so anything that reads current.angle (audio, effects) sees
     // a sane value, even though only shape_angle drives the model matrix.
     current.angle.y = i_angleY;
-    mNetSpeed = i_speed;
+    mNetMoveRate = i_moveRate;
     // Written every tick before execute() can reach selectAnimation() — execute() returns early
-    // until mHasPose, which is set right below — so this needs no separate initialisation.
+    // until mHasPose, which is set right below — so these need no separate initialisation.
     mNetSharpTurn = i_sharpTurn;
+    mNetZeroSpeed = i_zeroSpeed;
     mHasPose = true;
 }
 
 /**
- * Choose the gait from the replicated speed, the way the local player chooses it.
+ * Choose the gait from the sender's own gait rate, the way the local player chooses it.
  *
- * daAlink_c normalises speedF against its top ground speed and crosses over at two fixed fractions
- * (d_a_alink.cpp:7653/7784): wait blends into walk below mWalkChangeRate, walk into run below
- * mRunChangeRate, run alone above it. Each cycle plays at its own authored rate — the game never
- * speeds a walk up to stand in for a run.
+ * daAlink_c crosses over at two fixed fractions of that rate (d_a_alink.cpp:7653/7784): wait blends
+ * into walk below mWalkChangeRate, walk into run below mRunChangeRate, run alone above it. Each
+ * cycle plays at its own authored rate — the game never speeds a walk up to stand in for a run.
  *
  * Those numbers are read from daAlinkHIO_move_c0::m rather than copied, so the puppet cannot drift
  * out of step with the player if the table is ever corrected.
+ *
+ * ★ Nothing here scales, normalises or thresholds the replicated value, and that is the point. The
+ * rate arrives as getMoveGroundAngleSpeedRate()'s own output and the "is he standing" answer
+ * arrives as a bit beside it, because every time this function derived one of those for itself it
+ * got a different answer from the player it was copying — three times, each silent, each looking
+ * like a tuning problem: the wrong speed field, then the missing mMinWalkRate floor, then an idle
+ * threshold invented here. Read the sender's answer; do not recompute it.
  *
  * ★ The blend is the point, and it used to be missing. daAlink_c never swaps one gait for another:
  * he plays BOTH sides of a band at once and slides the weight across it. The puppet quantised to
@@ -1381,11 +1383,16 @@ void daRemotePlayer_c::setNetworkPose(
  * rather than a slightly worse version of the same one — a real player crossing from a walk into a
  * run passes through every mixture between them, and the puppet stepped over that in one frame.
  *
- * ★ One difference that remains, and is a knowing one: daAlink_c scales the fraction by the cosine
- * of the ground angle (getMoveGroundAngleSpeedRate, d_a_alink.cpp:7546-7556), so climbing a slope
- * shifts him toward the slower gait at the same speed. The puppet uses the flat fraction. It has
- * the floor under it — mGndChk is refreshed every tick — so this is fixable, and it belongs with
- * the foot-IK work that needs the same ground normal rather than on its own.
+ * ★ The ground-angle cosine used to be a knowing divergence here — daAlink_c shifts toward the
+ * slower gait when climbing at the same speed — and it is gone for free, because it is applied
+ * inside getMoveGroundAngleSpeedRate() before the rate is sent. So is the lock-on case, where his
+ * mMaxSpeed is a member that drops to the targeting maximum rather than the HIO constant this
+ * function used to divide by.
+ *
+ * ★ What remains is equipment, and it is job D: getMainBckData swaps the whole animation pair for a
+ * drawn sword, a raised shield, the kandelaar or the fishing rod, and heavy boots or the iron ball
+ * pin the rate into band 1 outright (d_a_alink.cpp:7620-7641). None of that is on the wire yet, so
+ * a puppet always uses the empty-handed table.
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
@@ -1427,12 +1434,20 @@ void daRemotePlayer_c::selectAnimation() {
      * below mRunChangeRate walk into run, and above it runs alone. The thresholds come from
      * daAlinkHIO_move_c0::m rather than being copied, so the puppet cannot drift out of step with
      * the player if the table is ever corrected. */
-    /* fabsf, because the replicated value is daAlink_c's mNormalSpeed and that goes NEGATIVE when
-     * he moves backwards (d_a_alink.cpp:10156, :10183). getMoveGroundAngleSpeedRate takes the same
-     * absolute value (:7555); without it a backing-up puppet reads as below the idle threshold and
-     * stands perfectly still while sliding. */
-    const f32 speed = fabsf(mNetSpeed);
-    const f32 fraction = speed / hio.mMaxSpeed;
+    /* No scaling, no absolute value, no threshold of our own: this IS the sender's own
+     * getMoveGroundAngleSpeedRate(), which has already divided by his mMaxSpeed, already applied
+     * the ground-angle cosine, and already taken fabsf (d_a_alink.cpp:7555). Every one of those
+     * steps used to happen here instead, and each was a way to disagree with him. */
+    const f32 fraction = mNetMoveRate;
+
+    /* Standing, decided by the SENDER and carried on the wire, because the branch it picks has a
+     * step in it rather than a taper — see the remap in band 1 below, and kPlayerStateZeroSpeed.
+     *
+     * The `<= 0` half is belt and braces for a rate that arrives at exactly zero with the bit
+     * somehow clear: the rate is an absolute value, so zero means the sender was not moving, and
+     * without this that combination would land on the moving side of the step and walk a
+     * motionless puppet on the spot. It costs a compare and removes a class of wire bug. */
+    const bool zeroSpeed = mNetZeroSpeed || fraction <= 0.0f;
 
     const daRemotePlayer_anm_c* anmA;
     const daRemotePlayer_anm_c* anmB;
@@ -1444,6 +1459,26 @@ void daRemotePlayer_c::selectAnimation() {
 
     if (fraction < hio.mWalkChangeRate) {
         blend = fraction / hio.mWalkChangeRate;
+        /* ★ Link's walk weight never drops below mMinWalkRate — 0.7 — once he is genuinely moving
+         * (d_a_alink.cpp:7752-7759, the else of the standing branch). Band 2 has no equivalent
+         * remap, which is exactly why walking was the only gait Stuart saw glide: "no still
+         * gliding, puppet is too slow (its animation) — but this is only on walking", 2026-08-13.
+         * At a slow walk the raw ratio is about 0.25, so Link was at 0.775 and the puppet at 0.25 —
+         * roughly a third of the walk weight over a body translating at the full speed.
+         *
+         * ⚠ Do NOT smooth the resulting 0 -> 0.7 jump. Link has the same discontinuity, in the same
+         * tick, for the same reason: he crosses from the standing branch to this one whole. A ramp
+         * here would be a divergence invented to hide a divergence.
+         *
+         * mMinTiredWalkRate (0.4) is the low-HP variant and belongs with ANM_WAIT_TIRED, which the
+         * puppet cannot play until the wire carries the sender's health — job D. */
+        if (!zeroSpeed) {
+            blend = hio.mMinWalkRate + blend * (1.0f - hio.mMinWalkRate);
+        }
+        /* Nothing pins the standing case to a hard zero, and deliberately: daAlink_c's standing
+         * branch keeps the raw ratio too, it simply never reaches the remap. The ratio is already
+         * zero to five decimal places whenever the bit is set — the bit means the sender's speed is
+         * under 0.001 — so pinning it would only be inventing a rule the game does not have. */
         anmA = &mIdleAnm;
         anmB = &mWalkAnm;
         idA = l_idleAnm;
@@ -1470,13 +1505,10 @@ void daRemotePlayer_c::selectAnimation() {
         speedB = hio.mRunAnmSpeed;
     }
 
-    /* Standing still is pinned to pure idle rather than left to a very small blend weight. The
-     * replicated speed is an interpolated value and does not settle to exactly zero, so without
-     * this a stationary puppet carries a few percent of walk forever — a visible shuffle on a
-     * character that is not moving. */
-    if (speed <= l_idleSpeedThreshold) {
-        blend = 0.0f;
-    }
+    /* ★ The standing test is applied in band 1 ONLY, which is where daAlink_c applies it: bands 2
+     * and 3 do not consult it at all (d_a_alink.cpp:7784-7798). The receiver used to pin every band
+     * to pure idle below a speed threshold of its own, which is a rule the game does not have — it
+     * only ever looked harmless because MODE_IDLE with a run-speed rate is rare, not impossible. */
 
     /* Which gait the puppet is mostly in. This no longer decides what is drawn — the blend does —
      * but it is still the animation the hand poses are read from and the value --mp-trace reports,
@@ -1531,11 +1563,25 @@ void daRemotePlayer_c::selectAnimation() {
     if (!mLoggedBlend && idA != idB && blend > 0.05f && blend < 0.95f) {
         mLoggedBlend = true;
         Log.debug("Puppet {} gait blend live: {:.2f} from anim {} bck {} (frame {:.1f} of {}) into "
-                  "anim {} bck {} (frame {:.1f} of {}) at speed {:.1f}",
+                  "anim {} bck {} (frame {:.1f} of {}) at rate {:.3f}",
             mPlayerId, blend, static_cast<int>(idA), anm_bck_idx(idA),
             mUnderFrameCtrl[0].getFrame(), mUnderFrameCtrl[0].getEnd(), static_cast<int>(idB),
             anm_bck_idx(idB), mUnderFrameCtrl[1].getFrame(), mUnderFrameCtrl[1].getEnd(),
-            mNetSpeed);
+            mNetMoveRate);
+    }
+
+    /* ★ Latched and permanent, and it proves the one thing a screenshot cannot: that the walk
+     * weight is on the RIGHT SIDE of Link's step. A puppet using the raw ratio and a puppet using
+     * the remap look like the same bug at a glance — both walk — and the difference between them
+     * is the entire gliding report. Fires the first time the sender is genuinely moving inside
+     * band 1, and states the raw ratio next to what it became. Anything below mMinWalkRate on the
+     * "remapped" number means the remap is not live. */
+    if (!mLoggedWalkFloor && !zeroSpeed && fraction < hio.mWalkChangeRate) {
+        mLoggedWalkFloor = true;
+        Log.debug("Puppet {} walk floor live: rate {:.3f} -> raw ratio {:.2f} -> remapped {:.2f} "
+                  "(floor mMinWalkRate {:.2f}); sender says standing = {}",
+            mPlayerId, fraction, fraction / hio.mWalkChangeRate, blend, hio.mMinWalkRate,
+            mNetZeroSpeed ? "yes" : "no");
     }
 }
 
@@ -1857,11 +1903,12 @@ void daRemotePlayer_c::setEyeMove() {
         vertical = cLib_minMaxLimit<f32>(l_eyeAngleToOffset * angleX, -1.0f, 1.0f);
         horizontal = cLib_minMaxLimit<f32>(l_eyeAngleToOffset * angleY, -1.0f, 1.0f);
         eyesActive = true;
-    } else if (fabsf(mNetSpeed) < l_idleSpeedThreshold) {
+    } else if (mNetZeroSpeed) {
         /* Nobody worth watching and standing still, so look about. daAlink_c::setEyeMove's idle
          * branch (d_a_alink.cpp:3337-3358), which is what stops a waiting Link from staring dead
          * ahead. His version gates on mProcID == PROC_WAIT and friends; a puppet has no proc, and
-         * "not moving" is the same idea.
+         * the sender's own "standing" bit is the closest thing to it that exists here — closer
+         * than the invented speed threshold this used to compare against.
          *
          * Unlike the tracking path these are NOT angles — they are already the -1..1 deflection,
          * so an idle glance always goes to full travel. */
@@ -2754,28 +2801,30 @@ void daRemotePlayer_c::setHatAngle() {
         mWindLogTicks++;
         if (mWindLogTicks % l_windLogPeriod == 0) {
             mWindLogCount++;
-            const daAlink_c* windLink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+            /* Non-const purely so the comparison below can ask Link for his own gait rate;
+             * getMoveGroundAngleSpeedRate() is a read but is not declared const in the decomp. */
+            daAlink_c* windLink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
             f32 linkRaw = -1.0f;
             if (windLink != NULL) {
                 cXyz linkPos = windLink->current.pos;
                 cXyz linkWindDir;
                 dKyw_get_AllWind_vec(&linkPos, &linkWindDir, &linkRaw);
             }
-            /* ★ Both SPEEDS go on this line, and they are not decoration. The cap's lateral swing
-             * is driven by how far the cap anchor moved, so a walking character's cap swings and a
-             * standing one's hangs — by design, and confirmed by Stuart when the idle hang was
-             * added. A comparison taken while one side walks and the other stands therefore shows a
-             * large difference that has NOTHING to do with wind, and that is exactly what the first
-             * human-form comparison caught: P1 walking, puppet parked. Trust the cap angles only
-             * when these two numbers are close. */
+            /* ★ Both GAIT RATES go on this line, and they are not decoration. The cap's lateral
+             * swing is driven by how far the cap anchor moved, so a walking character's cap swings
+             * and a standing one's hangs — by design, and confirmed by Stuart when the idle hang
+             * was added. A comparison taken while one side walks and the other stands therefore
+             * shows a large difference that has NOTHING to do with wind, and that is exactly what
+             * the first human-form comparison caught: P1 walking, puppet parked. Trust the cap
+             * angles only when these two numbers are close. */
             Log.debug("Puppet {} wind #{}: bend raw {:.2f} (P1 raw {:.2f}) flutter {:.2f} | "
                       "teach {} | rate {:.2f} (hit {}, dist {:.0f}) | push {:.2f} vs P1 {:.2f} | "
-                      "speed {:.2f} vs P1 {:.2f}",
+                      "gait rate {:.3f} vs P1 {:.3f}",
                 mPlayerId, mWindLogCount, bendWindPower, linkRaw, windPower, teachWind,
                 mWindWallRate, mWindChkHit ? "yes" : "no", mWindChkDist,
                 JMAFastSqrt(mWindPush.abs2()),
-                windLink != NULL ? JMAFastSqrt(windLink->field_0x35b8.abs2()) : -1.0f, mNetSpeed,
-                windLink != NULL ? windLink->speedF : -1.0f);
+                windLink != NULL ? JMAFastSqrt(windLink->field_0x35b8.abs2()) : -1.0f, mNetMoveRate,
+                windLink != NULL ? windLink->getMoveGroundAngleSpeedRate() : -1.0f);
 
             /* ★ The cap's SIDEWAYS swing, broken into its two inputs, because Stuart's report is
              * that the puppet's cap pitches like his but never gets thrown out to the side — and

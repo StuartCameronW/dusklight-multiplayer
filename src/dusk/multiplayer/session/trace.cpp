@@ -30,8 +30,8 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     std::size_t buffered, unsigned anm = 0) {
     sFile << tick << ',' << elapsed_ms() << ',' << sRole << ',' << kind << ',' << playerId << ','
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
-          << state.speed << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
-          << buffered << ',' << anm << '\n';
+          << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
+          << buffered << ',' << anm << ',' << static_cast<unsigned>(state.flags) << '\n';
 }
 
 }  // namespace
@@ -46,8 +46,11 @@ void open(const std::string& path, const char* role) {
     sRole = role;
     sStart = std::chrono::steady_clock::now();
     sEnabled = true;
-    sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,speed,delayTicks,starvations,snaps,buffered,"
-             "anm\n";
+    // `moveRate` was called `speed` until protocol 6, and it is genuinely a different quantity now
+    // — the sender's own getMoveGroundAngleSpeedRate(), roughly 0..1 — so the column is renamed
+    // rather than quietly refilled. An analyzer written against the old name fails loudly.
+    sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,"
+             "buffered,anm,flags\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

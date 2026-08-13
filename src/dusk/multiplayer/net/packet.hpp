@@ -24,8 +24,15 @@ namespace dusk::mp {
  * same type, so a v4 peer would parse it perfectly and simply animate wrong: every remote player
  * would walk visibly slower than the person driving them. Bumped anyway, deliberately. A rejected
  * handshake says what is wrong in one line; "everyone's legs are a bit off" is the kind of thing
- * that gets diagnosed twice and blamed on something else both times. */
-inline constexpr std::uint32_t kProtocolVersion = 5;
+ * that gets diagnosed twice and blamed on something else both times.
+ *
+ * 6: the same four bytes stopped being a speed at all. They now carry the sender's own
+ * getMoveGroundAngleSpeedRate() — the dimensionless value daAlink_c blends his gaits from — and
+ * flag bit 3 carries his "standing" predicate. Still 20 bytes, so once again a v5 peer would parse
+ * it perfectly: it would read a number between 0 and 1 as a speed in engine units, decide every
+ * remote player is standing still, and never animate one again. Rejecting the handshake turns a
+ * silent, total misbehaviour into one line. */
+inline constexpr std::uint32_t kProtocolVersion = 6;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

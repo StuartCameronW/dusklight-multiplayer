@@ -336,7 +336,7 @@ bool capture_local_player(PlayerState& out) {
     /* The same actor through the accessor that is documented to hold a daAlink_c — the one the rest
      * of the puppet code reads Link from (d_a_remote_player.cpp:414). Null-checked at every use
      * below; nothing here may assume a scene. */
-    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
 
     out.posX = link->current.pos.x;
     out.posY = link->current.pos.y;
@@ -344,45 +344,46 @@ bool capture_local_player(PlayerState& out) {
     // shape_angle is the visual facing that gets baked into the model matrix; current.angle is the
     // logical one and the two diverge while turning. The puppet is a visual, so mirror the visual.
     out.angleY = link->shape_angle.y;
-    /* ★ mNormalSpeed, NOT speedF, and the difference is the whole reason a puppet's legs ran slower
-     * than the player it was copying. Stuart, 2026-08-13: "the puppet glides a bit, its animation
-     * is always a tad bit slower... when MC walks, puppet walks very slowly. when MC does faster
-     * walk, puppet does normal walk", correct at a run.
+    /* ★ The gait rate daAlink_c computes for HIMSELF, sent whole rather than as any of the inputs
+     * to it. getMoveGroundAngleSpeedRate() (d_a_alink.cpp:7546-7556) is the first thing
+     * setBlendMoveAnime does (:7561), and everything the receiver needs to choose a gait follows
+     * from it.
      *
-     * speedF is Link's TRANSLATION speed and it is root-motion blended:
+     * This field has now been wrong twice, both times because the receiver was re-deriving what
+     * this line could simply have carried:
      *
+     *   - It was speedF, Link's TRANSLATION speed, which is root-motion blended —
      *     speedF = mNormalSpeed * (1 - mSpeedModifier) + footSpeed * mSpeedModifier
+     *     (:13028-13034), and mSpeedModifier is mFootPositionRatio, 0.99, at a walk (:7760). So
+     *     while walking essentially ALL of Link's movement comes from the walk cycle's own foot
+     *     motion — which is why his feet never slide — and speedF sits pinned near that cycle's
+     *     natural speed however hard the stick is pushed. Stuart, 2026-08-13: "when MC walks,
+     *     puppet walks very slowly", correct at a run. mNormalSpeed, the INTENT, fixed that.
+     *   - Sending mNormalSpeed still left the receiver dividing by the HIO constant 23.0 and
+     *     ignoring the ground angle. mMaxSpeed is a daAlink_c MEMBER and drops to the lock-on
+     *     maximum, or a flat 13.0, while targeting (:7867-7871, :12344-12353); and the cosine of
+     *     the ground angle shifts a climbing Link toward the slower gait at the same speed.
      *
-     * (d_a_alink.cpp:13028-13034, with footSpeed measured off the planted foot's joint matrices in
-     * setFootSpeed, :12959-12984). mSpeedModifier comes out of setBlendMoveAnime itself and is
-     * mFootPositionRatio — 0.99 — at a walk, tapering to 0 at a run (:7760, :7788, :7798). So while
-     * walking, essentially ALL of Link's movement comes from the walk cycle's own foot motion,
-     * which is exactly why his feet never slide; and speedF therefore sits pinned near that cycle's
-     * natural speed however hard the stick is pushed.
-     *
-     * mNormalSpeed is the INTENT — what the stick asked for — and it is what daAlink_c drives the
-     * gait blend from (getMoveGroundAngleSpeedRate, :7546-7556). Sending speedF meant the receiver
-     * saw almost no change across the whole walk band and held a low blend weight, and it explains
-     * the report band for band: the modifier is 0 at a run (correct), tapers to 0 approaching one
-     * (correct), and is at its largest exactly where he saw the worst of it.
-     *
-     * Nothing on the receiver wants the translation speed — position is replicated outright, and
-     * this value only picks the gait and feeds the trace. Checked before changing it. */
-    out.speed = alink != nullptr ? alink->mNormalSpeed : link->speedF;
+     * Both retired here for no extra bytes. Nothing on the receiver wants a speed in engine units:
+     * position is replicated outright, so this value only picks the gait and feeds the trace.
+     * Checked before changing it. */
+    out.moveRate = alink != nullptr ? alink->getMoveGroundAngleSpeedRate() : 0.0f;
 
-    /* Latched, permanent, and it exists to stop this being re-diagnosed. The two speeds AGREE at a
-     * run and diverge most at a walk, so a glance at the local player's numbers proves nothing
-     * unless it is taken while walking — which is exactly when nobody thinks to look. One line the
-     * first time they genuinely disagree records the size of the gap on the route that was actually
-     * walked. If anyone later "simplifies" this back to speedF, this line is the argument. */
+    /* Latched, permanent, and it exists to stop this being re-diagnosed a third time. The rate is
+     * derived from the intent, so the gap it records is the one that was invisible: the two speeds
+     * AGREE at a run and diverge most at a walk, and a glance at the local player's numbers proves
+     * nothing unless it is taken while walking — exactly when nobody thinks to look. If anyone
+     * later "simplifies" this back to a speed, this line is the argument. */
     static bool s_loggedSpeedGap = false;
     if (!s_loggedSpeedGap && alink != nullptr && std::fabs(alink->mNormalSpeed) > 1.0f &&
         std::fabs(link->speedF) < 0.8f * std::fabs(alink->mNormalSpeed))
     {
         s_loggedSpeedGap = true;
-        Log.debug("Local speed: intent (mNormalSpeed) {:.2f} vs translation (speedF) {:.2f} — "
-                  "{:.0f}% of intent. The wire carries the intent; see capture_local_player().",
-            alink->mNormalSpeed, link->speedF, 100.0f * link->speedF / alink->mNormalSpeed);
+        Log.debug("Local gait rate {:.3f} on the wire; intent (mNormalSpeed) {:.2f} vs translation "
+                  "(speedF) {:.2f} — {:.0f}% of intent. The wire carries the rate daAlink_c blends "
+                  "from; see capture_local_player().",
+            out.moveRate, alink->mNormalSpeed, link->speedF,
+            100.0f * link->speedF / alink->mNormalSpeed);
     }
     // Sampled every tick rather than on a change event, because there is no change event to hook:
     // daAlink_c::setArcName just overwrites mArcName during the pause menu's model rebuild. Reading
@@ -404,6 +405,19 @@ bool capture_local_player(PlayerState& out) {
      */
     if (alink != nullptr && alink->mProcID == daAlink_c::PROC_SLIP) {
         out.flags |= kPlayerStateSharpTurn;
+    }
+
+    /* Standing, as setBlendMoveAnime itself asks the question (d_a_alink.cpp:7656) — the same two
+     * tests in the same order, not an approximation of them. It selects a branch with a STEP in it:
+     * on the moving side Link's walk weight starts at mMinWalkRate, 0.7, so this bit is the
+     * difference between a puppet standing still and a puppet at seven tenths of a walk.
+     *
+     * A null alink sends it SET rather than clear. It means "no daAlink_c to ask", so the rate
+     * above went out as 0.0, and 0.0 on the moving side of that step is the one combination that
+     * cannot occur naturally — it would put a motionless puppet into a walk. The receiver has its
+     * own guard for the same reason; see selectAnimation(). */
+    if (alink == nullptr || alink->checkModeFlg(daAlink_c::MODE_IDLE) || alink->checkZeroSpeedF()) {
+        out.flags |= kPlayerStateZeroSpeed;
     }
 
     return true;
@@ -565,7 +579,8 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     }
 
     cXyz pos(state.posX, state.posY, state.posZ);
-    puppet->setNetworkPose(pos, state.angleY, state.speed, state.sharp_turn());
+    puppet->setNetworkPose(
+        pos, state.angleY, state.moveRate, state.sharp_turn(), state.zero_speed());
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -578,12 +593,17 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     out.posY = puppet->current.pos.y;
     out.posZ = puppet->current.pos.z;
     out.angleY = puppet->shape_angle.y;
-    out.speed = puppet->getNetSpeed();
+    out.moveRate = puppet->getNetMoveRate();
     // The outfit the puppet actually mounted, not the byte we last received, for the same reason
     // the rest of this function reads the actor rather than the network: this is the "did the
     // instruction land?" side of the comparison.
     out.outfit = static_cast<std::uint8_t>(puppet->getOutfit());
     out.flags = puppet->hasPose() ? kPlayerStateInWorld : 0;
+    // Read back off the puppet rather than remembered here, for the same reason as everything else
+    // in this function: this is the "did the instruction land?" side of the comparison.
+    if (puppet->getNetZeroSpeed()) {
+        out.flags |= kPlayerStateZeroSpeed;
+    }
     return true;
 }
 

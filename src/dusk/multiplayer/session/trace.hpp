@@ -13,7 +13,7 @@
  *
  * Rows are long-format (one row per subject per tick) because the number of players varies:
  *
- *   tick,ms,role,kind,playerId,x,y,z,angleY,speed,delayTicks,starvations,snaps,buffered,anm
+ *   tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,buffered,anm,flags
  *
  * `kind` is `local` for this instance's own Link, `applied` for the pose pushed onto a puppet, and
  * `actor` for the pose read back off the puppet actor afterwards. `applied` and `actor` disagreeing
@@ -22,6 +22,14 @@
  * `anm` is set on `actor` rows only: the AlAnm resource index of the gait the puppet chose. It is
  * here because a wrong gait is otherwise only visible on the OTHER player's screen, which makes it
  * the one class of bug the harness could not catch on its own.
+ *
+ * `moveRate` is NOT a speed — it is the sender's own getMoveGroundAngleSpeedRate(), roughly 0..1
+ * (see PlayerState::moveRate). It was called `speed` and carried engine units per tick before
+ * protocol 6; the column is renamed rather than refilled so an old analyzer fails loudly.
+ *
+ * `flags` is the PlayerStateFlags bitfield, which is what makes the gait check exact: the standing
+ * bit selects a branch of daAlink_c's blend that has a step in it, and no threshold on `moveRate`
+ * can recover which side of that step the sender was on.
  */
 
 namespace dusk::mp::trace {

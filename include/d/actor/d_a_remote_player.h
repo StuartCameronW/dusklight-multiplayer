@@ -64,7 +64,8 @@ public:
     int draw();
 
     /// Push an interpolated pose in from the network layer, before the actor pass runs.
-    void setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_speed, bool i_sharpTurn);
+    void setNetworkPose(
+        const cXyz& i_pos, s16 i_angleY, f32 i_moveRate, bool i_sharpTurn, bool i_zeroSpeed);
 
     u32 getPlayerId() const { return mPlayerId; }
     /* Index into the outfit table of the archive this puppet ACTUALLY mounted, which is not
@@ -80,9 +81,14 @@ public:
      * puppet as "it was alive once", which classified every subsequent failure as a vanish and
      * respawned it at full speed forever — the exact bug the spawn policy exists to stop. */
     bool createComplete() const { return mCreateComplete; }
-    /* Networked speed, which is NOT mirrored into speedF: nothing moves this actor locally, so the
-     * inherited field would read as a permanent zero and misreport the puppet as standing still. */
-    f32 getNetSpeed() const { return mNetSpeed; }
+    /* The sender's gait rate, which is NOT mirrored into speedF: it is not a speed, and nothing
+     * moves this actor locally anyway, so the inherited field would read as a permanent zero and
+     * misreport the puppet as standing still. */
+    f32 getNetMoveRate() const { return mNetMoveRate; }
+    /* The sender's "standing" bit as this puppet received it. Exposed for --mp-trace so the gait
+     * check can be exact: the rate alone cannot distinguish standing from crawling, and the two
+     * take different branches. */
+    bool getNetZeroSpeed() const { return mNetZeroSpeed; }
     bool hasPose() const { return mHasPose; }
     /* BCK resource index of the gait currently playing. Exposed for --mp-trace: which animation a
      * puppet picked is otherwise only checkable by looking at the other player's screen.
@@ -169,23 +175,24 @@ private:
     /* Index into the outfit table in the .cpp. Latched once, so a clothes change on the local
      * player cannot make create() and createHeap() disagree about which body to load. */
     int mOutfit;
-    /* ★ The sender's daAlink_c::mNormalSpeed — his INTENDED speed, what the stick asked for — and
-     * deliberately not his speedF. Picks the gait, against the same thresholds daAlink_c uses.
+    /* ★ The SENDER's own getMoveGroundAngleSpeedRate() — the dimensionless rate daAlink_c blends
+     * his gaits from (d_a_alink.cpp:7546-7556, used at :7561) — and NOT a speed, despite what two
+     * earlier versions of this member held. It is compared straight against mWalkChangeRate and
+     * mRunChangeRate here, with no scaling of any kind, because every scaling step this side used
+     * to perform was one the sender had already performed differently. See PlayerState::moveRate.
      *
-     * The distinction is not pedantry, it was a visible bug: speedF is root-motion blended, so
-     * while walking almost all of Link's translation comes from the walk cycle's own foot motion
-     * and speedF sits pinned near that cycle's natural speed however hard the stick is pushed. A
-     * receiver blending gaits off it saw almost no change across the whole walk band. See the long
-     * note at the sample site (player_bridge.cpp) for the arithmetic.
-     *
-     * May be NEGATIVE — mNormalSpeed is signed and goes negative moving backwards — so every read
-     * of it takes fabsf, as daAlink_c does (d_a_alink.cpp:7555). */
-    f32 mNetSpeed;
+     * Never negative: daAlink_c takes fabsf as the last thing it does (:7555). */
+    f32 mNetMoveRate;
     /* True on the ticks the SENDER was in daAlink_c::PROC_SLIP. Replicated rather than derived from
      * the yaw — see kPlayerStateSharpTurn in player_state.hpp for why deriving it inverts the
      * truth.
      */
     bool mNetSharpTurn;
+    /* True on the ticks the SENDER was standing — his own `checkModeFlg(MODE_IDLE) ||
+     * checkZeroSpeedF()`, the predicate setBlendMoveAnime branches on (d_a_alink.cpp:7656).
+     * Replicated because it selects a branch with a STEP in it, not a taper; see
+     * kPlayerStateZeroSpeed. */
+    bool mNetZeroSpeed;
     /* daAlink_c::daAlink_ANM id of the animation currently playing, so setAnm only fires on a real
      * change. Held as the ID rather than as the BCK resource index because the id is the key into
      * daAlink_c::m_anmDataTable, which owns BOTH the resource index AND the pair of hand poses that
@@ -221,6 +228,10 @@ private:
     /// neither end of the band. A blend that never leaves 0 or 1 is the outright switch it
     /// replaced.
     bool mLoggedBlend;
+    /// And for the first tick the walk weight is remapped onto Link's mMinWalkRate floor. A puppet
+    /// using the raw ratio and one using the floor both "walk"; the difference between them is the
+    /// whole gliding report, and it is not visible in a screenshot.
+    bool mLoggedWalkFloor;
     /* Latches the one-shot mount request, so re-entering create() polls rather than re-mounting. */
     bool mResRequested;
     /* Latches the one-shot pointer dump on the first calc(), so it stays one line per puppet. */
