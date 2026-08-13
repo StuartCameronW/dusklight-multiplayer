@@ -311,7 +311,8 @@ void load_script(const std::filesystem::path& path) {
         std::string a;
         std::string b;
         std::string c;
-        tokens >> a >> b >> c;
+        std::string d;
+        tokens >> a >> b >> c >> d;
 
         if (verb == "WAIT") {
             command.op = Op::Wait;
@@ -340,8 +341,12 @@ void load_script(const std::filesystem::path& path) {
             command.op = Op::Stick;
             double x = 0.0;
             double y = 0.0;
+            // The optional fourth argument is a button combination held for the whole push. Every
+            // tick's PADStatus is built from one command, so without this there is no way to
+            // express "guard while walking" — the two halves would have to be separate commands
+            // and would run one after the other.
             ok = parse_double(a, x) && parse_double(b, y) && parse_int(c, command.frames) &&
-                 command.frames > 0;
+                 command.frames > 0 && (d.empty() || parse_buttons(d, command.buttons));
             command.stickX = stick_value(x);
             command.stickY = stick_value(y);
         } else if (verb == "REPEAT") {
@@ -466,6 +471,7 @@ void tick() {
     case Op::Stick:
         status.stickX = command.stickX;
         status.stickY = command.stickY;
+        status.button = static_cast<u16>(command.buttons);
         break;
 
     default:
