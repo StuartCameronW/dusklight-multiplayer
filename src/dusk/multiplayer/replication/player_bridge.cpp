@@ -363,8 +363,19 @@ void fill_equip(daAlink_c* alink, PlayerState& out) {
     /* The seven-term test from setItemMatrix (d_a_alink.cpp:5921-5930), transcribed rather than
      * summarised. mShieldChangeWaitTimer != 0 is the outer gate there and means "leave the shield
      * exactly where it was"; there is no such memory here, so it is folded in as "on the back",
-     * which is where the shield sits for all but the guarding frames anyway. */
-    if (alink->mShieldChangeWaitTimer == 0 &&
+     * which is where the shield sits for all but the guarding frames anyway.
+     *
+     * ★ checkShieldGet() is ANDed in, and leaving it out was a real bug (2026-08-13). It is not
+     * part of the disjunction — it is the test INSIDE the branch that decides which way
+     * field_0x2e44's 0xF pass flag goes (:5931-5935), and that flag is what makes setDrawHand show
+     * hand pose 6. With no shield owned, onPassNum(0xF) fires and his right hand falls through to
+     * the ANIMATION's own pose; running around shieldless is an ordinary thing to do in this game
+     * and he does not grip then. Without this term a shieldless puppet gripped an invisible shield.
+     *
+     * Folding it in here rather than testing it on the receiver keeps the bit meaning one thing.
+     * Nothing is lost for D1b either: he does not draw a shield he does not own, so "positioned at
+     * the hand but not owned" is not a state anything needs to render. */
+    if (alink->mShieldChangeWaitTimer == 0 && daPy_py_c::checkShieldGet() &&
         ((alink->checkPlayerGuardAndAttack() && alink->mEquipItem != dItemNo_IRONBALL_e &&
              !alink->checkModeFlg(0x400)) ||
             alink->checkNoResetFlg0(daPy_py_c::FLG0_UNK_2) ||
