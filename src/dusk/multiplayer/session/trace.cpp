@@ -32,7 +32,8 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
           << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
           << buffered << ',' << anm << ',' << static_cast<unsigned>(state.flags) << ','
-          << static_cast<unsigned>(state.equip) << '\n';
+          << static_cast<unsigned>(state.equip) << ',' << static_cast<unsigned>(state.idleKind)
+          << '\n';
 }
 
 }  // namespace
@@ -51,7 +52,7 @@ void open(const std::string& path, const char* role) {
     // — the sender's own getMoveGroundAngleSpeedRate(), roughly 0..1 — so the column is renamed
     // rather than quietly refilled. An analyzer written against the old name fails loudly.
     sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,"
-             "buffered,anm,flags,equip\n";
+             "buffered,anm,flags,equip,idleKind\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

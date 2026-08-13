@@ -105,7 +105,28 @@ enum PlayerStateFlags : std::uint8_t {
     kPlayerStateNoFootIk = 1 << 5,
 };
 
-/// 21 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
+/**
+ * Which idle daAlink_c actually chose. Not a set of independent flags: setBlendMoveAnime picks
+ * exactly ONE (d_a_alink.cpp:7585-7598, :7732-7737), and procWait/procTiredWait can override it
+ * wholesale (:15624-15625, :15637-15643). An enumeration is that structure.
+ *
+ * The comment beside each name is the daAlink_c::daAlink_ANM enumerator it stands for, and its
+ * resource id. The ANM ids are NOT sent — they are 16-bit and they are an engine detail this layer
+ * is not allowed to know (layering rule, 04) — so this byte is the stable wire name for them and
+ * d_a_remote_player.cpp is the single place that maps it back.
+ */
+enum PlayerIdleKind : std::uint8_t {
+    kPlayerIdleWait = 0,      // ANM_WAIT 0x19
+    kPlayerIdleWaitB = 1,     // ANM_WAIT_B 0x1A
+    kPlayerIdleTired = 2,     // ANM_WAIT_TIRED 0xB6
+    kPlayerIdleService = 3,   // ANM_SERVICE_WAIT 0x90
+    kPlayerIdleWind = 4,      // ANM_WAIT_WIND 0xFF
+    kPlayerIdleInsect = 5,    // ANM_WAIT_INSECT 0x185
+    kPlayerIdleAtnLeft = 6,   // ANM_ATN_WAIT_LEFT 0x10
+    kPlayerIdleAtnRight = 7,  // ANM_ATN_WAIT_RIGHT 0x11
+};
+
+/// 22 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -147,6 +168,27 @@ struct PlayerState {
     /// Discrete like `flags` and `outfit`, and taken whole from the newer sample for the same
     /// reason — blending the two kind fields would name a model neither player is holding.
     std::uint8_t equip = 0;
+    /**
+     * Which idle the sender is actually playing. See PlayerIdleKind.
+     *
+     * ★ An ENUMERATION rather than more bits in `flags`, and that is the shape of the thing rather
+     * than a preference: the variants are mutually exclusive by construction, because
+     * setBlendMoveAnime picks exactly one and procWait/procTiredWait replace it outright. Spending
+     * a flag bit each on states that can never co-occur would put illegal combinations on the wire
+     * for the receiver to have to rank, and ranking them is precisely the re-derivation this field
+     * exists to stop.
+     *
+     * kPlayerIdleInsect is NAMED but not yet sampled — the sender's chain in fill_idle_kind() does
+     * not test for it. It is listed here so the wire value is fixed now rather than being invented
+     * later, since a byte with 248 spare values means finishing the set costs no protocol bump.
+     *
+     * Discrete like `flags`, `outfit` and `equip`, and taken whole from the newer sample for the
+     * same reason: blending 0 and 2 would name idle 1 — a different animation — for the crossover.
+     *
+     * kPlayerIdleWait is the default and the safe reading: it is the ordinary standing idle, which
+     * is what the puppet already played before this field existed.
+     */
+    std::uint8_t idleKind = kPlayerIdleWait;
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
@@ -176,11 +218,13 @@ struct PlayerState {
         w.write_u8(outfit);
         w.write_u8(flags);
         w.write_u8(equip);
+        w.write_u8(idleKind);
     }
 
     bool read(Reader& r) {
         return r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
-               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip);
+               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
+               r.read_u8(idleKind);
     }
 };
 
@@ -225,6 +269,10 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     // Flags are discrete: take the newer sample's, never a blend of two bitfields.
     out.flags = b.flags;
     out.equip = b.equip;
+    // Discrete for the same reason as the outfit: it is an index into a table of animations, not a
+    // quantity. Halfway between the tired idle and the service idle is the plain one, which is
+    // neither of the two the sender was ever in.
+    out.idleKind = b.idleKind;
     return out;
 }
 

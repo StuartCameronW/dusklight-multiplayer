@@ -298,6 +298,88 @@ void note_create_failure(std::uint32_t playerId, PuppetRef& ref, const char* rea
         playerId, reason_text(ref), ref.consecutiveFailures, kMaxCreateFailures, delay);
 }
 
+/// The enumerator each PlayerIdleKind stands for, for the log line below. Indexed by the wire
+/// value, so a value this table does not cover is reported as such rather than reading off the end.
+const char* idle_kind_name(std::uint8_t kind) {
+    switch (kind) {
+    case kPlayerIdleWait:
+        return "ANM_WAIT";
+    case kPlayerIdleWaitB:
+        return "ANM_WAIT_B";
+    case kPlayerIdleTired:
+        return "ANM_WAIT_TIRED";
+    case kPlayerIdleService:
+        return "ANM_SERVICE_WAIT";
+    case kPlayerIdleWind:
+        return "ANM_WAIT_WIND";
+    case kPlayerIdleInsect:
+        return "ANM_WAIT_INSECT";
+    case kPlayerIdleAtnLeft:
+        return "ANM_ATN_WAIT_LEFT";
+    case kPlayerIdleAtnRight:
+        return "ANM_ATN_WAIT_RIGHT";
+    default:
+        return "unnamed";
+    }
+}
+
+/**
+ * Fill the idle byte with the animation daAlink_c is genuinely playing.
+ *
+ * ★ This reads the sender's ANSWER, not his inputs. checkUnderMove0BckNoArc (d_a_alink.cpp:6951)
+ * compares mUnderAnmHeap[0].getIdx() against getMainBckData(id)->m_underID — i.e. the resource the
+ * lower body is loaded with RIGHT NOW, with every substitution the state machine applied already
+ * baked in. Re-deriving an animation choice from Link's flags has been wrong three times on this
+ * project (the gait speed twice, the standing predicate once); asking what he is playing cannot be
+ * wrong in that way, because it is not a prediction.
+ *
+ * The ORDER is load-bearing and is not a priority ranking. During a morf mUnderAnmHeap[0] holds
+ * exactly one animation, so at most one of these tests can pass and the first match IS the answer;
+ * the chain is written as else-if only to stop asking once it has been answered.
+ *
+ * Slot 1 (checkUnderMove1BckNoArc) is deliberately not consulted: that is the OUTGOING animation
+ * being blended away, so reading it would report the idle he is LEAVING for the length of every
+ * transition.
+ *
+ * ANM_WAIT itself is the default rather than a case, because it is what "none of the above" means:
+ * it is the idle daAlink_c falls back to, and it is what a null alink has to report.
+ */
+void fill_idle_kind(daAlink_c* alink, PlayerState& out) {
+    out.idleKind = kPlayerIdleWait;
+    if (alink != nullptr) {
+        if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_ATN_WAIT_LEFT)) {
+            out.idleKind = kPlayerIdleAtnLeft;
+        } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_ATN_WAIT_RIGHT)) {
+            out.idleKind = kPlayerIdleAtnRight;
+        } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_SERVICE_WAIT)) {
+            out.idleKind = kPlayerIdleService;
+        } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_WAIT_TIRED)) {
+            out.idleKind = kPlayerIdleTired;
+        } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_WAIT_B)) {
+            out.idleKind = kPlayerIdleWaitB;
+        } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_WAIT_WIND)) {
+            out.idleKind = kPlayerIdleWind;
+        } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_WAIT_INSECT)) {
+            out.idleKind = kPlayerIdleInsect;
+        }
+    }
+
+    /* One line, once, the first time this instance reports anything other than the plain idle.
+     *
+     * It exists because the alternative is an unfalsifiable claim. Every idle here plays only in a
+     * narrow situation — the alert idles need a lock-on, the tired one needs low hearts — so "the
+     * alert idle works" is otherwise established by one person watching another person's screen and
+     * saying it looked right. This line makes it a fact with a timestamp: if it never appears, the
+     * sender never sampled one, and no amount of receiver work was ever going to show one. */
+    static bool s_loggedIdleKind = false;
+    if (!s_loggedIdleKind && out.idleKind != kPlayerIdleWait) {
+        s_loggedIdleKind = true;
+        Log.debug("Local idle kind {} ({}) sampled off the sender's animation heap and sent; see "
+                  "fill_idle_kind(). This is the only line — later changes are not reported.",
+            static_cast<unsigned>(out.idleKind), idle_kind_name(out.idleKind));
+    }
+}
+
 /**
  * Fill the equipment byte from the sender's own answers.
  *
@@ -537,6 +619,7 @@ bool capture_local_player(PlayerState& out) {
         out.flags |= kPlayerStateNoFootIk;
     }
 
+    fill_idle_kind(alink, out);
     fill_equip(alink, out);
 
     return true;

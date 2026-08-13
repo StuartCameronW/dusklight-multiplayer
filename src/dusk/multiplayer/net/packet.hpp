@@ -43,8 +43,17 @@ namespace dusk::mp {
  * cautious kind: a v7 peer's read() under-runs on the new trailing byte and discards every pose
  * packet, which looks like a session that connects and then shows nobody moving. The byte is filled
  * completely from this version, including the shield half the puppet does not draw yet, so
- * finishing the shield will not need a second bump. */
-inline constexpr std::uint32_t kProtocolVersion = 8;
+ * finishing the shield will not need a second bump.
+ *
+ * 9: PlayerState grew an idle byte (21 -> 22) — which of daAlink_c's idle animations the sender is
+ * actually playing, sampled off the animation heap rather than re-derived from his flags. Another
+ * SIZE change, so this is the mandatory kind of bump: a v8 peer's read() under-runs on the new
+ * trailing byte, returns false, and discards every pose packet — the same "connects fine, nobody
+ * moves" failure as versions 4 and 8. It is an enumeration and not more flag bits because the
+ * variants are mutually exclusive by construction (setBlendMoveAnime picks exactly one), and a byte
+ * has room for all 256 of them where only eight are named so far — so the remaining idle variants,
+ * and the rest of D3, cost no second bump. */
+inline constexpr std::uint32_t kProtocolVersion = 9;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
