@@ -6,6 +6,7 @@
 #include "d/dolzel_rel.h"  // IWYU pragma: keep
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "JSystem/J3DGraphAnimator/J3DJoint.h"
@@ -23,6 +24,7 @@
 #include "dusk/player_equip.hpp"
 #include "dusk/player_idle.hpp"
 #include "f_op/f_op_actor_mng.h"
+#include "m_Do/m_Do_dvd_thread.h"
 // The sword and sheath resource indices. Safe to include even though the per-outfit headers are
 // not: Alink.h's joint enums are all prefixed by their own model (AL_SWA_JNT, AL_PODM_JNT), so
 // nothing in it collides the way AL_JNT in Kmdl.h collides with BL_JNT in Bmdl.h.
@@ -1598,8 +1600,73 @@ u8 daRemotePlayer_localOutfitToWire() {
  * Link budgets 0x7000 for one of these archives (d_a_alink.cpp:4976), against the 0xA2800 he
  * budgets for the outfit archive the puppet already mounts.
  */
+/**
+ * Development only: how long the DVD thread should dawdle over THIS actor's mounts, in ms.
+ *
+ * Zero unless DUSK_DVD_MOUNT_DELAY_MS is set in the environment, which nothing but a test ever
+ * does. It exists because the bug readyForDelete() guards cannot otherwise be reached: every mount
+ * in every recorded session resolved after one tick, so "delete arrives while the mount is in
+ * flight" is a window one frame wide on this machine, and a test that has to hit it by luck is not
+ * a test. Widening the window is the only honest way to exercise the wait.
+ *
+ * An environment variable rather than a --cvar or a setting, deliberately: it is not a preference,
+ * it must not persist into anyone's config.json, and it cannot be reached from the UI by accident.
+ */
+u32 debug_mount_delay_ms() {
+    static bool s_read = false;
+    static u32 s_delayMs = 0;
+    if (!s_read) {
+        s_read = true;
+        const char* env = std::getenv("DUSK_DVD_MOUNT_DELAY_MS");
+        if (env != NULL) {
+            const long parsed = std::strtol(env, NULL, 10);
+            if (parsed > 0 && parsed <= 5000) {
+                s_delayMs = static_cast<u32>(parsed);
+                Log.warn("DUSK_DVD_MOUNT_DELAY_MS={} — the DVD thread will sleep that long before "
+                         "every command issued while a puppet is mounting. This is a TEST knob for "
+                         "the delete-mid-mount race; it makes loads slower on purpose.",
+                    s_delayMs);
+            } else {
+                Log.warn("DUSK_DVD_MOUNT_DELAY_MS='{}' is not a number in 1..5000; ignoring", env);
+            }
+        }
+    }
+    return s_delayMs;
+}
+
+/**
+ * Raise or lower the artificial DVD delay, and log the edges so a test run says plainly when the
+ * window was open. Idempotent, because both callers poke it every tick.
+ */
+void set_debug_mount_delay(bool i_wanted) {
+#if TARGET_PC
+    const u32 delayMs = debug_mount_delay_ms();
+    if (delayMs == 0) {
+        return;
+    }
+    const u32 target = i_wanted ? delayMs : 0;
+    if (mDoDvdThd::DebugCommandDelayMs != target) {
+        mDoDvdThd::DebugCommandDelayMs = target;
+        /* ★ Budgeted at exactly the number of commands this actor is about to queue, and that is
+         * the difference between a test that works and one that cannot. A plain "slow everything
+         * down while a puppet mounts" also slowed the STAGE RELOAD the test triggers on purpose,
+         * so the teardown arrived 250 ticks later — after the mounts had settled — on every run.
+         * The four are the outfit archive plus the three shields; see mountOwnArchive. */
+        mDoDvdThd::DebugCommandDelayCount = i_wanted ? 1 + dusk::mp::kPlayerEquipShieldKindNum : 0;
+        Log.warn(
+            "Artificial DVD delay {} ({} ms x {} command(s)) — a puppet's private mounts are {}",
+            i_wanted ? "RAISED" : "cleared", target, mDoDvdThd::DebugCommandDelayCount,
+            i_wanted ? "in flight" : "settled");
+    }
+#endif
+}
+
 int daRemotePlayer_c::mountOwnArchive() {
     if (!mResRequested) {
+        /* Raised BEFORE the set() calls so the very first command is already slow — see
+         * debug_mount_delay_ms(). No-op unless the environment variable is set. */
+        set_debug_mount_delay(true);
+
         /* Latched BEFORE the set() calls, not after them. A set() that fails used to leave this
          * false with one to three commands already issued, so a re-entered create() would call
          * set() again on a dRes_info_c that already holds a live mDoDvdThd_mountArchive_c and
@@ -1674,6 +1741,9 @@ int daRemotePlayer_c::mountOwnArchive() {
         // Even when something has already failed: see above. The failure is not going anywhere.
         return cPhs_LOADING_e;
     }
+
+    // Nothing of this puppet's is in flight any more, so stop punishing everybody else's loads.
+    set_debug_mount_delay(false);
 
     if (failed) {
         /* One line, once — create() returns this straight to the framework, which cancels the
@@ -1858,6 +1928,10 @@ bool daRemotePlayer_c::readyForDelete() {
     }
 
     if (pending == 0) {
+        /* Cleared here as well as in mountOwnArchive, and this is the path that matters: a puppet
+         * deleted mid-mount never reaches mountOwnArchive again, so without this the artificial
+         * delay would stay raised for the rest of the session. */
+        set_debug_mount_delay(false);
         if (mDeleteWaitTicks != 0) {
             Log.info("Puppet for player {}: its in-flight archive mount(s) finished after {} "
                      "delete attempt(s); destructing now",
@@ -2013,6 +2087,74 @@ void daRemotePlayer_c::selectAnimation() {
         }
         // The idle-frame probe below counts consecutive IDLE ticks; a skid is not one of them.
         mIdleTicks = 0;
+        return;
+    }
+
+    /* ★ The idle fidget is a SINGLE animation, taken before the bands and returned from, exactly
+     * like the skid above — and putting it here instead of in the wait slot of band 1 is the fix
+     * for a regression Stuart saw by eye on 2026-08-13: "everytime the puppet wants to play the
+     * idle fidget, he just freezes (not even the idle animation playing)".
+     *
+     * ANM_SERVICE_WAIT is not a gait. daAlink_c reaches it through a proc of its own,
+     * procServiceWaitInit -> setSingleAnimeBase (d_a_alink.cpp:15499-15506), which is
+     * setSingleAnime(id, 1.0f, 0.0f, -1, 3.0f) — one animation across both halves, started at frame
+     * ZERO. The receiver used to hand it to setDoubleAnm as band 1's wait slot instead, and
+     * setDoubleAnm carries the NORMALISED PHASE of the outgoing pair into the incoming one. That is
+     * right for two looping cycles, which is what it was written for; it is wrong for a one-shot.
+     *
+     * Measured on both ends of one run, host log 2026-08-13 21:01:56:
+     *
+     *   local  service-wait probe tick 0:   frame   0.0 of 260 rate 1.000 attr 0
+     *   puppet alert-idle    probe tick 420: frame  77.1 of 260 rate 1.000 attr 0
+     *
+     * attr 0 is J3DFrameCtrl::EMode_NONE — SWAITA is a 260-frame ONE-SHOT. The puppet entered it
+     * about 62 frames in, because WAITS is 45 frames long and whatever phase it happened to hold at
+     * the swap became phase * 260. So it ran out of animation roughly two seconds before the sender
+     * did, and J3DFrameCtrl::update zeroes mRate and pins the frame at the end
+     * (J3DAnimation.cpp:147-151) — measured holding frame 260.0 for 45+ ticks with rate 0.000. The
+     * carried phase is effectively random, so a trigger that landed near frame 250 froze at once
+     * having shown no fidget at all, which is what Stuart described.
+     *
+     * Entering at 0 removes both halves: the whole fidget plays, and the two copies run the same
+     * 260 frames from the same start, so the end arrives on both within the network delay instead
+     * of two seconds apart. The held end pose that remains is daAlink_c's own — he holds it too,
+     * for the ~15 ticks between the animation ending and PROC_SERVICE_WAIT letting go.
+     *
+     * Not gated on the sender standing, and the skid above is not either. The two states are
+     * mutually exclusive on the sender by construction — PROC_SERVICE_WAIT is entered from
+     * procWait with mNormalSpeed pinned to 0 — and a starved StateBuffer holds the WHOLE sample
+     * (state_buffer.cpp:164-169), so a held "service" carries the zero rate that came with it.
+     * There is no wire state in which this can fire over a moving puppet. */
+    if (mNetIdleKind == dusk::mp::kPlayerIdleService && mServiceWaitAnm.mpUnder != NULL) {
+        if (mCurrentAnm != l_serviceWaitAnm) {
+            /* daAlink_c's own parameters, from setSingleAnimeBase (d_a_alink.cpp:7209-7211): rate
+             * 1.0, start frame 0, end frame from the asset, morf 3.0. The 3.0 is a literal there
+             * rather than an HIO entry, so it is a literal here, named and cited instead of
+             * silently copied. The play mode is the asset's own, which is what commonSingleAnime
+             * uses (:7180) and which measured as EMode_NONE. */
+            const f32 serviceWaitMorf = 3.0f;
+            setAnm(mServiceWaitAnm, mServiceWaitAnm.mpUnder->getAttribute(), serviceWaitMorf, 1.0f,
+                0.0f, -1);
+            mCurrentAnm = static_cast<u16>(l_serviceWaitAnm);
+
+            /* Latched and permanent, and it is what makes "the fidget is fixed" falsifiable rather
+             * than a claim about how something looked. The number to read is the frame: 0.0 is the
+             * fix, anything else is the phase carry-over back again. */
+            if (!mLoggedServiceWait) {
+                mLoggedServiceWait = true;
+                Log.debug("Puppet {} idle fidget: entering SWAITA (anm {}, bck {}) at frame {:.1f} "
+                          "of {}, mode {} — daAlink_c enters at 0.0 (setSingleAnimeBase)",
+                    mPlayerId, static_cast<int>(l_serviceWaitAnm),
+                    anm_bck_idx(l_serviceWaitAnm, mNetEquip), mUnderFrameCtrl[0].getFrame(),
+                    mUnderFrameCtrl[0].getEnd(),
+                    static_cast<int>(mUnderFrameCtrl[0].getAttribute()));
+            }
+        }
+        /* Standing still IS an idle tick, unlike the skid — the probe below reports on a puppet
+         * that has been stationary a long time, and the fidget only happens after 10-15 s of it. */
+        if (mIdleTicks < 0xFFFF) {
+            mIdleTicks++;
+        }
         return;
     }
 
@@ -2354,12 +2496,12 @@ const daRemotePlayer_anm_c& daRemotePlayer_c::idleAnm(u16* o_anmID) const {
             id = l_waitBAnm;
         }
         break;
-    case dusk::mp::kPlayerIdleService:
-        if (mServiceWaitAnm.mpUnder != NULL) {
-            anm = &mServiceWaitAnm;
-            id = l_serviceWaitAnm;
-        }
-        break;
+    /* ★ kPlayerIdleService is deliberately NOT here. It is a 260-frame one-shot, not a cycle, and
+     * selectAnimation() plays it as a single animation from frame 0 before it reaches the bands —
+     * see the block above setDoubleAnm for the measurements. Naming it here as well would not be
+     * redundant, it would be the bug back again: this function is also what a kind falls through to
+     * when the fidget block does NOT fire, and the only way that happens is a wire sample that says
+     * "service" in a state daAlink_c cannot be in. The plain wait is the right answer there. */
     case dusk::mp::kPlayerIdleTired:
         if (mTiredWaitAnm.mpUnder != NULL) {
             anm = &mTiredWaitAnm;
@@ -5302,6 +5444,41 @@ void daRemotePlayer_c::shadowDraw() {
 
 int daRemotePlayer_c::draw() {
     if (!mHasPose) {
+        return 1;
+    }
+
+    /* ★★ CRASH ON STAGE CHANGE. Measured 2026-08-13, the first time a scripted `warp` was ever run
+     * with a peer in the session: EXCEPTION_ACCESS_VIOLATION at 0x4200, in
+     * daRemotePlayer_c::draw -> settingTevStruct -> setLight_actor ->
+     * daPy_py_c::checkNowWolfPowerUp.
+     *
+     * That last one is `daAlink_getAlinkActorClass()->checkWolfEyeUp()` (d_a_player.cpp:471-473) —
+     * an UNCHECKED dereference of the local player. 0x4200 is mWolfEyeUp's offset from a NULL
+     * `this`. During a stage transition the local Link is destroyed while this actor is still in
+     * the draw list, so the pointer is NULL and the read lands in the first page.
+     *
+     * daAlink_c cannot hit it because he IS the thing being dereferenced: when he is gone, the
+     * caller is gone. Type 10 was Link's alone until this actor started using it (see the note by
+     * settingTevStruct below), which is exactly why the original code can afford no null check —
+     * and why adding one in d_kankyo.cpp would be a decomp change made for a Dusk-only caller. The
+     * honest guard belongs here: with no local player there is no scene to light this puppet
+     * against, and drawing it is meaningless as well as unsafe.
+     *
+     * Checked every draw rather than latched, because it is a transient: the actor is alive on
+     * both sides of the transition and only unlit in the middle of it. Returning 1 is "drew
+     * nothing", which is what every other early-out in this function returns.
+     *
+     * ⚠ Do NOT relax this to a test on the puppet's own state. What is missing is somebody else's
+     * actor, and nothing this actor knows about itself can predict it. */
+    if (daAlink_getAlinkActorClass() == NULL) {
+        if (!mLoggedNoLocalPlayer) {
+            mLoggedNoLocalPlayer = true;
+            Log.debug("Puppet {} skipped a draw with no local player actor — a stage or room "
+                      "transition is in progress. Link-typed lighting dereferences him unchecked "
+                      "(daPy_py_c::checkNowWolfEyeUp), so this is a crash avoided, not a frame "
+                      "dropped.",
+                mPlayerId);
+        }
         return 1;
     }
 

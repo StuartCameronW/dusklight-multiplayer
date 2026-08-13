@@ -797,6 +797,15 @@ private:
     /// the feature falsifiable: a fallback for a resource that failed to load looks identical to
     /// the feature not existing. See selectAnimation().
     bool mLoggedIdleKind;
+    /// Latches the one-shot "drew nothing because the local player is gone" line. See draw(): that
+    /// state is a stage transition in progress, it lasts a handful of frames, and without the latch
+    /// it would fill the log on every room change for the rest of the session.
+    bool mLoggedNoLocalPlayer;
+    /// Latches the one-shot "the idle fidget started, and at which frame" line. Separate from
+    /// mLoggedIdleKind because the fidget no longer goes through the blend at all — it is a single
+    /// animation taken before the bands — and the frame it starts on is the whole measurement: 0.0
+    /// is daAlink_c's own entry, anything else is the phase carry-over that froze it.
+    bool mLoggedServiceWait;
     /// Latches the one-shot "equipment is being drawn, and here is what" line; see drawEquip().
     bool mLoggedEquip;
     /// And the same for the shield, which needs its OWN latch rather than sharing mLoggedEquip: the

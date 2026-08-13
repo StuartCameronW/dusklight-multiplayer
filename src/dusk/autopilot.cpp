@@ -48,6 +48,7 @@ enum class Op {
     Repeat,
     End,
     Say,
+    Warp,
     Quit,
 };
 
@@ -61,6 +62,10 @@ struct Command {
     s8 stickX = 0;
     s8 stickY = 0;
     std::string text;
+    /// Warp only: spawn point, room and layer. The destination stage travels in `text`.
+    int point = 0;
+    int room = 0;
+    int layer = 0;
     /// Repeat -> index of its End, and vice versa.
     std::size_t pair = 0;
     int line = 0;
@@ -260,6 +265,29 @@ bool settle_program_counter() {
             sPc++;
             continue;
 
+        case Op::Warp:
+            /* The same one call the warp window makes (dusk/ui/warp.cpp:325) — everything else in
+             * that file is the picker. Exposed to scripts because a STAGE CHANGE at a known tick
+             * is otherwise unreachable from the harness: the only other way to leave a stage is to
+             * walk into a load zone, which needs map knowledge the script does not have and
+             * timing it cannot control.
+             *
+             * That matters beyond convenience. A stage change is what cancels outstanding actor
+             * create requests, and "a puppet deleted while its private archive mount is still in
+             * flight" is a real use-after-free in ~dRes_info_c that no amount of ordinary play
+             * reproduces here, because every mount on this machine lands within one tick. With
+             * this verb and DUSK_DVD_MOUNT_DELAY_MS the window is seconds wide and the timing is
+             * a script line.
+             *
+             * Not gated on in_world(): a warp issued before the world exists is the game's own
+             * problem to reject, and pretending otherwise would hide a real ordering bug. */
+            Log.info("[{}] warping to stage '{}' point {} room {} layer {}", sTicks, command.text,
+                command.point, command.room, command.layer);
+            dComIfGp_setNextStage(command.text.c_str(), static_cast<s16>(command.point),
+                static_cast<s8>(command.room), static_cast<s8>(command.layer));
+            sPc++;
+            continue;
+
         case Op::Quit:
             Log.info("Script asked to quit after {} ticks", sTicks);
             request_quit();
@@ -364,6 +392,14 @@ void load_script(const std::filesystem::path& path) {
                                               std::string::npos :
                                               line.find_first_not_of(" \t", verbEnd);
             command.text = textStart == std::string::npos ? "" : line.substr(textStart);
+        } else if (verb == "WARP") {
+            command.op = Op::Warp;
+            // "warp F_SP115 0 0 0" — stage, spawn point, room, layer. The layer is optional and
+            // defaults to 0, which is the ordinary one; the rest are not, because a warp with a
+            // guessed room number lands somewhere the script did not mean to be.
+            command.text = a;
+            ok = !a.empty() && parse_int(b, command.point) && parse_int(c, command.room) &&
+                 (d.empty() || parse_int(d, command.layer));
         } else if (verb == "QUIT") {
             command.op = Op::Quit;
         } else {

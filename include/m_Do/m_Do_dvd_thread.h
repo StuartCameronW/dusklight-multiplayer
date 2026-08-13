@@ -146,6 +146,32 @@ struct mDoDvdThd {
     static u8 DVDLogoMode;
     static bool SyncWidthSound;
     static u8 Report_DVDRead;
+
+#if TARGET_PC
+    /**
+     * Development only: milliseconds to sleep in the DVD thread before executing a queued command,
+     * and how many more commands that applies to. Zero — the value they always have unless
+     * something deliberately sets them — costs one compare per command and changes nothing.
+     *
+     * They exist because a whole class of bug in this engine only exists WHILE a mount is in
+     * flight, and on a local disc image every mount lands in one tick. Deleting an actor mid-mount
+     * is the example that prompted this: ~dRes_info_c destroys a command the DVD thread still owns
+     * rather than cancelling it (d_resorce.cpp:37-51), which is a use-after-free that no amount of
+     * playing will reproduce on this hardware because the window is a single frame wide. Widening
+     * it is the only way to test the code that guards it.
+     *
+     * ★ A COUNT and not just a duration, and that is measured rather than tidy-mindedness. The
+     * first version slowed every command issued while a puppet was mounting, which included the
+     * commands of the stage reload the test itself had just asked for — so the reload took 250
+     * ticks instead of 40 and the teardown arrived AFTER the mounts had settled, every time. The
+     * count makes the delay land on the four mounts that were queued when it was armed and on
+     * nothing else.
+     *
+     * Whoever sets these owns clearing them again — see daRemotePlayer_c::mountOwnArchive.
+     */
+    static u32 DebugCommandDelayMs;
+    static s32 DebugCommandDelayCount;
+#endif
 };
 
 namespace mDoDvdHack {

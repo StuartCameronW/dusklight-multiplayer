@@ -15,6 +15,10 @@
 #include "m_Do/m_Do_controller_pad.h"
 #include "m_Do/m_Do_ext.h"
 #include "os_report.h"
+#if TARGET_PC
+#include <chrono>
+#include <thread>
+#endif
 
 s32 mDoDvdThd::main(void* param_0) {
     JKRThread(OSGetCurrentThread(), 0);
@@ -45,6 +49,11 @@ u32 mDoDvdHack::MaxEntryNum;
 mDoDvdHack::Manager mDoDvdHack::Manager::sManager;
 #else
 bool mDoDvdThd::SyncWidthSound;
+#endif
+
+#if TARGET_PC
+u32 mDoDvdThd::DebugCommandDelayMs;
+s32 mDoDvdThd::DebugCommandDelayCount;
 #endif
 
 u8 sDefaultDirection;
@@ -162,6 +171,17 @@ void mDoDvdThd_param_c::mainLoop() {
     while (this->waitForKick() != 0) {
         while ((command = this->getFirstCommand())) {
             this->cut(command);
+#if TARGET_PC
+            /* Development only, and zero in every ordinary run — see the members' comment in the
+             * header for why they exist. Read fresh per command rather than cached, because the
+             * whole point is that they are raised and cleared around a specific mount. The count is
+             * what keeps the delay off the commands of whatever load the test then triggers. */
+            const u32 delayMs = mDoDvdThd::DebugCommandDelayMs;
+            if (delayMs != 0 && mDoDvdThd::DebugCommandDelayCount > 0) {
+                mDoDvdThd::DebugCommandDelayCount--;
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            }
+#endif
             if (mDoDvdThd::SyncWidthSound) {
                 #if TARGET_PC
                 JASDvd::getThreadPointer()->sendCmdMsg(cb, &command, sizeof(void*));
