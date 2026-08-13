@@ -96,4 +96,17 @@ bool refuse_card_write();
  */
 bool consume_refused_card_write();
 
+/**
+ * Tell the player, once, that losing the host did not give them their save back.
+ *
+ * Stuart, 2026-08-13: *"if the host is gone, fire the notif that saving wont work."* This is the
+ * moment the sticky flag stops being self-explanatory — while the session is up, "I can't save"
+ * reads as part of playing in someone else's game; the instant it ends, the natural assumption is
+ * that your own game resumed. It did not: `g_dComIfG_gameInfo` still holds the host's world.
+ *
+ * No-op unless the flag is actually set, and fires at most once, so a flaky connection cannot turn
+ * it into spam.
+ */
+void notify_save_disabled_after_host_left();
+
 }  // namespace dusk::mp

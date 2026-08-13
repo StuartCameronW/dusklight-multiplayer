@@ -279,6 +279,13 @@ void NetworkManager::handle_event(const TransportEvent& event) {
             } else if (mRole == Role::Client) {
                 // Lost the host: every puppet's authority is gone, so clear the whole world view.
                 replication_manager().clear();
+                // ★ And say out loud that saving is still off. This is the one moment the rule
+                // becomes surprising: up to here "I can't save" reads as part of being in someone
+                // else's game, and the instant that game ends a player reasonably assumes their own
+                // came back. It did not — the world in memory is still the host's (save_guard.hpp),
+                // and the flag is sticky for exactly that reason. Told once, at the moment it stops
+                // being obvious, rather than at join when it already is.
+                notify_save_disabled_after_host_left();
             }
         }
         Log.info("Peer {} disconnected", event.peer);

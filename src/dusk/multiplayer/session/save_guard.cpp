@@ -57,6 +57,9 @@ bool sToastedOnce = false;
 /// Set by refuse_card_write, consumed by SaveSync so the caller's wait terminates. See the header.
 bool sRefusedWritePending = false;
 
+/// One notification per process when the host goes away, not one per reconnect attempt.
+bool sNotifiedHostLeft = false;
+
 }  // namespace
 
 bool save_would_be_contaminated() {
@@ -97,6 +100,22 @@ bool refuse_card_write() {
     }
 
     return true;
+}
+
+void notify_save_disabled_after_host_left() {
+    if (!sContaminated || sNotifiedHostLeft) {
+        return;
+    }
+
+    sNotifiedHostLeft = true;
+    dusk::ui::push_toast({
+        .title = "Saving is still disabled",
+        .content = "This world belongs to the host. Restart Dusklight to play your own save.",
+        .duration = std::chrono::seconds(8),
+    });
+    Log.warn("Host left. Saving stays disabled for this process: the in-memory game state is still "
+             "the host's world, so writing it to this machine's card would overwrite the player's "
+             "own progress. A restart loads their save from card and clears the flag.");
 }
 
 bool consume_refused_card_write() {
