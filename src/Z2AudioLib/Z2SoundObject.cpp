@@ -21,6 +21,10 @@
 #endif
 #include "os_report.h"
 
+#if TARGET_PC
+Z2SoundObjAnimeStartHook g_Z2SoundObjAnime_startHook = NULL;
+#endif
+
 Z2SoundObjBase::Z2SoundObjBase()
 #if PARTIAL_DEBUG || DEBUG
 : JSULink<Z2SoundObjBase>(this)
@@ -525,10 +529,16 @@ void Z2SoundObjAnime::startSoundInner(const JGeometry::TVec3<f32>& pos, f32 para
                 handle = getFreeHandle();
             }
 
+#if TARGET_PC
+            bool duskStarted = false;
+#endif
             if (handle != NULL) {
                 bool result = soundStarter->startSound(id, handle, &pos, mapinfo, (f32)reverb / 127.0f,
                                                        animationSound->field_0x0c, (f32)animationSound->field_0x14 / 127.0f,
                                                        -1.0f, -1.0f, 0);
+#if TARGET_PC
+                duskStarted = result;
+#endif
                 if ((*handle) != false) {
                     (*handle)->setAnimationState(1);
                     (*handle)->setUserData(user_data);
@@ -537,6 +547,13 @@ void Z2SoundObjAnime::startSoundInner(const JGeometry::TVec3<f32>& pos, f32 para
                     }
                 }
             }
+#if TARGET_PC
+            if (g_Z2SoundObjAnime_startHook != NULL) {
+                g_Z2SoundObjAnime_startHook(this, id, mapinfo, (f32)animationSound->field_0x04,
+                                            handle != NULL, duskStarted,
+                                            handle != NULL && (*handle) != false);
+            }
+#endif
         }
     }
 }
