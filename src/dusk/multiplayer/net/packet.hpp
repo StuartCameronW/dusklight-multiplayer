@@ -81,7 +81,10 @@ namespace dusk::mp {
  * In the same version, block (2): 18 bytes of action-animation override after those six
  * (actUnder, actUpper, actFrame, actUpperFrame, actRate, actMorf, actHandL, actHandR,
  * actRootX/Y/Z), so the puppet plays the sender's own BCK during swings, rolls and jumps. 23 -> 47
- * bytes in all.
+ * bytes so far.
+ *     Then a trailing `gear` byte after everything else (offset 47), bit 0 the sender's
+ *     checkEquipHeavyBoots() (iron boots on), because `flags` and `equip` were both full.
+ *     23 -> 48 bytes in all. Still 14: none of it has shipped.
  */
 inline constexpr std::uint32_t kProtocolVersion = 14;
 

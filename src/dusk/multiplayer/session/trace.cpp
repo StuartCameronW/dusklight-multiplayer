@@ -46,7 +46,7 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << static_cast<unsigned>(state.actMorf) << ',' << static_cast<unsigned>(state.actHandL)
           << ',' << static_cast<unsigned>(state.actHandR) << ',' << state.act_root_x() << ','
           << state.act_root_y() << ',' << state.act_root_z() << ',' << rootWX << ',' << rootWY
-          << ',' << rootWZ << '\n';
+          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << '\n';
 }
 
 }  // namespace
@@ -69,7 +69,7 @@ void open(const std::string& path, const char* role) {
              "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
              // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
-             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ\n";
+             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

@@ -137,6 +137,31 @@ enum PlayerStateFlags : std::uint8_t {
 };
 
 /**
+ * Bit flags in PlayerState::gear — worn equipment that is neither the sword nor the shield.
+ *
+ * A byte of its own because `flags` and `equip` were both full (protocol 14). Seven bits are spare,
+ * so the magne-boot stick, the magic armour's heavy state and the like can follow at no size cost.
+ */
+enum PlayerGearFlags : std::uint8_t {
+    /**
+     * The sender is wearing the iron boots: `daPy_py_c::checkEquipHeavyBoots()`, i.e.
+     * FLG0_EQUIP_HVY_BOOTS, verbatim.
+     *
+     * ★ That flag and nothing derived from it, because it is the one value both consumers of
+     * "boots on" in daAlink_c read. setHeavyBoots sets it and calls
+     * `mZ2Link.setLinkBootsType(1)` in the same two lines, and clears it with
+     * `setLinkBootsType(0)` (d_a_alink_hvyboots.inc:43-45, :74-76); the footstep code swaps
+     * WALK/JUMP_DUMMY for the _HEAVY sounds on that boots type (Z2LinkMgr.cpp:585-597). The draw
+     * code gates the boot models on the same predicate (d_a_alink.cpp:5995, :19832).
+     *
+     * NOT checkBootsOrArmorHeavy(): that also folds in the magic armour at zero rupees and the
+     * iron-ball wait, which are heavy for the physics but are not boots and do not change the
+     * footstep.
+     */
+    kPlayerGearHeavyBoots = 1 << 0,
+};
+
+/**
  * The joint-aim fields' wire scale: one s8 step is 128 binary-angle units, 0.70 degrees.
  *
  * The range this buys is +-16256 units (+-89 degrees). Every on-foot human value fits with room to
@@ -213,8 +238,9 @@ inline std::int8_t act_encode_s8(float value, float scale) {
     return static_cast<std::int8_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
 }
 
-/// 47 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2). Sent
-/// unreliably at the sim rate, so it has to stay small.
+/// 48 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), then
+/// the 1-byte `gear` (offset 47, always LAST). Sent unreliably at the sim rate, so it has to
+/// stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -362,6 +388,11 @@ struct PlayerState {
     float act_root_y() const { return static_cast<float>(actRootY) / kPlayerActRootScale; }
     float act_root_z() const { return static_cast<float>(actRootZ) / kPlayerActRootScale; }
 
+    /// Worn equipment other than the sword and shield. See PlayerGearFlags. Protocol 14. Discrete,
+    /// so lerp_state takes it whole from the newer sample. ★ The LAST field on the wire (offset 47,
+    /// after block 2), in write(), read() and lerp_state alike.
+    std::uint8_t gear = 0;
+
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
@@ -382,6 +413,7 @@ struct PlayerState {
         return static_cast<std::uint8_t>(
             (equip & kPlayerEquipShieldKindMask) >> kPlayerEquipShieldKindShift);
     }
+    bool heavy_boots() const { return (gear & kPlayerGearHeavyBoots) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);
@@ -412,6 +444,8 @@ struct PlayerState {
         w.write_s16(actRootX);
         w.write_s16(actRootY);
         w.write_s16(actRootZ);
+        // After block (2): `gear` is always the last byte.
+        w.write_u8(gear);
     }
 
     bool read(Reader& r) {
@@ -427,7 +461,9 @@ struct PlayerState {
                 r.read_u16(actUnder) && r.read_u16(actUpper) && r.read_u16(actFrame) &&
                 r.read_u16(actUpperFrame) && r.read_u8(rate) && r.read_u8(actMorf) &&
                 r.read_u8(actHandL) && r.read_u8(actHandR) && r.read_s16(actRootX) &&
-                r.read_s16(actRootY) && r.read_s16(actRootZ)))
+                r.read_s16(actRootY) && r.read_s16(actRootZ) &&
+                // after block (2): gear, always last
+                r.read_u8(gear)))
         {
             return false;
         }
@@ -547,6 +583,9 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
         out.actRootZ = act_encode_s16(
             a.act_root_z() + (b.act_root_z() - a.act_root_z()) * t, kPlayerActRootScale);
     }
+
+    // gear: a bit set, like `flags`: never blended.
+    out.gear = b.gear;
     return out;
 }
 

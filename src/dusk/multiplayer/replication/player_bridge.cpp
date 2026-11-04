@@ -425,8 +425,13 @@ void fill_equip(daAlink_c* alink, PlayerState& out) {
     if (alink->checkSwordDraw()) {
         out.equip |= kPlayerEquipSwordDraw;
     }
-    // 0x103 is dItemNo_SWORD_e; written as the literal daAlink_c compares against at :5894 and
-    // :4386 so the two read identically.
+    /* 0x103 is daAlink_c's "sword in hand" pseudo item — NOT dItemNo_SWORD_e, which is 0x28 and is
+     * mapped onto 0x103 at create (d_a_alink.cpp:4716-4717). Written as the literal setItemMatrix
+     * places the blade by (:5907) so the two read identically.
+     *
+     * ★ Deliberately independent of the draw bit above, as it is in daAlink_c: in hand while not
+     * drawn is a real state (see kPlayerEquipSwordInHand). Checked against a trace before keeping
+     * this line unchanged — the "in hand but undrawn" ticks were a stage arrival, not a B tap. */
     if (alink->mEquipItem == 0x103) {
         out.equip |= kPlayerEquipSwordInHand;
     }
@@ -474,6 +479,22 @@ void fill_equip(daAlink_c* alink, PlayerState& out) {
                 !alink->checkModeFlg(0x400))))
     {
         out.equip |= kPlayerEquipShieldInHand;
+    }
+}
+
+/**
+ * Fill the gear byte. Today that is one bit: the iron boots, as daAlink_c's own
+ * checkEquipHeavyBoots() — the flag setHeavyBoots raises together with Z2CreatureLink's boots type,
+ * so it is exactly what decides his heavy footstep. See kPlayerGearHeavyBoots for why it is not
+ * checkBootsOrArmorHeavy().
+ *
+ * Read off the same member that sits beside checkMagneBootsOn(), which the foot-IK gate above
+ * already calls on this pointer. A wolf never has the flag set, so he sends it clear.
+ */
+void fill_gear(daAlink_c* alink, PlayerState& out) {
+    out.gear = 0;
+    if (alink != nullptr && alink->checkEquipHeavyBoots()) {
+        out.gear |= kPlayerGearHeavyBoots;
     }
 }
 
@@ -1107,6 +1128,7 @@ bool capture_local_player(PlayerState& out) {
 
     fill_idle_kind(alink, out);
     fill_equip(alink, out);
+    fill_gear(alink, out);
     fill_atn_kind(alink, out);
     fill_upper_guard(alink, out);
     fill_joint_aim(alink, out);
@@ -1278,6 +1300,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
         state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip, state.idleKind);
     puppet->setNetworkAtn(state.atnKind);
     puppet->setNetworkUpperGuard(state.upper_guard());
+    puppet->setNetworkHeavyBoots(state.heavy_boots());
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.
@@ -1320,6 +1343,8 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     if (puppet->getNetUpperGuard()) {
         out.flags |= kPlayerStateUpperGuard;
     }
+    // Read back off the puppet, so the trace's `gear` column is the both-ends check for the bit.
+    out.gear = puppet->getNetHeavyBoots() ? kPlayerGearHeavyBoots : 0;
     // The joint aim values the puppet's callbacks are drawing from this tick, read back off it.
     out.neckX = puppet->getNetNeckX();
     out.neckY = puppet->getNetNeckY();
