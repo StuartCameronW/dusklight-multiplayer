@@ -40,9 +40,9 @@ namespace dusk::mp {
  * having is named here now even where neither end handles it yet:
  *   - `kPlayerIdleInsect` is named but not sampled — the sender's chain does test for it, but no
  *     receiver plays it.
- *   - `kPlayerIdleAtnLeft` / `Right` are the lock-on stance, deliberately deferred to job D3b:
- *     shipping the stance without the matching ATN strafe set would trade a wrong-but-stable pose
- *     for one that pops the instant its owner moves.
+ *   - `kPlayerIdleAtnLeft` / `Right` are the lock-on stance. They're still sampled and sent, but
+ *     the puppet plays the stance from PlayerAtnKind (player_atn.hpp, D3b), which carries the
+ *     whole stance-and-strafe set. The stance alone would pop the instant its owner moved.
  *
  * `kPlayerIdleWait` is the default and the safe reading — the ordinary standing idle, which is what
  * the puppet played before this field existed.

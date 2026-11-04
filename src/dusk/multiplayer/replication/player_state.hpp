@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "dusk/player_atn.hpp"
 #include "dusk/player_equip.hpp"
 #include "dusk/player_idle.hpp"
 
@@ -122,7 +123,7 @@ enum PlayerStateFlags : std::uint8_t {
     kPlayerStateTimeCanPass = 1 << 6,
 };
 
-/// 22 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
+/// 23 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -185,6 +186,18 @@ struct PlayerState {
      * is what the puppet already played before this field existed.
      */
     std::uint8_t idleKind = kPlayerIdleWait;
+    /**
+     * Which attention (Z-target / lock-on) move set the sender is playing, and which way. See
+     * PlayerAtnKind. Added in protocol 12 (D3b).
+     *
+     * This is a byte of its own, not more values in `idleKind`. An attention set isn't an idle:
+     * it covers the stance AND the strafe walk and run, and the receiver blends it across the
+     * whole speed range with its own HIO table. The stance and the strafe are one set
+     * (12-d3-idle-spec.md §1), so one value has to name all of it.
+     *
+     * Discrete, so lerp_state takes it whole from the newer sample, like `idleKind`.
+     */
+    std::uint8_t atnKind = kPlayerAtnNone;
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
@@ -216,12 +229,13 @@ struct PlayerState {
         w.write_u8(flags);
         w.write_u8(equip);
         w.write_u8(idleKind);
+        w.write_u8(atnKind);
     }
 
     bool read(Reader& r) {
         return r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
                r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
-               r.read_u8(idleKind);
+               r.read_u8(idleKind) && r.read_u8(atnKind);
     }
 };
 
@@ -270,6 +284,8 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     // quantity. Halfway between the tired idle and the service idle is the plain one, which is
     // neither of the two the sender was ever in.
     out.idleKind = b.idleKind;
+    // Discrete too. Halfway between "strafing left" and "backing off" is no animation at all.
+    out.atnKind = b.atnKind;
     return out;
 }
 

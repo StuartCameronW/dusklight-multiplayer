@@ -130,6 +130,11 @@ public:
     /// `local` row that produced it, and a byte that never arrived looks exactly like one that
     /// arrived as 0. See PlayerIdleKind for the values.
     u8 getNetIdleKind() const { return mNetIdleKind; }
+    /// D3b. The sender's attention byte (PlayerAtnKind), pushed in alongside setNetworkPose() every
+    /// tick. A separate call so the outfit/model work and this one don't collide in one
+    /// signature. Stored whole; selectAtnAnimation() treats an unknown value as "none".
+    void setNetworkAtn(u8 i_atnKind) { mNetAtnKind = i_atnKind; }
+    u8 getNetAtnKind() const { return mNetAtnKind; }
     bool hasPose() const { return mHasPose; }
     /* Where the floating name tag hangs from (src/dusk/imgui/ImGuiNameTags.cpp): the body's head
      * joint as it is DRAWN this frame. On an interpolated frame that is frame_interp's lerped copy
@@ -172,6 +177,12 @@ private:
     /// keyed on — the hand pair, the BCK pair, the tired special cases — so returning the animation
     /// without it would leave every caller re-deriving which one it got.
     const daRemotePlayer_anm_c& idleAnm(u16* o_anmID) const;
+    /// D3b. Play daAlink_c's attention (Z-target / lock-on) stance and strafe set when the wire
+    /// says the sender is in it. setBlendAtnMoveAnime / setBlendAtnBackMoveAnime's bands, read off
+    /// the same HIO tables. True if it set this tick's animation. selectAnimation() then returns.
+    bool selectAtnAnimation();
+    /// D3b. Load the attention set into the solid heap. Non-fatal, once, from createHeap().
+    void loadAtnAnimations();
     /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
     /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
     void setDrawHand();
@@ -519,6 +530,37 @@ private:
     daRemotePlayer_anm_c mWaitBAnm;
     daRemotePlayer_anm_c mServiceWaitAnm;
     daRemotePlayer_anm_c mTiredWaitAnm;
+
+    /* --- D3b: the attention (Z-target / lock-on) set. Kept in one block on purpose. ---------
+     *
+     * Indexed by daAlink_c's own animation id, 0x00 (ANM_ATN_RETURN_FROM_WALK) through 0x11
+     * (ANM_ATN_WAIT_RIGHT). 0x0E (ANM_WALK_HEAVY) and 0x0F (ANM_ATN_BACK_WALK_HEAVY) are never
+     * loaded and stay NULL. Every entry is OPTIONAL, on the terms the alert idles are:
+     * selectAtnAnimation() falls back to the ordinary gait for any kind whose pair is missing.
+     *
+     * Each row is loaded as its own object, including the two stances' shared upper half AT
+     * (0x0E). A J3DAnmTransform holds its own frame, so two rows sharing one object would have two
+     * controllers stepping it at once. That costs one extra small BCK and makes the hazard
+     * impossible rather than "safe because only one is in the packs". */
+    daRemotePlayer_anm_c mAtnAnm[0x12];
+    /* The two stances with a sword drawn. getMainBckData's sword table names {ATL, ATL} and
+     * {ATR, ATR} for 0x10/0x11 (d_a_alink.cpp:256-262). These share the plain row's under object
+     * and hold no second resource; see load_gait_anm_sword. */
+    daRemotePlayer_anm_c mAtnWaitSwordAnm[2];
+    /// The sender's PlayerAtnKind, whole. Zero (none) at spawn via fopAcM_ct's zeroing.
+    u8 mNetAtnKind;
+    /// Whether last tick's animation came from selectAtnAnimation(). Entering or leaving the set
+    /// is a change of pair, which daAlink_c cross-fades with mBasicInterpolation.
+    bool mAtnActive;
+    /// Set when the set is left, consumed by the ordinary gait's morf on the next blend.
+    bool mAtnExitMorf;
+    /// Last tick's attention pair, as the animation objects themselves. A change of either one is
+    /// a change of loaded resource, the condition daAlink_c morfs on. That includes the stance's
+    /// sword variant swapping in, which the animation ids alone can't see.
+    const daRemotePlayer_anm_c* mpAtnPrevA;
+    const daRemotePlayer_anm_c* mpAtnPrevB;
+    /// The kind last played, for the change log both ends' logs are compared on.
+    u8 mAtnPrevKind;
 
     /* Link is four models. The body is the one the animation drives; these three are posed off its
      * joints every frame in setMatrix(). Any of them may be NULL — a puppet missing a head is a

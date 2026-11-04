@@ -33,7 +33,7 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
           << buffered << ',' << anm << ',' << static_cast<unsigned>(state.flags) << ','
           << static_cast<unsigned>(state.equip) << ',' << static_cast<unsigned>(state.idleKind)
-          << '\n';
+          << ',' << static_cast<unsigned>(state.atnKind) << '\n';
 }
 
 }  // namespace
@@ -52,7 +52,7 @@ void open(const std::string& path, const char* role) {
     // — the sender's own getMoveGroundAngleSpeedRate(), roughly 0..1 — so the column is renamed
     // rather than quietly refilled. An analyzer written against the old name fails loudly.
     sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,"
-             "buffered,anm,flags,equip,idleKind\n";
+             "buffered,anm,flags,equip,idleKind,atnKind\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
@@ -67,7 +67,13 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
 
     PlayerState local;
     if (capture_local_player(local)) {
-        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0);
+        /* The anm column on a local row is the sender's under slot 0 BCK, i.e. what his legs are
+         * actually DRAWING. It was always 0 before. That's the value a puppet's own `actor` anm
+         * has to be checked against. A plain-gait puppet reports its DOMINANT half, so the two
+         * only line up exactly inside the attention set, where both report slot 0. */
+        std::uint16_t localAnm = 0;
+        read_local_anim(localAnm);
+        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm);
     } else {
         // Written rather than skipped: a missing row is ambiguous between "loading" and "the trace
         // stopped", and the first probe run cost real time to that ambiguity.

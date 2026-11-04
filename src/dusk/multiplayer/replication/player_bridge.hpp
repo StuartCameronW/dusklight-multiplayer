@@ -55,6 +55,10 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out);
 /// PlayerState, which is a wire type: this is local presentation, not replicated state.
 bool read_puppet_anim(std::uint32_t playerId, std::uint16_t& out);
 
+/// The BCK resource index in the LOCAL player's under slot 0, i.e. what he is drawing on his legs
+/// right now, every substitution applied. For --mp-trace, so a puppet's choice can be compared
+/// against what its sender actually played. 0 (false) when there is no playable Link.
+bool read_local_anim(std::uint16_t& out);
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 
