@@ -790,7 +790,7 @@ void measure_joint_aim(J3DModel* bodyModel, s16 facingY, DrawnJointAim& out) {
 
 /**
  * The procs whose animation the puppet already REPRODUCES from the rest of the wire: the idles,
- * the gait, the attention set, the turn-in-place and the skid. Whitelist-the-known,
+ * the gait, the attention set, the moving turn and the skid. Whitelist-the-known,
  * override-the-rest: a proc nobody has thought about gets the sender's real BCK rather than a
  * glide, which is the right direction for an omission to fail in.
  */
@@ -803,7 +803,10 @@ bool puppet_reproduces_proc(std::uint16_t proc) {
     case daAlink_c::PROC_ATN_MOVE:
     case daAlink_c::PROC_ATN_ACTOR_WAIT:
     case daAlink_c::PROC_ATN_ACTOR_MOVE:
-    case daAlink_c::PROC_WAIT_TURN:
+    /* NOT PROC_WAIT_TURN: procWaitTurnInit plays BCK STEPL (ANM_STEP_TURN, d_a_alink.cpp:15775)
+     * as a single anime when he turns >~169 deg from standing, and the puppet has no STEPL path,
+     * so it showed WAITS through the step-turn. Overriding carries STEPL, and the override exit
+     * restarts the puppet's run at phase 0 like the sender's. */
     case daAlink_c::PROC_MOVE_TURN:
     case daAlink_c::PROC_SLIP:
         return true;
