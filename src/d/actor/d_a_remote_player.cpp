@@ -23,6 +23,7 @@
 #include "dusk/game_clock.h"
 #include "dusk/interp/frame_interpolation.h"
 #include "dusk/logging.h"
+#include "dusk/player_atn.hpp"
 #include "dusk/player_equip.hpp"
 #include "dusk/player_idle.hpp"
 #include "f_op/f_op_actor_mng.h"
@@ -531,7 +532,8 @@ const daAlink_c::daAlink_ANM l_slipAnm = daAlink_c::ANM_SLIP;
  * (:7951-8027), so the stance and the strafe are one animation set. Shipping the stance alone gives
  * a puppet that stands correctly and then snaps to a forward-facing walk the instant its owner
  * strafes — trading a wrong-but-stable pose for one that pops, which reads as a bug rather than as
- * low fidelity. Job D3b, with the eight ATN gait BCKs and their own band arithmetic. */
+ * low fidelity. D3b now plays the whole set, stance included, from its own wire byte (atnKind)
+ * rather than from these idle kinds. See selectAtnAnimation(). */
 const daAlink_c::daAlink_ANM l_waitBAnm = daAlink_c::ANM_WAIT_B;
 const daAlink_c::daAlink_ANM l_serviceWaitAnm = daAlink_c::ANM_SERVICE_WAIT;
 const daAlink_c::daAlink_ANM l_tiredWaitAnm = daAlink_c::ANM_WAIT_TIRED;
@@ -1324,6 +1326,11 @@ int daRemotePlayer_c::createHeap() {
     // somewhere else. One line makes the margin a number instead of a guess — and it earned its
     // keep, because the guess it replaced was wrong. Before DASHA was added this read 112528 free
     // of 0x20000 (131072), i.e. ~18 KB used, against a comment here that claimed ~35 KB.
+    /* D3b: the attention stance and strafe set, 30 BCKs. Loaded LAST, after every model, unlike
+     * the animations above. So if the heap ever runs short it costs attention animations (each
+     * non-fatal, each falling back to the ordinary gait) and never a model. */
+    loadAtnAnimations();
+
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
         Log.info("Puppet heap after setup: {} bytes free, largest block {}", heap->getFreeSize(),
@@ -1907,7 +1914,26 @@ int daRemotePlayer_c::create() {
         return mountPhase;
     }
 
-    /* ★ 0x30000, raised from 0x20000 when the idle variants landed, and the number is measured
+    /* ★ D3b raised this 0x30000 -> 0x50000 for the attention set's 30 BCKs, from a measurement.
+     * loadAtnAnimations() logs its own cost: 236,832 bytes. Two facts were measured on the way, and
+     * the next reader needs both:
+     *
+     *   - The budget is NOT the heap size on PC. At 0x80000 (524,288) the heap had 787,520 bytes
+     *     free BEFORE the attention set loaded. Fitting the two budgets (0x30000 -> 135,296 free
+     *     after setup, 0x80000 -> 550,688) gives a heap of about 1.99x the budget. So the real heap
+     *     is twice this number, and the pre-D3b contents were ~256 KB rather than the ~60 KB the
+     *     paragraph below implies. That's an inference from two points, not a reading of the
+     *     allocator.
+     *   - entrySolidHeap shrinks the heap to fit afterwards (mDoExt_adjustSolidHeap,
+     *     f_op_actor_mng.cpp:492). So the budget only has to be free for the moment of creation.
+     *
+     * 0x50000 means ~655 KB physical against ~493 KB used, leaving ~160 KB of margin. The attention
+     * set loads LAST (after every model), so if it ever doesn't fit, it costs attention
+     * animations, never a model.
+     *
+     * The text below is the earlier (0x30000) history, kept as it was.
+     *
+     * ★ 0x30000, raised from 0x20000 when the idle variants landed, and the number is measured
      * rather than chosen. The loader keeps each animation's whole staging buffer resident, so an
      * animation costs its buffer, not its expanded size, and the three idle variants weighed:
      *
@@ -1925,7 +1951,7 @@ int daRemotePlayer_c::create() {
      * standing player's idle ticks (measured: `idle applied: wait 74%, service 26%`), which is
      * worth 55 KB; if a room is ever found where this does not fit, drop ANM_SERVICE_WAIT before
      * dropping the other two — it is 78% of the added weight. */
-    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x30000)) {
+    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x50000)) {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
@@ -1936,7 +1962,7 @@ int daRemotePlayer_c::create() {
          */
         g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
         g_daRemotePlayer_lastCreateFail.mReason =
-            "the 0x30000 solid heap, or one of the models/animations createHeap() loads into it";
+            "the 0x50000 solid heap, or one of the models/animations createHeap() loads into it";
         return cPhs_ERROR_e;
     }
 
@@ -2273,6 +2299,12 @@ void daRemotePlayer_c::selectAnimation() {
         return;
     }
 
+    /* D3b: the attention stance and strafe. A set of its own with its own bands, so it is taken
+     * here and returned from, like the two single animations above. */
+    if (selectAtnAnimation()) {
+        return;
+    }
+
     /* The three bands daAlink_c crosses over in, and the pair he blends inside each
      * (setBlendMoveAnime, d_a_alink.cpp:7749-7800). Below mWalkChangeRate he mixes wait into walk,
      * below mRunChangeRate walk into run, and above it runs alone. The thresholds come from
@@ -2429,6 +2461,14 @@ void daRemotePlayer_c::selectAnimation() {
      * from a pose to itself. The only thing there is to fade out of is the skid, which is a single
      * animation, and mDoubleAnmSet is exactly "the last thing set was a blended pair". */
     f32 morf = mDoubleAnmSet ? -1.0f : l_gaitMorf;
+
+    /* D3b: leaving the attention set swaps both slots at once, which daAlink_c's setDoubleAnime
+     * cross-fades with mBasicInterpolation (d_a_alink.cpp:7101-7108). Without this the puppet
+     * would snap from the strafe into the gait in one frame. */
+    if (mAtnExitMorf) {
+        mAtnExitMorf = false;
+        morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+    }
 
     /* ★ ONE exception, and the variable idle is what creates it: the wait SLOT can now change
      * animation outright while the blend weights do not move at all. Nothing else in this function
@@ -2616,7 +2656,9 @@ const daRemotePlayer_anm_c& daRemotePlayer_c::runAnm() const {
  * outcome is setDoubleAnm returning early on a NULL and freezing the puppet's pose outright.
  *
  * Anything not named here (the wind and insect idles, and both attention stances) falls through to
- * the plain wait deliberately; see l_waitBAnm above for why the stances are not a "todo".
+ * the plain wait deliberately. The stances are played by selectAtnAnimation() off the atnKind byte,
+ * which runs before this is reached, so an idle kind naming a stance only gets here when the
+ * attention byte said "none".
  */
 const daRemotePlayer_anm_c& daRemotePlayer_c::idleAnm(u16* o_anmID) const {
     const daRemotePlayer_anm_c* anm = &mIdleAnm;
@@ -2647,6 +2689,299 @@ const daRemotePlayer_anm_c& daRemotePlayer_c::idleAnm(u16* o_anmID) const {
 
     *o_anmID = static_cast<u16>(id);
     return *anm;
+}
+
+/* --- D3b: the attention (Z-target / lock-on) stance and strafe. -------------------------------
+ *
+ * Everything for D3b on the receiver lives in this block, apart from three one-line hooks:
+ * createHeap() calls loadAtnAnimations(), selectAnimation() calls selectAtnAnimation(), and the
+ * ordinary gait takes mAtnExitMorf. */
+
+namespace {
+
+/* The six numbers setBlendAtnMoveAnime / setBlendAtnBackMoveAnime pick per call. They come from
+ * daAlinkHIO_atnMove_c1 when a target is locked and from daAlinkHIO_noActAtnMove_c1 otherwise.
+ * Those are two distinct types with identical layout (d_a_alink.h:4700-4770), so a template reads
+ * either without copying any number. */
+struct AtnBand {
+    f32 minWalkFrame;
+    f32 walkChangeRate;
+    f32 runChangeRate;
+    f32 waitSpeed;
+    f32 walkSpeed;
+    f32 runSpeed;
+};
+
+/// Sideways and forward: setBlendAtnMoveAnime's sp30/sp2C/sp28/sp24/sp20/var_f30 (:7945-7961).
+template <typename HIO>
+AtnBand atn_side_band(const HIO& i_hio) {
+    AtnBand band;
+    band.minWalkFrame = i_hio.mMinWalkFrame;
+    band.walkChangeRate = i_hio.mWalkChangeRate;
+    band.runChangeRate = i_hio.mRunChangeRate;
+    band.waitSpeed = i_hio.mWaitAnmSpeed;
+    band.walkSpeed = i_hio.mWalkAnmSpeed;
+    band.runSpeed = i_hio.mRunAnmSpeed;
+    return band;
+}
+
+/// Backwards: setBlendAtnBackMoveAnime's var_f27/var_f31/var_f26/var_f24/var_f25/var_f29
+/// (:8106-8126).
+template <typename HIO>
+AtnBand atn_back_band(const HIO& i_hio) {
+    AtnBand band;
+    band.minWalkFrame = i_hio.mMinBackWalkFrame;
+    band.walkChangeRate = i_hio.mBackWalkChangeRate;
+    band.runChangeRate = i_hio.mBackRunChangeRate;
+    band.waitSpeed = i_hio.mWaitAnmSpeed;
+    band.walkSpeed = i_hio.mBackWalkAnmSpeed;
+    band.runSpeed = i_hio.mBackRunAnmSpeed;
+    return band;
+}
+
+}  // namespace
+
+void daRemotePlayer_c::loadAtnAnimations() {
+    JKRHeap* heap = JKRGetCurrentHeap();
+    const s32 freeBefore = heap != NULL ? heap->getFreeSize() : 0;
+    int wanted = 0;
+    int loaded = 0;
+    for (int i = 0; i < 0x12; i++) {
+        mAtnAnm[i].mpUnder = NULL;
+        mAtnAnm[i].mpUpper = NULL;
+        const daAlink_c::daAlink_ANM anm = static_cast<daAlink_c::daAlink_ANM>(i);
+        // Iron-boots rows. The puppet has no heavy gait, and the sender reports these as "none".
+        if (anm == daAlink_c::ANM_WALK_HEAVY || anm == daAlink_c::ANM_ATN_BACK_WALK_HEAVY) {
+            continue;
+        }
+        wanted++;
+        /* Equip 0. Rows 0x00-0x0D are outside the sword window, and the two stances get their
+         * sword variant just below. */
+        if (load_gait_anm(&mAtnAnm[i], anm, 0)) {
+            loaded++;
+        } else {
+            mAtnAnm[i].mpUnder = NULL;
+            mAtnAnm[i].mpUpper = NULL;
+            Log.warn("Puppet has no attention animation {}; that strafe direction will play the "
+                     "ordinary gait",
+                i);
+        }
+    }
+
+    for (int side = 0; side < 2; side++) {
+        const daAlink_c::daAlink_ANM anm =
+            static_cast<daAlink_c::daAlink_ANM>(daAlink_c::ANM_ATN_WAIT_LEFT + side);
+        mAtnWaitSwordAnm[side].mpUnder = NULL;
+        mAtnWaitSwordAnm[side].mpUpper = NULL;
+        if (mAtnAnm[anm].mpUnder != NULL &&
+            !load_gait_anm_sword(&mAtnWaitSwordAnm[side], mAtnAnm[anm], anm))
+        {
+            mAtnWaitSwordAnm[side].mpUnder = NULL;
+            mAtnWaitSwordAnm[side].mpUpper = NULL;
+        }
+    }
+
+    // The cost is printed because the heap budget in create() is sized from it.
+    Log.debug("Puppet {} attention set: {} of {} animations resident; armed stances {}/{}; cost {} "
+              "bytes of heap ({} -> {} free)",
+        mPlayerId, loaded, wanted, mAtnWaitSwordAnm[0].mpUnder != NULL ? "ok" : "MISSING",
+        mAtnWaitSwordAnm[1].mpUnder != NULL ? "ok" : "MISSING",
+        heap != NULL ? freeBefore - heap->getFreeSize() : 0, freeBefore,
+        heap != NULL ? heap->getFreeSize() : 0);
+}
+
+/**
+ * The attention set, as daAlink_c plays it: setBlendAtnMoveAnime (d_a_alink.cpp:7853-8079) for the
+ * sideways and forward kinds, and setBlendAtnBackMoveAnime (:8081-8171) for backing off.
+ *
+ * Which kind arrives is the sender's answer, read off his animation heap (fill_atn_kind,
+ * player_bridge.cpp). That covers the direction, held in his field_0x2f98, which is unrecoverable
+ * here (12-d3-idle-spec.md §1), and the lock. What's left is the band arithmetic, which daAlink_c
+ * does from the same getMoveGroundAngleSpeedRate() already on the wire. Here
+ * it has already been divided by the attention mMaxSpeed he sets in the same call (:7880-7885,
+ * :8093-8122). Every threshold and play rate is read from his HIO tables.
+ *
+ * Three bands, same shape for every kind:
+ *   - below walkChangeRate: stance into walk. While moving, the walk weight is remapped onto
+ *     mMinWalkFrame, the attention twin of the ordinary gait's mMinWalkRate floor (:7991-7998).
+ *   - below runChangeRate: walk into run.
+ *   - above: run alone. setDoubleAnm collapses the identical pair.
+ *
+ * The morf follows setDoubleAnime (:7100-7108). When the loaded pair changes, including on entry,
+ * it substitutes mBasicInterpolation for the -1 its callers pass. procAtnMoveInit asks for
+ * that same value explicitly (:15703).
+ *
+ * mCurrentAnm becomes slot A, not the dominant half the ordinary gait reports. setDoubleAnime ends
+ * with setHandIndex(i_anmA) (:7114), so A is whose hand pair daAlink_c shows. It's also what the
+ * sender's trace now reports (his under slot 0), so the two `anm` columns line up tick for tick.
+ *
+ * Not reproduced: the shield-guard and fishing-rod substitutions of the UPPER half (guard state is
+ * not on the wire), and iron boots, which the sender reports as "none".
+ */
+bool daRemotePlayer_c::selectAtnAnimation() {
+    const daAlinkHIO_atnMove_c1& lockHio = daAlinkHIO_atnMove_c0::m;
+    const daAlinkHIO_noActAtnMove_c1& freeHio = daAlinkHIO_noActAtnMove_c0::m;
+
+    const u8 kind = mNetAtnKind;
+    daAlink_c::daAlink_ANM idWait = daAlink_c::ANM_ATN_WAIT_RIGHT;
+    daAlink_c::daAlink_ANM idWalk = daAlink_c::ANM_ATN_WALK_RIGHT;
+    daAlink_c::daAlink_ANM idRun = daAlink_c::ANM_ATN_RUN_RIGHT;
+    AtnBand band = atn_side_band(freeHio);
+    bool known = true;
+
+    switch (kind) {
+    case dusk::mp::kPlayerAtnForward:
+    case dusk::mp::kPlayerAtnForwardLock:
+        /* field_0x2f98 == 0. The band table follows the lock like every other kind, but the two
+         * forward play rates are ALWAYS mAtnMove's, target or not (:7970, :8004-8005, :8027). */
+        idWait = daAlink_c::ANM_ATN_WAIT_RIGHT;
+        idWalk = daAlink_c::ANM_ATN_RETURN_FROM_WALK;
+        idRun = daAlink_c::ANM_ATN_RETURN_FROM_RUN;
+        band = kind == dusk::mp::kPlayerAtnForwardLock ? atn_side_band(lockHio) :
+                                                         atn_side_band(freeHio);
+        band.walkSpeed = lockHio.mWalkForwardAnmSpeed;
+        band.runSpeed = lockHio.mRunForwardAnmSpeed;
+        break;
+    case dusk::mp::kPlayerAtnBack:
+        // No target: the stance band's idle is the plain ANM_WAIT at the ordinary wait rate
+        // (:8115-8126).
+        idWait = daAlink_c::ANM_WAIT;
+        idWalk = daAlink_c::ANM_ATN_BACK_WALK;
+        idRun = daAlink_c::ANM_ATN_BACK_RUN;
+        band = atn_back_band(freeHio);
+        band.waitSpeed = daAlinkHIO_move_c0::m.mWaitAnmSpeed;
+        break;
+    case dusk::mp::kPlayerAtnBackLock:
+        idWait = daAlink_c::ANM_ATN_WAIT_RIGHT;
+        idWalk = daAlink_c::ANM_ATN_LOCK_BACK_WALK;
+        idRun = daAlink_c::ANM_ATN_LOCK_BACK_RUN;
+        band = atn_back_band(lockHio);
+        break;
+    case dusk::mp::kPlayerAtnLeft:
+        idWait = daAlink_c::ANM_ATN_WAIT_LEFT;
+        idWalk = daAlink_c::ANM_ATN_WALK_LEFT;
+        idRun = daAlink_c::ANM_ATN_RUN_LEFT;
+        band = atn_side_band(freeHio);
+        break;
+    case dusk::mp::kPlayerAtnLeftLock:
+        idWait = daAlink_c::ANM_ATN_WAIT_LEFT;
+        idWalk = daAlink_c::ANM_ATN_LOCK_WALK_LEFT;
+        idRun = daAlink_c::ANM_ATN_LOCK_RUN_LEFT;
+        band = atn_side_band(lockHio);
+        break;
+    case dusk::mp::kPlayerAtnRight:
+        idWait = daAlink_c::ANM_ATN_WAIT_RIGHT;
+        idWalk = daAlink_c::ANM_ATN_WALK_RIGHT;
+        idRun = daAlink_c::ANM_ATN_RUN_RIGHT;
+        band = atn_side_band(freeHio);
+        break;
+    case dusk::mp::kPlayerAtnRightLock:
+        idWait = daAlink_c::ANM_ATN_WAIT_RIGHT;
+        idWalk = daAlink_c::ANM_ATN_LOCK_WALK_RIGHT;
+        idRun = daAlink_c::ANM_ATN_LOCK_RUN_RIGHT;
+        band = atn_side_band(lockHio);
+        break;
+    default:
+        // kPlayerAtnNone, or a value from a newer peer this build has no table for.
+        known = false;
+        break;
+    }
+
+    const daRemotePlayer_anm_c* wait = NULL;
+    if (known) {
+        if (idWait == daAlink_c::ANM_WAIT) {
+            wait = &mIdleAnm;
+        } else if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0 &&
+                   mAtnWaitSwordAnm[idWait - daAlink_c::ANM_ATN_WAIT_LEFT].mpUnder != NULL)
+        {
+            // getMainBckData's sword table, the same `mEquipItem == 0x103` test (:6951-6955).
+            wait = &mAtnWaitSwordAnm[idWait - daAlink_c::ANM_ATN_WAIT_LEFT];
+        } else {
+            wait = &mAtnAnm[idWait];
+        }
+    }
+
+    const bool playable = known && wait->mpUnder != NULL && mAtnAnm[idWalk].mpUnder != NULL &&
+                          mAtnAnm[idRun].mpUnder != NULL;
+    if (!playable) {
+        if (mAtnActive) {
+            mAtnActive = false;
+            mAtnExitMorf = true;
+            Log.debug("Puppet {} attention set {} -> {}: back to the ordinary gait{}", mPlayerId,
+                static_cast<unsigned>(mAtnPrevKind), static_cast<unsigned>(kind),
+                known ? " (FELL BACK: an animation for this kind is not resident)" : "");
+            mAtnPrevKind = dusk::mp::kPlayerAtnNone;
+        }
+        return false;
+    }
+
+    const f32 rate = mNetMoveRate;
+    // The standing test setBlendAtnMoveAnime makes is setBlendMoveAnime's (:7987, :8131), which is
+    // exactly what kPlayerStateZeroSpeed carries. The `<= 0` guard is selectAnimation()'s own.
+    const bool zeroSpeed = mNetZeroSpeed || rate <= 0.0f;
+
+    const daRemotePlayer_anm_c* anmA;
+    const daRemotePlayer_anm_c* anmB;
+    daAlink_c::daAlink_ANM idA;
+    daAlink_c::daAlink_ANM idB;
+    f32 speedA;
+    f32 speedB;
+    f32 blend;
+
+    if (rate < band.walkChangeRate) {
+        blend = rate / band.walkChangeRate;
+        if (!zeroSpeed) {
+            blend = band.minWalkFrame + blend * (1.0f - band.minWalkFrame);
+        }
+        anmA = wait;
+        anmB = &mAtnAnm[idWalk];
+        idA = idWait;
+        idB = idWalk;
+        speedA = band.waitSpeed;
+        speedB = band.walkSpeed;
+    } else if (rate < band.runChangeRate) {
+        blend = (rate - band.walkChangeRate) / (band.runChangeRate - band.walkChangeRate);
+        anmA = &mAtnAnm[idWalk];
+        anmB = &mAtnAnm[idRun];
+        idA = idWalk;
+        idB = idRun;
+        speedA = band.walkSpeed;
+        speedB = band.runSpeed;
+    } else {
+        blend = 1.0f;
+        anmA = &mAtnAnm[idRun];
+        anmB = &mAtnAnm[idRun];
+        idA = idRun;
+        idB = idRun;
+        speedA = band.runSpeed;
+        speedB = band.runSpeed;
+    }
+
+    f32 morf = -1.0f;
+    if (!mAtnActive || !mDoubleAnmSet || anmA != mpAtnPrevA || anmB != mpAtnPrevB) {
+        morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+    }
+
+    setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, morf);
+
+    if (!mAtnActive || kind != mAtnPrevKind) {
+        const daAlink_AnmData& handData = anm_data(idA);
+        Log.debug("Puppet {} attention set {} -> {}: anm {} (bck {}) into {} (bck {}) at {:.2f}, "
+                  "rate {:.3f}{}, hands {}/{}",
+            mPlayerId, static_cast<unsigned>(mAtnActive ? mAtnPrevKind : 0),
+            static_cast<unsigned>(kind), static_cast<int>(idA), anm_bck_idx(idA, mNetEquip),
+            static_cast<int>(idB), anm_bck_idx(idB, mNetEquip), blend, rate,
+            zeroSpeed ? " standing" : "", handData.m_handIndexL, handData.m_handIndexR);
+    }
+
+    mCurrentAnm = static_cast<u16>(idA);
+    mIdleTicks = 0;
+    mAtnActive = true;
+    mAtnExitMorf = false;
+    mpAtnPrevA = anmA;
+    mpAtnPrevB = anmB;
+    mAtnPrevKind = kind;
+    return true;
 }
 
 /**

@@ -474,6 +474,157 @@ void fill_equip(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+/* --- D3b: the attention (Z-target / lock-on) move set. ---------------------------------------- */
+
+/// The animation that sits in the sender's under slot 1 for each attention kind, in every band.
+/// See fill_atn_kind() for why slot 1 is the one to read.
+struct AtnSlotAnm {
+    daAlink_c::daAlink_ANM anm;
+    std::uint8_t kind;
+};
+
+const AtnSlotAnm l_atnSlot1Anm[] = {
+    {daAlink_c::ANM_ATN_RETURN_FROM_WALK, kPlayerAtnForward},
+    {daAlink_c::ANM_ATN_RETURN_FROM_RUN, kPlayerAtnForward},
+    {daAlink_c::ANM_ATN_BACK_WALK, kPlayerAtnBack},
+    {daAlink_c::ANM_ATN_BACK_RUN, kPlayerAtnBack},
+    {daAlink_c::ANM_ATN_LOCK_BACK_WALK, kPlayerAtnBackLock},
+    {daAlink_c::ANM_ATN_LOCK_BACK_RUN, kPlayerAtnBackLock},
+    {daAlink_c::ANM_ATN_WALK_LEFT, kPlayerAtnLeft},
+    {daAlink_c::ANM_ATN_RUN_LEFT, kPlayerAtnLeft},
+    {daAlink_c::ANM_ATN_LOCK_WALK_LEFT, kPlayerAtnLeftLock},
+    {daAlink_c::ANM_ATN_LOCK_RUN_LEFT, kPlayerAtnLeftLock},
+    {daAlink_c::ANM_ATN_WALK_RIGHT, kPlayerAtnRight},
+    {daAlink_c::ANM_ATN_RUN_RIGHT, kPlayerAtnRight},
+    {daAlink_c::ANM_ATN_LOCK_WALK_RIGHT, kPlayerAtnRightLock},
+    {daAlink_c::ANM_ATN_LOCK_RUN_RIGHT, kPlayerAtnRightLock},
+};
+
+/// What may legitimately sit in slot 0 next to one of the above. Checked first, so that a slot-1
+/// index left behind by an earlier blend can't be read as a current one.
+const daAlink_c::daAlink_ANM l_atnSlot0Anm[] = {
+    daAlink_c::ANM_ATN_WAIT_LEFT,
+    daAlink_c::ANM_ATN_WAIT_RIGHT,
+    daAlink_c::ANM_WAIT,  // the stance band of the no-target back-off (setBlendAtnBackMoveAnime)
+    daAlink_c::ANM_ATN_RETURN_FROM_WALK,
+    daAlink_c::ANM_ATN_RETURN_FROM_RUN,
+    daAlink_c::ANM_ATN_BACK_WALK,
+    daAlink_c::ANM_ATN_BACK_RUN,
+    daAlink_c::ANM_ATN_LOCK_BACK_WALK,
+    daAlink_c::ANM_ATN_LOCK_BACK_RUN,
+    daAlink_c::ANM_ATN_WALK_LEFT,
+    daAlink_c::ANM_ATN_LOCK_WALK_LEFT,
+    daAlink_c::ANM_ATN_WALK_RIGHT,
+    daAlink_c::ANM_ATN_LOCK_WALK_RIGHT,
+    daAlink_c::ANM_ATN_RUN_LEFT,
+    daAlink_c::ANM_ATN_LOCK_RUN_LEFT,
+    daAlink_c::ANM_ATN_RUN_RIGHT,
+    daAlink_c::ANM_ATN_LOCK_RUN_RIGHT,
+};
+
+const char* atn_kind_name(std::uint8_t kind) {
+    switch (kind) {
+    case kPlayerAtnNone:
+        return "none";
+    case kPlayerAtnForward:
+        return "forward";
+    case kPlayerAtnForwardLock:
+        return "forward (lock)";
+    case kPlayerAtnBack:
+        return "back";
+    case kPlayerAtnBackLock:
+        return "back (lock)";
+    case kPlayerAtnLeft:
+        return "left";
+    case kPlayerAtnLeftLock:
+        return "left (lock)";
+    case kPlayerAtnRight:
+        return "right";
+    case kPlayerAtnRightLock:
+        return "right (lock)";
+    default:
+        return "unnamed";
+    }
+}
+
+/**
+ * Fill the attention byte with the attention move set daAlink_c is actually playing.
+ *
+ * Same rule as fill_idle_kind(): read the answer off his animation heap, not his inputs.
+ * `field_0x2f98` (the direction) and `mTargetedActor` (the lock) are the inputs to the choice, and
+ * both are also written by procs that never play this set (jumps, bottles, side rolls). The heap
+ * holds the choice itself.
+ *
+ * ★ The decision comes from slot 1, the B side of the double animation, on purpose. In every band
+ * of setBlendAtnMoveAnime (d_a_alink.cpp:7965-8031) and setBlendAtnBackMoveAnime (:8124-8150),
+ * slot 1 holds an animation that names the direction and the lock by itself. Slot 0 can't: in the
+ * stance band it is ATN_WAIT_RIGHT for forward, for right AND for locked back-off. Slot 1 here is
+ * NOT "the outgoing animation". The cross-fade lives in the old-frame morf, and commonSingleAnime
+ * resets slot 1 (:7164), so a single animation never matches.
+ *
+ * Each of these animations' UNDER resources is unique within the set. getMainBckData's shield and
+ * fishing-rod tables leave the under half of rows 0x00-0x0D alone (:233-254, :264-291), so the
+ * test still holds while he is guarding or fishing.
+ *
+ * One override comes from slot 0. With no target, setBlendMoveAnime's guard branch (:7685) pairs
+ * ATN_WAIT_RIGHT with ATN_WALK_LEFT, a typo in the original kept as it is. It plays at a weight of
+ * exactly 0, so slot 0 is all that is drawn. When slot 0 is a side stance that disagrees with slot
+ * 1's side, slot 0 wins.
+ *
+ * Forward is the one kind whose animations don't name the lock. ATN_RETURN_FROM_WALK/RUN play
+ * with or without a target, and only the band table differs (:7945-7961). So the lock for forward
+ * is read from mTargetedActor, the exact test setBlendAtnMoveAnime makes on that same tick.
+ *
+ * ATN_BACK_WALK_HEAVY (backing off in iron boots) isn't named. The puppet has no heavy-boots gait
+ * to pair it with, so that case reports none and the puppet keeps its ordinary gait.
+ */
+void fill_atn_kind(daAlink_c* alink, PlayerState& out) {
+    out.atnKind = kPlayerAtnNone;
+    if (alink != nullptr && !alink->checkWolf()) {
+        bool slot0InSet = false;
+        for (const daAlink_c::daAlink_ANM anm : l_atnSlot0Anm) {
+            if (alink->checkUnderMove0BckNoArc(anm)) {
+                slot0InSet = true;
+                break;
+            }
+        }
+
+        if (slot0InSet) {
+            for (const AtnSlotAnm& entry : l_atnSlot1Anm) {
+                if (alink->checkUnderMove1BckNoArc(entry.anm)) {
+                    out.atnKind = entry.kind;
+                    break;
+                }
+            }
+        }
+
+        if (out.atnKind == kPlayerAtnLeft || out.atnKind == kPlayerAtnRight) {
+            if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_ATN_WAIT_RIGHT)) {
+                out.atnKind = kPlayerAtnRight;
+            } else if (alink->checkUnderMove0BckNoArc(daAlink_c::ANM_ATN_WAIT_LEFT)) {
+                out.atnKind = kPlayerAtnLeft;
+            }
+        }
+
+        if (out.atnKind == kPlayerAtnForward && alink->mTargetedActor != NULL) {
+            out.atnKind = kPlayerAtnForwardLock;
+        }
+    }
+
+    /* Logged on every change, not latched. A strafe changes direction a few times a second at most,
+     * so this can't flood, and the both-ends check needs the timestamped sequence of changes. */
+    static std::uint8_t s_lastAtnKind = kPlayerAtnNone;
+    if (out.atnKind != s_lastAtnKind) {
+        Log.debug("Local attention set {} -> {} ({}); rate {:.3f}, target {}, dir field {}",
+            static_cast<unsigned>(s_lastAtnKind), static_cast<unsigned>(out.atnKind),
+            atn_kind_name(out.atnKind),
+            alink != nullptr ? alink->getMoveGroundAngleSpeedRate() : 0.0f,
+            alink != nullptr && alink->mTargetedActor != NULL ? "yes" : "no",
+            alink != nullptr ? static_cast<unsigned>(alink->field_0x2f98) : 0u);
+        s_lastAtnKind = out.atnKind;
+    }
+}
+
 }  // namespace
 
 /**
@@ -641,6 +792,7 @@ bool capture_local_player(PlayerState& out) {
 
     fill_idle_kind(alink, out);
     fill_equip(alink, out);
+    fill_atn_kind(alink, out);
 
     return true;
 }
@@ -806,6 +958,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
      * function becoming the place that knows which bit pattern means the master sword. */
     puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
         state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip, state.idleKind);
+    puppet->setNetworkAtn(state.atnKind);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -837,6 +990,17 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     // chose the fidget idle" and "the puppet is playing the fidget idle" are two different claims,
     // and only the second one is about the feature working.
     out.idleKind = puppet->getNetIdleKind();
+    out.atnKind = puppet->getNetAtnKind();
+    return true;
+}
+
+bool read_local_anim(std::uint16_t& out) {
+    out = 0;
+    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr || !world_is_playable() || !alink->mUnderAnmHeap[0].checkNoSetArcNo()) {
+        return false;
+    }
+    out = alink->mUnderAnmHeap[0].getIdx();
     return true;
 }
 

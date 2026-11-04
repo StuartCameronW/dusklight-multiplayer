@@ -68,8 +68,12 @@ namespace dusk::mp {
  * instead of leaving it connected and half-admitted. No packet changed size, so nothing would fail
  * to parse — a v10 peer would simply read every reason as 0, "connection lost", and tell its
  * player the wrong thing. Bumped so that never happens silently.
+ *
+ * 12: PlayerState grew a trailing `atnKind` byte (22 -> 23 bytes): the sender's attention /
+ * lock-on move set and its direction, so the puppet can play the ATN stance and strafe (D3b). A
+ * size change, so the bump is mandatory. A v11 peer's read() would under-run and drop every pose.
  */
-inline constexpr std::uint32_t kProtocolVersion = 11;
+inline constexpr std::uint32_t kProtocolVersion = 12;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
