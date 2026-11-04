@@ -11,6 +11,7 @@
 #include "fmt/format.h"
 #include "ImGuiConsole.hpp"
 #include "ImGuiEngine.hpp"
+#include "ImGuiNameTags.hpp"
 #include "JSystem/JUtility/JUTGamePad.h"
 #include "dusk/action_bindings.h"
 #include "dusk/audio/DuskAudioSystem.h"
@@ -355,6 +356,7 @@ namespace dusk {
             ImGui::End();
         }
 
+        ShowNameTags();
         m_menuTools.ShowInputViewer();
 
         if (dusk::IsGameLaunched && !dusk::getSettings().game.speedrunMode) {

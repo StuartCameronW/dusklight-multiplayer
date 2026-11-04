@@ -131,6 +131,12 @@ public:
     /// arrived as 0. See PlayerIdleKind for the values.
     u8 getNetIdleKind() const { return mNetIdleKind; }
     bool hasPose() const { return mHasPose; }
+    /* Where the floating name tag hangs from (src/dusk/imgui/ImGuiNameTags.cpp): the body's head
+     * joint as it is DRAWN this frame. On an interpolated frame that is frame_interp's lerped copy
+     * of the joint matrix — the one J3DShapeMtx renders the head with — so a tag placed from it
+     * cannot drift against the model the way one placed from current.pos (a sim-tick value) would.
+     * False before the first pose arrives, or without a body model. */
+    bool getNameTagAnchor(cXyz* o_pos);
     /* BCK resource index of the gait currently playing. Exposed for --mp-trace: which animation a
      * puppet picked is otherwise only checkable by looking at the other player's screen.
      *

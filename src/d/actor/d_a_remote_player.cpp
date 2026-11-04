@@ -2494,6 +2494,24 @@ void daRemotePlayer_c::selectAnimation() {
 }
 
 /* See the header. Out of line so it can go through the same table everything else here does. */
+bool daRemotePlayer_c::getNameTagAnchor(cXyz* o_pos) {
+    if (!mHasPose || !mCreateComplete || model == NULL) {
+        return false;
+    }
+
+    /* The raw joint matrix is the SIM-tick pose. J3DModel::calc records it with frame_interp, and
+     * on an interpolated frame the renderer draws the lerp between the last two recordings instead
+     * (lookup_concat_replacement, J3DShapeMtx.cpp). Ask for that same lerp, so the tag follows the
+     * head that is on screen rather than the one the next sim tick will draw. */
+    MtxP jointMtx = model->getAnmMtx(l_headJointNo);
+    Mtx interpolated;
+    if (dusk::frame_interp::lookup_replacement(jointMtx, interpolated)) {
+        jointMtx = interpolated;
+    }
+    o_pos->set(jointMtx[0][3], jointMtx[1][3], jointMtx[2][3]);
+    return true;
+}
+
 u16 daRemotePlayer_c::getCurrentAnm() const {
     /* ★ 0 until selectAnimation has actually run once, and that is a correctness fix, not padding.
      * create() seeds mCurrentAnm with ANM_WAIT so the hysteresis has a starting value, and there is
