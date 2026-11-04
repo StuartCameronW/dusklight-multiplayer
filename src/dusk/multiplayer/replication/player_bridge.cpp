@@ -6,11 +6,13 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_com_inf_game.h"
 #include "dusk/logging.h"
 #include "f_op/f_op_actor_mng.h"
+#include "m_Do/m_Do_mtx.h"
 
 /**
  * The one translation unit allowed to include engine headers (see player_bridge.hpp).
@@ -625,6 +627,177 @@ void fill_atn_kind(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+/* ── Action animation override (wire block 2) ───────────────────────────────────────────────
+ * .claude/future-plans/puppet-action-states.md §2.1. */
+
+/**
+ * The procs whose animation the puppet already REPRODUCES from the rest of the wire: the idles,
+ * the gait, the attention set, the turn-in-place and the skid. Whitelist-the-known,
+ * override-the-rest: a proc nobody has thought about gets the sender's real BCK rather than a
+ * glide, which is the right direction for an omission to fail in.
+ */
+bool puppet_reproduces_proc(std::uint16_t proc) {
+    switch (proc) {
+    case daAlink_c::PROC_SERVICE_WAIT:
+    case daAlink_c::PROC_TIRED_WAIT:
+    case daAlink_c::PROC_WAIT:
+    case daAlink_c::PROC_MOVE:
+    case daAlink_c::PROC_ATN_MOVE:
+    case daAlink_c::PROC_ATN_ACTOR_WAIT:
+    case daAlink_c::PROC_ATN_ACTOR_MOVE:
+    case daAlink_c::PROC_WAIT_TURN:
+    case daAlink_c::PROC_MOVE_TURN:
+    case daAlink_c::PROC_SLIP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/**
+ * The hand-model material whose shape the local player is SHOWING, or kPlayerActBodyHand for the
+ * body's own hand. The output of daAlink_c::setDrawHand (d_a_alink.cpp:18944-19045), not its
+ * input: mLeftHandIndex/mRightHandIndex are rewritten by that chain (the sword grip, the shield
+ * grip, 0x64 -> 2...), and comparing inputs is how the grip bug was once misdiagnosed (memory:
+ * measure the output, not the input). Same resolution d_a_remote_player.cpp's grip log uses.
+ */
+std::uint8_t shown_hand_index(J3DModel* handModel, J3DShape* shown) {
+    if (handModel == nullptr || shown == nullptr) {
+        return kPlayerActBodyHand;
+    }
+    J3DModelData* handData = handModel->getModelData();
+    if (handData == nullptr) {
+        return kPlayerActBodyHand;
+    }
+    for (u16 i = 0; i < handData->getMaterialNum(); i++) {
+        if (handData->getMaterialNodePointer(i)->getShape() == shown) {
+            return static_cast<std::uint8_t>(i);
+        }
+    }
+    // field_0x06d8/06dc — the body model's plain hands, his own answer for 0xFE.
+    return kPlayerActBodyHand;
+}
+
+void clear_action_anim(PlayerState& out) {
+    out.actUnder = kPlayerActNone;
+    out.actUpper = kPlayerActNone;
+    out.actFrame = 0;
+    out.actUpperFrame = 0;
+    out.actRate = 0;
+    out.actMorf = 0;
+    out.actHandL = kPlayerActBodyHand;
+    out.actHandR = kPlayerActBodyHand;
+    out.actRootX = 0;
+    out.actRootY = 0;
+    out.actRootZ = 0;
+}
+
+/**
+ * Fill block (2): what Link is DRAWING when he is in a proc the puppet does not reconstruct.
+ *
+ * ★ capture_local_player() runs twice per tick (once to send, once for --mp-trace), so every piece
+ * of state here must be idempotent within a tick. The morf latch is keyed on the idx CHANGING,
+ * which the second call does not see, so it hands back the value the first call latched.
+ */
+void fill_action_anim(daAlink_c* alink, PlayerState& out) {
+    clear_action_anim(out);
+
+    static std::uint16_t s_latchedUnder = kPlayerActNone;
+    static std::uint8_t s_latchedMorf = 0;
+    static std::uint16_t s_loggedDemoProc = 0xFFFF;
+    static std::uint16_t s_demoLogCount = 0;
+    static std::uint16_t s_changeLogCount = 0;
+    static std::uint16_t s_lastSentUnder = kPlayerActNone;
+
+    if (alink == nullptr || alink->checkWolf() || puppet_reproduces_proc(alink->mProcID)) {
+        s_latchedUnder = kPlayerActNone;
+    } else {
+        const daPy_anmHeap_c& under = alink->mUnderAnmHeap[0];
+        const daPy_anmHeap_c& upper = alink->mUpperAnmHeap[0];
+
+        if (!under.checkNoSetArcNo() || (!upper.checkNoSetIdx() && !upper.checkNoSetArcNo())) {
+            /* A demo-archive BCK (loadDataDemoRID, d_a_player.cpp:356) — doors, sumo, boss grabs.
+             * The puppet has none of those archives, so "no override" (the glide) is sent rather
+             * than an id it would resolve against the wrong archive. Logged once per proc so the
+             * gap is visible instead of being mistaken for "works". */
+            if (alink->mProcID != s_loggedDemoProc && s_demoLogCount < 32) {
+                s_loggedDemoProc = alink->mProcID;
+                s_demoLogCount++;
+                Log.debug(
+                    "Local action override skipped: proc 0x{:X} plays bck {} from demo arc {} "
+                    "(upper {} arc {}); the puppet glides for this one",
+                    alink->mProcID, under.getIdx(), under.getArcNo(), upper.getIdx(),
+                    upper.getArcNo());
+            }
+            s_latchedUnder = kPlayerActNone;
+        } else if (!under.checkNoSetIdx()) {
+            out.actUnder = under.getIdx();
+            out.actUpper = upper.getIdx();  // 0xFFFF already means "follows under"
+
+            out.actFrame =
+                act_encode_u16(alink->mUnderFrameCtrl[0].getFrame(), kPlayerActFrameScale);
+            if (out.actUpper != kPlayerActNone) {
+                out.actUpperFrame =
+                    act_encode_u16(alink->mUpperFrameCtrl[0].getFrame(), kPlayerActFrameScale);
+            }
+            out.actRate = act_encode_s8(alink->mUnderFrameCtrl[0].getRate(), kPlayerActRateScale);
+
+            /* The morf Link started, latched on the tick the idx changed. setSingleAnime calls
+             * initOldFrameMorf(m) (d_a_alink.cpp:7239), which decrements once (counter m-1), and
+             * the body's calc later in the same execute decrements again (m_Do_ext.cpp:1233), so a
+             * capture after the actor pass reads m-2. The receiver's setAnm + calc repeat exactly
+             * that sequence, which is why m — not the counter — is what travels. REASONED, not
+             * measured: a proc that sets its animation after modelCalc would read m-1 and send
+             * one frame long. */
+            if (out.actUnder != s_latchedUnder) {
+                s_latchedUnder = out.actUnder;
+                const f32 counter = alink->field_0x2060 != nullptr ?
+                                        alink->field_0x2060->getOldFrameMorfCounter() :
+                                        0.0f;
+                const f32 morf = counter > 0.0f ? counter + 2.0f : 0.0f;
+                s_latchedMorf = static_cast<std::uint8_t>(morf > 255.0f ? 255.0f : morf + 0.5f);
+            }
+            out.actMorf = s_latchedMorf;
+
+            out.actHandL = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d0);
+            out.actHandR = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d4);
+
+            /* Joint 0's FINAL model-space translation, after jointControll has applied whatever
+             * root clear this proc asked for (d_a_alink.cpp:2213-2235, including the 0x60 case).
+             * Read off the matrix his calc produced — this runs after the actor pass, and his
+             * modelCalc is inside execute — and taken back to model space through mInvMtx, the
+             * inverse setMatrix built from the same base (d_a_alink.cpp:5794-5795). Reading it,
+             * not writing it: writes after calc are invisible (memory). */
+            if (alink->mpLinkModel != nullptr) {
+                MtxP root = alink->mpLinkModel->getAnmMtx(0);
+                const cXyz world(root[0][3], root[1][3], root[2][3]);
+                cXyz local;
+                mDoMtx_multVec(alink->mInvMtx, &world, &local);
+                out.actRootX = act_encode_s16(local.x, kPlayerActRootScale);
+                out.actRootY = act_encode_s16(local.y, kPlayerActRootScale);
+                out.actRootZ = act_encode_s16(local.z, kPlayerActRootScale);
+            }
+        } else {
+            s_latchedUnder = kPlayerActNone;
+        }
+    }
+
+    /* On every change of what is sent, capped: combat changes BCK several times a second, and the
+     * trace carries the full series anyway. This is for a human reading the log. */
+    if (out.actUnder != s_lastSentUnder) {
+        if (s_changeLogCount < 200) {
+            s_changeLogCount++;
+            Log.debug("Local action override {} -> {} (upper {}), proc 0x{:X}, frame {:.1f}, rate "
+                      "{:.2f}, morf {}, hands {}/{}",
+                s_lastSentUnder, out.actUnder, out.actUpper,
+                alink != nullptr ? static_cast<unsigned>(alink->mProcID) : 0xFFFFu, out.act_frame(),
+                out.act_rate(), static_cast<unsigned>(out.actMorf),
+                static_cast<unsigned>(out.actHandL), static_cast<unsigned>(out.actHandR));
+        }
+        s_lastSentUnder = out.actUnder;
+    }
+}
+
 }  // namespace
 
 /**
@@ -793,6 +966,7 @@ bool capture_local_player(PlayerState& out) {
     fill_idle_kind(alink, out);
     fill_equip(alink, out);
     fill_atn_kind(alink, out);
+    fill_action_anim(alink, out);
 
     return true;
 }
@@ -959,6 +1133,11 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
         state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip, state.idleKind);
     puppet->setNetworkAtn(state.atnKind);
+    // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.
+    const cXyz rootTrans(state.act_root_x(), state.act_root_y(), state.act_root_z());
+    puppet->setNetworkAction(state.actUnder, state.actUpper, state.act_frame(),
+        state.act_upper_frame(), state.act_rate(), static_cast<f32>(state.actMorf), state.actHandL,
+        state.actHandR, rootTrans);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -991,6 +1170,26 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     // and only the second one is about the feature working.
     out.idleKind = puppet->getNetIdleKind();
     out.atnKind = puppet->getNetAtnKind();
+    /* Block (2): what the puppet DRAWS, not what it received — the heap idx installed in its packs,
+     * the frame on the animation object itself, the hand shapes it is showing and joint 0 as its
+     * calc left it. The local row carries the same columns for the sender, so the two compare. */
+    out.actUnder = puppet->getActDrawnUnder();
+    out.actUpper = puppet->getActDrawnUpper();
+    out.actFrame = act_encode_u16(puppet->getActDrawnFrame(), kPlayerActFrameScale);
+    out.actUpperFrame = act_encode_u16(puppet->getActDrawnUpperFrame(), kPlayerActFrameScale);
+    out.actRate = act_encode_s8(puppet->getActDrawnRate(), kPlayerActRateScale);
+    const f32 morf = puppet->getActDrawnMorf();
+    out.actMorf =
+        static_cast<std::uint8_t>(morf > 0.0f ? (morf > 255.0f ? 255.0f : morf + 0.5f) : 0.0f);
+    out.actHandL = puppet->getDrawnHand(0);
+    out.actHandR = puppet->getDrawnHand(1);
+    cXyz rootLocal;
+    cXyz rootWorld;
+    if (puppet->getDrawnRoot(&rootLocal, &rootWorld)) {
+        out.actRootX = act_encode_s16(rootLocal.x, kPlayerActRootScale);
+        out.actRootY = act_encode_s16(rootLocal.y, kPlayerActRootScale);
+        out.actRootZ = act_encode_s16(rootLocal.z, kPlayerActRootScale);
+    }
     return true;
 }
 
@@ -1001,6 +1200,36 @@ bool read_local_anim(std::uint16_t& out) {
         return false;
     }
     out = alink->mUnderAnmHeap[0].getIdx();
+    return true;
+}
+
+bool read_local_root(float& x, float& y, float& z) {
+    x = y = z = 0.0f;
+    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr || !world_is_playable() || alink->mpLinkModel == nullptr) {
+        return false;
+    }
+    MtxP root = alink->mpLinkModel->getAnmMtx(0);
+    x = root[0][3];
+    y = root[1][3];
+    z = root[2][3];
+    return true;
+}
+
+bool read_puppet_root(std::uint32_t playerId, float& x, float& y, float& z) {
+    x = y = z = 0.0f;
+    daRemotePlayer_c* puppet = resolve_puppet(playerId);
+    if (puppet == nullptr) {
+        return false;
+    }
+    cXyz local;
+    cXyz world;
+    if (!puppet->getDrawnRoot(&local, &world)) {
+        return false;
+    }
+    x = world.x;
+    y = world.y;
+    z = world.z;
     return true;
 }
 

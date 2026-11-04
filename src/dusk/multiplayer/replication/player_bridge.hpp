@@ -59,6 +59,14 @@ bool read_puppet_anim(std::uint32_t playerId, std::uint16_t& out);
 /// right now, every substitution applied. For --mp-trace, so a puppet's choice can be compared
 /// against what its sender actually played. 0 (false) when there is no playable Link.
 bool read_local_anim(std::uint16_t& out);
+
+/// World position of joint 0 (the root) as the LOCAL player's body was last calc'd, for
+/// --mp-trace's root-motion check (puppet-action-states.md §4.5). False when there is no playable
+/// Link.
+bool read_local_root(float& x, float& y, float& z);
+
+/// The same for a puppet: joint 0 as its own calc left it. False when it doesn't exist.
+bool read_puppet_root(std::uint32_t playerId, float& x, float& y, float& z);
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 

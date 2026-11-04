@@ -6,6 +6,7 @@
 #include "d/dolzel_rel.h"  // IWYU pragma: keep
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -14,6 +15,7 @@
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphLoader/J3DAnmLoader.h"
 #include "JSystem/JKernel/JKRArchive.h"
+#include "JSystem/JKernel/JKRExpHeap.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_mirror.h"
 #include "d/actor/d_a_npc4.h"
@@ -1331,6 +1333,10 @@ int daRemotePlayer_c::createHeap() {
      * non-fatal, each falling back to the ordinary gait) and never a model. */
     loadAtnAnimations();
 
+    /* The action override's 0x10800 buffer and six anm heaps. LAST of all, after the attention
+     * set, so a short heap costs the override (glide, as before) and never a model or a gait. */
+    setupActionAnimation();
+
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
         Log.info("Puppet heap after setup: {} bytes free, largest block {}", heap->getFreeSize(),
@@ -2199,6 +2205,12 @@ void daRemotePlayer_c::selectAnimation() {
      * than create()'s seed, which is what getCurrentAnm() reports on. */
     mAnmChosen = true;
 
+    /* The action override (wire block 2) beats everything below: the sender is in a proc the
+     * puppet does not reconstruct, and what he is drawing came over the wire. */
+    if (selectActionAnimation()) {
+        return;
+    }
+
     /* The sharp turn wins over the gait outright, exactly as it does for the local player:
      * PROC_SLIP is a proc of its own and setSingleAnimeParam replaces the move blend wholesale, it
      * does not layer over it (d_a_alink.cpp:16675). Taken FIRST and returned from, so the gait code
@@ -2629,6 +2641,10 @@ u16 daRemotePlayer_c::getCurrentAnm() const {
      * analyzer filters those rows out. */
     if (!mAnmChosen) {
         return 0;
+    }
+    // During an action override the puppet is drawing the sender's BCK, not a table row.
+    if (mActActive) {
+        return mActShownUnder;
     }
     return anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm), mNetEquip);
 }
@@ -3076,6 +3092,12 @@ void daRemotePlayer_c::setDrawHand() {
     }
     if ((mNetEquip & dusk::mp::kPlayerEquipShieldInHand) != 0) {
         handIdx[1] = l_shieldGripHandIdx;
+    }
+    /* During an action override the pair is the sender's SHOWN pair, already through his whole
+     * resolution chain, grips included — the answer, not the table row it started from. */
+    if (mActActive) {
+        handIdx[0] = mNetActHand[0];
+        handIdx[1] = mNetActHand[1];
     }
 
     J3DModelData* handData = mpHandModel != NULL ? mpHandModel->getModelData() : NULL;
@@ -4507,6 +4529,9 @@ static int daRemotePlayer_bodyModelCallBack(J3DJoint* i_joint, int i_pass) {
 int daRemotePlayer_c::bodyModelCallBack(int i_jointNo) {
     if (i_jointNo == l_footIkCallBackJointNo) {
         setFootMatrix();
+    } else if (i_jointNo == l_underRootJointNo) {
+        // The action override's root-motion overwrite. Registered by setupActionAnimation().
+        applyActionRoot();
     } else if (i_jointNo == l_hipFollowJointNo[0] || i_jointNo == l_hipFollowJointNo[1]) {
         /* daAlink_c::jointControll's joint-27 and joint-29 arms (d_a_alink.cpp:2228-2231), and the
          * only two arms of that function a puppet is currently able to reproduce — see
@@ -4640,6 +4665,437 @@ void daRemotePlayer_c::setupFootIk() {
      * and footBgCheck refuses to run until it is true. So a callback that is attached but never
      * fires shows up as the "foot IK probing" line never appearing at all — the two failure modes
      * stay distinguishable in the log instead of both reading as flat ground. */
+}
+
+/* ═══ Action animation override (wire block 2) ═══════════════════════════════════════════════
+ *
+ * .claude/future-plans/puppet-action-states.md, slice 1. When the sender is in a proc the puppet
+ * does not reconstruct (a swing, a roll, a jump, a hurt reaction...), the wire carries the BCK he
+ * is drawing, its frame and his joint-0 translation, and the puppet plays exactly that instead of
+ * gliding in its locomotion pose.
+ *
+ * The loading is daAlink_c's own, not load_aram_anm: daPy_anmHeap_c::loadDataIdx into a tiny
+ * per-slot solid heap that is freeAll()ed first (d_a_player.cpp:301-372), over one buffer laid out
+ * the way daAlink_c::initModel lays out his. Synchronous, same tick, the same as Link — he has no
+ * async animation loading at all. */
+
+/// "No override" on the wire (dusk::mp::kPlayerActNone; this file does not include the wire
+/// layout, the same arrangement setNetworkPose already has).
+const u16 l_actNone = 0xFFFF;
+/// daAlink_c::initModel's buffer and stride (d_a_alink.cpp:4307, :4555-4563).
+const u32 l_actBufferSize = 0x10800;
+const u32 l_actSlotStride = 0x2C00;
+const u32 l_actUpperOffset = 0x8400;
+/// The buffer sizes getUnderUpperAnime hands getAnimeResource for slot 0 of a single animation
+/// (d_a_alink.cpp:7246 passes 0x10800; :6994-6996 turns that into (3 - 0) * 0x2C00 for the upper).
+const u32 l_actUnderLoadSize = 0x10800;
+const u32 l_actUpperLoadSize = 3 * 0x2C00;
+/// Game-heap headroom required before carving the six slot heaps from it. createHeap's
+/// JKRHEAP_NAME dereferences a NULL heap on PC, so a failure has to be refused up front, not
+/// caught.
+const u32 l_actGameHeapMargin = 0x1000;
+/// Caps on the transition and failure logs. Combat changes animation several times a second.
+const u16 l_actLogMax = 200;
+const u16 l_actFailLogMax = 32;
+
+void daRemotePlayer_c::setupActionAnimation() {
+    mActHeapReady = false;
+    mActActive = false;
+    mActStarved = false;
+    mpActUnderBck = NULL;
+    mpActUpperBck = NULL;
+    mActShownUnder = l_actNone;
+    mActShownUpper = l_actNone;
+    mActAppliedMorf = 0.0f;
+    mActFailedUnder = l_actNone;
+    mActFailedUpper = l_actNone;
+    mNetActUnder = l_actNone;
+    mNetActUpper = l_actNone;
+    mActPrevNetUnder = l_actNone;
+    mActPrevNetFrame = -1.0f;
+    mNetActHand[0] = l_defaultHandIdx;
+    mNetActHand[1] = l_defaultHandIdx;
+
+    /* ★ The spec's warning, honoured: daPy_anmHeap_c's constructor leaves mAnimeHeap/mBuffer alone
+     * and its destructor destroys a non-NULL mAnimeHeap. On the first run they are zero (the actor
+     * is cleared before construction, fpcBs_Create -> sBs_ClearArea). A NON-NULL heap here
+     * therefore means createHeap is being run a second time — fopAcM_entrySolidHeap_ can retry the
+     * callback on a fresh heap — and the first run's slot heaps live in the GAME heap, not the
+     * actor heap that was thrown away, so they are destroyed rather than leaked. The buffer was on
+     * the discarded actor heap and is simply forgotten. */
+    for (int i = 0; i < 3; i++) {
+        daPy_anmHeap_c* heaps[2] = {&mActUnderHeap[i], &mActUpperHeap[i]};
+        for (int h = 0; h < 2; h++) {
+            if (heaps[h]->mAnimeHeap != NULL) {
+                mDoExt_destroySolidHeap(heaps[h]->mAnimeHeap);
+            }
+            heaps[h]->mAnimeHeap = NULL;
+            heaps[h]->mBuffer = NULL;
+            heaps[h]->mBufferSize = 0;
+            heaps[h]->initData();
+        }
+    }
+
+    JKRHeap* actorHeap = JKRGetCurrentHeap();
+    const u32 freeBefore = actorHeap != NULL ? actorHeap->getFreeSize() : 0;
+    if (actorHeap == NULL || actorHeap->getMaxAllocatableSize(0x20) < l_actBufferSize + 0x40) {
+        Log.warn("Puppet {} action override OFF: actor heap has {} free, largest block {}, needs "
+                 "{} — sword swings, rolls and jumps will glide in the locomotion pose",
+            mPlayerId, freeBefore, actorHeap != NULL ? actorHeap->getMaxAllocatableSize(0x20) : 0,
+            l_actBufferSize);
+        return;
+    }
+
+    mActUnderHeap[0].setBufferSize(l_actBufferSize);
+    if (mActUnderHeap[0].mallocBuffer() == NULL) {
+        Log.warn("Puppet {} action override OFF: the {}-byte buffer did not allocate", mPlayerId,
+            l_actBufferSize);
+        return;
+    }
+
+    JKRHeap* gameHeap = mDoExt_getGameHeap();
+    if (gameHeap == NULL || gameHeap->getMaxAllocatableSize(0x20) < l_actGameHeapMargin) {
+        Log.warn("Puppet {} action override OFF: game heap's largest block is {}, needs {} for six "
+                 "anm heaps",
+            mPlayerId, gameHeap != NULL ? gameHeap->getMaxAllocatableSize(0x20) : 0,
+            l_actGameHeapMargin);
+        return;
+    }
+
+    // daAlink_c::initModel's layout, line for line (d_a_alink.cpp:4555-4563).
+    u8* const base = mActUnderHeap[0].getBuffer();
+    for (int i = 0; i < 3; i++) {
+        mActUnderHeap[i].setBuffer(base + i * l_actSlotStride);
+        PLAYER_CREATE_ANM_HEAP_F(
+            mActUnderHeap[i], daPy_anmHeap_c::HEAP_TYPE_3, "daRemotePlayer::actUnder[%d]", i);
+    }
+    mActUpperHeap[0].setBuffer(base + l_actUpperOffset);
+    for (int i = 0; i < 3; i++) {
+        mActUpperHeap[i].setBuffer(mActUpperHeap[0].getBuffer() + i * l_actSlotStride);
+        PLAYER_CREATE_ANM_HEAP_F(
+            mActUpperHeap[i], daPy_anmHeap_c::HEAP_TYPE_3, "daRemotePlayer::actUpper[%d]", i);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (mActUnderHeap[i].mAnimeHeap == NULL || mActUpperHeap[i].mAnimeHeap == NULL) {
+            Log.warn("Puppet {} action override OFF: anm heap slot {} did not allocate from the "
+                     "game heap",
+                mPlayerId, i);
+            return;
+        }
+    }
+
+    /* Joint 0 gets the body callback for the root-motion overwrite. Same idiom and guard as
+     * setupFootIk(); the user area is the same value, so setting it again is harmless and keeps
+     * this independent of whether the foot IK attached. */
+    J3DModelData* modelData = model->getModelData();
+    if (modelData == NULL || modelData->getJointNum() <= l_underRootJointNo) {
+        Log.warn("Puppet {} action override OFF: no joint {} to carry the root translation",
+            mPlayerId, l_underRootJointNo);
+        return;
+    }
+    model->setUserArea((uintptr_t)this);
+    modelData->getJointNodePointer(l_underRootJointNo)
+        ->setCallBack(daRemotePlayer_bodyModelCallBack);
+
+    mActHeapReady = true;
+    // Latched and permanent: the measured cost of the buffer, which the spec only reasoned.
+    Log.info("Puppet {} action override ready: {}-byte buffer + 6 anm heaps; actor heap {} -> {} "
+             "free",
+        mPlayerId, l_actBufferSize, freeBefore, actorHeap->getFreeSize());
+}
+
+void daRemotePlayer_c::setNetworkAction(u16 i_under, u16 i_upper, f32 i_frame, f32 i_upperFrame,
+    f32 i_rate, f32 i_morf, u8 i_handL, u8 i_handR, const cXyz& i_rootTrans) {
+    mNetActUnder = i_under;
+    mNetActUpper = i_upper;
+    mNetActFrame = i_frame;
+    mNetActUpperFrame = i_upperFrame;
+    mNetActRate = i_rate;
+    mNetActMorf = i_morf;
+    mNetActHand[0] = i_handL;
+    mNetActHand[1] = i_handR;
+    mNetActRoot = i_rootTrans;
+}
+
+J3DAnmTransform* daRemotePlayer_c::loadActionBck(daPy_anmHeap_c& io_heap, u16 i_idx, u32 i_bufSize,
+    J3DAnmTransform* i_current, bool* o_reloaded) {
+    *o_reloaded = false;
+
+    // Already resident: loadDataIdx would return NULL for "same idx", which is indistinguishable
+    // from a failed load, so the cache is answered here instead.
+    if (i_current != NULL && io_heap.getIdx() == i_idx && io_heap.checkNoSetArcNo()) {
+        return i_current;
+    }
+
+    /* Refused before anything is overwritten when the index is not in the archive at all — a peer
+     * on a different build, or a corrupt byte. loadData does not check the read: an absent entry
+     * reads nothing and the loader would then parse whatever the buffer last held. */
+    JKRArchive* archive = dComIfGp_getAnmArchive();
+    if (archive == NULL || archive->findIdxResource(i_idx) == NULL) {
+        return NULL;
+    }
+
+    *o_reloaded = true;
+    io_heap.setBufferSize(i_bufSize);
+    // A read that delivers nothing must not leave a stale 'J3D1' header for the loader to accept.
+    std::memset(io_heap.getBuffer(), 0, 4);
+
+    J3DAnmBase* anm = static_cast<J3DAnmBase*>(io_heap.loadDataIdx(i_idx));
+    if (anm == NULL || !anm_kind_matches(anm->getKind(), ANM_FAMILY_TRANSFORM)) {
+        // The heap was freeAll()ed by the attempt: whatever it held before is gone either way.
+        io_heap.resetIdx();
+        return NULL;
+    }
+    return static_cast<J3DAnmTransform*>(anm);
+}
+
+void daRemotePlayer_c::exitActionAnimation(const char* i_why) {
+    mActActive = false;
+    mActShownUnder = l_actNone;
+    mActShownUpper = l_actNone;
+    mActStarved = false;
+    /* Not slip and not the fidget, so selectAnimation's "if it is not already playing" tests
+     * re-install their animation this tick instead of trusting packs the override overwrote. */
+    mCurrentAnm = static_cast<u16>(l_idleAnm);
+    /* Out with daAlink_c's basic interpolation, the morf his procs return to the move blend with —
+     * the same flag the attention set uses for its own exit. */
+    mAtnExitMorf = true;
+
+    if (mActLogCount < l_actLogMax) {
+        mActLogCount++;
+        Log.debug("Puppet {} action override off: {}", mPlayerId, i_why);
+    }
+}
+
+bool daRemotePlayer_c::selectActionAnimation() {
+    const u16 under = mNetActUnder;
+    const u16 upper = mNetActUpper;
+
+    if (!mActHeapReady || under == l_actNone) {
+        if (mActActive) {
+            exitActionAnimation("the sender is back in a proc the puppet reconstructs");
+        }
+        mActPrevNetUnder = l_actNone;
+        return false;
+    }
+
+    const bool needInstall = !mActActive || mActShownUnder != under || mActShownUpper != upper;
+
+    if (needInstall) {
+        if (under == mActFailedUnder && upper == mActFailedUpper) {
+            if (mActActive) {
+                exitActionAnimation("the new BCK did not load");
+            }
+            mActPrevNetUnder = l_actNone;
+            return false;
+        }
+
+        const bool underChange = !mActActive || mActShownUnder != under;
+
+        bool underReloaded = false;
+        J3DAnmTransform* underBck = loadActionBck(
+            mActUnderHeap[0], under, l_actUnderLoadSize, mpActUnderBck, &underReloaded);
+        if (underBck == NULL) {
+            /* The attempt may have freed the heap the last override was drawing from and written
+             * over the upper region of the shared buffer, so both cached halves are dropped. The
+             * packs still name them for the rest of this tick only: exitActionAnimation hands back
+             * to selectAnimation, whose every branch re-installs slot 0 before animePlay runs. */
+            mpActUnderBck = NULL;
+            mpActUpperBck = NULL;
+            mActUpperHeap[0].resetIdx();
+            mActFailedUnder = under;
+            mActFailedUpper = upper;
+            if (mActFailLogCount < l_actFailLogMax) {
+                mActFailLogCount++;
+                Log.warn("Puppet {} override load failed idx={} (upper {}); gliding instead",
+                    mPlayerId, under, upper);
+            }
+            if (mActActive) {
+                exitActionAnimation("the new BCK did not load");
+            }
+            mActPrevNetUnder = l_actNone;
+            return false;
+        }
+        mpActUnderBck = underBck;
+
+        J3DAnmTransform* upperBck = NULL;
+        if (upper == l_actNone) {
+            /* daAlink_c's own "upper follows under" (getUnderUpperAnime resets the upper idx,
+             * d_a_alink.cpp:7008). Reset ours too: a single animation may be large enough to have
+             * written over the upper region, so whatever the upper heap held is no longer valid. */
+            mActUpperHeap[0].resetIdx();
+            mpActUpperBck = NULL;
+        } else {
+            if (underReloaded) {
+                // Same reason, the other way round: an earlier large single under may have
+                // overwritten the upper region since the upper heap last loaded. Read it fresh.
+                mActUpperHeap[0].resetIdx();
+                mpActUpperBck = NULL;
+            }
+            bool upperReloaded = false;
+            upperBck = loadActionBck(
+                mActUpperHeap[0], upper, l_actUpperLoadSize, mpActUpperBck, &upperReloaded);
+            if (upperBck == NULL && mActFailLogCount < l_actFailLogMax) {
+                mActFailLogCount++;
+                Log.warn("Puppet {} override upper half {} did not load (under {}); its arms will "
+                         "play the lower body's",
+                    mPlayerId, upper, under);
+            }
+            mpActUpperBck = upperBck;
+        }
+
+        daRemotePlayer_anm_c anm;
+        anm.mpUnder = underBck;
+        anm.mpUpper = upperBck;
+        /* The sender's morf, and only when the UNDER half changed — that is the tick Link called
+         * initOldFrameMorf. An upper-only change gets none, as his does not reset the morf. */
+        const f32 morf = underChange ? mNetActMorf : -1.0f;
+        setAnm(anm, underBck->getAttribute(), morf, mNetActRate, 0.0f, -1);
+        if (upperBck != NULL) {
+            // Each half on its own BCK's play mode, as commonSingleAnime does (d_a_alink.cpp:7197).
+            mUpperFrameCtrl[0].setAttribute(upperBck->getAttribute());
+        }
+        if (underChange) {
+            mActAppliedMorf = morf;
+        }
+
+        /* The ids REQUESTED, so an upper half that failed to load is not re-read from ARAM every
+         * tick. What is drawn is told apart by mpActUpperBck: NULL means the arms play the under
+         * BCK, and getActDrawnUpper() reports that as 0xFFFF. */
+        mActShownUnder = under;
+        mActShownUpper = upper;
+        mActFailedUnder = l_actNone;
+        mActFailedUpper = l_actNone;
+
+        if (!mActActive && mActLogCount < l_actLogMax) {
+            mActLogCount++;
+            Log.debug("Puppet {} action override on: bck {} / upper {} at frame {:.1f} of {}, rate "
+                      "{:.2f}, morf {:.1f}, hands {}/{}",
+                mPlayerId, under, upper, mNetActFrame, underBck->getFrameMax(), mNetActRate,
+                mNetActMorf, mNetActHand[0], mNetActHand[1]);
+        }
+        if (!mLoggedActLive) {
+            // Latched and permanent: if this line is missing from a session, no override ever
+            // played, whatever the trace's received columns say.
+            mLoggedActLive = true;
+            Log.info("Puppet {} action override live: first BCK {} (upper {}) loaded and installed",
+                mPlayerId, under, upper);
+        }
+        mActActive = true;
+    }
+
+    /* The frame. ★ Never two drivers on one animation (memory: a J3DAnmTransform holds its own
+     * frame): the controller is seated so that animePlay()'s ONE updateFrame() lands exactly on the
+     * wire frame, rather than being stepped and then overwritten. That keeps the controller's rate
+     * honest for anything else that reads it.
+     *
+     * A STARVED buffer holds the last sample, which arrives here as the same id at the same frame
+     * with a non-zero rate — impossible for a live stream. Then the seat is skipped and the
+     * controller runs on at the sender's rate, so a swing keeps moving instead of freezing
+     * mid-arc; the next fresh sample re-seats it, with no morf. */
+    const bool held =
+        under == mActPrevNetUnder && mNetActFrame == mActPrevNetFrame && mNetActRate != 0.0f;
+    mActStarved = held && !needInstall;
+
+    if (!mActStarved) {
+        mUnderFrameCtrl[0].setRate(mNetActRate);
+        mUnderFrameCtrl[0].setFrame(mNetActFrame - mNetActRate);
+        if (mpActUpperBck != NULL) {
+            mUpperFrameCtrl[0].setRate(mNetActRate);
+            mUpperFrameCtrl[0].setFrame(mNetActUpperFrame - mNetActRate);
+        }
+    }
+    mActPrevNetUnder = under;
+    mActPrevNetFrame = mNetActFrame;
+
+    /* Foot IK off for the whole override. daAlink_c turns it off himself for jumps, climbs and
+     * swims (that is already on the wire as NoFootIk); for the rest, an IK solved against a pose
+     * the puppet did not choose would fight the root translation the sender sent. Re-written every
+     * tick by setNetworkPose, so this lasts exactly as long as the override. */
+    mNetFootIkOff = true;
+    mIdleTicks = 0;
+    return true;
+}
+
+void daRemotePlayer_c::applyActionRoot() {
+    if (!mActActive || model == NULL || mpOldFrame == NULL) {
+        return;
+    }
+
+    /* ★ daAlink_c clears root translation on joint 0 by writing the cleared value into the OLD
+     * FRAME's trans info (jointControll, d_a_alink.cpp:2213-2235). The puppet writes the sender's
+     * final answer there instead — which covers every clear mode, the 0x60 special case and
+     * anything else jointControll does to the root — so the morf OUT of this pose starts from the
+     * cleared root rather than a body length ahead of it. */
+    J3DTransformInfo* oldTrans = mpOldFrame->getOldFrameTransInfo(l_underRootJointNo);
+    oldTrans->mTranslate.x = mNetActRoot.x;
+    oldTrans->mTranslate.y = mNetActRoot.y;
+    oldTrans->mTranslate.z = mNetActRoot.z;
+
+    /* And the matrix this calc is producing. Joint 0's anm matrix is base * local, so its world
+     * translation is the base transform applied to the local one; rotation is untouched. Written
+     * to J3DSys::mCurrentMtx as well, because that is what joint 0's CHILDREN inherit
+     * (J3DJoint::recursiveCalc descends straight after this pass-0 callback) — the same reason the
+     * hip-follow arm copies into it. */
+    cXyz world;
+    mDoMtx_multVec(model->getBaseTRMtx(), &mNetActRoot, &world);
+    MtxP rootMtx = model->getAnmMtx(l_underRootJointNo);
+    rootMtx[0][3] = world.x;
+    rootMtx[1][3] = world.y;
+    rootMtx[2][3] = world.z;
+    J3DSys::mCurrentMtx[0][3] = world.x;
+    J3DSys::mCurrentMtx[1][3] = world.y;
+    J3DSys::mCurrentMtx[2][3] = world.z;
+
+    if (!mLoggedActRoot) {
+        // Latched: proves the callback is attached AND firing during an override.
+        mLoggedActRoot = true;
+        Log.debug("Puppet {} action root overwrite live: joint 0 local ({:.1f}, {:.1f}, {:.1f})",
+            mPlayerId, mNetActRoot.x, mNetActRoot.y, mNetActRoot.z);
+    }
+}
+
+u16 daRemotePlayer_c::getActDrawnUnder() const {
+    return mActActive ? mActShownUnder : l_actNone;
+}
+
+u16 daRemotePlayer_c::getActDrawnUpper() const {
+    return mActActive && mpActUpperBck != NULL ? mActShownUpper : l_actNone;
+}
+
+// Read off the animation objects themselves — the frame J3D will actually sample — not the
+// controller and not the wire.
+f32 daRemotePlayer_c::getActDrawnFrame() const {
+    return mActActive && mpActUnderBck != NULL ? mpActUnderBck->getFrame() : 0.0f;
+}
+
+f32 daRemotePlayer_c::getActDrawnUpperFrame() const {
+    return mActActive && mpActUpperBck != NULL ? mpActUpperBck->getFrame() : 0.0f;
+}
+
+f32 daRemotePlayer_c::getActDrawnRate() const {
+    return mActActive ? mUnderFrameCtrl[0].getRate() : 0.0f;
+}
+
+u8 daRemotePlayer_c::getDrawnHand(int i_hand) const {
+    if (i_hand < 0 || i_hand > 1) {
+        return l_defaultHandIdx;
+    }
+    const int shown = resolve_hand_shape(mpHandModel, mpShownHandShape[i_hand]);
+    return shown < 0 ? l_defaultHandIdx : static_cast<u8>(shown);
+}
+
+bool daRemotePlayer_c::getDrawnRoot(cXyz* o_local, cXyz* o_world) {
+    if (model == NULL || !mHasPose) {
+        return false;
+    }
+    MtxP rootMtx = model->getAnmMtx(l_underRootJointNo);
+    o_world->set(rootMtx[0][3], rootMtx[1][3], rootMtx[2][3]);
+    // mInvMtx is the inverse of the base transform setMatrix() last built (kept in step by
+    // setBodySinkOffset), which is the one this calc used.
+    mDoMtx_multVec(mInvMtx, o_world, o_local);
+    return true;
 }
 
 /* Where on each foot the floor is probed, in that joint's own space (d_a_alink.cpp:3846-3849). The

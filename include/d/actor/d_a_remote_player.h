@@ -150,6 +150,30 @@ public:
      * The value handed back is unchanged, and .claude/scripts' analyzers still match on it. */
     u16 getCurrentAnm() const;
 
+    /* --- Action animation override (wire block 2; .claude/future-plans/puppet-action-states.md).
+     *
+     * Pushed in every tick from the network layer alongside setNetworkPose(). i_under == 0xFFFF
+     * means "no override" and the puppet plays its own locomotion reconstruction. Plain values,
+     * already decoded from the wire's fixed point, for the same reason setNetworkPose takes plain
+     * values: this header does not include the wire layout. */
+    void setNetworkAction(u16 i_under, u16 i_upper, f32 i_frame, f32 i_upperFrame, f32 i_rate,
+        f32 i_morf, u8 i_handL, u8 i_handR, const cXyz& i_rootTrans);
+    /* What the puppet is actually DRAWING for the override, for --mp-trace's actor row — the heap
+     * idx installed in the packs and the animation objects' own frames, not what was received.
+     * 0xFFFF when no override is playing. */
+    u16 getActDrawnUnder() const;
+    u16 getActDrawnUpper() const;
+    f32 getActDrawnFrame() const;
+    f32 getActDrawnUpperFrame() const;
+    f32 getActDrawnRate() const;
+    f32 getActDrawnMorf() const { return mActAppliedMorf; }
+    /// The hand-model material the puppet is showing on hand i (0 left, 1 right), or 0xFE for the
+    /// body's own hand. Resolved back from the shape pointer, which is what is drawn.
+    u8 getDrawnHand(int i_hand) const;
+    /// Joint 0's translation as drawn: model space (o_local) and world space (o_world). False with
+    /// no model or no pose.
+    bool getDrawnRoot(cXyz* o_local, cXyz* o_world);
+
 private:
     void setMatrix();
     /// Build the two-halves animation rig on the body model. Once, at createHeap time.
@@ -186,6 +210,21 @@ private:
     /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
     /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
     void setDrawHand();
+    /// Action override: allocate the six Link-identical anm heaps and hook joint 0. LAST in
+    /// createHeap, non-fatal — on any failure the override stays off and locomotion plays as
+    /// before.
+    void setupActionAnimation();
+    /// Action override: play the sender's BCK if the wire says so. True if it set this tick's
+    /// animation, in which case selectAnimation() returns without choosing a gait.
+    bool selectActionAnimation();
+    /// Action override: leave it, handing the body back to selectAnimation() with a cross-fade.
+    void exitActionAnimation(const char* i_why);
+    /// Action override: load one BCK into one of the action heaps, the way daAlink_c's
+    /// getAnimeResource does. Returns the cached animation when the heap already holds i_idx.
+    J3DAnmTransform* loadActionBck(daPy_anmHeap_c& io_heap, u16 i_idx, u32 i_bufSize,
+        J3DAnmTransform* i_current, bool* o_reloaded);
+    /// Action override: the root-motion overwrite, from the joint-0 callback (inside calc).
+    void applyActionRoot();
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
     void groundCheck();
     void setRoomInfo();
@@ -891,6 +930,50 @@ private:
     /// is meaningful: it means the double draw did not happen in that session, not that the guard
     /// is broken.
     bool mLoggedDoubleDraw;
+
+    /* --- Action animation override (wire block 2). See setupActionAnimation() in the .cpp.
+     *
+     * The six heaps are laid out exactly as daAlink_c::initModel lays out his
+     * (d_a_alink.cpp:4307, :4555-4563): one 0x10800 buffer on the actor heap, under[i] at
+     * +i*0x2C00, upper[0] at +0x8400 and upper[i] at +0x8400+i*0x2C00. Only slot 0 is played in
+     * slice 1; 1 and 2 exist so slice 2 (double anime) inherits the same geometry.
+     *
+     * ★ daPy_anmHeap_c's constructor never initialises mAnimeHeap/mBuffer, but its destructor
+     * destroys a non-NULL mAnimeHeap. These members are only safe because the actor's memory is
+     * zeroed before construction (fpcBs_Create -> sBs_ClearArea); setupActionAnimation() NULLs
+     * them explicitly as well before anything can fail. */
+    daPy_anmHeap_c mActUnderHeap[3];
+    daPy_anmHeap_c mActUpperHeap[3];
+    /// The animations currently loaded in mActUnderHeap[0] / mActUpperHeap[0]. They point INTO the
+    /// heaps' buffers, so they are invalid the moment that heap reloads.
+    J3DAnmTransform* mpActUnderBck;
+    J3DAnmTransform* mpActUpperBck;
+    bool mActHeapReady;
+    bool mActActive;
+    /// The ids currently installed in the ratio packs (0xFFFF none).
+    u16 mActShownUnder;
+    u16 mActShownUpper;
+    f32 mActAppliedMorf;
+    /// A pair that failed to load, so it is not re-read from ARAM every tick. Cleared by a change.
+    u16 mActFailedUnder;
+    u16 mActFailedUpper;
+    // The wire's values, as pushed by setNetworkAction().
+    u16 mNetActUnder;
+    u16 mNetActUpper;
+    f32 mNetActFrame;
+    f32 mNetActUpperFrame;
+    f32 mNetActRate;
+    f32 mNetActMorf;
+    u8 mNetActHand[2];
+    cXyz mNetActRoot;
+    /// The previous tick's wire under id and frame, for spotting a held (starved) sample.
+    u16 mActPrevNetUnder;
+    f32 mActPrevNetFrame;
+    bool mActStarved;
+    u16 mActLogCount;
+    u16 mActFailLogCount;
+    bool mLoggedActLive;
+    bool mLoggedActRoot;
 };
 
 /**

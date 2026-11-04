@@ -123,7 +123,57 @@ enum PlayerStateFlags : std::uint8_t {
     kPlayerStateTimeCanPass = 1 << 6,
 };
 
-/// 23 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
+/**
+ * The action animation override (block 2). `actUnder == kPlayerActNone` means "no override": the
+ * puppet plays its own locomotion reconstruction, exactly as before this block existed.
+ *
+ * Fixed-point scales, chosen so every field fits its type over the range Link actually uses:
+ * frames at 1/8 (u16 -> 8191 frames), rate at 1/32 (s8 -> +-3.97), root translation at 1/8 unit
+ * (s16 -> +-4096 units, a body length is ~150).
+ */
+constexpr std::uint16_t kPlayerActNone = 0xFFFF;
+constexpr float kPlayerActFrameScale = 8.0f;
+constexpr float kPlayerActRateScale = 32.0f;
+constexpr float kPlayerActRootScale = 8.0f;
+/// The hand-pose sentinel for "the body's own hand" — daAlink_c's 0xFE (setDrawHand).
+constexpr std::uint8_t kPlayerActBodyHand = 0xFE;
+
+/// Saturating float -> fixed point, rounded to nearest. Engine-free so both ends share it.
+inline std::uint16_t act_encode_u16(float value, float scale) {
+    const float scaled = value * scale + 0.5f;
+    if (!(scaled > 0.0f)) {
+        return 0;
+    }
+    if (scaled >= 65535.0f) {
+        return 65535;
+    }
+    return static_cast<std::uint16_t>(scaled);
+}
+
+inline std::int16_t act_encode_s16(float value, float scale) {
+    const float scaled = value * scale;
+    if (!(scaled > -32768.0f)) {
+        return -32768;
+    }
+    if (scaled >= 32767.0f) {
+        return 32767;
+    }
+    return static_cast<std::int16_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
+}
+
+inline std::int8_t act_encode_s8(float value, float scale) {
+    const float scaled = value * scale;
+    if (!(scaled > -128.0f)) {
+        return -128;
+    }
+    if (scaled >= 127.0f) {
+        return 127;
+    }
+    return static_cast<std::int8_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
+}
+
+/// 41 bytes on the wire (23 + 18, before the head/torso block is merged in ahead of block 2). Sent
+/// unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -199,6 +249,50 @@ struct PlayerState {
      */
     std::uint8_t atnKind = kPlayerAtnNone;
 
+    // block (2): action anim — goes after the head/torso block
+    /**
+     * What Link is DRAWING when he is in a proc the puppet does not reconstruct — a sword swing, a
+     * roll, a jump, a hurt reaction. 18 bytes, all of them the sender's answers rather than inputs
+     * (.claude/future-plans/puppet-action-states.md §2-3):
+     *
+     *   actUnder / actUpper  mUnderAnmHeap[0] / mUpperAnmHeap[0].getIdx(), ALANM resource indices.
+     *                        actUnder == kPlayerActNone: no override. actUpper == kPlayerActNone:
+     *                        the upper half plays the under BCK (daAlink_c's own encoding,
+     *                        getUnderUpperAnime resets the upper idx to 0xFFFF in that case).
+     *   actFrame / actUpperFrame  the two frame controllers' frames, x kPlayerActFrameScale.
+     *   actRate              the under controller's rate, x kPlayerActRateScale. Used by the
+     *                        receiver only while starved, to keep a swing moving.
+     *   actMorf              the cross-fade length in frames Link started on the tick actUnder
+     *                        last changed, latched.
+     *   actHandL / actHandR  the hand shapes he is SHOWING (field_0x06d0/06d4 resolved back to a
+     *                        hand-model material index), kPlayerActBodyHand for the body's own.
+     *   actRootX/Y/Z         joint 0's final model-space translation after jointControll, x
+     *                        kPlayerActRootScale — the root-motion clear, as an answer.
+     *
+     * Discrete except the frames and the root translation — see lerp_state for the rule.
+     */
+    std::uint16_t actUnder = kPlayerActNone;
+    std::uint16_t actUpper = kPlayerActNone;
+    std::uint16_t actFrame = 0;
+    std::uint16_t actUpperFrame = 0;
+    std::int8_t actRate = 0;
+    std::uint8_t actMorf = 0;
+    std::uint8_t actHandL = kPlayerActBodyHand;
+    std::uint8_t actHandR = kPlayerActBodyHand;
+    std::int16_t actRootX = 0;
+    std::int16_t actRootY = 0;
+    std::int16_t actRootZ = 0;
+
+    bool act_active() const { return actUnder != kPlayerActNone; }
+    float act_frame() const { return static_cast<float>(actFrame) / kPlayerActFrameScale; }
+    float act_upper_frame() const {
+        return static_cast<float>(actUpperFrame) / kPlayerActFrameScale;
+    }
+    float act_rate() const { return static_cast<float>(actRate) / kPlayerActRateScale; }
+    float act_root_x() const { return static_cast<float>(actRootX) / kPlayerActRootScale; }
+    float act_root_y() const { return static_cast<float>(actRootY) / kPlayerActRootScale; }
+    float act_root_z() const { return static_cast<float>(actRootZ) / kPlayerActRootScale; }
+
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
@@ -230,12 +324,33 @@ struct PlayerState {
         w.write_u8(equip);
         w.write_u8(idleKind);
         w.write_u8(atnKind);
+        // block (2): action anim — goes after the head/torso block
+        w.write_u16(actUnder);
+        w.write_u16(actUpper);
+        w.write_u16(actFrame);
+        w.write_u16(actUpperFrame);
+        w.write_u8(static_cast<std::uint8_t>(actRate));
+        w.write_u8(actMorf);
+        w.write_u8(actHandL);
+        w.write_u8(actHandR);
+        w.write_s16(actRootX);
+        w.write_s16(actRootY);
+        w.write_s16(actRootZ);
     }
 
     bool read(Reader& r) {
-        return r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
-               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
-               r.read_u8(idleKind) && r.read_u8(atnKind);
+        std::uint8_t rate = 0;
+        const bool ok = r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) &&
+                        r.read_s16(angleY) && r.read_f32(moveRate) && r.read_u8(outfit) &&
+                        r.read_u8(flags) && r.read_u8(equip) && r.read_u8(idleKind) &&
+                        r.read_u8(atnKind) &&
+                        // block (2): action anim — goes after the head/torso block
+                        r.read_u16(actUnder) && r.read_u16(actUpper) && r.read_u16(actFrame) &&
+                        r.read_u16(actUpperFrame) && r.read_u8(rate) && r.read_u8(actMorf) &&
+                        r.read_u8(actHandL) && r.read_u8(actHandR) && r.read_s16(actRootX) &&
+                        r.read_s16(actRootY) && r.read_s16(actRootZ);
+        actRate = static_cast<std::int8_t>(rate);
+        return ok;
     }
 };
 
@@ -286,6 +401,43 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.idleKind = b.idleKind;
     // Discrete too. Halfway between "strafing left" and "backing off" is no animation at all.
     out.atnKind = b.atnKind;
+
+    // block (2): action anim — goes after the head/torso block
+    // Ids, rate, morf and hands are discrete: taken whole from the newer sample.
+    out.actUnder = b.actUnder;
+    out.actUpper = b.actUpper;
+    out.actRate = b.actRate;
+    out.actMorf = b.actMorf;
+    out.actHandL = b.actHandL;
+    out.actHandR = b.actHandR;
+    out.actFrame = b.actFrame;
+    out.actUpperFrame = b.actUpperFrame;
+    out.actRootX = b.actRootX;
+    out.actRootY = b.actRootY;
+    out.actRootZ = b.actRootZ;
+    /* Frames lerp ONLY across forward play of one animation: same id on both sides and b not
+     * behind a. A loop seam, a restart or a reverse-played animation takes b whole, which is a
+     * one-tick hold — invisible at 30 Hz, and it keeps this layer from needing frameMax. The upper
+     * frame is held to the same rule on its own id (it can restart alone). */
+    const bool sameUnder = a.act_active() && a.actUnder == b.actUnder;
+    if (sameUnder && b.actFrame >= a.actFrame) {
+        out.actFrame = act_encode_u16(
+            (a.act_frame() + (b.act_frame() - a.act_frame()) * t), kPlayerActFrameScale);
+    }
+    if (sameUnder && a.actUpper == b.actUpper && b.actUpperFrame >= a.actUpperFrame) {
+        out.actUpperFrame =
+            act_encode_u16((a.act_upper_frame() + (b.act_upper_frame() - a.act_upper_frame()) * t),
+                kPlayerActFrameScale);
+    }
+    // The root translation is continuous within one animation, and meaningless across two.
+    if (sameUnder) {
+        out.actRootX = act_encode_s16(
+            a.act_root_x() + (b.act_root_x() - a.act_root_x()) * t, kPlayerActRootScale);
+        out.actRootY = act_encode_s16(
+            a.act_root_y() + (b.act_root_y() - a.act_root_y()) * t, kPlayerActRootScale);
+        out.actRootZ = act_encode_s16(
+            a.act_root_z() + (b.act_root_z() - a.act_root_z()) * t, kPlayerActRootScale);
+    }
     return out;
 }
 
