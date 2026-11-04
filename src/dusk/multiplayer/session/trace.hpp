@@ -37,6 +37,9 @@
  * and `actor` rows (zero on `applied`); see DrawnJointAim. `fireJ1,fireJ2,fireJ4` count the
  * puppet's joint-aim callback arms (actor rows only), `aimClamps` the sender's wire-range clamps
  * (local rows only).
+ *
+ * `gear` is the PlayerGearFlags byte, last column (bit 0 = iron boots on): as sent on `local`, as
+ * pushed on `applied`, and as the puppet holds it on `actor`.
  */
 
 namespace dusk::mp::trace {

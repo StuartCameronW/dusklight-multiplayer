@@ -38,8 +38,25 @@ namespace dusk::mp {
 enum PlayerEquipFlags : std::uint8_t {
     /// daAlink_c::checkSwordDraw() (d_a_alink.cpp:19060) — draw the sword and its sheath at all.
     kPlayerEquipSwordDraw = 1 << 0,
-    /// The sword is in his hand rather than on his back: `mEquipItem == 0x103`
-    /// (d_a_alink.cpp:5894). The sheath stays on the back either way.
+    /**
+     * The sword is in his hand rather than on his back: `mEquipItem == 0x103`, the test
+     * setItemMatrix places the blade by (d_a_alink.cpp:5907) and getMainBckData picks the sword
+     * gait table by (:6951). The sheath stays on the back either way.
+     *
+     * ★ "In hand" WITHOUT kPlayerEquipSwordDraw is a real state, not a bad byte, and the sender
+     * must not "fix" it. The two bits answer different questions: Draw is visibility
+     * (checkSwordDraw(), which also goes false for the swap tick, the sumo outfit and the
+     * demo-driven FLG2_UNK_2000000 hide), InHand is placement and the animation table. They are
+     * independent in daAlink_c too — mEquipItem is restored to 0x103 from the last scene mode at
+     * create (:4715-4717), and nothing ties that to the visibility terms. Which term hid the
+     * blade below was not identified — that is reasoning, not measurement. Measured (run-guard3,
+     * 2026-11-04):
+     * the only 29 such ticks were a stage ARRIVAL — an unscripted stage change in the Cave of
+     * Ordeals while he strafed with the sword out — with his position frozen until the next
+     * load. The B tap itself went straight from "on the back" to "drawn, in hand". The
+     * puppet received the same byte (57/57 applied and actor rows), drew no blade, and played
+     * the sword table, which is what the sender did.
+     */
     kPlayerEquipSwordInHand = 1 << 1,
     /// Which sword, as a PlayerEquipSword value in bits 2-3.
     kPlayerEquipSwordKindShift = 2,

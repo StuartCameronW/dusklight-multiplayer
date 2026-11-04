@@ -140,6 +140,14 @@ public:
     /// table (m_mainBckShield) instead of the plain or sword pair.
     void setNetworkUpperGuard(bool i_guard) { mNetUpperGuard = i_guard; }
     bool getNetUpperGuard() const { return mNetUpperGuard; }
+    /// The sender's daPy_py_c::checkEquipHeavyBoots() (kPlayerGearHeavyBoots), pushed in every tick
+    /// like the guard bit. Stored only, for now: the puppet draws no boot models (daAlink_c's
+    /// mpLinkBootModels, d_a_alink.cpp:5995/:19832) and has no heavy gait or heavy-boots attention
+    /// rows (see loadAtnAnimations). Its first consumer is the sound pass's footstep swap,
+    /// WALK/JUMP_DUMMY -> _HEAVY (Z2LinkMgr.cpp:585-597; .claude/future-plans/puppet-sound.md
+    /// slice 2).
+    void setNetworkHeavyBoots(bool i_heavyBoots) { mNetHeavyBoots = i_heavyBoots; }
+    bool getNetHeavyBoots() const { return mNetHeavyBoots; }
     /// Worklist 14. The sender's head turn and torso lean, as jointControll's answers: the neck
     /// (field_0x3124.x/.y), joint 1's pitch (`sp8`), the twist (field_0x30c8), joint 1's roll
     /// (mBodyAngle.z), and the whole-model bank (shape_angle.z). Pushed every tick alongside
@@ -895,6 +903,9 @@ private:
     /* The SENDER's equipment byte, whole. Every field in it is an answer he computed rather than a
      * fact about the world, so there is nothing here to re-derive; see PlayerEquipFlags. */
     u8 mNetEquip;
+    /// kPlayerGearHeavyBoots as received. False at spawn via fopAcM_ct's zeroing. See
+    /// setNetworkHeavyBoots().
+    bool mNetHeavyBoots;
     /* The SENDER's idle byte, whole, for exactly the same reason: which idle he is in is not a fact
      * about the world at all. It is sampled off his own animation heap — what he is genuinely
      * PLAYING, every substitution already applied — so there is nothing here to re-derive and no

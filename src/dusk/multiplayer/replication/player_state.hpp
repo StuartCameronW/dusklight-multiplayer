@@ -137,6 +137,31 @@ enum PlayerStateFlags : std::uint8_t {
 };
 
 /**
+ * Bit flags in PlayerState::gear — worn equipment that is neither the sword nor the shield.
+ *
+ * A byte of its own because `flags` and `equip` were both full (protocol 14). Seven bits are spare,
+ * so the magne-boot stick, the magic armour's heavy state and the like can follow at no size cost.
+ */
+enum PlayerGearFlags : std::uint8_t {
+    /**
+     * The sender is wearing the iron boots: `daPy_py_c::checkEquipHeavyBoots()`, i.e.
+     * FLG0_EQUIP_HVY_BOOTS, verbatim.
+     *
+     * ★ That flag and nothing derived from it, because it is the one value both consumers of
+     * "boots on" in daAlink_c read. setHeavyBoots sets it and calls
+     * `mZ2Link.setLinkBootsType(1)` in the same two lines, and clears it with
+     * `setLinkBootsType(0)` (d_a_alink_hvyboots.inc:43-45, :74-76); the footstep code swaps
+     * WALK/JUMP_DUMMY for the _HEAVY sounds on that boots type (Z2LinkMgr.cpp:585-597). The draw
+     * code gates the boot models on the same predicate (d_a_alink.cpp:5995, :19832).
+     *
+     * NOT checkBootsOrArmorHeavy(): that also folds in the magic armour at zero rupees and the
+     * iron-ball wait, which are heavy for the physics but are not boots and do not change the
+     * footstep.
+     */
+    kPlayerGearHeavyBoots = 1 << 0,
+};
+
+/**
  * The joint-aim fields' wire scale: one s8 step is 128 binary-angle units, 0.70 degrees.
  *
  * The range this buys is +-16256 units (+-89 degrees). Every on-foot human value fits with room to
@@ -164,7 +189,8 @@ inline std::int16_t joint_aim_from_wire(std::uint8_t v) {
     return static_cast<std::int16_t>(static_cast<std::int8_t>(v) * kJointAimWireScale);
 }
 
-/// 29 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
+/// 30 bytes on the wire (48 once the action block is merged). Sent unreliably at the sim rate, so
+/// it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -268,6 +294,13 @@ struct PlayerState {
     /// jointControll, but bodyZ without it is half a lean.
     std::int16_t bankZ = 0;
 
+    /* MERGE NOTE: must go after the action block (2). `gear` was written against a tree without
+     * the 18-byte action block; on merge it must stay the LAST field, here, in write()/read() and
+     * in lerp_state, so the wire order is ... atnKind | head 6 B | action 18 B | gear 1 B. */
+    /// Worn equipment other than the sword and shield. See PlayerGearFlags. Protocol 14. Discrete,
+    /// so lerp_state takes it whole from the newer sample.
+    std::uint8_t gear = 0;
+
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
@@ -288,6 +321,7 @@ struct PlayerState {
         return static_cast<std::uint8_t>(
             (equip & kPlayerEquipShieldKindMask) >> kPlayerEquipShieldKindShift);
     }
+    bool heavy_boots() const { return (gear & kPlayerGearHeavyBoots) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);
@@ -306,6 +340,8 @@ struct PlayerState {
         w.write_u8(joint_aim_to_wire(bodyTwist));
         w.write_u8(joint_aim_to_wire(bodyZ));
         w.write_u8(joint_aim_to_wire(bankZ));
+        // MERGE NOTE: must go after the action block (2).
+        w.write_u8(gear);
     }
 
     bool read(Reader& r) {
@@ -314,7 +350,9 @@ struct PlayerState {
                 r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
                 r.read_u8(idleKind) && r.read_u8(atnKind) && r.read_u8(aim[0]) &&
                 r.read_u8(aim[1]) && r.read_u8(aim[2]) && r.read_u8(aim[3]) && r.read_u8(aim[4]) &&
-                r.read_u8(aim[5])))
+                r.read_u8(aim[5]) &&
+                // MERGE NOTE: must go after the action block (2).
+                r.read_u8(gear)))
         {
             return false;
         }
@@ -396,6 +434,8 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.bodyTwist = lerp_angle(a.bodyTwist, b.bodyTwist, aimT);
     out.bodyZ = lerp_angle(a.bodyZ, b.bodyZ, aimT);
     out.bankZ = lerp_angle(a.bankZ, b.bankZ, aimT);
+    // A bit set, like `flags`: never blended.
+    out.gear = b.gear;
     return out;
 }
 

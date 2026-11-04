@@ -37,7 +37,8 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << ',' << state.bodyX << ',' << state.bodyTwist << ',' << state.bodyZ << ','
           << state.bankZ << ',' << drawn.headYawRel << ',' << drawn.headPitch << ','
           << drawn.torsoYawRel << ',' << drawn.armFires[0] << ',' << drawn.armFires[1] << ','
-          << drawn.armFires[2] << ',' << drawn.clamps << '\n';
+          << drawn.armFires[2] << ',' << drawn.clamps << ',' << static_cast<unsigned>(state.gear)
+          << '\n';
 }
 
 }  // namespace
@@ -57,7 +58,7 @@ void open(const std::string& path, const char* role) {
     // rather than quietly refilled. An analyzer written against the old name fails loudly.
     sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,"
              "buffered,anm,flags,equip,idleKind,atnKind,neckX,neckY,bodyX,bodyTwist,bodyZ,bankZ,"
-             "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps\n";
+             "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,gear\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

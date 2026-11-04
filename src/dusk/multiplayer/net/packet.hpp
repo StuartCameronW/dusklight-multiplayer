@@ -78,6 +78,8 @@ namespace dusk::mp {
  * fine and simply never show a guard. Bumped so the mismatch is refused instead of silent.
  * 14: PlayerState grew six head-turn / torso-lean bytes after `atnKind` (23 -> 29): neckX, neckY,
  * bodyX, bodyTwist, bodyZ, bankZ, each an s8 of (angle / 128).
+ *     Still 14 (none of it has shipped): a trailing `gear` byte after everything else, bit 0 the
+ *     sender's checkEquipHeavyBoots() (iron boots on), because `flags` and `equip` were both full.
  */
 inline constexpr std::uint32_t kProtocolVersion = 14;
 
