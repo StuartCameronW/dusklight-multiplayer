@@ -3,6 +3,7 @@
 #include "world_clock.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -625,6 +626,43 @@ void fill_atn_kind(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+/**
+ * The shield-guard bit: daAlink_c's own checkUpperGuardAnime(), the exact predicate getMainBckData
+ * consults before choosing m_mainBckShield (d_a_alink.cpp:6947). Wolf Link never takes that path
+ * (his animations come from the wolf tables), so a stale flag on a wolf is not sent.
+ *
+ * TEST ONLY: DUSK_MP_TEST_FORCE_UPPER_GUARD=1 also sets it whenever the attention set is playing,
+ * so the receiver's guard path can be driven end to end without a shielded enemy to lock onto.
+ * The sender's own animation does NOT change under the knob, so a sender/receiver BCK comparison
+ * disagrees on the stance rows by design while it is set.
+ */
+void fill_upper_guard(daAlink_c* alink, PlayerState& out) {
+    static const bool s_forceGuard = [] {
+        const char* value = std::getenv("DUSK_MP_TEST_FORCE_UPPER_GUARD");
+        const bool on = value != nullptr && value[0] != '\0' && value[0] != '0';
+        if (on) {
+            Log.warn("TEST KNOB DUSK_MP_TEST_FORCE_UPPER_GUARD is set: the guard bit is forced "
+                     "on whenever the attention set plays");
+        }
+        return on;
+    }();
+
+    if (alink != nullptr && !alink->checkWolf() &&
+        (alink->checkUpperGuardAnime() || (s_forceGuard && out.atnKind != kPlayerAtnNone)))
+    {
+        out.flags |= kPlayerStateUpperGuard;
+    }
+
+    static bool s_lastGuard = false;
+    const bool guard = out.upper_guard();
+    if (guard != s_lastGuard) {
+        Log.debug("Local upper guard {} -> {}; atn kind {}, target {}", s_lastGuard ? 1 : 0,
+            guard ? 1 : 0, static_cast<unsigned>(out.atnKind),
+            alink != nullptr && alink->mTargetedActor != NULL ? "yes" : "no");
+        s_lastGuard = guard;
+    }
+}
+
 }  // namespace
 
 /**
@@ -793,6 +831,7 @@ bool capture_local_player(PlayerState& out) {
     fill_idle_kind(alink, out);
     fill_equip(alink, out);
     fill_atn_kind(alink, out);
+    fill_upper_guard(alink, out);
 
     return true;
 }
@@ -959,6 +998,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
         state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip, state.idleKind);
     puppet->setNetworkAtn(state.atnKind);
+    puppet->setNetworkUpperGuard(state.upper_guard());
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -991,6 +1031,9 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     // and only the second one is about the feature working.
     out.idleKind = puppet->getNetIdleKind();
     out.atnKind = puppet->getNetAtnKind();
+    if (puppet->getNetUpperGuard()) {
+        out.flags |= kPlayerStateUpperGuard;
+    }
     return true;
 }
 

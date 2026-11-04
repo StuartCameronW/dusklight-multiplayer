@@ -579,7 +579,15 @@ const daAlink_AnmData& anm_data(daAlink_c::daAlink_ANM i_anm) {
  * see — "the puppet ... [isn't] using the sword running animation" — because the under half, the
  * legs, was already DASHS either way and only the arms were wrong.
  */
-const daAlink_BckData& anm_bck_data(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
+const daAlink_BckData& anm_bck_data(
+    daAlink_c::daAlink_ANM i_anm, u8 i_equip, bool i_upperGuard = false) {
+    /* The shield-guard branch (:6947-6949), keyed on the sender's checkUpperGuardAnime() off the
+     * wire (kPlayerStateUpperGuard). Tested BEFORE the sword one because getMainBckData does: a
+     * guarding player with a drawn sword plays m_mainBckShield, never m_mainBckSword. */
+    if (i_upperGuard && i_anm < daAlink_c::ANM_SWIM_WAIT) {
+        return daAlink_c::m_mainBckShield[i_anm];
+    }
+
     if ((i_equip & dusk::mp::kPlayerEquipSwordInHand) != 0 &&
         i_anm >= daAlink_c::ANM_ATN_WAIT_LEFT && i_anm < daAlink_c::ANM_STEP_TURN)
     {
@@ -615,12 +623,12 @@ int resolve_hand_shape(J3DModel* i_handModel, J3DShape* i_shown) {
     return -1;
 }
 
-u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
-    return anm_bck_data(i_anm, i_equip).m_underID;
+u16 anm_bck_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip, bool i_upperGuard = false) {
+    return anm_bck_data(i_anm, i_equip, i_upperGuard).m_underID;
 }
 
-u16 anm_bck_upper_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip) {
-    return anm_bck_data(i_anm, i_equip).m_upperID;
+u16 anm_bck_upper_idx(daAlink_c::daAlink_ANM i_anm, u8 i_equip, bool i_upperGuard = false) {
+    return anm_bck_data(i_anm, i_equip, i_upperGuard).m_upperID;
 }
 
 /* Which pointer type a caller of load_aram_anm intends to downcast the result to. */
@@ -1330,6 +1338,8 @@ int daRemotePlayer_c::createHeap() {
      * the animations above. So if the heap ever runs short it costs attention animations (each
      * non-fatal, each falling back to the ordinary gait) and never a model. */
     loadAtnAnimations();
+    /* The shield-guard rows. Last of all for the same reason, and cheap: two new BCKs. */
+    loadGuardAnimations();
 
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
@@ -1574,8 +1584,20 @@ void daRemotePlayer_c::animePlay() {
         J3DAnmTransform* upper = mAnmPackUpper[i].getAnmTransform();
         /* Pointer comparison, not a null check, and it is the whole reason this loop is separate:
          * an animation with no distinct upper half has BOTH packs pointing at one object, and
-         * stepping it twice would advance it at double speed. */
-        if (upper != mAnmPackUnder[i].getAnmTransform()) {
+         * stepping it twice would advance it at double speed.
+         *
+         * ★ Compared against EVERY slot's under half and every earlier slot's upper half, not just
+         * this slot's under. The shield-guard rows put one ATLS object on the upper half of walk
+         * AND run (m_mainBckShield[0x12]/[0x13], and [0x02]/[0x03]), so a guarded walk/run blend
+         * has the same object in upper slots 0 and 1. daAlink_c gets two copies from two heaps;
+         * the puppet holds one, and both controllers are wound to the same phase and rate by
+         * setDoubleAnm, so stepping it once is the same pose. */
+        bool stepped = false;
+        for (int j = 0; j < daRemotePlayer_anmSlotNum && !stepped; j++) {
+            stepped = upper == mAnmPackUnder[j].getAnmTransform() ||
+                      (j < i && upper == mAnmPackUpper[j].getAnmTransform());
+        }
+        if (!stepped) {
             gait_anime_play(upper, &mUpperFrameCtrl[i]);
         }
     }
@@ -2378,7 +2400,7 @@ void daRemotePlayer_c::selectAnimation() {
          * zero to five decimal places whenever the bit is set — the bit means the sender's speed is
          * under 0.001 — so pinning it would only be inventing a rule the game does not have. */
         anmA = &idle;
-        anmB = &mWalkAnm;
+        anmB = &guardOr(l_walkAnm, mWalkAnm);
         idA = idleID;
         idB = l_walkAnm;
         /* ★ 1.0f for the tired idle, NOT mWaitAnmSpeed, and daAlink_c overrides it in exactly this
@@ -2391,7 +2413,7 @@ void daRemotePlayer_c::selectAnimation() {
         speedB = hio.mWalkAnmSpeed;
     } else if (fraction < hio.mRunChangeRate) {
         blend = (fraction - hio.mWalkChangeRate) / (hio.mRunChangeRate - hio.mWalkChangeRate);
-        anmA = &mWalkAnm;
+        anmA = &guardOr(l_walkAnm, mWalkAnm);
         anmB = &runAnm();
         idA = l_walkAnm;
         idB = l_runAnm;
@@ -2468,6 +2490,17 @@ void daRemotePlayer_c::selectAnimation() {
     if (mAtnExitMorf) {
         mAtnExitMorf = false;
         morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+    }
+
+    /* A shield raised or lowered mid-gait swaps the walk and run rows' upper half (WALKS/DASHA ->
+     * ATLS). daAlink_c's setDoubleAnime sees getUnderUpperAnime change a resource and substitutes
+     * mBasicInterpolation for the caller's -1 (d_a_alink.cpp:7085-7108), so the arms swing up
+     * rather than snapping. */
+    if (mNetUpperGuard != mGaitPrevGuard) {
+        mGaitPrevGuard = mNetUpperGuard;
+        if (morf < 0.0f) {
+            morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+        }
     }
 
     /* ★ ONE exception, and the variable idle is what creates it: the wait SLOT can now change
@@ -2630,12 +2663,15 @@ u16 daRemotePlayer_c::getCurrentAnm() const {
     if (!mAnmChosen) {
         return 0;
     }
-    return anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm), mNetEquip);
+    return anm_bck_idx(static_cast<daAlink_c::daAlink_ANM>(mCurrentAnm), mNetEquip, mNetUpperGuard);
 }
 
 /* See the header. Out of line so anm_bck_data's table read stays in one translation unit with the
  * rest of the animation code. */
 const daRemotePlayer_anm_c& daRemotePlayer_c::runAnm() const {
+    if (mNetUpperGuard && mGuardAnm[l_runAnm].mpUnder != NULL) {
+        return mGuardAnm[l_runAnm];
+    }
     return (mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0 ? mRunSwordAnm : mRunAnm;
 }
 
@@ -2791,6 +2827,112 @@ void daRemotePlayer_c::loadAtnAnimations() {
 }
 
 /**
+ * The shield-guard rows: getMainBckData's m_mainBckShield (d_a_alink.cpp:233-254), which replaces
+ * every row below ANM_SWIM_WAIT while checkUpperGuardAnime() holds (:6947-6949). That is the
+ * attention set and the ordinary walk and run, so a locked-on player strafing with his shield up
+ * draws as one strafing with it down unless the puppet has these.
+ *
+ * Almost nothing new is loaded, and that is read off the two tables rather than assumed:
+ *
+ *   - Rows 0x00-0x0D name the plain row's UNDER resource on both halves ({ATRFWS, ATRFW} becomes
+ *     {ATRFWS, ATRFWS}). The guard variant is the plain row's under object with mpUpper NULL.
+ *   - Rows 0x02, 0x03, 0x12, 0x13 keep the plain under half and put ATLS on the upper.
+ *   - Rows 0x10 and 0x11 are {ATLS, ATLS} and {ATRS, ATRS}: the two new resources.
+ *
+ * So resources are resolved by id: first against the plain row's own halves, then against what
+ * this function already loaded. One ATLS object therefore sits on the upper half of several rows;
+ * walk and run are blended together with it on both upper slots, which animePlay() steps once.
+ * Rows 0x0E/0x0F (iron boots) are skipped as loadAtnAnimations() skips them.
+ *
+ * ★ Reusing the plain row's object is safe for the reason load_gait_anm_sword() gives: a row and
+ * its guard variant are never both in the ratio packs, because guardOr() picks one of the two.
+ *
+ * Non-fatal per row: a row that does not resolve stays NULL and guardOr() plays the plain one.
+ */
+void daRemotePlayer_c::loadGuardAnimations() {
+    JKRHeap* heap = JKRGetCurrentHeap();
+    const s32 freeBefore = heap != NULL ? heap->getFreeSize() : 0;
+
+    struct Loaded {
+        u16 id;
+        J3DAnmTransform* anm;
+    };
+    Loaded loaded[4];
+    int loadedNum = 0;
+    int resident = 0;
+    int wanted = 0;
+
+    for (int i = 0; i < 0x14; i++) {
+        mGuardAnm[i].mpUnder = NULL;
+        mGuardAnm[i].mpUpper = NULL;
+        const daAlink_c::daAlink_ANM anm = static_cast<daAlink_c::daAlink_ANM>(i);
+        if (anm == daAlink_c::ANM_WALK_HEAVY || anm == daAlink_c::ANM_ATN_BACK_WALK_HEAVY) {
+            continue;
+        }
+        wanted++;
+
+        const daRemotePlayer_anm_c& plain = anm == l_walkAnm ? mWalkAnm :
+                                            anm == l_runAnm  ? mRunAnm :
+                                                               mAtnAnm[i];
+        const daAlink_BckData& plainBck = anm_bck_data(anm, 0);
+        const daAlink_BckData& guardBck = anm_bck_data(anm, 0, true);
+
+        J3DAnmTransform* half[2] = {NULL, NULL};
+        const u16 ids[2] = {guardBck.m_underID, guardBck.m_upperID};
+        for (int h = 0; h < 2; h++) {
+            if (h == 1 && ids[1] == ids[0]) {
+                break;  // one resource on both halves: mpUpper stays NULL
+            }
+            const u16 id = ids[h];
+            if (plain.mpUnder != NULL && id == plainBck.m_underID) {
+                half[h] = plain.mpUnder;
+            } else if (plain.mpUnder != NULL && id == plainBck.m_upperID) {
+                half[h] = plain.mpUpper != NULL ? plain.mpUpper : plain.mpUnder;
+            }
+            for (int k = 0; k < loadedNum && half[h] == NULL; k++) {
+                if (loaded[k].id == id) {
+                    half[h] = loaded[k].anm;
+                }
+            }
+            if (half[h] == NULL && loadedNum < 4) {
+                half[h] = static_cast<J3DAnmTransform*>(load_aram_anm(id, ANM_FAMILY_TRANSFORM));
+                if (half[h] != NULL) {
+                    loaded[loadedNum].id = id;
+                    loaded[loadedNum].anm = half[h];
+                    loadedNum++;
+                }
+            }
+            if (half[h] == NULL) {
+                break;
+            }
+        }
+
+        if (half[0] == NULL || (ids[1] != ids[0] && half[1] == NULL)) {
+            Log.warn("Puppet has no shield-guard animation {} ({}/{}); it will guard with the "
+                     "plain row",
+                i, ids[0], ids[1]);
+            continue;
+        }
+        mGuardAnm[i].mpUnder = half[0];
+        mGuardAnm[i].mpUpper = half[1];
+        resident++;
+    }
+
+    Log.debug("Puppet {} shield-guard set: {} of {} rows resident, {} new BCKs; cost {} bytes of "
+              "heap ({} -> {} free)",
+        mPlayerId, resident, wanted, loadedNum, heap != NULL ? freeBefore - heap->getFreeSize() : 0,
+        freeBefore, heap != NULL ? heap->getFreeSize() : 0);
+}
+
+const daRemotePlayer_anm_c& daRemotePlayer_c::guardOr(
+    u16 i_anmID, const daRemotePlayer_anm_c& i_plain) const {
+    if (mNetUpperGuard && i_anmID < 0x14 && mGuardAnm[i_anmID].mpUnder != NULL) {
+        return mGuardAnm[i_anmID];
+    }
+    return i_plain;
+}
+
+/**
  * The attention set, as daAlink_c plays it: setBlendAtnMoveAnime (d_a_alink.cpp:7853-8079) for the
  * sideways and forward kinds, and setBlendAtnBackMoveAnime (:8081-8171) for backing off.
  *
@@ -2815,8 +2957,9 @@ void daRemotePlayer_c::loadAtnAnimations() {
  * with setHandIndex(i_anmA) (:7114), so A is whose hand pair daAlink_c shows. It's also what the
  * sender's trace now reports (his under slot 0), so the two `anm` columns line up tick for tick.
  *
- * Not reproduced: the shield-guard and fishing-rod substitutions of the UPPER half (guard state is
- * not on the wire), and iron boots, which the sender reports as "none".
+ * The shield-guard substitution (m_mainBckShield) is applied off kPlayerStateUpperGuard; see
+ * loadGuardAnimations(). Not reproduced: the fishing-rod one, and iron boots, which the sender
+ * reports as "none".
  */
 bool daRemotePlayer_c::selectAtnAnimation() {
     const daAlinkHIO_atnMove_c1& lockHio = daAlinkHIO_atnMove_c0::m;
@@ -2888,9 +3031,16 @@ bool daRemotePlayer_c::selectAtnAnimation() {
     }
 
     const daRemotePlayer_anm_c* wait = NULL;
+    const daRemotePlayer_anm_c* walk = NULL;
+    const daRemotePlayer_anm_c* run = NULL;
     if (known) {
+        walk = &guardOr(idWalk, mAtnAnm[idWalk]);
+        run = &guardOr(idRun, mAtnAnm[idRun]);
         if (idWait == daAlink_c::ANM_WAIT) {
             wait = &mIdleAnm;
+        } else if (mNetUpperGuard && mGuardAnm[idWait].mpUnder != NULL) {
+            // getMainBckData's shield table, which it tests before the sword one (:6947-6949).
+            wait = &mGuardAnm[idWait];
         } else if ((mNetEquip & dusk::mp::kPlayerEquipSwordInHand) != 0 &&
                    mAtnWaitSwordAnm[idWait - daAlink_c::ANM_ATN_WAIT_LEFT].mpUnder != NULL)
         {
@@ -2901,8 +3051,8 @@ bool daRemotePlayer_c::selectAtnAnimation() {
         }
     }
 
-    const bool playable = known && wait->mpUnder != NULL && mAtnAnm[idWalk].mpUnder != NULL &&
-                          mAtnAnm[idRun].mpUnder != NULL;
+    const bool playable =
+        known && wait->mpUnder != NULL && walk->mpUnder != NULL && run->mpUnder != NULL;
     if (!playable) {
         if (mAtnActive) {
             mAtnActive = false;
@@ -2934,23 +3084,23 @@ bool daRemotePlayer_c::selectAtnAnimation() {
             blend = band.minWalkFrame + blend * (1.0f - band.minWalkFrame);
         }
         anmA = wait;
-        anmB = &mAtnAnm[idWalk];
+        anmB = walk;
         idA = idWait;
         idB = idWalk;
         speedA = band.waitSpeed;
         speedB = band.walkSpeed;
     } else if (rate < band.runChangeRate) {
         blend = (rate - band.walkChangeRate) / (band.runChangeRate - band.walkChangeRate);
-        anmA = &mAtnAnm[idWalk];
-        anmB = &mAtnAnm[idRun];
+        anmA = walk;
+        anmB = run;
         idA = idWalk;
         idB = idRun;
         speedA = band.walkSpeed;
         speedB = band.runSpeed;
     } else {
         blend = 1.0f;
-        anmA = &mAtnAnm[idRun];
-        anmB = &mAtnAnm[idRun];
+        anmA = run;
+        anmB = run;
         idA = idRun;
         idB = idRun;
         speedA = band.runSpeed;
@@ -2964,13 +3114,16 @@ bool daRemotePlayer_c::selectAtnAnimation() {
 
     setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, morf);
 
-    if (!mAtnActive || kind != mAtnPrevKind) {
+    if (!mAtnActive || kind != mAtnPrevKind || mNetUpperGuard != mAtnPrevGuard) {
         const daAlink_AnmData& handData = anm_data(idA);
-        Log.debug("Puppet {} attention set {} -> {}: anm {} (bck {}) into {} (bck {}) at {:.2f}, "
-                  "rate {:.3f}{}, hands {}/{}",
+        Log.debug("Puppet {} attention set {} -> {}{}: anm {} (bck {}/{}) into {} (bck {}/{}) at "
+                  "{:.2f}, rate {:.3f}{}, hands {}/{}",
             mPlayerId, static_cast<unsigned>(mAtnActive ? mAtnPrevKind : 0),
-            static_cast<unsigned>(kind), static_cast<int>(idA), anm_bck_idx(idA, mNetEquip),
-            static_cast<int>(idB), anm_bck_idx(idB, mNetEquip), blend, rate,
+            static_cast<unsigned>(kind), mNetUpperGuard ? " GUARD" : "", static_cast<int>(idA),
+            anm_bck_idx(idA, mNetEquip, mNetUpperGuard),
+            anm_bck_upper_idx(idA, mNetEquip, mNetUpperGuard), static_cast<int>(idB),
+            anm_bck_idx(idB, mNetEquip, mNetUpperGuard),
+            anm_bck_upper_idx(idB, mNetEquip, mNetUpperGuard), blend, rate,
             zeroSpeed ? " standing" : "", handData.m_handIndexL, handData.m_handIndexR);
     }
 
@@ -2981,6 +3134,7 @@ bool daRemotePlayer_c::selectAtnAnimation() {
     mpAtnPrevA = anmA;
     mpAtnPrevB = anmB;
     mAtnPrevKind = kind;
+    mAtnPrevGuard = mNetUpperGuard;
     return true;
 }
 

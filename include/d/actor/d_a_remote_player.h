@@ -135,6 +135,11 @@ public:
     /// signature. Stored whole; selectAtnAnimation() treats an unknown value as "none".
     void setNetworkAtn(u8 i_atnKind) { mNetAtnKind = i_atnKind; }
     u8 getNetAtnKind() const { return mNetAtnKind; }
+    /// The sender's daAlink_c::checkUpperGuardAnime(), pushed in every tick like the attention
+    /// byte. While set, the gait and attention rows below ANM_SWIM_WAIT play getMainBckData's shield
+    /// table (m_mainBckShield) instead of the plain or sword pair.
+    void setNetworkUpperGuard(bool i_guard) { mNetUpperGuard = i_guard; }
+    bool getNetUpperGuard() const { return mNetUpperGuard; }
     bool hasPose() const { return mHasPose; }
     /* Where the floating name tag hangs from (src/dusk/imgui/ImGuiNameTags.cpp): the body's head
      * joint as it is DRAWN this frame. On an interpolated frame that is frame_interp's lerped copy
@@ -183,6 +188,12 @@ private:
     bool selectAtnAnimation();
     /// D3b. Load the attention set into the solid heap. Non-fatal, once, from createHeap().
     void loadAtnAnimations();
+    /// The shield-guard variants of every row m_mainBckShield covers. Non-fatal, once, from
+    /// createHeap(), after loadAtnAnimations() because it reuses what that loaded.
+    void loadGuardAnimations();
+    /// i_plain, or its shield-guard variant when the wire says he is guarding and that variant is
+    /// resident. getMainBckData's guard branch, which beats the sword one.
+    const daRemotePlayer_anm_c& guardOr(u16 i_anmID, const daRemotePlayer_anm_c& i_plain) const;
     /// Show exactly one hand shape per hand, the pair the current animation asks for. Must run
     /// every tick, after selectAnimation() — the choice is per-ANIMATION, not per-actor.
     void setDrawHand();
@@ -551,6 +562,18 @@ private:
     daRemotePlayer_anm_c mAtnWaitSwordAnm[2];
     /// The sender's PlayerAtnKind, whole. Zero (none) at spawn via fopAcM_ct's zeroing.
     u8 mNetAtnKind;
+    /* The shield-guard (m_mainBckShield) variant of each row 0x00-0x13, indexed by daAlink_c's
+     * animation id. A NULL mpUnder means "not resident", and guardOr() then plays the plain row.
+     * Only two resources are new, ATLS and ATRS; every other half is the plain row's own object.
+     * See loadGuardAnimations(). */
+    daRemotePlayer_anm_c mGuardAnm[0x14];
+    /// kPlayerStateUpperGuard as received. False at spawn via fopAcM_ct's zeroing.
+    bool mNetUpperGuard;
+    /// Last ordinary-gait tick's guard state, so a guard flip in the gait cross-fades as
+    /// daAlink_c's setDoubleAnime does when the loaded pair changes.
+    bool mGaitPrevGuard;
+    /// Last attention tick's guard state, for the change log.
+    bool mAtnPrevGuard;
     /// Whether last tick's animation came from selectAtnAnimation(). Entering or leaving the set
     /// is a change of pair, which daAlink_c cross-fades with mBasicInterpolation.
     bool mAtnActive;

@@ -72,8 +72,12 @@ namespace dusk::mp {
  * 12: PlayerState grew a trailing `atnKind` byte (22 -> 23 bytes): the sender's attention /
  * lock-on move set and its direction, so the puppet can play the ATN stance and strafe (D3b). A
  * size change, so the bump is mandatory. A v11 peer's read() would under-run and drop every pose.
+ *
+ * 13: flags bit 7 is now kPlayerStateUpperGuard (the sender's checkUpperGuardAnime()), so the
+ * puppet raises its shield in the stance and strafe. No size change, so a v12 peer would parse
+ * fine and simply never show a guard. Bumped so the mismatch is refused instead of silent.
  */
-inline constexpr std::uint32_t kProtocolVersion = 12;
+inline constexpr std::uint32_t kProtocolVersion = 13;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

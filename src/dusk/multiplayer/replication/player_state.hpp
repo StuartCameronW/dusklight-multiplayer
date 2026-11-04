@@ -121,6 +121,18 @@ enum PlayerStateFlags : std::uint8_t {
      * which takes `flags` whole from the newer sample.
      */
     kPlayerStateTimeCanPass = 1 << 6,
+    /**
+     * `daAlink_c::checkUpperGuardAnime()`, verbatim: the shield is raised in the stance and gait
+     * (setShieldGuard's FLG2_UNK_8000000, minus events and the guard-break/reverse/attack procs).
+     * While it holds, getMainBckData plays m_mainBckShield for every row below ANM_SWIM_WAIT, and
+     * the receiver makes the same substitution (d_a_remote_player.cpp, loadGuardAnimations).
+     *
+     * The sender's ANSWER, not the inputs to it — lock-on target group, battle stage, shield
+     * owned — for the same reason every other bit here is an answer.
+     *
+     * The last free bit of the flags byte. Safe through lerp_state, which takes `flags` whole.
+     */
+    kPlayerStateUpperGuard = 1 << 7,
 };
 
 /// 23 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
@@ -205,6 +217,7 @@ struct PlayerState {
     bool mode_idle() const { return (flags & kPlayerStateModeIdle) != 0; }
     bool no_foot_ik() const { return (flags & kPlayerStateNoFootIk) != 0; }
     bool time_can_pass() const { return (flags & kPlayerStateTimeCanPass) != 0; }
+    bool upper_guard() const { return (flags & kPlayerStateUpperGuard) != 0; }
 
     bool sword_draw() const { return (equip & kPlayerEquipSwordDraw) != 0; }
     bool sword_in_hand() const { return (equip & kPlayerEquipSwordInHand) != 0; }
