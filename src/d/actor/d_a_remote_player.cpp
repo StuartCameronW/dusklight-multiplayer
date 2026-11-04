@@ -14,6 +14,7 @@
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphLoader/J3DAnmLoader.h"
 #include "JSystem/JKernel/JKRArchive.h"
+#include "JSystem/JMath/JMath.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_mirror.h"
 #include "d/actor/d_a_npc4.h"
@@ -147,6 +148,11 @@ STATIC_ASSERT(dusk::mp::kPlayerEquipShieldKindNum == 3);
  * overwritten with the body's hand joints after its calc (d_a_alink.cpp:19013-19014).
  */
 const u16 l_headJointNo = 4;
+/* The two torso joints daAlink_c::jointControll leans and twists (d_a_alink.cpp:2198-2212): 1 is
+ * the body root the whole upper body hangs from, 2 the spine above it. Each takes half the twist.
+ */
+const u16 l_bodyRootJointNo = 1;
+const u16 l_spineJointNo = 2;
 /* How many grip comparison lines to print per puppet, and daAlink_c's "the sword is in hand" value
  * for mEquipItem (dItemNo_SWORD_e). Both used by setDrawHand's grip series. */
 const u16 l_gripLogMax = 12;
@@ -1250,6 +1256,7 @@ int daRemotePlayer_c::createHeap() {
 
     setupHeadSway();
     setupFootIk();
+    setupJointControl();
     setupEquipModels();
 
     /* Hands, and the one body shape this outfit is built with hidden. Both are the tail of
@@ -2176,6 +2183,28 @@ void daRemotePlayer_c::setNetworkPose(const cXyz& i_pos, s16 i_angleY, f32 i_mov
      * what every other unknown wire value already degrades to. */
     mNetIdleKind = i_idleKind;
     mHasPose = true;
+}
+
+/**
+ * Worklist 14. The sender's head turn and torso lean — jointControll's answers, stored whole.
+ *
+ * Nothing is derived here. The sender has run setNeckAngle's target chain, its HIO clamps and the
+ * rein-ride predicate for joint 1; see fill_joint_aim() in player_bridge.cpp. The joint callbacks
+ * read these during calc, so they must be in place before execute() — they are, because the network
+ * layer pushes the pose before the actor pass.
+ *
+ * ★ The bank goes into shape_angle.z, where daAlink_c keeps it: his setMatrix tilts the WHOLE model
+ * by it (d_a_alink.cpp:5776), and joint 1 carries only the other half (mBodyAngle.z). setMatrix()
+ * here now builds the base matrix the same way, so a zero bank is the old matrix exactly.
+ */
+void daRemotePlayer_c::setNetworkJointAim(
+    s16 i_neckX, s16 i_neckY, s16 i_bodyX, s16 i_bodyTwist, s16 i_bodyZ, s16 i_bankZ) {
+    mNetNeckX = i_neckX;
+    mNetNeckY = i_neckY;
+    mNetBodyX = i_bodyX;
+    mNetBodyTwist = i_bodyTwist;
+    mNetBodyZ = i_bodyZ;
+    shape_angle.z = i_bankZ;
 }
 
 /**
@@ -3497,10 +3526,12 @@ void daRemotePlayer_c::playFaceTextureAnime() {
  * See the offset constants above.
  *
  * ★ One deliberate departure. Zelda halves the clamped angle (`>> 1`, d_a_hozelda.cpp:820-821)
- * because her NECK takes the other half; the eyes only ever carry the remainder. This puppet has no
- * joint callback, so its head is rigid and there is no other half — it uses the full clamped angle,
- * so the total gaze lands in roughly the right place instead of half way there. Turning the neck
- * too is the better answer and is a separate change.
+ * because her NECK takes the other half; the eyes only ever carry the remainder. This puppet's neck
+ * is not aimed at the local player — it carries the SENDER's neck turn (worklist 14, joint 4 in
+ * neckJointControl), which points wherever he was looking. So the eyes do not halve; they take the
+ * full angle to the target measured relative to the head as drawn, i.e. minus the turn the neck
+ * already applied this calc. That keeps the gaze from double-counting the neck. (A later option,
+ * +2 bytes: send Link's own eye residue so the puppet's eyes agree with its head's target.)
  *
  * The local player's eyePos as the target is not a stand-in for something replicated: it is what
  * daHoZelda_c and daMidna_c both genuinely use. Aiming at what the REMOTE player is looking at
@@ -3529,9 +3560,16 @@ void daRemotePlayer_c::setEyeMove() {
             (away <= l_eyeGateAngleNear && toPlayer.abs2XZ() < l_eyeGateNearDistSq))
         {
             const cXyz toTarget = player->eyePos - headPos;
-            angleX = cLib_minMaxLimit<s16>(toTarget.atan2sY_XZ(), l_eyeLimitUp, l_eyeLimitDown);
-            angleY = cLib_minMaxLimit<s16>(
-                toTarget.atan2sX_Z() - shape_angle.y, -l_eyeLimitSide, l_eyeLimitSide);
+            /* Relative to the HEAD, not the body. The neck arm (neckJointControl) has already
+             * turned the head by mNeckYawDelta / mNeckPitchDelta this calc, measured off the drawn
+             * joint matrix, so the eyes take only what is left. Without this they would add the
+             * neck's turn a second time and overshoot. With the neck still both are zero and this
+             * is the body-relative gaze it has always been. */
+            angleX = cLib_minMaxLimit<s16>(
+                (s16)(toTarget.atan2sY_XZ() - mNeckPitchDelta), l_eyeLimitUp, l_eyeLimitDown);
+            angleY =
+                cLib_minMaxLimit<s16>((s16)(toTarget.atan2sX_Z() - shape_angle.y - mNeckYawDelta),
+                    -l_eyeLimitSide, l_eyeLimitSide);
             haveTarget = true;
         }
     }
@@ -4662,9 +4700,9 @@ int daRemotePlayer_c::bodyModelCallBack(int i_jointNo) {
     if (i_jointNo == l_footIkCallBackJointNo) {
         setFootMatrix();
     } else if (i_jointNo == l_hipFollowJointNo[0] || i_jointNo == l_hipFollowJointNo[1]) {
-        /* daAlink_c::jointControll's joint-27 and joint-29 arms (d_a_alink.cpp:2228-2231), and the
-         * only two arms of that function a puppet is currently able to reproduce — see
-         * setupFootIk() for the four that need state which is not on the wire.
+        /* daAlink_c::jointControll's joint-27 and joint-29 arms (d_a_alink.cpp:2228-2231). Their
+         * input is solved locally by this actor's own foot IK; the torso and neck arms below take
+         * the sender's replicated answers instead (setupJointControl()).
          *
          * No mFootDataValid guard, matching him: mHipAngle is zero until the first solve (the actor
          * is zero-initialised by fopAcM_ct) and a zero rotation is a no-op, so the untested path
@@ -4691,6 +4729,10 @@ int daRemotePlayer_c::bodyModelCallBack(int i_jointNo) {
          * The head sway's callback already uses this exact idiom for the same reason
          * (headModelCallBack). It is the established form here, not a new one. */
         mDoMtx_copy(mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
+    } else if (i_jointNo == l_bodyRootJointNo || i_jointNo == l_spineJointNo ||
+               i_jointNo == l_headJointNo)
+    {
+        jointAimControl(i_jointNo);
     }
 
     return 1;
@@ -4761,26 +4803,12 @@ void daRemotePlayer_c::setupFootIk() {
             jointNum, l_hipFollowJointNo[0], l_hipFollowJointNo[1]);
     }
 
-    /* ★ STILL UNIMPLEMENTED, and deliberately so: jointControll's other arms.
-     *
-     *   joint 1  — body lean and twist (d_a_alink.cpp:2186-2195). Needs mBodyAngle.x/.z and
-     *              field_0x30c8, i.e. the upper-body aim daAlink_c derives from what he is looking
-     *              at, what he is holding and which analogue direction is being pushed.
-     *   joint 2  — the second half of the same twist (:2196-2199), same field_0x30c8.
-     *   joint 4  — hat/shoulder blend rates via changeBlendRate (:2437-2441), keyed on
-     * field_0x2fb6, which is an animation-blend MODE rather than a pose. joint 16 — the matrix
-     * calculator swap at :168-170, not a jointControll arm at all.
-     *
-     * Every one of them wants replicated state that does not exist on the wire — aim angles, a
-     * blend mode — and there is no honest local substitute: a puppet cannot re-derive where another
-     * player is looking from a position and an animation ID. Faking them would produce a puppet
-     * that leans confidently in the wrong direction, which is worse than one that does not lean at
-     * all. The hip follow above is implementable precisely BECAUSE its input, mHipAngle, is solved
-     * locally by this actor's own foot IK and needs nothing from the sender.
-     *
-     * When aim state does go on the wire, joints 1 and 2 are the two arms to add here, and they
-     * will need the same mDoMtx_copy into J3DSys::mCurrentMtx that the hip follow does — daAlink_c
-     * passes param_4 = 1 at :2194 and :2198 as well. */
+    /* jointControll's other human arms. Joints 1, 2 and 4 (the torso lean and twist, and the neck)
+     * are hooked by setupJointControl(), from the sender's replicated answers. Joint 16
+     * (field_0x3088/308a, d_a_alink.cpp:2195-2197) is a real arm too, but every writer of it is a
+     * horse, boar, glide or demo state the puppet cannot show yet, so it stays unhooked. The rest
+     * of the chain (joints 0, 5, 12/13) is root-translation clearing, bow-on-horseback and canoe
+     * fishing — likewise states with no puppet counterpart. */
 
     /* The envelope count is logged because it is the measurement that the callback is NEEDED, not
      * merely tidier. calcWeightEnvelopeMtx() does nothing at all when it is zero
@@ -4794,6 +4822,170 @@ void daRemotePlayer_c::setupFootIk() {
      * and footBgCheck refuses to run until it is true. So a callback that is attached but never
      * fires shows up as the "foot IK probing" line never appearing at all — the two failure modes
      * stay distinguishable in the log instead of both reading as flat ground. */
+}
+
+/**
+ * Worklist 14. Hook the body-model joint callback onto joints 1, 2 and 4. Once, at createHeap time.
+ *
+ * These are daAlink_c::jointControll's torso and neck arms (d_a_alink.cpp:2192-2212). He hangs his
+ * callback on all 35 joints (d_a_alink_swindow.inc:171-173); the puppet hooks only the joints it
+ * acts on, as setupFootIk() does, and through the SAME trampoline, so bodyModelCallBack stays the
+ * one place body joints are dispatched.
+ *
+ * ★ A callback and not a post-calc write, for the reason setupFootIk() spells out: skinning and the
+ * frame-interp recording both consume the joint matrices INSIDE calc. The head and face models take
+ * getAnmMtx(4) as their base after calc (setMatrix()), so they inherit the neck for free, and the
+ * hat sway reads its forward axis off the same matrix, so a turned head moves the cap too.
+ *
+ * Same archive precondition as the other two hooks: setCallBack is on the model DATA, safe only
+ * because the puppet mounts its own copy.
+ */
+void daRemotePlayer_c::setupJointControl() {
+    J3DModelData* modelData = model->getModelData();
+    if (modelData == NULL) {
+        return;
+    }
+
+    const u16 jointNum = modelData->getJointNum();
+    if (jointNum <= l_headJointNo) {
+        Log.warn(
+            "Puppet body model has only {} joints; no head turn or torso lean (needs joint {})",
+            jointNum, l_headJointNo);
+        return;
+    }
+
+    model->setUserArea((uintptr_t)this);
+    modelData->getJointNodePointer(l_bodyRootJointNo)
+        ->setCallBack(daRemotePlayer_bodyModelCallBack);
+    modelData->getJointNodePointer(l_spineJointNo)->setCallBack(daRemotePlayer_bodyModelCallBack);
+    modelData->getJointNodePointer(l_headJointNo)->setCallBack(daRemotePlayer_bodyModelCallBack);
+    Log.info("Puppet head turn / torso lean attached to body joints {}, {} and {} of {}",
+        l_bodyRootJointNo, l_spineJointNo, l_headJointNo, jointNum);
+}
+
+/**
+ * The joint 1 / 2 / 4 arms of daAlink_c::jointControll (d_a_alink.cpp:2192-2212), from the sender's
+ * replicated answers. Runs inside the body's calc, on pass 0, from bodyModelCallBack.
+ *
+ * Joint 1: setMatrixWorldAxisRot(bodyX, twist, bodyZ) when any is non-zero (:2205-2207).
+ * Joint 2: setMatrixWorldAxisRot(0, twist, 0) when the twist is non-zero (:2209-2211). The total
+ *          twist is therefore 2 x field_0x30c8, which is roughly mBodyAngle.y, as for him.
+ * Joint 4: the neck, see neckJointControl().
+ *
+ * ★ The mCurrentMtx copy on 1 and 2 is daAlink_c's `param_4 = 1` and is NOT optional — same reason
+ * as the hip follow above it in bodyModelCallBack: mCurrentMtx is what the joint's children
+ * inherit. Without it the torso skin twists while the arms, the neck and the hand-held sword and
+ * shield stay where the animation left them.
+ *
+ * The puppet's setMatrixWorldAxisRot omits his magne-boot concat (:2121, :2125). That is identity
+ * unless he is walking on a ceiling, and magne boots are not replicated; revisit if they are.
+ */
+void daRemotePlayer_c::jointAimControl(int i_jointNo) {
+    int arm;
+    bool applied = false;
+    if (i_jointNo == l_bodyRootJointNo) {
+        arm = 0;
+        if (mNetBodyX != 0 || mNetBodyTwist != 0 || mNetBodyZ != 0) {
+            setMatrixWorldAxisRot(
+                model->getAnmMtx(l_bodyRootJointNo), mNetBodyX, mNetBodyTwist, mNetBodyZ, NULL);
+            mDoMtx_copy(mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
+            applied = true;
+        }
+    } else if (i_jointNo == l_spineJointNo) {
+        arm = 1;
+        if (mNetBodyTwist != 0) {
+            setMatrixWorldAxisRot(model->getAnmMtx(l_spineJointNo), 0, mNetBodyTwist, 0, NULL);
+            mDoMtx_copy(mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
+            applied = true;
+        }
+    } else {
+        arm = 2;
+        neckJointControl();
+        applied = mNetNeckX != 0 || mNetNeckY != 0;
+    }
+
+    mJointAimFires[arm]++;
+    if (applied && !mLoggedJointAim[arm]) {
+        mLoggedJointAim[arm] = true;
+        Log.debug(
+            "Puppet {} joint {} aim first applied: neck {},{} body {},{},{} bank {} (call #{})",
+            mPlayerId, i_jointNo, mNetNeckX, mNetNeckY, mNetBodyX, mNetBodyTwist, mNetBodyZ,
+            shape_angle.z, mJointAimFires[arm]);
+    }
+}
+
+/**
+ * Joint 4, the neck: daAlink_c::jointControll's `i_jointNo == 4` arm (d_a_alink.cpp:2192-2194) and
+ * its quaternion tail (:2260-2336), transcribed against this actor's own mpOldFrame — the same
+ * mDoExt_MtxCalcOldFrame class as his field_0x2060, holding the joint's un-turned local rotation
+ * that the blend calculator wrote a moment ago (m_Do_ext.cpp, *oldQuat = quat3).
+ *
+ * sp18 = (neckX, -neckY, 0) and sp10 = (2, 1, 0): the Y part turns about local Y, the X part about
+ * local Z. field_0x3124.z is never written by daAlink_c, so its arm is absent here.
+ *
+ * The tail rebuilds the joint: recover the parent matrix by un-applying the old local transform,
+ * rebuild the local matrix from the turned quaternion, and concat it back into mCurrentMtx, so the
+ * head's own children follow.
+ *
+ * Also measures how far the head's forward axis moved, for setEyeMove(). Measured off the matrix
+ * rather than computed from the angles, so it is the turn that is actually drawn.
+ */
+void daRemotePlayer_c::neckJointControl() {
+    mNeckYawDelta = 0;
+    mNeckPitchDelta = 0;
+
+    const csXyz sp18(mNetNeckX, (s16)-mNetNeckY, 0);
+    if (mpOldFrame == NULL || (sp18.x == 0 && sp18.y == 0)) {
+        return;
+    }
+
+    MtxP jointMtx = model->getAnmMtx(l_headJointNo);
+    cXyz fwdBefore;
+    mDoMtx_multVecSR(jointMtx, &cXyz::BaseX, &fwdBefore);
+
+    const J3DTransformInfo rootTrans = *mpOldFrame->getOldFrameTransInfo(l_headJointNo);
+    const Quaternion sp20 = *mpOldFrame->getOldFrameQuaternion(l_headJointNo);
+
+    Quaternion sp50;
+    Quaternion sp40;
+    Quaternion sp30;
+
+    // sp10.y == 1: the Y part about local Y.
+    if (sp18.y != 0) {
+        sp50 = *mpOldFrame->getOldFrameQuaternion(l_headJointNo);
+        JMAEulerToQuat(0, sp18.y, 0, &sp40);
+        mDoMtx_QuatConcat(&sp50, &sp40, &sp30);
+    } else {
+        sp30 = *mpOldFrame->getOldFrameQuaternion(l_headJointNo);
+    }
+
+    // sp10.x == 2: the X part about local Z.
+    if (sp18.x != 0) {
+        sp50 = sp30;
+        JMAEulerToQuat(0, 0, sp18.x, &sp40);
+        mDoMtx_QuatConcat(&sp50, &sp40, &sp30);
+    }
+
+    const J3DTransformInfo* trans = mpOldFrame->getOldFrameTransInfo(l_headJointNo);
+
+    mDoMtx_stack_c::transS(rootTrans.mTranslate.x, rootTrans.mTranslate.y, rootTrans.mTranslate.z);
+    mDoMtx_stack_c::quatM(&sp20);
+    mDoMtx_stack_c::inverse();
+    cMtx_concat(jointMtx, mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
+
+    MTXQuat(jointMtx, &sp30);
+
+    jointMtx[0][3] = trans->mTranslate.x;
+    jointMtx[1][3] = trans->mTranslate.y;
+    jointMtx[2][3] = trans->mTranslate.z;
+
+    cMtx_concat(J3DSys::mCurrentMtx, jointMtx, J3DSys::mCurrentMtx);
+    cMtx_copy(J3DSys::mCurrentMtx, jointMtx);
+
+    cXyz fwdAfter;
+    mDoMtx_multVecSR(jointMtx, &cXyz::BaseX, &fwdAfter);
+    mNeckYawDelta = (s16)(fwdAfter.atan2sX_Z() - fwdBefore.atan2sX_Z());
+    mNeckPitchDelta = (s16)(fwdAfter.atan2sY_XZ() - fwdBefore.atan2sY_XZ());
 }
 
 /* Where on each foot the floor is probed, in that joint's own space (d_a_alink.cpp:3846-3849). The
@@ -5790,7 +5982,10 @@ void daRemotePlayer_c::drawEquip() {
 
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
-    mDoMtx_stack_c::YrotM(shape_angle.y);
+    /* daAlink_c's own rotation order (d_a_alink.cpp:5776), minus field_0x308c, which is a horse and
+     * demo offset. shape_angle.x is never set on a puppet and shape_angle.z is the sender's run
+     * bank (setNetworkJointAim), so with no bank this is exactly the YrotM it used to be. */
+    mDoMtx_stack_c::ZXYrotM(shape_angle.x, shape_angle.y, shape_angle.z);
     model->setBaseTRMtx(mDoMtx_stack_c::get());
 
     /* The world→model matrices the foot IK solves in, built here for the same reason daAlink_c

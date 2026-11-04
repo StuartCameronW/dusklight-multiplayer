@@ -76,8 +76,10 @@ namespace dusk::mp {
  * 13: flags bit 7 is now kPlayerStateUpperGuard (the sender's checkUpperGuardAnime()), so the
  * puppet raises its shield in the stance and strafe. No size change, so a v12 peer would parse
  * fine and simply never show a guard. Bumped so the mismatch is refused instead of silent.
+ * 14: PlayerState grew six head-turn / torso-lean bytes after `atnKind` (23 -> 29): neckX, neckY,
+ * bodyX, bodyTwist, bodyZ, bankZ, each an s8 of (angle / 128).
  */
-inline constexpr std::uint32_t kProtocolVersion = 13;
+inline constexpr std::uint32_t kProtocolVersion = 14;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

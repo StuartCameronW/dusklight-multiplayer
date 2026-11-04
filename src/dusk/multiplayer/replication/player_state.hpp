@@ -136,7 +136,35 @@ enum PlayerStateFlags : std::uint8_t {
     kPlayerStateUpperGuard = 1 << 7,
 };
 
-/// 23 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
+/**
+ * The joint-aim fields' wire scale: one s8 step is 128 binary-angle units, 0.70 degrees.
+ *
+ * The range this buys is +-16256 units (+-89 degrees). Every on-foot human value fits with room to
+ * spare: the neck is at most ~10000 (half of HIO mHeadMaxTurnHorizontal = 20000), the slope pitch
+ * 0x2800, the turn lead 0xC00 and the run bank 0x600. The sender clamps to kJointAimWireMax before
+ * it gets here and COUNTS the clamps (fill_joint_aim), so a range mistake shows up as a number in
+ * the trace instead of as a silent wrap. write() clamps again defensively, without counting.
+ */
+inline constexpr int kJointAimWireScale = 128;
+inline constexpr int kJointAimWireMax = 127 * kJointAimWireScale;
+
+/// s16 binary angle -> the s8 that goes on the wire. Rounds to nearest; saturates at +-127.
+inline std::uint8_t joint_aim_to_wire(std::int16_t v) {
+    int q = (v >= 0 ? v + kJointAimWireScale / 2 : v - kJointAimWireScale / 2) / kJointAimWireScale;
+    if (q > 127) {
+        q = 127;
+    } else if (q < -127) {
+        q = -127;
+    }
+    return static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+}
+
+/// The inverse: the wire's s8 back to an s16 binary angle.
+inline std::int16_t joint_aim_from_wire(std::uint8_t v) {
+    return static_cast<std::int16_t>(static_cast<std::int8_t>(v) * kJointAimWireScale);
+}
+
+/// 29 bytes on the wire. Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -212,6 +240,34 @@ struct PlayerState {
      */
     std::uint8_t atnKind = kPlayerAtnNone;
 
+    /* --- Head turn and torso lean (worklist 14, protocol 14) -----------------------------------
+     *
+     * The ANSWERS daAlink_c::jointControll consumes for joints 4, 1 and 2
+     * (d_a_alink.cpp:2192-2212), not the inputs to them. The sender has already run setNeckAngle's
+     * whole target chain (the NPC he is glancing at, Midna, the boomerang, the turn lead, the slope
+     * pitch) and its HIO clamps; the receiver could not re-derive any of it, because the look
+     * targets are HIS actors.
+     *
+     * All six are s16 binary angles HERE, quantised to s8 x 128 only in write()/read(), so
+     * lerp_state blends them at full precision. Zero for a wolf sender (his arms are different,
+     * :2150-2191) and for "not in the world". Six bytes, appended after atnKind. */
+    /// field_0x3124.x — the neck's pitch, applied about joint 4's local Z.
+    std::int16_t neckX = 0;
+    /// field_0x3124.y — the neck's yaw, applied about joint 4's local Y. Sent un-negated; the
+    /// receiver negates it exactly as jointControll does (:2193).
+    std::int16_t neckY = 0;
+    /// jointControll's `sp8` for joint 1 (:2199-2204): mBodyAngle.x, or mBodyAngle.x -
+    /// shape_angle.x when rein-riding. The sender evaluates that predicate; the receiver never sees
+    /// it.
+    std::int16_t bodyX = 0;
+    /// field_0x30c8 — half the torso twist, applied at joint 1 AND again at joint 2.
+    std::int16_t bodyTwist = 0;
+    /// mBodyAngle.z — the half of the run-turn bank that joint 1 carries (setMoveSlantAngle).
+    std::int16_t bodyZ = 0;
+    /// shape_angle.z — the other half, which tilts the whole model in setMatrix (:5776). Outside
+    /// jointControll, but bodyZ without it is half a lean.
+    std::int16_t bankZ = 0;
+
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
@@ -244,15 +300,30 @@ struct PlayerState {
         w.write_u8(equip);
         w.write_u8(idleKind);
         w.write_u8(atnKind);
+        w.write_u8(joint_aim_to_wire(neckX));
+        w.write_u8(joint_aim_to_wire(neckY));
+        w.write_u8(joint_aim_to_wire(bodyX));
+        w.write_u8(joint_aim_to_wire(bodyTwist));
+        w.write_u8(joint_aim_to_wire(bodyZ));
+        w.write_u8(joint_aim_to_wire(bankZ));
     }
 
     bool read(Reader& r) {
+        std::uint8_t aim[6] = {};
         if (!(r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
                 r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
-                r.read_u8(idleKind) && r.read_u8(atnKind)))
+                r.read_u8(idleKind) && r.read_u8(atnKind) && r.read_u8(aim[0]) &&
+                r.read_u8(aim[1]) && r.read_u8(aim[2]) && r.read_u8(aim[3]) && r.read_u8(aim[4]) &&
+                r.read_u8(aim[5])))
         {
             return false;
         }
+        neckX = joint_aim_from_wire(aim[0]);
+        neckY = joint_aim_from_wire(aim[1]);
+        bodyX = joint_aim_from_wire(aim[2]);
+        bodyTwist = joint_aim_from_wire(aim[3]);
+        bodyZ = joint_aim_from_wire(aim[4]);
+        bankZ = joint_aim_from_wire(aim[5]);
         // A non-finite float from the wire would poison the interpolation buffer and every pose
         // lerped from it, so reject the snapshot outright. An unusable rate only picks the gait,
         // so it is zeroed instead.
@@ -313,6 +384,18 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.idleKind = b.idleKind;
     // Discrete too. Halfway between "strafing left" and "backing off" is no animation at all.
     out.atnKind = b.atnKind;
+    /* The joint aim angles are continuous, so they blend — but with t clamped to 1. The rest of the
+     * pose extrapolates briefly past the newest sample when the buffer starves; these angles
+     * reverse often (a head glancing left and back, the bank flipping between turns), and
+     * extrapolating through a reversal overshoots, which reads as a twitch. Holding the newest
+     * sample is the honest answer for a head. */
+    const float aimT = t > 1.0f ? 1.0f : t;
+    out.neckX = lerp_angle(a.neckX, b.neckX, aimT);
+    out.neckY = lerp_angle(a.neckY, b.neckY, aimT);
+    out.bodyX = lerp_angle(a.bodyX, b.bodyX, aimT);
+    out.bodyTwist = lerp_angle(a.bodyTwist, b.bodyTwist, aimT);
+    out.bodyZ = lerp_angle(a.bodyZ, b.bodyZ, aimT);
+    out.bankZ = lerp_angle(a.bankZ, b.bankZ, aimT);
     return out;
 }
 

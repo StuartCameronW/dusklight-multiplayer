@@ -30,6 +30,13 @@
  * `flags` is the PlayerStateFlags bitfield, which is what makes the gait check exact: the standing
  * bit selects a branch of daAlink_c's blend that has a step in it, and no threshold on `moveRate`
  * can recover which side of that step the sender was on.
+ *
+ * `neckX..bankZ` are the six joint-aim angles in s16 binary units: as sent on `local`, after the
+ * lerp on `applied`, as the puppet holds them on `actor`. `headYawRel,headPitch,torsoYawRel` are
+ * the head and torso as DRAWN, in degrees, measured off the body model's joint matrices on `local`
+ * and `actor` rows (zero on `applied`); see DrawnJointAim. `fireJ1,fireJ2,fireJ4` count the
+ * puppet's joint-aim callback arms (actor rows only), `aimClamps` the sender's wire-range clamps
+ * (local rows only).
  */
 
 namespace dusk::mp::trace {

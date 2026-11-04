@@ -59,6 +59,37 @@ bool read_puppet_anim(std::uint32_t playerId, std::uint16_t& out);
 /// right now, every substitution applied. For --mp-trace, so a puppet's choice can be compared
 /// against what its sender actually played. 0 (false) when there is no playable Link.
 bool read_local_anim(std::uint16_t& out);
+
+/**
+ * The head turn and torso twist as they are DRAWN, for --mp-trace (worklist 14).
+ *
+ * Measured off the body model's joint matrices after calc, not off the wire values that feed them,
+ * so a sign or axis mistake in the puppet's joint callbacks shows up as a number. Comparing wire to
+ * wire would pass a mirrored head. All angles in degrees, relative to the actor's shape_angle.y.
+ *
+ *  - headYawRel / headPitch: the yaw and pitch of joint 4's X axis — the same "which way the head
+ *    points" axis the hat sway reads (d_a_alink.cpp:5596-5599).
+ *  - torsoYawRel: the yaw of joint 2's Y axis. Joint 2's X runs up the spine (daAlink_c's cap code
+ *    treats it as such, :2706-2713), so Y is the horizontal one. It carries an anatomical constant
+ *    that is the same on both ends; only drawn-vs-drawn differences are meaningful.
+ *
+ * `armFires` is the puppet's per-arm callback counter (joint 1, 2, 4) — zero on a local row.
+ * `clamps` is the sender's running count of joint-aim values clamped to the wire range — zero on a
+ * puppet row. Both exist so "attached but never fires" and "fires but wraps" are numbers.
+ */
+struct DrawnJointAim {
+    float headYawRel = 0.0f;
+    float headPitch = 0.0f;
+    float torsoYawRel = 0.0f;
+    std::uint32_t armFires[3] = {0, 0, 0};
+    std::uint32_t clamps = 0;
+};
+
+/// The local player's drawn head/torso. False when there is no playable Link.
+bool read_local_joint_aim(DrawnJointAim& out);
+/// A puppet's drawn head/torso. False when the puppet does not exist.
+bool read_puppet_joint_aim(std::uint32_t playerId, DrawnJointAim& out);
+
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 

@@ -27,13 +27,17 @@ long long elapsed_ms() {
 
 void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     const PlayerState& state, double delayTicks, std::uint32_t starvations, std::uint32_t snaps,
-    std::size_t buffered, unsigned anm = 0) {
+    std::size_t buffered, unsigned anm = 0, const DrawnJointAim& drawn = DrawnJointAim{}) {
     sFile << tick << ',' << elapsed_ms() << ',' << sRole << ',' << kind << ',' << playerId << ','
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
           << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
           << buffered << ',' << anm << ',' << static_cast<unsigned>(state.flags) << ','
           << static_cast<unsigned>(state.equip) << ',' << static_cast<unsigned>(state.idleKind)
-          << ',' << static_cast<unsigned>(state.atnKind) << '\n';
+          << ',' << static_cast<unsigned>(state.atnKind) << ',' << state.neckX << ',' << state.neckY
+          << ',' << state.bodyX << ',' << state.bodyTwist << ',' << state.bodyZ << ','
+          << state.bankZ << ',' << drawn.headYawRel << ',' << drawn.headPitch << ','
+          << drawn.torsoYawRel << ',' << drawn.armFires[0] << ',' << drawn.armFires[1] << ','
+          << drawn.armFires[2] << ',' << drawn.clamps << '\n';
 }
 
 }  // namespace
@@ -52,7 +56,8 @@ void open(const std::string& path, const char* role) {
     // — the sender's own getMoveGroundAngleSpeedRate(), roughly 0..1 — so the column is renamed
     // rather than quietly refilled. An analyzer written against the old name fails loudly.
     sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,"
-             "buffered,anm,flags,equip,idleKind,atnKind\n";
+             "buffered,anm,flags,equip,idleKind,atnKind,neckX,neckY,bodyX,bodyTwist,bodyZ,bankZ,"
+             "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
@@ -73,7 +78,11 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
          * only line up exactly inside the attention set, where both report slot 0. */
         std::uint16_t localAnm = 0;
         read_local_anim(localAnm);
-        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm);
+        // The DRAWN head and torso, off his body model's joints: the sender half of the
+        // drawn-vs-drawn comparison (.claude/mp_head_compare.py).
+        DrawnJointAim drawn;
+        read_local_joint_aim(drawn);
+        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm, drawn);
     } else {
         // Written rather than skipped: a missing row is ambiguous between "loading" and "the trace
         // stopped", and the first probe run cost real time to that ambiguity.
@@ -90,7 +99,9 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
         if (read_puppet_pose(player.playerId, actual)) {
             std::uint16_t anm = 0;
             read_puppet_anim(player.playerId, anm);
-            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm);
+            DrawnJointAim drawn;
+            read_puppet_joint_aim(player.playerId, drawn);
+            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm, drawn);
         }
     }
 
