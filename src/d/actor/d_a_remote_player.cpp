@@ -19,7 +19,8 @@
 #include "d/actor/d_a_npc4.h"
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_bg_s.h"
-#include "dusk/frame_interpolation.h"
+#include "SSystem/SComponent/c_counter.h"
+#include "dusk/game_clock.h"
 #include "dusk/logging.h"
 #include "dusk/player_equip.hpp"
 #include "dusk/player_idle.hpp"
@@ -36,7 +37,7 @@
 
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 /* Every human outfit daAlink_c::setArcName can select (d_a_alink_swindow.inc:14-26), with the body
  * model inside each. The skeletons are joint-for-joint identical across all of them (compare AL_JNT
@@ -5570,8 +5571,8 @@ int daRemotePlayer_c::draw() {
      * Aurora FIFO guard catches as "command stream reached 268435456 bytes".
      *
      * With frame interpolation on, every actor is legitimately drawn TWICE per presentation frame
-     * (m_Do_main.cpp:298-322): once inside fapGm_Execute with frame_interp::is_sim_frame() true,
-     * and once from fpcM_DrawIterater with it false. That is safe, because mDoExt_modelEntryDL
+     * (m_Do_main.cpp, the separatePresentation branch): once inside fapGm_Execute with
+     * game_clock::is_sim_frame() true, and once from fpcM_DrawIterater with it false. That is safe, because mDoExt_modelEntryDL
      * early-outs to J3DModel::diff() on the second (m_Do_ext.cpp) and never re-enters.
      *
      * The puppet was getting TWO draws with is_sim_frame() TRUE, both on the SAME sim tick. It is
@@ -5591,13 +5592,19 @@ int daRemotePlayer_c::draw() {
      * global real-shadow slots on the same puppet. Interpolated frames (is_sim_frame() false) are
      * never skipped: they carry the diff() that makes the puppet move between sim ticks.
      *
+     * The tick is identified by g_Counter.mCounter0, which cCt_Counter() bumps once per
+     * fapGm_Execute AFTER fpcM_Management (so both entry-draws of one tick see the same value), and
+     * NOT by interp::sim_tick_seq(). That one only advances while frame interpolation is enabled,
+     * so with interpolation Off every draw would match the first and the puppet would be drawn
+     * exactly once and then never again.
+     *
      * Deliberately fixed HERE and not in the actor framework. The framework drawing a
      * just-created actor twice may well be general, but every other actor in the game is created
      * during a scene load rather than from a network event mid-session, and this is Dusk-authored
      * code that cannot affect the local player. If it turns out to bite a stock actor too, the
      * framework is the place — see 00-status.md. */
-    if (dusk::frame_interp::is_sim_frame()) {
-        const u64 simTick = dusk::frame_interp::sim_tick_seq();
+    if (dusk::game_clock::is_sim_frame()) {
+        const u64 simTick = g_Counter.mCounter0;
         if (mHasDrawnSimTick && mDrawnSimTick == simTick) {
             if (!mLoggedDoubleDraw) {
                 mLoggedDoubleDraw = true;

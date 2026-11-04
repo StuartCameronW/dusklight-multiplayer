@@ -17,7 +17,7 @@
 #if TARGET_PC
 namespace {
 
-aurora::Module J3DDrawBufferLog{"J3D"};
+constexpr borealis::Log J3DDrawBufferLog{"J3D"};
 
 /* ★ Entering the same packet into a draw buffer twice within one pass is never legitimate, and
  * before this it was not survivable either.

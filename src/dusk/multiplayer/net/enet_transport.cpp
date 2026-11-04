@@ -10,7 +10,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp::enet"};
+constexpr borealis::Log Log{"dusk::mp::enet"};
 
 /// ENet requires exactly one global init per process. Ref-counting instead of a plain bool so a
 /// future dedicated-server build can create and destroy transports freely without tearing down

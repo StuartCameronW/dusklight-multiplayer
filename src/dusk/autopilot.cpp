@@ -26,7 +26,7 @@
 namespace dusk::autopilot {
 namespace {
 
-aurora::Module Log{"dusk::autopilot"};
+constexpr borealis::Log Log{"dusk::autopilot"};
 
 constexpr u32 kPort = 0;
 /// Comfortably past fapGmHIO_getLROnValue(), so a scripted L or R reads as fully pressed.

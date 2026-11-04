@@ -10,7 +10,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 /**
  * How far the clock has to move in one tick before it counts as somebody SETTING it rather than it

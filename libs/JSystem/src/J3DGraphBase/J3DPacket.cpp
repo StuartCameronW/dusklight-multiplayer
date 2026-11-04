@@ -216,7 +216,7 @@ bool J3DMatPacket::isSame(J3DMatPacket* pOther) const {
 #if TARGET_PC
 namespace {
 
-aurora::Module J3DPacketLog{"J3D"};
+constexpr borealis::Log J3DPacketLog{"J3D"};
 
 /* A cycle repeats on every frame until whatever built it stops, and one line per frame would bury
  * everything else in the log. The first few carry all the information there is. */

@@ -10,7 +10,7 @@
 namespace dusk::mp::trace {
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 std::ofstream sFile;
 std::string sRole;
