@@ -625,6 +625,105 @@ void fill_atn_kind(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+/// Running count of joint-aim values the sender had to clamp to the wire range. Reported on every
+/// `local` trace row, so a range mistake is a non-zero number rather than a silent wrap.
+std::uint32_t s_jointAimClamps = 0;
+
+std::int16_t clamp_joint_aim(int v, const char* name) {
+    if (v > kJointAimWireMax || v < -kJointAimWireMax) {
+        s_jointAimClamps++;
+        /* Logged on the first few only: a clamp is a range assumption being wrong, and the first
+         * one names which field and in which state, which is all the diagnosis needs. */
+        if (s_jointAimClamps <= 8) {
+            Log.warn("Joint aim {} = {} is outside the wire range +-{}; clamped (#{})", name, v,
+                kJointAimWireMax, s_jointAimClamps);
+        }
+        return static_cast<std::int16_t>(v > 0 ? kJointAimWireMax : -kJointAimWireMax);
+    }
+    return static_cast<std::int16_t>(v);
+}
+
+/**
+ * Fill the six head-turn / torso-lean angles with the answers daAlink_c::jointControll consumes
+ * this tick (d_a_alink.cpp:2192-2212), plus shape_angle.z.
+ *
+ * Fresh at capture: setNeckAngle runs inside Link's execute after setMatrix, and field_0x30c8 is
+ * written from mBodyAngle.y at the end of it (:18563), so these are the values his next calc — the
+ * one being drawn — reads.
+ *
+ * ★ bodyX is jointControll's `sp8`, evaluated HERE with the same predicate (:2199-2204), not
+ * mBodyAngle.x. When rein-riding the joint takes the difference with shape_angle.x; the receiver
+ * has no idea he is riding, and must not be asked to find out (reuse-the-games-own-values).
+ *
+ * Joint 16 (field_0x3088/308a) is skipped: every writer of it is a horse, boar, glide or demo
+ * state, none of which the puppet can show yet.
+ *
+ * Wolf: zeros. His jointControll arms are a different set (:2150-2191) on a different skeleton.
+ */
+void fill_joint_aim(daAlink_c* alink, PlayerState& out) {
+    out.neckX = 0;
+    out.neckY = 0;
+    out.bodyX = 0;
+    out.bodyTwist = 0;
+    out.bodyZ = 0;
+    out.bankZ = 0;
+    if (alink == nullptr || alink->checkWolf()) {
+        return;
+    }
+
+    s16 bodyX;
+    if (alink->checkReinRide() && !alink->checkHorseLieAnime() &&
+        alink->mProcID != daAlink_c::PROC_HORSE_RUN && alink->mProcID != daAlink_c::PROC_BOAR_RUN)
+    {
+        bodyX = (s16)(alink->mBodyAngle.x - alink->shape_angle.x);
+    } else {
+        bodyX = alink->mBodyAngle.x;
+    }
+
+    out.neckX = clamp_joint_aim(alink->field_0x3124.x, "neckX");
+    out.neckY = clamp_joint_aim(alink->field_0x3124.y, "neckY");
+    out.bodyX = clamp_joint_aim(bodyX, "bodyX");
+    out.bodyTwist = clamp_joint_aim(alink->field_0x30c8, "bodyTwist");
+    out.bodyZ = clamp_joint_aim(alink->mBodyAngle.z, "bodyZ");
+    out.bankZ = clamp_joint_aim(alink->shape_angle.z, "bankZ");
+
+    /* field_0x3124.z is never written anywhere in daAlink_c (only read), so it is not on the wire.
+     * If that ever stops being true this line says so instead of the head silently missing a roll.
+     */
+    static bool s_loggedNeckZ = false;
+    if (!s_loggedNeckZ && alink->field_0x3124.z != 0) {
+        s_loggedNeckZ = true;
+        Log.warn("field_0x3124.z is {} — the neck roll is NOT replicated; see fill_joint_aim()",
+            alink->field_0x3124.z);
+    }
+}
+
+/// s16 binary angle to degrees, for the trace.
+float angle_to_degrees(s16 v) {
+    return static_cast<float>(v) * (360.0f / 65536.0f);
+}
+
+/**
+ * The drawn head and torso angles off a body model, relative to a facing. Shared by the local and
+ * puppet readers so the two sides of the comparison are the same arithmetic on the same joints.
+ */
+void measure_joint_aim(J3DModel* bodyModel, s16 facingY, DrawnJointAim& out) {
+    if (bodyModel == NULL || bodyModel->getModelData() == NULL ||
+        bodyModel->getModelData()->getJointNum() <= 4)
+    {
+        return;
+    }
+
+    cXyz headFwd;
+    mDoMtx_multVecSR(bodyModel->getAnmMtx(4), &cXyz::BaseX, &headFwd);
+    out.headYawRel = angle_to_degrees((s16)(headFwd.atan2sX_Z() - facingY));
+    out.headPitch = angle_to_degrees(headFwd.atan2sY_XZ());
+
+    cXyz torsoSide;
+    mDoMtx_multVecSR(bodyModel->getAnmMtx(2), &cXyz::BaseY, &torsoSide);
+    out.torsoYawRel = angle_to_degrees((s16)(torsoSide.atan2sX_Z() - facingY));
+}
+
 }  // namespace
 
 /**
@@ -793,6 +892,7 @@ bool capture_local_player(PlayerState& out) {
     fill_idle_kind(alink, out);
     fill_equip(alink, out);
     fill_atn_kind(alink, out);
+    fill_joint_aim(alink, out);
 
     return true;
 }
@@ -959,6 +1059,8 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkPose(pos, state.angleY, state.moveRate, state.sharp_turn(),
         state.zero_speed(), state.mode_idle(), state.no_foot_ik(), state.equip, state.idleKind);
     puppet->setNetworkAtn(state.atnKind);
+    puppet->setNetworkJointAim(
+        state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -991,6 +1093,37 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     // and only the second one is about the feature working.
     out.idleKind = puppet->getNetIdleKind();
     out.atnKind = puppet->getNetAtnKind();
+    // The joint aim values the puppet's callbacks are drawing from this tick, read back off it.
+    out.neckX = puppet->getNetNeckX();
+    out.neckY = puppet->getNetNeckY();
+    out.bodyX = puppet->getNetBodyX();
+    out.bodyTwist = puppet->getNetBodyTwist();
+    out.bodyZ = puppet->getNetBodyZ();
+    out.bankZ = puppet->shape_angle.z;
+    return true;
+}
+
+bool read_local_joint_aim(DrawnJointAim& out) {
+    out = DrawnJointAim{};
+    out.clamps = s_jointAimClamps;
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr || !world_is_playable()) {
+        return false;
+    }
+    measure_joint_aim(alink->mpLinkModel, alink->shape_angle.y, out);
+    return true;
+}
+
+bool read_puppet_joint_aim(std::uint32_t playerId, DrawnJointAim& out) {
+    out = DrawnJointAim{};
+    daRemotePlayer_c* puppet = resolve_puppet(playerId);
+    if (puppet == nullptr) {
+        return false;
+    }
+    measure_joint_aim(puppet->model, puppet->shape_angle.y, out);
+    for (int i = 0; i < 3; i++) {
+        out.armFires[i] = puppet->getJointAimFires(i);
+    }
     return true;
 }
 

@@ -135,6 +135,23 @@ public:
     /// signature. Stored whole; selectAtnAnimation() treats an unknown value as "none".
     void setNetworkAtn(u8 i_atnKind) { mNetAtnKind = i_atnKind; }
     u8 getNetAtnKind() const { return mNetAtnKind; }
+    /// Worklist 14. The sender's head turn and torso lean, as jointControll's answers: the neck
+    /// (field_0x3124.x/.y), joint 1's pitch (`sp8`), the twist (field_0x30c8), joint 1's roll
+    /// (mBodyAngle.z), and the whole-model bank (shape_angle.z). Pushed every tick alongside
+    /// setNetworkPose(); the joint callbacks on joints 1, 2 and 4 read them during calc.
+    void setNetworkJointAim(
+        s16 i_neckX, s16 i_neckY, s16 i_bodyX, s16 i_bodyTwist, s16 i_bodyZ, s16 i_bankZ);
+    s16 getNetNeckX() const { return mNetNeckX; }
+    s16 getNetNeckY() const { return mNetNeckY; }
+    s16 getNetBodyX() const { return mNetBodyX; }
+    s16 getNetBodyTwist() const { return mNetBodyTwist; }
+    s16 getNetBodyZ() const { return mNetBodyZ; }
+    /// How many times the joint-aim callback has run for arm 0 (joint 1), 1 (joint 2), 2 (joint 4).
+    /// For --mp-trace: zero means the hook is not attached, which looks exactly like "no head
+    /// turn".
+    u32 getJointAimFires(int i_arm) const {
+        return i_arm >= 0 && i_arm < 3 ? mJointAimFires[i_arm] : 0;
+    }
     bool hasPose() const { return mHasPose; }
     /* Where the floating name tag hangs from (src/dusk/imgui/ImGuiNameTags.cpp): the body's head
      * joint as it is DRAWN this frame. On an interpolated frame that is frame_interp's lerped copy
@@ -209,10 +226,17 @@ private:
     void footBgCheck();
     void setFootMatrix();
     /// Hook the body-model joint callback onto joints 26, 27 and 29. Once, at createHeap time.
-    /// 26 runs setFootMatrix; 27 and 29 apply each leg's hip angle to the joint that follows it,
-    /// which is daAlink_c::jointControll's only two arms a puppet can currently reproduce. See the
-    /// .cpp for the four it cannot and why.
+    /// 26 runs setFootMatrix; 27 and 29 apply each leg's hip angle to the joint that follows it
+    /// (daAlink_c::jointControll's hip-follow arms). The torso and neck arms are
+    /// setupJointControl()'s.
     void setupFootIk();
+    /// Worklist 14. Hook the body-model joint callback onto joints 1, 2 and 4 — daAlink_c's
+    /// jointControll arms for the torso lean/twist and the neck. Once, at createHeap time.
+    void setupJointControl();
+    /// The joint 1 / 2 / 4 arms themselves, from bodyModelCallBack, i.e. INSIDE the body's calc.
+    void jointAimControl(int i_jointNo);
+    /// Joint 4's arm: jointControll's quaternion tail (d_a_alink.cpp:2260-2336) against mpOldFrame.
+    void neckJointControl();
     /// Solve one leg for a height delta. daAlink_c::setLegAngle (d_a_alink.cpp:3699), the
     /// param_4 != 0 branch — the other branch is the arms, which the puppet does not IK.
     bool setLegAngle(
@@ -891,6 +915,28 @@ private:
     /// is meaningful: it means the double draw did not happen in that session, not that the guard
     /// is broken.
     bool mLoggedDoubleDraw;
+
+    /* --- Worklist 14: head turn and torso lean ------------------------------------------------
+     *
+     * The sender's jointControll answers, whole, as setNetworkJointAim() received them. Constant
+     * across a calc: they are written before execute(), and only the joint callbacks read them.
+     * Zero at spawn via fopAcM_ct, which is "no turn" — every arm is a no-op at zero. */
+    s16 mNetNeckX;
+    s16 mNetNeckY;
+    s16 mNetBodyX;
+    s16 mNetBodyTwist;
+    s16 mNetBodyZ;
+    /* How far joint 4's arm turned the head's forward axis on the last calc, in yaw and pitch.
+     * MEASURED off the joint matrix before and after the rotation, not computed from the wire
+     * values. setEyeMove() subtracts it, so the eyes aim relative to the head the neck is now
+     * turning instead of double-counting the turn. Zero whenever the arm did nothing. */
+    s16 mNeckYawDelta;
+    s16 mNeckPitchDelta;
+    /// Callback invocations per arm (joint 1, 2, 4). See getJointAimFires().
+    u32 mJointAimFires[3];
+    /// One-shot "this arm applied a non-zero rotation" latches, so "fires with zeros" and "fires
+    /// and turns" are distinguishable in the log as well as in the trace.
+    bool mLoggedJointAim[3];
 };
 
 /**
