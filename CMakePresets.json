@@ -23,29 +23,17 @@
       }
     },
     {
-      "name": "release",
-      "hidden": true,
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL",
-        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": {
-          "type": "BOOL",
-          "value": true
-        }
-      }
-    },
-    {
       "name": "ci",
       "hidden": true,
       "cacheVariables": {
         "CMAKE_C_COMPILER_LAUNCHER": "sccache",
         "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
-        "DUSK_ENABLE_SENTRY_NATIVE": {
+        "BOREALIS_ENABLE_SENTRY": {
           "type": "BOOL",
           "value": true
         },
-        "DUSK_SENTRY_DSN": "$env{SENTRY_DSN}",
-        "DUSK_SENTRY_ENVIRONMENT": "production",
+        "BOREALIS_SENTRY_DSN": "$env{SENTRY_DSN}",
+        "BOREALIS_SENTRY_ENVIRONMENT": "production",
         "Rust_RUSTUP_INSTALL_MISSING_TARGET": {
           "type": "BOOL",
           "value": true
@@ -200,16 +188,12 @@
     {
       "name": "windows-arm64-msvc",
       "displayName": "Windows ARM64 (MSVC)",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/${presetName}",
+      "inherits": [
+        "windows-msvc"
+      ],
       "architecture": {
         "value": "arm64",
         "strategy": "external"
-      },
-      "cacheVariables": {
-        "CMAKE_C_COMPILER": "cl",
-        "CMAKE_CXX_COMPILER": "cl",
-        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install"
       },
       "vendor": {
         "microsoft.com/VisualStudioSettings/CMake/1.0": {
@@ -318,6 +302,10 @@
           "type": "BOOL",
           "value": false
         },
+        "ENABLE_VISIBILITY": {
+          "type": "BOOL",
+          "value": true
+        },
         "Rust_CARGO_TARGET": "aarch64-apple-ios",
         "BUILD_SHARED_LIBS": {
           "type": "BOOL",
@@ -357,6 +345,10 @@
         "ENABLE_ARC": {
           "type": "BOOL",
           "value": false
+        },
+        "ENABLE_VISIBILITY": {
+          "type": "BOOL",
+          "value": true
         },
         "Rust_CARGO_TARGET": "aarch64-apple-tvos",
         "Rust_TOOLCHAIN": "nightly",
@@ -429,11 +421,10 @@
       "hidden": true,
       "inherits": [
         "android-base",
-        "ci",
-        "release"
+        "ci"
       ],
       "cacheVariables": {
-        "DUSK_ENABLE_SENTRY_NATIVE": {
+        "BOREALIS_ENABLE_SENTRY": {
           "type": "BOOL",
           "value": false
         }
@@ -459,6 +450,7 @@
       ],
       "cacheVariables": {
         "AURORA_SDL3_PROVIDER": "vendor",
+        "BOREALIS_CURL_PROVIDER": "vendor",
         "CMAKE_LINKER_TYPE": "MOLD"
       }
     },
