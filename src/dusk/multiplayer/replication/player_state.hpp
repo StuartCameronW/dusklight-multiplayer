@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 #include "dusk/player_atn.hpp"
@@ -246,9 +247,22 @@ struct PlayerState {
     }
 
     bool read(Reader& r) {
-        return r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
-               r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
-               r.read_u8(idleKind) && r.read_u8(atnKind);
+        if (!(r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
+                r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
+                r.read_u8(idleKind) && r.read_u8(atnKind)))
+        {
+            return false;
+        }
+        // A non-finite float from the wire would poison the interpolation buffer and every pose
+        // lerped from it, so reject the snapshot outright. An unusable rate only picks the gait,
+        // so it is zeroed instead.
+        if (!std::isfinite(posX) || !std::isfinite(posY) || !std::isfinite(posZ)) {
+            return false;
+        }
+        if (!std::isfinite(moveRate)) {
+            moveRate = 0.0f;
+        }
+        return true;
     }
 };
 

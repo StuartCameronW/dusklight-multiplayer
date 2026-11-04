@@ -733,6 +733,11 @@ bool capture_local_player(PlayerState& out) {
      * position is replicated outright, so this value only picks the gait and feeds the trace.
      * Checked before changing it. */
     out.moveRate = alink != nullptr ? alink->getMoveGroundAngleSpeedRate() : 0.0f;
+    // The game's own function divides by mMaxSpeed; the log shows it returning NaN on the tick an
+    // attention set ends. Link survives that internally; a peer receiving it would not.
+    if (!std::isfinite(out.moveRate)) {
+        out.moveRate = 0.0f;
+    }
 
     /* Latched, permanent, and it exists to stop this being re-diagnosed a third time. The rate is
      * derived from the intent, so the gap it records is the one that was invisible: the two speeds
