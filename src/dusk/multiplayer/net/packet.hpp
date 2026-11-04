@@ -62,8 +62,14 @@ namespace dusk::mp {
  * anybody. Silent, total, and it would read as "time sync doesn't work" rather than as a version
  * mismatch. Also adds TimeOverride (client -> host), which an older host would drop as an unknown
  * id — so a guest's cutscene would set the time for itself and be quietly overwritten a tick later.
+ *
+ * 11: every hang-up now carries a DisconnectReason in ENet's disconnect data, and a host refuses
+ * a client it will not admit (wrong version, session full) by hanging up on it with the reason
+ * instead of leaving it connected and half-admitted. No packet changed size, so nothing would fail
+ * to parse — a v10 peer would simply read every reason as 0, "connection lost", and tell its
+ * player the wrong thing. Bumped so that never happens silently.
  */
-inline constexpr std::uint32_t kProtocolVersion = 10;
+inline constexpr std::uint32_t kProtocolVersion = 11;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -132,6 +138,27 @@ enum class PacketId : std::uint8_t {
     ///
     /// Reliable, because these are rare, discrete, and losing one loses the event's whole point.
     TimeOverride = 10,
+};
+
+/**
+ * Why a peer hung up, carried in ENet's 32-bit disconnect data — the one field that survives even a
+ * protocol mismatch, because it is part of the transport's own goodbye rather than a packet either
+ * side has to parse. That is what lets a rejected client tell its player WHY in their own words.
+ *
+ * 0 is what ENet reports for a timeout, so it means "the line went dead" and is never sent on
+ * purpose. Values are append-only.
+ */
+enum class DisconnectReason : std::uint32_t {
+    /// Nothing was said: a timeout, a crash, a pulled cable, or a peer that predates v11.
+    ConnectionLost = 0,
+    /// A deliberate leave: the player chose to, or quit the game. From the host, the session ended.
+    Left = 1,
+    /// Host -> client: protocol versions differ. HelloAck said so too, if the client could read it.
+    VersionMismatch = 2,
+    /// Host -> client: every player slot is taken.
+    SessionFull = 3,
+    /// Host -> client: connected but never introduced itself with a Hello.
+    HandshakeTimeout = 4,
 };
 
 /// The host occupies a fixed player id so both ends can name it without a lookup.

@@ -29,6 +29,9 @@ struct TransportEvent {
     TransportEventType type = TransportEventType::Data;
     PeerId peer = kInvalidPeer;
     std::vector<std::uint8_t> data;
+    /// Disconnected only: the code the far end gave when it hung up (see DisconnectReason in
+    /// packet.hpp), or 0 when it gave none, which is what a timeout produces.
+    std::uint32_t reason = 0;
 };
 
 class ITransport {
@@ -58,7 +61,14 @@ public:
 
     virtual std::size_t peer_count() const = 0;
 
-    virtual void disconnect_all() = 0;
+    /// Hang up on one peer, telling it why. With @p i_afterQueued the packets already queued to it
+    /// go out first, so a refusal can be explained before the line drops. A Disconnected event for
+    /// the peer follows once the far end acknowledges (or the attempt times out).
+    virtual void disconnect(PeerId peer, std::uint32_t reason, bool afterQueued) = 0;
+
+    /// Hang up on everyone and close, blocking briefly so the far ends hear it rather than having
+    /// to time out. No Disconnected events are produced: the caller is the one leaving.
+    virtual void disconnect_all(std::uint32_t reason) = 0;
 };
 
 }  // namespace dusk::mp

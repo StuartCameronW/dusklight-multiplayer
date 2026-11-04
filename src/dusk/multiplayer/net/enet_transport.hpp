@@ -32,12 +32,15 @@ public:
     void flush() override;
     std::uint32_t rtt_ms(PeerId peer) const override;
     std::size_t peer_count() const override;
-    void disconnect_all() override;
+    void disconnect(PeerId peer, std::uint32_t reason, bool afterQueued) override;
+    void disconnect_all(std::uint32_t reason) override;
 
 private:
     /// Stable ids handed out to callers, so nothing above this layer ever holds an ENetPeer*.
     PeerId acquire_id(_ENetPeer* peer);
     _ENetPeer* lookup(PeerId id) const;
+    /// Apply the session's timeout policy. See kPeerTimeout* in enet_transport.cpp.
+    static void apply_timeouts(_ENetPeer* peer);
 
     _ENetHost* mHost = nullptr;
     std::unordered_map<PeerId, _ENetPeer*> mPeers;
