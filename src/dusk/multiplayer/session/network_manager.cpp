@@ -11,6 +11,8 @@
 #include "../replication/replication_manager.hpp"
 #include "../replication/world_clock.hpp"
 #include "dusk/logging.h"
+#include "dusk/ui/ui.hpp"
+#include "fmt/format.h"
 #include "save_guard.hpp"
 #include "trace.hpp"
 
@@ -27,6 +29,107 @@ constexpr std::uint64_t kRateReportIntervalTicks = 150;
 
 /// How often to log interpolation health (buffer depth, starvations). ~10 s at 30 Hz.
 constexpr std::uint64_t kInterpReportIntervalTicks = 300;
+
+/**
+ * Client: how long to wait for the host's HelloAck before giving up on the join.
+ *
+ * Our own deadline rather than ENet's, because ENet's connect timeout falls out of its retransmit
+ * backoff from a 500 ms initial guess at the RTT and lands somewhere near 15 s — long enough that a
+ * player who typed the wrong address assumes the game froze. And it only covers "nobody answered":
+ * something that accepts the connection and never replies would leave us waiting forever.
+ */
+constexpr std::chrono::seconds kJoinTimeout{10};
+
+/// Host: how long a connected peer gets to send its Hello. A real client sends it the instant it
+/// connects, on the reliable channel, so this only ever fires for something that is not one of us
+/// and would otherwise sit in a player slot indefinitely.
+constexpr std::chrono::seconds kHelloTimeout{5};
+
+/// Extra ENet peer slots beyond the player cap. Without a spare, ENet ignores the connect of the
+/// player who makes it one too many, and they wait out a timeout and are told "unreachable". With
+/// one, we can accept the connection just long enough to tell them the session is full.
+constexpr std::size_t kSpareConnectionSlots = 2;
+
+/// Heartbeats older than this are forgotten unanswered. They are broadcast, so one sequence number
+/// is answered once per peer; keeping it around until it ages out is what lets every peer's reply
+/// produce an RTT, not just the first one.
+constexpr std::chrono::seconds kHeartbeatExpiry{10};
+
+/**
+ * ★ Test knobs for the two refusals, which a scripted run otherwise cannot reach: "full" needs
+ * eight running copies, and "wrong version" needs two different builds. Same trade as
+ * DUSK_MP_TEST_SAVE_REFUSAL — without them these paths could only be reasoned about. Read once;
+ * never set in normal play.
+ *
+ * DUSK_MP_TEST_MAX_PLAYERS (host): lower the player cap, host included. Clamped to [2,
+ * kMaxPlayers]. DUSK_MP_TEST_PROTOCOL_VERSION (client): the version this client CLAIMS in its
+ * Hello.
+ */
+std::size_t max_players() {
+    static const std::size_t value = [] {
+        const char* env = std::getenv("DUSK_MP_TEST_MAX_PLAYERS");
+        const long parsed = env != nullptr ? std::strtol(env, nullptr, 10) : 0;
+        return parsed >= 2 && parsed <= static_cast<long>(kMaxPlayers) ?
+                   static_cast<std::size_t>(parsed) :
+                   kMaxPlayers;
+    }();
+    return value;
+}
+
+std::uint32_t advertised_protocol_version() {
+    static const std::uint32_t value = [] {
+        const char* env = std::getenv("DUSK_MP_TEST_PROTOCOL_VERSION");
+        return env != nullptr && env[0] != '\0' ?
+                   static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10)) :
+                   kProtocolVersion;
+    }();
+    return value;
+}
+
+/// DUSK_MP_TEST_LEAVE_AT_TICK: call leave_session() on this session tick, exactly as the overlay's
+/// Leave button does. The button is the only other way in, and a scripted run cannot press it.
+std::uint64_t test_leave_tick() {
+    static const std::uint64_t value = [] {
+        const char* env = std::getenv("DUSK_MP_TEST_LEAVE_AT_TICK");
+        return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+    }();
+    return value;
+}
+
+/// Both the toast and the log, always together, so a run's log shows exactly what the player saw.
+void notify(const std::string& title, const std::string& content, int seconds = 5) {
+    Log.info("Notify: {} — {}", title, content);
+    dusk::ui::push_toast({
+        .title = title,
+        .content = content,
+        .duration = std::chrono::seconds(seconds),
+    });
+}
+
+const char* reason_text(std::uint32_t reason) {
+    switch (static_cast<DisconnectReason>(reason)) {
+    case DisconnectReason::ConnectionLost:
+        return "connection lost";
+    case DisconnectReason::Left:
+        return "left";
+    case DisconnectReason::VersionMismatch:
+        return "protocol version mismatch";
+    case DisconnectReason::SessionFull:
+        return "session full";
+    case DisconnectReason::HandshakeTimeout:
+        return "handshake timed out";
+    }
+    return "unknown reason";
+}
+
+std::uint32_t ms_since(std::chrono::steady_clock::time_point then) {
+    if (then == std::chrono::steady_clock::time_point{}) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - then)
+            .count());
+}
 
 const char* env_or_null(const char* name) {
     const char* value = std::getenv(name);
@@ -163,16 +266,24 @@ bool NetworkManager::host(std::uint16_t port) {
 
     auto transport = std::make_unique<EnetTransport>();
     // Peers, not players: the host occupies one of the kMaxPlayers slots itself, and the snapshot
-    // packet is sized so that all of them fit in one unfragmented datagram.
-    if (!transport->listen(port, kMaxPlayers - 1)) {
+    // packet is sized so that all of them fit in one unfragmented datagram. The cap itself is
+    // enforced at Hello; the spare connections exist only so a refusal can be delivered.
+    if (!transport->listen(port, kMaxPlayers - 1 + kSpareConnectionSlots)) {
+        notify("Couldn't host a session",
+            fmt::format(
+                "UDP port {} is unavailable. Is another copy of Dusklight already hosting?", port),
+            8);
         return false;
     }
 
     mTransport = std::move(transport);
     mRole = Role::Host;
+    mEndpoint = fmt::format("port {}", port);
+    mLastEndMessage.clear();
     mRateWindowStart = std::chrono::steady_clock::now();
     mRateWindowStartTick = mSimTick;
     Log.info("Session started as HOST (protocol v{})", kProtocolVersion);
+    notify("Hosting a co-op session", fmt::format("Waiting for players on UDP port {}.", port));
     return true;
 }
 
@@ -184,11 +295,18 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
 
     auto transport = std::make_unique<EnetTransport>();
     if (!transport->connect(address, port)) {
+        notify("Couldn't join", fmt::format("'{}' is not an address Dusklight can reach.", address),
+            8);
         return false;
     }
 
     mTransport = std::move(transport);
     mRole = Role::Client;
+    mJoined = false;
+    mJoinStarted = std::chrono::steady_clock::now();
+    mEndpoint = fmt::format("{}:{}", address, port);
+    mHostNickname.clear();
+    mLastEndMessage.clear();
     mRateWindowStart = std::chrono::steady_clock::now();
     mRateWindowStartTick = mSimTick;
     // The host owns the save. Latch it here, at the moment we become a guest, rather than at the
@@ -200,16 +318,33 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
     return true;
 }
 
-void NetworkManager::shutdown() {
+NetworkManager::~NetworkManager() {
+    // Process exit. Hang up so everyone else sees "left" at once instead of a frozen puppet until
+    // the timeout; nothing else, because the game this would otherwise tidy up is already gone.
     if (mTransport) {
-        mTransport->disconnect_all();
+        mTransport->disconnect_all(static_cast<std::uint32_t>(DisconnectReason::Left));
         mTransport.reset();
     }
+}
+
+void NetworkManager::shutdown() {
+    if (mTransport) {
+        mTransport->disconnect_all(static_cast<std::uint32_t>(DisconnectReason::Left));
+        mTransport.reset();
+    }
+    // Every puppet goes, and the clock stops being anyone else's: with the role back to Inactive,
+    // WorldClock::should_advance and reconcile hand control straight back to vanilla. The save
+    // flag is deliberately NOT touched — see save_guard.hpp for why leaving does not undo joining.
     replication_manager().clear();
     world_clock().clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
     mRole = Role::Inactive;
+    mJoined = false;
+    mHostNickname.clear();
+    mLocalPlayerId = 0;
+    mNextPlayerId = 1;
+    mLeaveRequested = false;
     trace::close();
     Log.info("Session ended");
 }
@@ -220,12 +355,44 @@ void NetworkManager::pre_actor_tick() {
         return;
     }
 
+    if (test_leave_tick() != 0 && mSimTick == test_leave_tick()) {
+        Log.info("DUSK_MP_TEST_LEAVE_AT_TICK: leaving at tick {}", mSimTick);
+        leave_session();
+    }
+
+    if (mLeaveRequested) {
+        const bool wasClient = mRole == Role::Client;
+        const bool wasJoined = mJoined;
+        shutdown();
+        if (wasClient) {
+            mLastEndMessage = "You left the session.";
+            notify("Left the co-op session", "You are playing on your own now.");
+            if (wasJoined) {
+                notify_save_disabled_after_host_left();
+            }
+        } else {
+            mLastEndMessage = "You ended the session.";
+            notify("Co-op session ended", "Everyone who was connected has been told.");
+        }
+        return;
+    }
+
     ++mSimTick;
 
     mEventScratch.clear();
     mTransport->poll(mEventScratch);
     for (const TransportEvent& event : mEventScratch) {
         handle_event(event);
+        if (!mTransport) {
+            // That event ended the session (the host went away). The rest of the batch belongs to
+            // a connection that no longer exists.
+            return;
+        }
+    }
+
+    check_handshake_deadlines();
+    if (!mTransport) {
+        return;
     }
 
     // Apply inbound state BEFORE actors run, so this tick's actors see fresh remote positions.
@@ -261,6 +428,8 @@ void NetworkManager::handle_event(const TransportEvent& event) {
     case TransportEventType::Connected: {
         PeerSession session;
         session.id = event.peer;
+        session.connectedAt = std::chrono::steady_clock::now();
+        session.lastHeard = session.connectedAt;
         mPeers[event.peer] = session;
         Log.info("Peer {} connected ({} total)", event.peer, mPeers.size());
         // The client speaks first so the host can vet its protocol version.
@@ -269,45 +438,195 @@ void NetworkManager::handle_event(const TransportEvent& event) {
         }
         break;
     }
-    case TransportEventType::Disconnected: {
-        const auto it = mPeers.find(event.peer);
-        if (it != mPeers.end()) {
-            const std::uint32_t playerId = it->second.playerId;
-            mPeers.erase(it);
-            if (mRole == Role::Host && playerId != 0) {
-                // Despawn locally and tell the remaining clients, otherwise a puppet stands frozen
-                // in the world forever — one of the ways tpmp sessions visibly rot.
-                replication_manager().remove_player(playerId);
-                // ★ And drop their vote on the world clock. Under the AllPlayers rule, someone who
-                // quits while standing in a dungeon would otherwise stop the sun for everyone left,
-                // permanently, with no way to see why.
-                world_clock().forget_peer(playerId);
-                broadcast_peer_left(playerId);
-            } else if (mRole == Role::Client) {
-                // Lost the host: every puppet's authority is gone, so clear the whole world view.
-                replication_manager().clear();
-                // ★ And say out loud that saving is still off. This is the one moment the rule
-                // becomes surprising: up to here "I can't save" reads as part of being in someone
-                // else's game, and the instant that game ends a player reasonably assumes their own
-                // came back. It did not — the world in memory is still the host's (save_guard.hpp),
-                // and the flag is sticky for exactly that reason. Told once, at the moment it stops
-                // being obvious, rather than at join when it already is.
-                notify_save_disabled_after_host_left();
-            }
-        }
-        Log.info("Peer {} disconnected", event.peer);
+    case TransportEventType::Disconnected:
+        handle_disconnect(event.peer, event.reason);
         break;
-    }
     case TransportEventType::Data:
+        if (auto it = mPeers.find(event.peer); it != mPeers.end()) {
+            it->second.lastHeard = std::chrono::steady_clock::now();
+        }
         handle_packet(event.peer, event.data.data(), event.data.size());
         break;
     }
 }
 
+void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
+    // "Silent for" is the time-to-detection: for a clean leave it is about one tick, for a peer
+    // that vanished it is how long the transport took to give up on it.
+    const auto known = mPeers.find(peer);
+    Log.info("Peer {} disconnected ({}), silent for {} ms", peer, reason_text(reason),
+        known != mPeers.end() ? ms_since(known->second.lastHeard) : 0);
+
+    if (mRole == Role::Client) {
+        // A client has exactly one connection, so whatever this was, the session is over. Say why
+        // in terms of what the player was doing: a join that never landed reads differently from
+        // a game that was going and stopped.
+        const std::string host = mHostNickname.empty() ? mEndpoint : mHostNickname;
+        switch (static_cast<DisconnectReason>(reason)) {
+        case DisconnectReason::Left:
+            end_client_session("Co-op session ended", fmt::format("{} ended the session.", host));
+            break;
+        case DisconnectReason::VersionMismatch:
+            end_client_session("Couldn't join",
+                "The host is running a different version of Dusklight. Both players need the "
+                "same build.");
+            break;
+        case DisconnectReason::SessionFull:
+            end_client_session("Couldn't join", "The session is full.");
+            break;
+        case DisconnectReason::HandshakeTimeout:
+            end_client_session("Couldn't join", "The host stopped waiting for us to introduce "
+                                                "ourselves. Try joining again.");
+            break;
+        case DisconnectReason::ConnectionLost:
+        default:
+            if (mJoined) {
+                end_client_session(
+                    "Lost connection to the host", fmt::format("{} stopped responding.", host));
+            } else {
+                end_client_session("Couldn't join",
+                    fmt::format("No answer from {}. Check the address and that the host is "
+                                "running, and that UDP is not blocked by a firewall.",
+                        mEndpoint));
+            }
+            break;
+        }
+        return;
+    }
+
+    const auto it = mPeers.find(peer);
+    if (it == mPeers.end()) {
+        return;
+    }
+    const PeerSession session = it->second;
+    mPeers.erase(it);
+
+    if (mRole != Role::Host || !session.handshakeComplete) {
+        // Never admitted, so no puppet, no roster entry and nothing anyone else was told about.
+        return;
+    }
+
+    // Despawn locally and tell the remaining clients, otherwise a puppet stands frozen in the world
+    // forever — one of the ways tpmp sessions visibly rot.
+    replication_manager().remove_player(session.playerId);
+    // ★ And drop their vote on the world clock. Under the AllPlayers rule, someone who quits while
+    // standing in a dungeon would otherwise stop the sun for everyone left, permanently, with no
+    // way to see why.
+    world_clock().forget_peer(session.playerId);
+    broadcast_peer_left(session.playerId);
+
+    if (reason == static_cast<std::uint32_t>(DisconnectReason::Left)) {
+        notify(fmt::format("{} left", session.nickname), "They left the session.", 4);
+    } else {
+        notify(fmt::format("{} lost connection", session.nickname),
+            "They stopped responding and were removed from the session.", 5);
+    }
+}
+
+void NetworkManager::end_client_session(const std::string& title, const std::string& message) {
+    const bool wasJoined = mJoined;
+    // Everything a host drove goes with it — puppets, and the world clock, which reverts to this
+    // machine's own the moment the role is Inactive. See shutdown().
+    shutdown();
+    mLastEndMessage = message;
+    notify(title, message, 8);
+    // ★ And say out loud that saving is still off. This is the one moment the rule becomes
+    // surprising: up to here "I can't save" reads as part of being in someone else's game, and the
+    // instant that game ends a player reasonably assumes their own came back. It did not — the
+    // world in memory is still the host's (save_guard.hpp), and the flag is sticky for exactly that
+    // reason. Only after a session that actually got going: a join that never connected has nothing
+    // of the host's in memory to warn about, though the flag stays latched regardless.
+    if (wasJoined) {
+        notify_save_disabled_after_host_left();
+    }
+}
+
+void NetworkManager::refuse_peer(PeerSession& session, DisconnectReason reason) {
+    session.refused = true;
+    Log.warn("Refusing peer {}: {}", session.id, reason_text(static_cast<std::uint32_t>(reason)));
+    // After queued packets, so the HelloAck that says no is delivered before the line drops. The
+    // reason travels in the hang-up itself, which even a client whose protocol we cannot parse can
+    // read.
+    mTransport->disconnect(session.id, static_cast<std::uint32_t>(reason), true);
+}
+
+void NetworkManager::check_handshake_deadlines() {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (mRole == Role::Client) {
+        if (!mJoined && now - mJoinStarted > kJoinTimeout) {
+            Log.warn("No HelloAck from {} after {} s; giving up", mEndpoint, kJoinTimeout.count());
+            end_client_session("Couldn't join",
+                fmt::format("No answer from {}. Check the address and that the host is running, "
+                            "and that UDP is not blocked by a firewall.",
+                    mEndpoint));
+        }
+        return;
+    }
+
+    for (auto& [id, session] : mPeers) {
+        if (!session.handshakeComplete && !session.refused &&
+            now - session.connectedAt > kHelloTimeout)
+        {
+            refuse_peer(session, DisconnectReason::HandshakeTimeout);
+        }
+    }
+}
+
+std::string NetworkManager::player_name(std::uint32_t playerId) const {
+    const auto& players = replication_manager().players();
+    if (const auto it = players.find(playerId); it != players.end() && !it->second.nickname.empty())
+    {
+        return it->second.nickname;
+    }
+    return fmt::format("Player {}", playerId);
+}
+
+SessionStatus NetworkManager::status() const {
+    SessionStatus out;
+    out.role = mRole;
+    out.connected = mRole == Role::Host || (mRole == Role::Client && mJoined);
+    out.endpoint = mEndpoint;
+    out.localNickname = mLocalNickname;
+    out.localColor = mLocalColor;
+    out.localPlayerId = mLocalPlayerId;
+    out.lastEndMessage = mLastEndMessage;
+
+    // Direct connections first: on a client that is just the host.
+    for (const auto& [id, session] : mPeers) {
+        PlayerStatus p;
+        p.playerId = session.playerId;
+        p.nickname = session.nickname.empty() ? "(connecting)" : session.nickname;
+        p.color = session.color;
+        p.direct = true;
+        p.handshakeComplete = session.handshakeComplete;
+        p.rttMs = mTransport ? mTransport->rtt_ms(id) : 0;
+        p.silentMs = ms_since(session.lastHeard);
+        out.players.push_back(std::move(p));
+    }
+
+    // A client reaches everyone else through the host. The roster it was given is the replication
+    // view, so read it from there rather than keeping a second copy that could disagree.
+    if (mRole == Role::Client) {
+        for (const auto& [playerId, player] : replication_manager().players()) {
+            if (playerId == kHostPlayerId || playerId == mLocalPlayerId) {
+                continue;
+            }
+            PlayerStatus p;
+            p.playerId = playerId;
+            p.nickname = player.nickname;
+            p.color = player.color;
+            p.handshakeComplete = true;
+            out.players.push_back(std::move(p));
+        }
+    }
+    return out;
+}
+
 void NetworkManager::send_hello(PeerId peer) {
     Writer w;
     w.write_u8(static_cast<std::uint8_t>(PacketId::Hello));
-    w.write_u32(kProtocolVersion);
+    w.write_u32(advertised_protocol_version());
     w.write_string(mLocalNickname);
     w.write_u8(mColorExplicit ? 1 : 0);
     w.write_u32(mLocalColor);
@@ -321,8 +640,40 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         return;
     }
 
-    switch (static_cast<PacketId>(rawId)) {
+    const PacketId id = static_cast<PacketId>(rawId);
+    const auto sender = mPeers.find(peer);
+    if (sender == mPeers.end()) {
+        return;
+    }
+
+    // ★ Who may say what. Every packet below changes someone's world, so it has to come from the
+    // side that is allowed to change it: roster and snapshot updates only ever flow down from the
+    // host, poses and Hellos only ever up to it. Without this a client could send the host a
+    // PeerLeft and make it despawn a third player. And a host acts on nothing from a peer it has
+    // not admitted (or has refused) beyond the Hello itself — a heartbeat is harmless either way.
+    const bool hostBound =
+        id == PacketId::Hello || id == PacketId::PlayerStateUpdate || id == PacketId::TimeOverride;
+    const bool clientBound = id == PacketId::HelloAck || id == PacketId::WorldSnapshot ||
+                             id == PacketId::PeerList || id == PacketId::PeerJoined ||
+                             id == PacketId::PeerLeft;
+    if ((hostBound && mRole != Role::Host) || (clientBound && mRole != Role::Client)) {
+        Log.warn("Ignoring packet {} from peer {}: wrong direction for this role", rawId, peer);
+        return;
+    }
+    if (mRole == Role::Host && id != PacketId::Hello && id != PacketId::Heartbeat &&
+        id != PacketId::HeartbeatAck &&
+        (!sender->second.handshakeComplete || sender->second.refused))
+    {
+        return;
+    }
+
+    switch (id) {
     case PacketId::Hello: {
+        if (sender->second.handshakeComplete || sender->second.refused) {
+            // Already decided. A second Hello must not mint a second player id and puppet.
+            Log.warn("Ignoring repeated Hello from peer {}", peer);
+            return;
+        }
         std::uint32_t version = 0;
         std::string nickname;
         std::uint8_t colorExplicit = 0;
@@ -334,15 +685,23 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             return;
         }
 
-        const bool accepted = version == kProtocolVersion;
-        if (!accepted) {
+        std::size_t admitted = 0;
+        for (const auto& entry : mPeers) {
+            if (entry.second.handshakeComplete) {
+                ++admitted;
+            }
+        }
+        const bool versionOk = version == kProtocolVersion;
+        // The host is one of the kMaxPlayers.
+        const bool roomOk = admitted + 1 < max_players();
+        const bool accepted = versionOk && roomOk;
+        if (!versionOk) {
             Log.warn("Rejecting peer {}: protocol v{} != our v{}", peer, version, kProtocolVersion);
+        } else if (!roomOk) {
+            Log.warn("Rejecting peer {}: session full ({} players)", peer, max_players());
         }
 
-        const auto peerIt = mPeers.find(peer);
-        if (peerIt == mPeers.end()) {
-            return;
-        }
+        const auto peerIt = sender;
 
         // World identity comes from our own counter, never from the transport's peer id — see
         // PeerSession::playerId for why reusing ENet's id space would collide with the host.
@@ -364,22 +723,29 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         w.write_u32(mLocalColor);
         mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
 
-        if (accepted) {
-            peerIt->second.playerId = playerId;
-            peerIt->second.nickname = nickname;
-            peerIt->second.color = assignedColor;
-            peerIt->second.handshakeComplete = true;
-
-            // Order matters: the newcomer must learn the existing roster before anyone is told
-            // about the newcomer, so no client can receive a PeerJoined for a session it has an
-            // incomplete view of.
-            send_peer_list(peer);
-            broadcast_peer_joined(peerIt->second);
-
-            replication_manager().add_player(playerId, nickname, assignedColor);
-            Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
-                assignedColor);
+        if (!accepted) {
+            // Hang up, not just say no. A refused peer left connected holds a player slot and keeps
+            // a puppet-less ghost in the transport until it gives up on its own.
+            refuse_peer(peerIt->second,
+                versionOk ? DisconnectReason::SessionFull : DisconnectReason::VersionMismatch);
+            break;
         }
+
+        peerIt->second.playerId = playerId;
+        peerIt->second.nickname = nickname;
+        peerIt->second.color = assignedColor;
+        peerIt->second.handshakeComplete = true;
+
+        // Order matters: the newcomer must learn the existing roster before anyone is told about
+        // the newcomer, so no client can receive a PeerJoined for a session it has an incomplete
+        // view of.
+        send_peer_list(peer);
+        broadcast_peer_joined(peerIt->second);
+
+        replication_manager().add_player(playerId, nickname, assignedColor);
+        Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
+            assignedColor);
+        notify(fmt::format("{} joined", nickname), "They are now in your world.", 4);
         break;
     }
     case PacketId::HelloAck: {
@@ -398,7 +764,23 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
 
         if (accepted == 0) {
-            Log.error("Host rejected us (host protocol v{}, ours v{})", version, kProtocolVersion);
+            Log.error("Host rejected us (host protocol v{}, ours v{})", version,
+                advertised_protocol_version());
+            // Leave now rather than wait for the host's hang-up: a pre-v11 host never sends one,
+            // and would leave us connected to nothing until the transport gave up. The host
+            // states its own version, so a matching one means the refusal was for room.
+            if (version != advertised_protocol_version()) {
+                end_client_session("Couldn't join",
+                    fmt::format("The host is running a different version of Dusklight (protocol "
+                                "v{}, you have v{}). Both players need the same build.",
+                        version, advertised_protocol_version()));
+            } else {
+                end_client_session("Couldn't join", "The session is full.");
+            }
+            return;
+        }
+        if (mJoined) {
+            Log.warn("Ignoring repeated HelloAck from peer {}", peer);
             return;
         }
 
@@ -417,8 +799,12 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // The host is a player too, and it is the one player never announced by PeerJoined.
         replication_manager().add_player(kHostPlayerId, hostNickname, hostColor);
 
+        mJoined = true;
+        mHostNickname = hostNickname;
         Log.info("Handshake complete — we are player {} ('{}', #{:06X}), host is '{}' (#{:06X})",
             assignedId, mLocalNickname, mLocalColor, hostNickname, hostColor);
+        notify(fmt::format("Joined {}'s session", hostNickname),
+            "You are playing in their world. Their save is the one that counts.", 6);
         break;
     }
     case PacketId::Heartbeat: {
@@ -447,10 +833,12 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             return;
         }
 
+        // Left in the map on purpose: the heartbeat was broadcast, so every peer answers this same
+        // sequence, and erasing on the first reply silently denied everyone else an RTT. Expired
+        // in send_heartbeats() instead.
         const auto elapsed = std::chrono::steady_clock::now() - it->second;
         const auto rttMs =
             std::chrono::duration_cast<std::chrono::duration<double, std::milli> >(elapsed).count();
-        mPendingHeartbeats.erase(it);
 
         if (auto peerIt = mPeers.find(peer); peerIt != mPeers.end()) {
             peerIt->second.lastRttMs = static_cast<std::uint32_t>(rttMs);
@@ -580,6 +968,7 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
         replication_manager().add_player(playerId, nickname, color);
         Log.info("Player {} ('{}', #{:06X}) joined", playerId, nickname, color);
+        notify(fmt::format("{} joined", nickname), "Another player is in the session.", 4);
         break;
     }
     case PacketId::PeerLeft: {
@@ -587,8 +976,18 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         if (!r.read_u32(playerId) || !r.ok()) {
             return;
         }
+        if (playerId == mLocalPlayerId || playerId == kHostPlayerId) {
+            // Neither is a third player. Losing the host is a transport event, not a roster one.
+            return;
+        }
+        // Named before removal; the roster is the only place the name lives on a client.
+        const std::string name = player_name(playerId);
+        const bool known = replication_manager().players().count(playerId) != 0;
         replication_manager().remove_player(playerId);
         Log.info("Player {} left", playerId);
+        if (known) {
+            notify(fmt::format("{} left", name), "They are no longer in the session.", 4);
+        }
         break;
     }
     default:
@@ -793,8 +1192,9 @@ void NetworkManager::send_heartbeats() {
     mTransport->broadcast(w.data().data(), w.size(), kChannelControl, true);
 
     // Don't let unanswered heartbeats accumulate if a peer goes quiet.
-    if (mPendingHeartbeats.size() > 64) {
-        mPendingHeartbeats.clear();
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = mPendingHeartbeats.begin(); it != mPendingHeartbeats.end();) {
+        it = now - it->second > kHeartbeatExpiry ? mPendingHeartbeats.erase(it) : std::next(it);
     }
 }
 

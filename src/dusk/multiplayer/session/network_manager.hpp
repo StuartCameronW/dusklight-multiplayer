@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../net/packet.hpp"
 #include "../net/transport.hpp"
 #include "../replication/player_state.hpp"
 #include "dusk/multiplayer.hpp"
@@ -30,7 +31,46 @@ struct PeerSession {
     /// 0xRRGGBB tint used to tell players apart, borrowed from tpmp's name+colour idea (08).
     std::uint32_t color = 0xFFFFFF;
     bool handshakeComplete = false;
+    /// Host: we have refused this peer and are waiting for the hang-up to land. Nothing it sends
+    /// is acted on from here, and it is never refused twice.
+    bool refused = false;
     std::uint32_t lastRttMs = 0;
+    /// When the transport connected, so a peer that never says Hello can be timed out.
+    std::chrono::steady_clock::time_point connectedAt{};
+    /// Last time ANY packet arrived from this peer. Surfaced in the status so a stalling player
+    /// reads as "not responding" seconds before the transport gives up on them.
+    std::chrono::steady_clock::time_point lastHeard{};
+};
+
+/// One player as the UI should show it. Built fresh by NetworkManager::status(); holds no state.
+struct PlayerStatus {
+    std::uint32_t playerId = 0;
+    std::string nickname;
+    std::uint32_t color = 0xFFFFFF;
+    /// True for a peer this machine has its own connection to: every client, on the host; the host,
+    /// on a client. Other clients are reached through the host, so a client has no RTT for them.
+    bool direct = false;
+    bool handshakeComplete = false;
+    /// ENet's smoothed round-trip time. 0 when not direct or not yet measured.
+    std::uint32_t rttMs = 0;
+    /// Milliseconds since anything arrived from this peer. Only meaningful when direct.
+    std::uint32_t silentMs = 0;
+};
+
+/// A read-only picture of the session for UI. Cheap to build; call it per frame if need be.
+struct SessionStatus {
+    Role role = Role::Inactive;
+    /// Client: the handshake with the host completed. Host: always true while hosting.
+    bool connected = false;
+    /// Client: "address:port" we joined. Host: the UDP port we listen on, as text.
+    std::string endpoint;
+    std::string localNickname;
+    std::uint32_t localColor = 0xFFFFFF;
+    std::uint32_t localPlayerId = 0;
+    /// Everyone else, host first on a client.
+    std::vector<PlayerStatus> players;
+    /// Why the last session ended, in words meant for the player. Empty if none has.
+    std::string lastEndMessage;
 };
 
 /**
@@ -51,7 +91,21 @@ public:
     /// with the command line winning. Idempotent; called lazily from the first tick.
     void ensure_initialized();
 
+    /// The session object outlives the game loop, and its destructor is what hangs up cleanly at
+    /// process exit. It deliberately touches nothing but the transport: by then the actors, heaps
+    /// and the other singletons may already be gone.
+    ~NetworkManager();
+
+    /// End the session immediately: hang up on everyone, despawn every puppet, release the world
+    /// clock. Must run on the game thread outside the actor pass. Save stays disabled on a guest
+    /// regardless (save_guard.hpp) — nothing here touches that flag.
     void shutdown();
+
+    /// Leave (client) or end (host) the session, from UI. Deferred to the next pre_actor_tick, so
+    /// a button press can never destroy puppet actors in the middle of a frame.
+    void leave_session() { mLeaveRequested = is_active(); }
+
+    SessionStatus status() const;
 
     bool host(std::uint16_t port);
     bool join(const std::string& address, std::uint16_t port);
@@ -72,6 +126,20 @@ public:
 
 private:
     void handle_event(const TransportEvent& event);
+    void handle_disconnect(PeerId peer, std::uint32_t reason);
+
+    /// Client: the session is over, whatever ended it. Tears down to a clean single-player state
+    /// and tells the player @p title / @p message, which is also kept for the status page.
+    void end_client_session(const std::string& title, const std::string& message);
+
+    /// Host: refuse a peer. Explains with @p reason in the hang-up, after anything already queued
+    /// to it (a HelloAck saying no) has gone out.
+    void refuse_peer(PeerSession& session, DisconnectReason reason);
+
+    /// Time out connections that are not getting anywhere: a client still waiting on its host, a
+    /// host holding a peer that never introduced itself.
+    void check_handshake_deadlines();
+    std::string player_name(std::uint32_t playerId) const;
     void handle_packet(PeerId peer, const std::uint8_t* data, std::size_t size);
     void send_hello(PeerId peer);
     void send_heartbeats();
@@ -111,6 +179,14 @@ private:
     Role mRole = Role::Inactive;
     bool mInitialized = false;
     StartupRequest mStartup;
+    bool mLeaveRequested = false;
+
+    /// Client: when join() started, and whether the host has accepted us yet.
+    std::chrono::steady_clock::time_point mJoinStarted{};
+    bool mJoined = false;
+    std::string mEndpoint;
+    std::string mHostNickname;
+    std::string mLastEndMessage;
 
     std::string mLocalNickname;
     std::uint32_t mLocalColor = 0xFFFFFF;

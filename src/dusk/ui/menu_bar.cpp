@@ -10,8 +10,11 @@
 #include "dusk/speedrun.h"
 #include "dusk/livesplit.h"
 #include "dusk/main.h"
+#include "dusk/multiplayer/session/network_manager.hpp"
 #include "dusk/settings.h"
 #include "editor.hpp"
+#include "fmt/format.h"
+#include "pane.hpp"
 #include "f_pc/f_pc_manager.h"
 #include "f_pc/f_pc_name.h"
 #include "imgui.h"
@@ -39,7 +42,162 @@ const Rml::String kDocumentSource = R"RML(
 </rml>
 )RML";
 
-}
+/**
+ * The co-op session at a glance, and the way out of it.
+ *
+ * Always in the menu, because the tab bar is built once at startup and a session can open later.
+ * Outside a session it says so, and why the last one ended, which is the question a player who
+ * just got dropped is actually asking.
+ *
+ * Rebuilt only when the SHAPE of the session changes (someone joins or leaves, the handshake
+ * lands); RTT and "not responding" are rewritten in place every frame, so the page stays live
+ * without the Leave button losing focus under the player's thumb once a second.
+ */
+class MultiplayerWindow : public Window {
+public:
+    MultiplayerWindow() {
+        add_tab("Session", [this](Rml::Element* content) { build(content); });
+    }
+
+    void update() override {
+        const mp::SessionStatus status = mp::network_manager().status();
+        const std::string key = shape_of(status);
+        if (key != mShape) {
+            mShape = key;
+            refresh_active_tab();
+        } else {
+            update_live(status);
+        }
+        Window::update();
+    }
+
+private:
+    static std::string shape_of(const mp::SessionStatus& s) {
+        std::string key = fmt::format("{}|{}|{}|{}|{}", static_cast<int>(s.role), s.connected,
+            s.localPlayerId, s.endpoint, s.lastEndMessage);
+        for (const auto& p : s.players) {
+            key +=
+                fmt::format("|{}:{}:{}:{}", p.playerId, p.handshakeComplete, p.color, p.nickname);
+        }
+        return key;
+    }
+
+    static std::string colored(const std::string& text, std::uint32_t rgb) {
+        return fmt::format(
+            R"(<span style="color: #{:06X};">{}</span>)", rgb & 0xFFFFFFu, escape(text));
+    }
+
+    static std::string live_text(const mp::PlayerStatus& p) {
+        if (!p.direct) {
+            return "via the host";
+        }
+        // Well before the transport's own 8-12 s give-up: a player who has gone quiet for a couple
+        // of seconds is worth flagging, and is usually a hitch rather than a departure.
+        if (p.silentMs >= 2000) {
+            return fmt::format("not responding ({} s)", p.silentMs / 1000);
+        }
+        if (!p.handshakeComplete) {
+            return "connecting…";
+        }
+        return p.rttMs != 0 ? fmt::format("{} ms", p.rttMs) : "measuring…";
+    }
+
+    void update_live(const mp::SessionStatus& status) {
+        for (std::size_t i = 0; i < mLive.size() && i < status.players.size(); ++i) {
+            const std::string text = escape(live_text(status.players[i]));
+            if (mLive[i]->GetInnerRML() != text) {
+                mLive[i]->SetInnerRML(text);
+            }
+        }
+    }
+
+    void build(Rml::Element* content) {
+        mLive.clear();
+        const mp::SessionStatus s = mp::network_manager().status();
+        auto& pane = add_child<Pane>(content, Pane::Type::Uncontrolled);
+
+        if (s.role == mp::Role::Inactive) {
+            pane.add_section("Co-op");
+            pane.add_text("Not in a co-op session.");
+            if (!s.lastEndMessage.empty()) {
+                pane.add_text(s.lastEndMessage);
+            }
+            pane.finalize();
+            return;
+        }
+
+        pane.add_section("This game");
+        if (s.role == mp::Role::Host) {
+            pane.add_text(fmt::format("Hosting on UDP {}", s.endpoint));
+        } else if (s.connected) {
+            pane.add_text(fmt::format("Connected to {}", s.endpoint));
+        } else {
+            pane.add_text(fmt::format("Connecting to {}…", s.endpoint));
+        }
+        pane.add_rml(fmt::format(
+            "You: {} (player {})", colored(s.localNickname, s.localColor), s.localPlayerId));
+
+        pane.add_section(fmt::format("Other players ({})", s.players.size()));
+        if (s.players.empty()) {
+            pane.add_text(s.role == mp::Role::Host ? "Nobody has joined yet." : "Nobody else.");
+        }
+        for (const auto& p : s.players) {
+            const char* tag =
+                p.playerId == mp::kHostPlayerId && s.role == mp::Role::Client ? " — host" : "";
+            const std::string id =
+                p.handshakeComplete ? fmt::format(" (player {})", p.playerId) : "";
+            auto* row = pane.add_rml(fmt::format(
+                "{}{}{} · <span class=\"mp-live\"></span>", colored(p.nickname, p.color), tag, id));
+            Rml::ElementList found;
+            row->GetElementsByClassName(found, "mp-live");
+            Rml::Element* live = found.empty() ? row : found.front();
+            live->SetInnerRML(escape(live_text(p)));
+            mLive.push_back(live);
+        }
+
+        pane.add_section("Actions");
+        const bool isHost = s.role == mp::Role::Host;
+        const Rml::String label = isHost ? "End session for everyone" : "Leave session";
+        auto& leave = pane.add_button(label);
+        auto* leavePtr = &leave;
+        auto confirming = std::make_shared<bool>(false);
+        leave.on_nav_command([leavePtr, confirming, label](Rml::Event&, NavCommand cmd) {
+            if (cmd == NavCommand::Confirm) {
+                if (*confirming) {
+                    mDoAud_seStartMenu(kSoundClick);
+                    *confirming = false;
+                    // Deferred to the next sim tick inside the session; see leave_session().
+                    mp::network_manager().leave_session();
+                } else {
+                    *confirming = true;
+                    leavePtr->set_text("Are you sure?");
+                }
+                return true;
+            }
+            if (cmd == NavCommand::Cancel && *confirming) {
+                *confirming = false;
+                leavePtr->set_text(label);
+                return true;
+            }
+            return false;
+        });
+        leave.listen(Rml::EventId::Blur, [leavePtr, confirming, label](Rml::Event&) {
+            *confirming = false;
+            leavePtr->set_text(label);
+        });
+        if (!isHost) {
+            pane.add_text("Saving stays off after you leave, until Dusklight is restarted: the "
+                          "world in memory is still the host's.");
+        }
+        pane.finalize();
+    }
+
+    std::string mShape;
+    /// One live-text element per entry of status().players, in the same order.
+    std::vector<Rml::Element*> mLive;
+};
+
+}  // namespace
 
 MenuBar::MenuBar() : Document(kDocumentSource), mRoot(mDocument->GetElementById("popup")) {
     mTabBar = std::make_unique<TabBar>(mRoot, TabBar::Props{
@@ -58,6 +216,7 @@ MenuBar::MenuBar() : Document(kDocumentSource), mRoot(mDocument->GetElementById(
     }
 
     mTabBar->add_tab("Achievements", [this] { push(std::make_unique<AchievementsWindow>()); });
+    mTabBar->add_tab("Multiplayer", [this] { push(std::make_unique<MultiplayerWindow>()); });
 
 
     mTabBar->add_tab("Reset", [this] {
