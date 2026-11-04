@@ -78,6 +78,10 @@ namespace dusk::mp {
  * fine and simply never show a guard. Bumped so the mismatch is refused instead of silent.
  * 14: PlayerState grew six head-turn / torso-lean bytes after `atnKind` (23 -> 29): neckX, neckY,
  * bodyX, bodyTwist, bodyZ, bankZ, each an s8 of (angle / 128).
+ * In the same version, block (2): 18 bytes of action-animation override after those six
+ * (actUnder, actUpper, actFrame, actUpperFrame, actRate, actMorf, actHandL, actHandR,
+ * actRootX/Y/Z), so the puppet plays the sender's own BCK during swings, rolls and jumps. 23 -> 47
+ * bytes in all.
  */
 inline constexpr std::uint32_t kProtocolVersion = 14;
 

@@ -27,7 +27,8 @@ long long elapsed_ms() {
 
 void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     const PlayerState& state, double delayTicks, std::uint32_t starvations, std::uint32_t snaps,
-    std::size_t buffered, unsigned anm = 0, const DrawnJointAim& drawn = DrawnJointAim{}) {
+    std::size_t buffered, unsigned anm = 0, const DrawnJointAim& drawn = DrawnJointAim{},
+    float rootWX = 0.0f, float rootWY = 0.0f, float rootWZ = 0.0f) {
     sFile << tick << ',' << elapsed_ms() << ',' << sRole << ',' << kind << ',' << playerId << ','
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
           << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
@@ -37,7 +38,15 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << ',' << state.bodyX << ',' << state.bodyTwist << ',' << state.bodyZ << ','
           << state.bankZ << ',' << drawn.headYawRel << ',' << drawn.headPitch << ','
           << drawn.torsoYawRel << ',' << drawn.armFires[0] << ',' << drawn.armFires[1] << ','
-          << drawn.armFires[2] << ',' << drawn.clamps << '\n';
+          << drawn.armFires[2] << ',' << drawn.clamps;
+    // block (2): action anim — decoded to frames / units so the CSV reads directly. On a `local`
+    // row this is what Link draws; on an `actor` row, what the puppet draws.
+    sFile << ',' << state.actUnder << ',' << state.actUpper << ',' << state.act_frame() << ','
+          << state.act_upper_frame() << ',' << state.act_rate() << ','
+          << static_cast<unsigned>(state.actMorf) << ',' << static_cast<unsigned>(state.actHandL)
+          << ',' << static_cast<unsigned>(state.actHandR) << ',' << state.act_root_x() << ','
+          << state.act_root_y() << ',' << state.act_root_z() << ',' << rootWX << ',' << rootWY
+          << ',' << rootWZ << '\n';
 }
 
 }  // namespace
@@ -57,7 +66,10 @@ void open(const std::string& path, const char* role) {
     // rather than quietly refilled. An analyzer written against the old name fails loudly.
     sFile << "tick,ms,role,kind,playerId,x,y,z,angleY,moveRate,delayTicks,starvations,snaps,"
              "buffered,anm,flags,equip,idleKind,atnKind,neckX,neckY,bodyX,bodyTwist,bodyZ,bankZ,"
-             "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps\n";
+             "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
+             // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
+             "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
+             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
@@ -82,7 +94,11 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
         // drawn-vs-drawn comparison (.claude/mp_head_compare.py).
         DrawnJointAim drawn;
         read_local_joint_aim(drawn);
-        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm, drawn);
+        float rx = 0.0f;
+        float ry = 0.0f;
+        float rz = 0.0f;
+        read_local_root(rx, ry, rz);
+        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm, drawn, rx, ry, rz);
     } else {
         // Written rather than skipped: a missing row is ambiguous between "loading" and "the trace
         // stopped", and the first probe run cost real time to that ambiguity.
@@ -101,7 +117,11 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
             read_puppet_anim(player.playerId, anm);
             DrawnJointAim drawn;
             read_puppet_joint_aim(player.playerId, drawn);
-            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm, drawn);
+            float rx = 0.0f;
+            float ry = 0.0f;
+            float rz = 0.0f;
+            read_puppet_root(player.playerId, rx, ry, rz);
+            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm, drawn, rx, ry, rz);
         }
     }
 

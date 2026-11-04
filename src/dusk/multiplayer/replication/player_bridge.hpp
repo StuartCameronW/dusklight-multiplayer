@@ -90,6 +90,13 @@ bool read_local_joint_aim(DrawnJointAim& out);
 /// A puppet's drawn head/torso. False when the puppet does not exist.
 bool read_puppet_joint_aim(std::uint32_t playerId, DrawnJointAim& out);
 
+/// World position of joint 0 (the root) as the LOCAL player's body was last calc'd, for
+/// --mp-trace's root-motion check (puppet-action-states.md §4.5). False when there is no playable
+/// Link.
+bool read_local_root(float& x, float& y, float& z);
+
+/// The same for a puppet: joint 0 as its own calc left it. False when it doesn't exist.
+bool read_puppet_root(std::uint32_t playerId, float& x, float& y, float& z);
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 
