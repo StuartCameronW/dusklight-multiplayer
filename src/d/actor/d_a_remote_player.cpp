@@ -883,6 +883,43 @@ void* own_archive_idx(dRes_info_c& i_res, s32 i_index) {
 }
 
 /**
+ * The sound-animation ("BAS") block a BCK carries after its animation data, or NULL.
+ *
+ * This is the block daAlink_c::setBasAnime reads out of his anm heap (d_a_alink.cpp:14012-14030):
+ * `buffer + mSeAnmOffset`, with 0xFFFFFFFF meaning "this BCK has no notes". The puppet keeps each
+ * BCK's whole load buffer resident for its own life, so the block is used IN PLACE — the buffer
+ * outlives every sound that can point into it, provided ~daRemotePlayer_c stops mSound before the
+ * solid heap goes (it does; see the destructor).
+ *
+ * Bounds-checked against what was actually read, because a truncated read is exactly the failure
+ * load_aram_anm exists to catch, and a BAS pointer past it would be read by the sound system long
+ * after anyone could tell why. Link asserts the block fits his 0x800 copy buffer; the puppet copies
+ * nothing, so an oversize block is worth a warning, not a refusal.
+ */
+const void* anm_bas_block(const u8* i_buffer, u32 i_read, u16 i_resIdx) {
+    const JUTDataFileHeader* header = reinterpret_cast<const JUTDataFileHeader*>(i_buffer);
+    const u32 offset = header->mSeAnmOffset;
+    if (offset == 0xFFFFFFFF) {
+        return NULL;
+    }
+
+    const u32 fileSize = header->mFileSize;
+    if (offset < sizeof(JUTDataFileHeader) || offset >= fileSize || fileSize > i_read) {
+        Log.warn("Animation {} names a sound block at {:#x} outside its {} bytes ({} read); "
+                 "ignoring it",
+            i_resIdx, offset, fileSize, i_read);
+        return NULL;
+    }
+
+    if (fileSize - offset >= 0x800) {
+        Log.warn("Animation {} has a {}-byte sound block; daAlink_c would assert on that "
+                 "(d_a_alink.cpp:14028)",
+            i_resIdx, fileSize - offset);
+    }
+    return i_buffer + offset;
+}
+
+/**
  * Load one animation out of the ARAM archive.
  *
  * Sizing the staging buffer is the whole job here, and getting it wrong is not loud. `data_size` is
@@ -902,8 +939,14 @@ void* own_archive_idx(dRes_info_c& i_res, s32 i_index) {
  * Returns the loader's own J3DAnmBase* so this can serve BCK, BTP and BTK alike; callers downcast.
  * `i_family` is that downcast written down and checked, so handing this the wrong resource index is
  * a log line rather than a wrong-vtable call several frames later.
+ *
+ * `o_bas`, when given, receives the BCK's sound-animation block (see anm_bas_block), or NULL.
  */
-J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family) {
+J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family, const void** o_bas = NULL) {
+    if (o_bas != NULL) {
+        *o_bas = NULL;
+    }
+
     JKRArchive* archive = dComIfGp_getAnmArchive();
     if (archive == NULL) {
         return NULL;
@@ -967,6 +1010,9 @@ J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family) {
 
         Log.info("Loaded animation {}: {} stored -> {} expanded, {}-byte buffer", i_resIdx,
             storedSize, read, size);
+        if (o_bas != NULL && i_family == ANM_FAMILY_TRANSFORM) {
+            *o_bas = anm_bas_block(buffer, read, i_resIdx);
+        }
         return anm;
     }
 
@@ -989,8 +1035,8 @@ J3DAnmBase* load_aram_anm(u16 i_resIdx, AnmFamily i_family) {
 bool load_gait_anm(daRemotePlayer_anm_c* o_anm, daAlink_c::daAlink_ANM i_anmID, u8 i_equip) {
     const daAlink_BckData& bck = anm_bck_data(i_anmID, i_equip);
 
-    o_anm->mpUnder =
-        static_cast<J3DAnmTransform*>(load_aram_anm(bck.m_underID, ANM_FAMILY_TRANSFORM));
+    o_anm->mpUnder = static_cast<J3DAnmTransform*>(
+        load_aram_anm(bck.m_underID, ANM_FAMILY_TRANSFORM, &o_anm->mpUnderBas));
     o_anm->mpUpper = NULL;
 
     if (o_anm->mpUnder == NULL) {
@@ -1047,6 +1093,8 @@ bool load_gait_anm_sword(daRemotePlayer_anm_c* o_anm, const daRemotePlayer_anm_c
     }
 
     o_anm->mpUnder = i_plain.mpUnder;
+    // The same resource, so the same notes: daAlink_c keys his BAS on the under heap's idx.
+    o_anm->mpUnderBas = i_plain.mpUnderBas;
     o_anm->mpUpper = NULL;
 
     if (sword.m_upperID != sword.m_underID) {
@@ -1473,6 +1521,9 @@ void daRemotePlayer_c::setAnm(const daRemotePlayer_anm_c& i_anm, u8 i_attr, f32 
     }
 
     mDoubleAnmSet = false;
+
+    // commonSingleAnime's setBasAnime(UNDER_0) (d_a_alink.cpp:7218).
+    setBasSource(i_anm, 0);
 }
 
 /**
@@ -1874,6 +1925,328 @@ int daRemotePlayer_c::mountOwnArchive() {
     return cPhs_COMPLEATE_e;
 }
 
+/* --- Sound (slice 1) ---------------------------------------------------------------------------
+ *
+ * The test hook first, then the actor's own sound functions. See .claude/future-plans/
+ * puppet-sound.md for the design and .claude/mp_se_compare.py for the measurement this feeds. */
+
+namespace {
+
+/* DUSK_MP_TEST_SE_LOG=1 logs every BCK-note sound start of the LOCAL Link and of every puppet
+ * through one hook (g_Z2SoundObjAnime_startHook, Z2SoundObject.cpp), so the two ends of a session
+ * can be compared: steps per second per gait band, the floor-material mix, and that a standing or
+ * not-yet-posed puppet starts nothing. Off, nothing here runs and the hook stays NULL. */
+const int l_seTraceMax = 8;
+const int l_seTraceBandNum = 4;
+const char* const l_seTraceBandName[l_seTraceBandNum] = {"still", "slow", "mid", "run"};
+/// How often, in puppet ticks, the cumulative per-band tick counts are logged. The analyser takes
+/// the last line, so this only bounds what a killed run can lose.
+const u32 l_seTraceSummaryTicks = 150;
+
+struct SeTraceEntry {
+    const Z2SoundObjAnime* mObj;
+    const daRemotePlayer_c* mPuppet;
+    u32 mTicks[l_seTraceBandNum];
+};
+
+SeTraceEntry l_seTrace[l_seTraceMax];
+/// The local player's ticks per band, counted by the first registered puppet's tick so both
+/// sides of the comparison cover the same window (while a posed puppet exists).
+u32 l_seLocalTicks[l_seTraceBandNum];
+bool l_seTraceLoggedBands;
+
+bool se_trace_enabled() {
+    static const bool s_enabled = [] {
+        const char* env = std::getenv("DUSK_MP_TEST_SE_LOG");
+        return env != NULL && env[0] == '1';
+    }();
+    return s_enabled;
+}
+
+/* Which gait band a rate is in, on daAlink_c's own thresholds (the ones selectAnimation blends on),
+ * with band 1 split by the standing bit — the split that decides which half of the blend owns the
+ * notes. The plain move table even during attention, whose bands differ: this is a test bucket,
+ * not a gait decision, and one fixed bucketing is what makes the two ends comparable. */
+int se_trace_band(f32 i_rate, bool i_still) {
+    const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
+    if (i_rate < hio.mWalkChangeRate) {
+        return i_still || i_rate <= 0.0f ? 0 : 1;
+    }
+    return i_rate < hio.mRunChangeRate ? 2 : 3;
+}
+
+/* The local player's band inputs, exactly as the wire computes them (player_bridge.cpp:697, :746)
+ * so "local" and "puppet" are bucketed off the same numbers. */
+bool se_trace_local_sample(f32* o_rate, bool* o_still) {
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == NULL) {
+        return false;
+    }
+    *o_rate = alink->getMoveGroundAngleSpeedRate();
+    *o_still = alink->checkModeFlg(daAlink_c::MODE_IDLE) || alink->checkZeroSpeedF();
+    return true;
+}
+
+SeTraceEntry* se_trace_find(const Z2SoundObjAnime* i_obj) {
+    for (int i = 0; i < l_seTraceMax; i++) {
+        if (l_seTrace[i].mObj != NULL && l_seTrace[i].mObj == i_obj) {
+            return &l_seTrace[i];
+        }
+    }
+    return NULL;
+}
+
+bool se_trace_any_posed() {
+    for (int i = 0; i < l_seTraceMax; i++) {
+        if (l_seTrace[i].mPuppet != NULL && l_seTrace[i].mPuppet->hasPose()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void se_trace_hook(const Z2SoundObjAnime* i_obj, u32 i_soundID, u32 i_mapinfo, f32 i_noteFrame,
+    bool i_haveHandle, bool i_started, bool i_attached) {
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    const unsigned long long tick = g_Counter.mCounter0;
+
+    if (alink != NULL && i_obj == &alink->mZ2Link.mSoundObjAnime) {
+        // Only inside the comparison window, so boot and menus do not pad the local side.
+        if (!se_trace_any_posed()) {
+            return;
+        }
+        f32 rate = 0.0f;
+        bool still = false;
+        se_trace_local_sample(&rate, &still);
+        Log.info("se-trace note who=local tick={} id={:#x} map={} note={:.1f} rate={:.3f} band={} "
+                 "handle={:d} started={:d} attached={:d}",
+            tick, i_soundID, i_mapinfo, i_noteFrame, rate,
+            l_seTraceBandName[se_trace_band(rate, still)], i_haveHandle, i_started, i_attached);
+        return;
+    }
+
+    const SeTraceEntry* entry = se_trace_find(i_obj);
+    if (entry == NULL) {
+        return;  // An NPC, an enemy, a horse: not part of this comparison.
+    }
+
+    const daRemotePlayer_c* puppet = entry->mPuppet;
+    const f32 rate = puppet->getNetMoveRate();
+    // prepose / nolink must never be 1: soundFramework() does not run in either state.
+    Log.info("se-trace note who=puppet pid={} tick={} id={:#x} map={} note={:.1f} rate={:.3f} "
+             "band={} handle={:d} started={:d} attached={:d} prepose={:d} nolink={:d}",
+        puppet->getPlayerId(), tick, i_soundID, i_mapinfo, i_noteFrame, rate,
+        l_seTraceBandName[se_trace_band(rate, puppet->getNetZeroSpeed())], i_haveHandle, i_started,
+        i_attached, !puppet->hasPose(), alink == NULL);
+}
+
+void se_trace_register(const Z2SoundObjAnime* i_obj, const daRemotePlayer_c* i_puppet) {
+    if (!se_trace_enabled()) {
+        return;
+    }
+#if TARGET_PC
+    g_Z2SoundObjAnime_startHook = se_trace_hook;
+#endif
+    for (int i = 0; i < l_seTraceMax; i++) {
+        if (l_seTrace[i].mObj == NULL) {
+            l_seTrace[i].mObj = i_obj;
+            l_seTrace[i].mPuppet = i_puppet;
+            for (int b = 0; b < l_seTraceBandNum; b++) {
+                l_seTrace[i].mTicks[b] = 0;
+            }
+            return;
+        }
+    }
+    Log.warn("se-trace: more than {} puppets; player {} is not traced", l_seTraceMax,
+        i_puppet->getPlayerId());
+}
+
+void se_trace_unregister(const Z2SoundObjAnime* i_obj) {
+    for (int i = 0; i < l_seTraceMax; i++) {
+        if (l_seTrace[i].mObj == i_obj) {
+            l_seTrace[i].mObj = NULL;
+            l_seTrace[i].mPuppet = NULL;
+        }
+    }
+}
+
+/* One puppet tick of band accounting. The first registered puppet also counts the local player's
+ * tick, so with any number of puppets the local side is counted exactly once per tick. */
+void se_trace_tick(const Z2SoundObjAnime* i_obj, const daRemotePlayer_c* i_puppet) {
+    SeTraceEntry* entry = se_trace_find(i_obj);
+    if (entry == NULL) {
+        return;
+    }
+
+    if (!l_seTraceLoggedBands) {
+        l_seTraceLoggedBands = true;
+        const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
+        Log.info("se-trace bands walkChange={:.3f} runChange={:.3f}", hio.mWalkChangeRate,
+            hio.mRunChangeRate);
+    }
+
+    const f32 rate = i_puppet->getNetMoveRate();
+    entry->mTicks[se_trace_band(rate, i_puppet->getNetZeroSpeed())]++;
+
+    const SeTraceEntry* first = NULL;
+    for (int i = 0; i < l_seTraceMax && first == NULL; i++) {
+        if (l_seTrace[i].mObj != NULL) {
+            first = &l_seTrace[i];
+        }
+    }
+
+    u32 total = 0;
+    for (int b = 0; b < l_seTraceBandNum; b++) {
+        total += entry->mTicks[b];
+    }
+    const bool summary = total % l_seTraceSummaryTicks == 0;
+
+    if (first == entry) {
+        f32 localRate = 0.0f;
+        bool localStill = false;
+        if (se_trace_local_sample(&localRate, &localStill)) {
+            l_seLocalTicks[se_trace_band(localRate, localStill)]++;
+        }
+        if (summary) {
+            Log.info("se-trace ticks who=local still={} slow={} mid={} run={}", l_seLocalTicks[0],
+                l_seLocalTicks[1], l_seLocalTicks[2], l_seLocalTicks[3]);
+        }
+    }
+
+    if (summary) {
+        Log.info("se-trace ticks who=puppet pid={} still={} slow={} mid={} run={}",
+            i_puppet->getPlayerId(), entry->mTicks[0], entry->mTicks[1], entry->mTicks[2],
+            entry->mTicks[3]);
+    }
+}
+
+/* daAlink_c::initBasAnime (d_a_alink.cpp:14040-14060), verbatim — including its wrap arithmetic,
+ * which is the game's and is kept rather than "corrected". */
+void init_bas_anime(Z2Creature* io_sound, const void* i_bas, const daPy_frameCtrl_c* i_ctrl) {
+    f32 startFrame;
+    if (i_ctrl->getAttribute() == J3DFrameCtrl::EMode_LOOP) {
+        startFrame = i_ctrl->getFrame() - i_ctrl->getRate();
+        if (startFrame <= i_ctrl->getStart()) {
+            startFrame = i_ctrl->getEnd() - startFrame;
+        } else if (startFrame >= i_ctrl->getEnd()) {
+            startFrame -= i_ctrl->getEnd();
+        }
+    } else {
+        startFrame = 0.0f;
+    }
+
+    io_sound->initAnime(
+        const_cast<void*>(i_bas), i_ctrl->getRate() >= 0.0f, i_ctrl->getLoop(), startFrame);
+}
+
+}  // namespace
+
+/**
+ * Attach the notes of the animation now in under slot i_slot. daAlink_c::setBasAnime
+ * (d_a_alink.cpp:13988-14038), with the BAS pointer as the identity his (anm heap idx, arc no)
+ * pair is: an unchanged animation keeps its note cursor and only follows the controller, and only
+ * a new animation or a flip of the rate's sign restarts it.
+ *
+ * Two things daAlink_c does not need:
+ *  - The collapsed pair. setDoubleAnm leaves slot 1 empty when both halves are one animation
+ *    (above the run threshold); Link has two copies of DASHS there and reads UNDER_1's. The puppet
+ *    reads slot 0's — the same animation, at the same phase.
+ *  - A refused set. setAnm / setDoubleAnm return early on a missing animation, so the pack, not
+ *    the caller's intent, says what is playing. If it is not i_anm, nothing changes.
+ */
+void daRemotePlayer_c::setBasSource(const daRemotePlayer_anm_c& i_anm, int i_slot) {
+    if (i_anm.mpUnder == NULL) {
+        return;
+    }
+    if (i_slot != 0 && mAnmPackUnder[i_slot].getAnmTransform() == NULL) {
+        i_slot = 0;
+    }
+    if (mAnmPackUnder[i_slot].getAnmTransform() != i_anm.mpUnder) {
+        return;
+    }
+
+    daPy_frameCtrl_c* ctrl = &mUnderFrameCtrl[i_slot];
+    if (i_anm.mpUnderBas == NULL) {
+        resetBasSource();
+        return;
+    }
+
+    if (i_anm.mpUnderBas == mBasData && mBasRate * ctrl->getRate() >= 0.0f) {
+        mBasCtrl = ctrl;
+        return;
+    }
+
+    mBasData = i_anm.mpUnderBas;
+    mBasCtrl = ctrl;
+    mBasRate = ctrl->getRate();
+    if (mSoundReady) {
+        init_bas_anime(&mSound, mBasData, mBasCtrl);
+    }
+}
+
+/// daAlink_c::resetBasAnime (d_a_alink.cpp:14062-14067). Like his, it does not stop a note that is
+/// already sounding; it only stops new ones.
+void daRemotePlayer_c::resetBasSource() {
+    mBasData = NULL;
+    mBasCtrl = NULL;
+}
+
+void daRemotePlayer_c::soundFramework() {
+    /* Never while the local player is gone. That is a stage transition, the listener (Link's mic)
+     * is going with him, and the engine assumes Link exists on more paths than anyone has counted
+     * (see draw()). Before the first pose execute() does not get here at all. */
+    if (!mSoundReady || daAlink_getAlinkActorClass() == NULL) {
+        return;
+    }
+
+    /* Floor material from the puppet's own ground check, as Link's mPolySound is from his
+     * (d_a_alink.cpp:18440). Link's water and leaf overrides are not known on this end. */
+    mSound.framework(mGroundValid ? dKy_pol_sound_get(&mGndChk) : 0, mReverb);
+    if (mBasCtrl != NULL) {
+        mSound.updateAnime(mBasCtrl->getFrame(), mBasCtrl->getRate());
+        if (!mLoggedSound) {
+            mLoggedSound = true;
+            Log.debug("Puppet {} sound live: BAS {:#x} on under slot {}, frame {:.1f} rate {:.2f}, "
+                      "floor sound {}, reverb {}",
+                mPlayerId, reinterpret_cast<uintptr_t>(mBasData),
+                static_cast<int>(mBasCtrl - mUnderFrameCtrl), mBasCtrl->getFrame(),
+                mBasCtrl->getRate(), mGroundValid ? dKy_pol_sound_get(&mGndChk) : 0,
+                static_cast<int>(mReverb));
+        }
+    }
+
+    if (se_trace_enabled()) {
+        se_trace_tick(&mSound.mSoundObjAnime, this);
+    }
+}
+
+void daRemotePlayer_c::initSound() {
+    /* 6 notes at once on the animation object, 1 on the simple one: Link's own counts
+     * (Z2LinkMgr.cpp:95) and the horse's (d_a_horse.cpp:785). Handles are allocated lazily from
+     * the global pool as notes overlap, so this is a ceiling, not a reservation. */
+    mSound.init(&current.pos, &eyePos, 6, 1);
+    mSoundReady = true;
+    se_trace_register(&mSound.mSoundObjAnime, this);
+
+    // Falsifiable: a puppet whose BCKs all report no notes looks exactly like one never wired up.
+    Log.debug("Puppet {} sound ready: BAS idle {} walk {} run {}", mPlayerId,
+        mIdleAnm.mpUnderBas != NULL ? "yes" : "no", mWalkAnm.mpUnderBas != NULL ? "yes" : "no",
+        mRunAnm.mpUnderBas != NULL ? "yes" : "no");
+
+    // Whatever setupAnimation() already put in the packs was attached before the sound existed.
+    if (mBasCtrl != NULL) {
+        init_bas_anime(&mSound, mBasData, mBasCtrl);
+    }
+}
+
+void daRemotePlayer_c::deleteSound() {
+    se_trace_unregister(&mSound.mSoundObjAnime);
+    mSoundReady = false;
+    mBasData = NULL;
+    mBasCtrl = NULL;
+    mSound.deleteObject();
+}
+
 /* Read and cleared by the network layer's spawn backoff; see d_a_remote_player.h. */
 daRemotePlayer_createFail_c g_daRemotePlayer_lastCreateFail = {0, NULL};
 
@@ -1987,6 +2360,8 @@ int daRemotePlayer_c::create() {
     // exact place the original crash happened.
     Log.info("Puppet for player {} wearing '{}' from its own archive copy", mPlayerId,
         l_outfits[mOutfit].arcName);
+    // Only now, so a puppet whose create failed never owns a sound handle.
+    initSound();
     // Last line, deliberately: this is the network layer's ONLY trustworthy "creation succeeded"
     // signal. See createComplete() in the header for why findability is not one.
     mCreateComplete = true;
@@ -1998,6 +2373,10 @@ static int daRemotePlayer_Create(fopAc_ac_c* i_this) {
 }
 
 daRemotePlayer_c::~daRemotePlayer_c() {
+    // FIRST, explicitly. A playing note's JAISound holds a pointer INTO a BCK buffer in this
+    // actor's solid heap (Z2SoundObject.cpp:529-532); stopping every handle now, rather than in
+    // ~Z2Creature after this body, means no sound can outlive the memory it points at.
+    deleteSound();
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
@@ -2500,6 +2879,16 @@ void daRemotePlayer_c::selectAnimation() {
     }
 
     setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, morf);
+    /* Which half of the blend owns the notes is setBlendMoveAnime's last setDoubleAnime argument:
+     * 2 (UNDER_0, the wait) while standing in band 1 — checkModeFlg(MODE_IDLE) ||
+     * checkZeroSpeedF(), which is exactly what kPlayerStateZeroSpeed carries — and 1 (UNDER_1, the
+     * walk or the run) everywhere else (d_a_alink.cpp:7669-7704, :7784, :7799, :7810). Taking the
+     * walk's notes while standing would play footsteps on the spot: the walk's controller keeps
+     * advancing at weight 0. */
+    {
+        const bool basOnA = fraction < hio.mWalkChangeRate && zeroSpeed;
+        setBasSource(basOnA ? *anmA : *anmB, basOnA ? 0 : 1);
+    }
 
     /* ★ Latched and permanent, and it is the ONLY thing that makes "the alert idle works" a
      * falsifiable claim. Everything downstream of the resolver degrades quietly by design — a WAITB
@@ -2963,6 +3352,12 @@ bool daRemotePlayer_c::selectAtnAnimation() {
     }
 
     setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, morf);
+    // setBlendAtnMoveAnime's own rule: 2 (UNDER_0) standing in band 1, 3 (UNDER_1) otherwise
+    // (d_a_alink.cpp:7990-7997, :8022, :8040). See selectAnimation().
+    {
+        const bool basOnA = rate < band.walkChangeRate && zeroSpeed;
+        setBasSource(basOnA ? *anmA : *anmB, basOnA ? 0 : 1);
+    }
 
     if (!mAtnActive || kind != mAtnPrevKind) {
         const daAlink_AnmData& handData = anm_data(idA);
@@ -5708,7 +6103,7 @@ void daRemotePlayer_c::setMatrix() {
 /// failed 800 times out of 800 and this function took its fallback branch for the puppet's whole
 /// life. It now reads daAlink_c's version instead — the collision result out of the actor's own
 /// ground-check member — which is what every grounded actor in the tree does. Midna's reverb line
-/// is still dropped: a puppet makes no sound of its own.
+/// is restored now that the puppet plays its BCKs' notes (soundFramework()).
 /**
  * Find the floor under the puppet, into the actor's OWN check object.
  *
@@ -5738,6 +6133,10 @@ void daRemotePlayer_c::setRoomInfo() {
     }
     tevStr.room_no = room_no;
     fopAcM_SetRoomNo(this, room_no);
+    /* The reverb line Midna has (d_a_midna.cpp:1183) and daAlink_c has (d_a_alink.cpp:5151), back
+     * now that the puppet makes sound. Guarded because the room table is a stage resource and this
+     * runs every tick, including the ones either side of a stage change. */
+    mReverb = dComIfGp_getStageRoom() != NULL ? dComIfGp_getReverb(room_no) : 0;
 }
 
 /* ★ TEMPORARY — Hang 4 bisection. See the declaration for why a trace stands in for a minidump
@@ -5796,6 +6195,9 @@ int daRemotePlayer_c::execute() {
     groundCheck();
     traceCalc("setRoomInfo");
     setRoomInfo();
+    // After animePlay() (the frames) and setRoomInfo() (the floor and reverb): daAlink_c's order.
+    traceCalc("soundFramework");
+    soundFramework();
     traceCalc("setMatrix");
     setMatrix();
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which

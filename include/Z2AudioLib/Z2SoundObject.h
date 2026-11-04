@@ -90,6 +90,22 @@ public:
     /* 0x44 */ bool reverse_;
 };
 
+#if TARGET_PC
+/**
+ * Dusk: an observer of every animation-note ("BAS") sound start, for the multiplayer footstep
+ * test — it lets the local Link's notes and a remote puppet's be logged through one code path.
+ * NULL in normal play, so the cost is one pointer test per note. Installed only when
+ * DUSK_MP_TEST_SE_LOG=1 (d_a_remote_player.cpp).
+ *
+ * i_haveHandle: a handle was free. i_started: the starter's return. i_attached: the handle holds a
+ * sound afterwards — the "it actually played" signal, as opposed to "we asked".
+ */
+typedef void (*Z2SoundObjAnimeStartHook)(const Z2SoundObjAnime* i_obj, u32 i_soundID,
+                                         u32 i_mapinfo, f32 i_noteFrame, bool i_haveHandle,
+                                         bool i_started, bool i_attached);
+extern Z2SoundObjAnimeStartHook g_Z2SoundObjAnime_startHook;
+#endif
+
 class Z2DopplerSoundObjBase : public Z2SoundObjBase {
 public:
     Z2DopplerSoundObjBase();

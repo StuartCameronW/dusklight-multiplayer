@@ -1,6 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
+#include "Z2AudioLib/Z2Creature.h"
 #include "d/actor/d_a_player.h"
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
@@ -27,6 +28,12 @@ class J3DShape;
 struct daRemotePlayer_anm_c {
     J3DAnmTransform* mpUnder;
     J3DAnmTransform* mpUpper;
+    /* The under BCK's own sound-animation ("BAS") block — the footstep notes — or NULL when the
+     * BCK carries none (JUTDataFileHeader::mSeAnmOffset == 0xFFFFFFFF). It points INTO mpUnder's
+     * load buffer, which lives as long as the animation does, so unlike daAlink_c (who has to copy
+     * it out of a reused anm heap, d_a_alink.cpp:14025-14030) nothing is copied. Only the under
+     * half's block is kept, because the under heap is the only one setBasAnime ever reads. */
+    const void* mpUnderBas;
 };
 
 /**
@@ -189,6 +196,26 @@ private:
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
     void groundCheck();
     void setRoomInfo();
+
+    /* Puppet sound, slice 1: the footsteps (and any other note) baked into the BCKs it plays.
+     * See .claude/future-plans/puppet-sound.md. All three are NEW and touch nothing else.
+     *
+     * setBasSource() — daAlink_c::setBasAnime + initBasAnime (d_a_alink.cpp:13988-14060), with the
+     *                  BAS block pointer standing in for his (anm heap idx, arc no) identity.
+     *                  Call AFTER the animation is in its pack: i_slot is the under slot whose
+     *                  frame controller drives the notes, and a refused set is detected from the
+     *                  pack rather than trusted.
+     * resetBasSource() — daAlink_c::resetBasAnime.
+     * soundFramework() — per sim tick, after groundCheck()/setRoomInfo(): framework + updateAnime,
+     *                    in daAlink_c's order (d_a_alink.cpp:18514-18524).
+     * initSound()     — last thing create() does before mCreateComplete.
+     * deleteSound()   — FIRST thing the destructor does: no handle may outlive the BCK buffers its
+     *                   sounds point into. Idempotent; ~Z2Creature repeats it harmlessly. */
+    void setBasSource(const daRemotePlayer_anm_c& i_anm, int i_slot);
+    void resetBasSource();
+    void soundFramework();
+    void initSound();
+    void deleteSound();
 
     /* Foot IK — planting the feet on the floor they are actually over, instead of on the flat plane
      * the animation was authored against. Transcribed from daAlink_c; see the block comment above
@@ -881,6 +908,30 @@ private:
     /// line appears and the shield line does not is a real and interesting state. Zero at spawn via
     /// fopAcM_ct's zeroing of the actor, like every other latch here.
     bool mLoggedShield;
+
+    /* --- Sound (slice 1) ------------------------------------------------------------------- */
+
+    /* ★ A plain Z2Creature, NEVER a Z2CreatureLink. Z2CreatureLink's constructor takes over the
+     * global Z2GetLink() pointer and its init() moves the listener's ears onto its position
+     * (Z2LinkMgr.cpp:50-54, :96) — a second one would steal both from the local player. This has
+     * no globals; Horse and Midna drive their BCK notes through exactly this class.
+     *
+     * Constructed by fopAcM_ct's placement new; init()'d only on the last lines of create(), so a
+     * puppet whose create failed never owns a sound handle. Handles come from the global
+     * Z2SoundHandlePool allocator, not the solid heap. */
+    Z2Creature mSound;
+    /// The BAS block currently driving mSound (daAlink_c field_0x2d80), and the frame controller
+    /// that drives it (field_0x2d7c). mBasCtrl NULL means "no notes": nothing calls updateAnime.
+    const void* mBasData;
+    daPy_frameCtrl_c* mBasCtrl;
+    /// The rate the BAS was started at (field_0x33d4). A sign flip forces a restart, as for Link.
+    f32 mBasRate;
+    /// The room's reverb, daAlink_c's mVoiceReverbIntensity, refreshed in setRoomInfo().
+    s8 mReverb;
+    /// mSound.init() has run. False before create() completes and after the destructor starts.
+    bool mSoundReady;
+    /// Latches the one-shot "a BAS is actually driving the puppet's sound" line.
+    bool mLoggedSound;
 
     /* Hang 4's guard. The sim tick this puppet last ENTERED the draw list on, and whether it ever
      * has. A J3DModel may be entered once per pass; a second entry builds a self-referential shape
