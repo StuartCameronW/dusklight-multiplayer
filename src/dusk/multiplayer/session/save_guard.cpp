@@ -9,7 +9,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 /**
  * ★ Test knob: DUSK_MP_TEST_SAVE_REFUSAL=1 exercises the refusal path without a session.

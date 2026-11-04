@@ -1,6 +1,6 @@
 /**
  * @file d_a_horse.cpp
- * 
+ *
 */
 
 #include "d/dolzel_rel.h" // IWYU pragma: keep
@@ -19,23 +19,6 @@
 #include "JSystem/JAudio2/JAUSectionHeap.h"
 #include <cmath>
 #include <cstring>
-
-#if TARGET_PC
-#include "dusk/dusk.h"
-#include "dusk/frame_interpolation.h"
-
-namespace {
-// FRAME INTERP NOTE: Sim tick control point snapshots for interpolation
-constexpr int kHorseReinSimMax = 75;
-cXyz s_horseReinSimPrev[kHorseReinSimMax];
-cXyz s_horseReinSimCurr[kHorseReinSimMax];
-int s_horseReinSimNumPrev;
-int s_horseReinSimNumCurr;
-bool s_horseReinSimPrevValid;
-bool s_horseReinSimCurrValid;
-uint64_t s_horseReinSimRolledSeq;
-}  // namespace
-#endif
 
 #define ANM_HS_BACK_WALK           6
 #define ANM_HS_WALK_START          7
@@ -76,11 +59,11 @@ static void strippedFunc() {
 
 static char const l_arcName[] = "Horse";
 
-const u16 daHorse_c::m_footJointTable[] = {
+DUSK_GAME_DATA const u16 daHorse_c::m_footJointTable[] = {
     3, 7, 27, 31,
 };
 
-const f32 daHorse_c::m_callLimitDistance2 = 640000.0f;
+DUSK_GAME_DATA const f32 daHorse_c::m_callLimitDistance2 = 640000.0f;
 
 static f32 l_autoUpHeight = 50.0f;
 
@@ -170,7 +153,7 @@ void daHorse_hio_c::genMessage(JORMContext* ctx) {
 }
 #endif
 
-const daHorse_hio_c1 daHorse_hio_c0::m = {
+DUSK_GAME_DATA const daHorse_hio_c1 daHorse_hio_c0::m = {
     600,
     50,
     45,
@@ -354,7 +337,7 @@ static dCcD_SrcSph l_sphSrc = {
 };
 
 void daHorse_c::coHitCallbackBoarJump(fopAc_ac_c* i_hitActor) {
-    if (!dComIfGp_event_runCheck() && 
+    if (!dComIfGp_event_runCheck() &&
         !checkEndResetStateFlg0(daHorse_ERFLG0(ERFLG0_UNK_4 | ERFLG0_UNK_2 | ERFLG0_UNK_1)) &&
         fopAcM_GetName(i_hitActor) == fpcNm_E_WB_e &&
         ((fopEn_enemy_c*)i_hitActor)->checkDownFlg())
@@ -385,7 +368,7 @@ void daHorse_c::coHitCallbackBoarJump(fopAc_ac_c* i_hitActor) {
         if (i == 3) {
             cXyz chk_pos;
             chk_pos.y = current.pos.y + 200.0f;
-            
+
             while (jump_chk_dist > 0.0f) {
                 chk_pos.x = current.pos.x + (jump_chk_dist * sin_y);
                 chk_pos.z = current.pos.z + (jump_chk_dist * cos_y);
@@ -620,7 +603,7 @@ int daHorse_c::createHeap() {
     if (m_oldFrame == NULL) {
         return 0;
     }
-    
+
     m_mtxcalc = JKR_NEW mDoExt_MtxCalcAnmBlendTblOld(m_oldFrame, 3, m_anmRatio);
     if (m_mtxcalc == NULL) {
         return 0;
@@ -785,7 +768,7 @@ int daHorse_c::create() {
 
         m_modelData->getJointNodePointer(0)->setMtxCalc(m_mtxcalc);
         fopAcM_SetMtx(this, m_model->getBaseTRMtx());
-        
+
         m_cc_stts.Init(0xFE, 0xFF, this);
         m_acchcir[0].SetWall(l_autoUpHeight + 0.1f, 60.0f);
         m_acchcir[1].SetWall(150.0f, 60.0f);
@@ -800,7 +783,7 @@ int daHorse_c::create() {
         attention_info.distances[fopAc_attn_SPEAK_e] = 38;
 
         m_sound.init(&current.pos, &eyePos, 6, 1);
-        
+
         resetBasAnime();
         m_anmRatio[2].setAnmTransform(NULL);
         m_anmRatio[2].setRatio(0.0f);
@@ -836,7 +819,7 @@ int daHorse_c::create() {
         m_boar_cyl.OnCoNoCoHitInfSet();
         m_boar_cyl.OffTgSetBit();
         m_boar_cyl.SetR(55.0f);
-        
+
         m_at_cyl.Set(l_cylSrc);
         m_at_cyl.SetStts(&m_cc_stts);
         m_at_cyl.OffTgSetBit();
@@ -1555,7 +1538,7 @@ void daHorse_c::setStickData() {
                 }
             }
         }
-    
+
         if (checkEndResetStateFlg0(ERFLG0_RIDE_RUN_FLG)) {
             m_padStickValue = 1.0f;
             m_padStickAngleY = shape_angle.y;
@@ -1615,7 +1598,7 @@ void daHorse_c::setMoveAnime(f32 i_morf) {
         if (var_f31 < 0.0f && m_anmIdx[0] == ANM_HS_WALK_START && !m_frameCtrl[0].checkAnmEnd()) {
             return;
         }
-        
+
         if (var_f31 < -m_hio->m.backward_idle_to_walk_rate) {
             setDoubleAnime(1.0f, m_hio->m.backwalk_anm_speed, m_hio->m.backwalk_anm_speed, ANM_HS_BACK_WALK, ANM_HS_BACK_WALK, i_morf);
         } else if (var_f31 < 0.0f) {
@@ -1679,7 +1662,7 @@ void daHorse_c::setMoveAnime(f32 i_morf) {
         } else {
             ratio = (var_f31 - m_hio->m.wait_to_walk_rate) / (m_hio->m.walk_to_fastwalk_rate - m_hio->m.wait_to_walk_rate);
             setDoubleAnime(ratio, m_hio->m.walk_anm_speed, m_hio->m.fast_walk_anm_speed, ANM_HS_WALK_SLOW, ANM_HS_WALK_FAST, i_morf);
-        }      
+        }
     } else if (var_f31 < m_hio->m.fastwalk_to_run_rate) {
         if (checkStateFlg0(FLG0_UNK_2) == 0) {
             setDoubleAnime(1.0f, m_hio->m.fast_walk_anm_speed, m_hio->m.fast_walk_anm_speed, ANM_HS_WALK_FAST, ANM_HS_WALK_FAST, i_morf);
@@ -2195,14 +2178,14 @@ int daHorse_c::setSpeedAndAngle() {
         if (dComIfG_Bgsp().ChkPolySafe(m_acch.m_gnd) && dComIfG_Bgsp().GetGroundCode(m_acch.m_gnd) == 11 && var_f31 > (m_normalMaxSpeedF + (0.5f * m_lashAddSpeed))) {
             var_f31 = m_normalMaxSpeedF + (0.5f * m_lashAddSpeed);
         }
-    
+
         if (var_f31 > fabsf(speedF)) {
             cLib_chaseF(&speedF, var_f31, var_f29);
         } else if (checkStateFlg0(FLG0_UNK_4) || (!dComIfGp_event_runCheck() && !daAlink_getAlinkActorClass()->checkHorseRide() && !checkStateFlg0(daHorse_FLG0(FLG0_RODEO_MODE | FLG0_UNK_10000000)) && m_procID == PROC_MOVE_e)) {
             if (checkStateFlg0(FLG0_UNK_2) && !checkStateFlg0(FLG0_UNK_4)) {
                 return 3;
             }
-    
+
             cLib_chaseF(&speedF, var_f31, m_hio->m.stopping_deceleration);
         } else {
             if (dComIfGp_event_runCheck() || checkStateFlg0(FLG0_UNK_10000000)) {
@@ -2210,7 +2193,7 @@ int daHorse_c::setSpeedAndAngle() {
             } else {
                 var_f29 = m_hio->m.deceleration;
             }
-    
+
             cLib_chaseF(&speedF, var_f31, var_f29);
         }
     }
@@ -2287,7 +2270,7 @@ void daHorse_c::setMatrix() {
         } else {
             var_f30 = 0.5f + ((0.5f * speedF) / m_lashMaxSpeedF);
         }
-        
+
         var_r29 = 4.0f * var_f30 * ((500.0f / (f32)field_0x16c2) * (s16)(field_0x16e8 - shape_angle.y));
         var_r27 = -var_r29;
     }
@@ -2325,7 +2308,7 @@ void daHorse_c::setMatrix() {
         attention_info.position.set(current.pos.x + (140.0f * cM_ssin(shape_angle.y)), 200.0f + current.pos.y, current.pos.z + (140.0f * cM_scos(shape_angle.y)));
     } else {
         attention_info.position.set(current.pos.x, 200.0f + current.pos.y, current.pos.z);
-    }    
+    }
 }
 
 void daHorse_c::setDashEffect(u32* i_emitterID) {
@@ -2431,7 +2414,7 @@ void daHorse_c::setEffect() {
     static DUSK_CONSTEXPR cXyz landScale(1.5f, 1.5f, 1.5f);
     static DUSK_CONSTEXPR cXyz grassRunScale(1.8f, 1.8f, 1.8f);
     static DUSK_CONSTEXPR cXyz waterDirection(0.0f, 1.0f, -0.75f);
-    
+
     int j;
     int i;
     int k;
@@ -2730,7 +2713,7 @@ int daHorse_c::setLegAngle(f32 param_0, int param_1, int param_2, s16* param_3) 
         sp10 = 1;
         var_f27 = 0.05f;
     }
-   
+
     for (i = 0; i < 2; i++) {
         sp1C = &spC0[i];
         sp18 = &spC0[i + 1];
@@ -2791,7 +2774,7 @@ int daHorse_c::setLegAngle(f32 param_0, int param_1, int param_2, s16* param_3) 
         }
 
         temp_f30 = var_f31 / temp_f30;
-    
+
         sp18->set(0.0f, sp68.y + (temp_f30 * sp5C.y), sp68.z + (temp_f30 * sp5C.z));
 
         sp8C = *sp18 - *sp1C;
@@ -3000,7 +2983,7 @@ void daHorse_c::setReinPosMoveInit(int param_0) {
     cXyz* sp20;
     int j, i;
     daHorseRein_c* rein_p = m_rein;
-    
+
     for (i = 0; i < 3; i++, rein_p++) {
         sp20 = rein_p->field_0x0[0] + 1;
         for (j = 1; j < rein_p->field_0x8[1]; j++, sp20++) {
@@ -3014,7 +2997,7 @@ void daHorse_c::copyReinPos() {
     int i;
     cXyz* pos_p = m_reinLine.getPos(0);
     daHorseRein_c* rein = &m_rein[0];
-    
+
     field_0x1204 = rein->field_0x8[0];
 
     for (i = 0; i < rein->field_0x8[0]; i++, pos_p++) {
@@ -3033,24 +3016,6 @@ void daHorse_c::copyReinPos() {
     for (i = rein->field_0x8[0] - 1; i >= 0; i--, pos_p++) {
         *pos_p = rein->field_0x0[0][i];
     }
-#if TARGET_PC
-    if (field_0x1204 > 0) {
-        const uint64_t simSeq = dusk::frame_interp::sim_tick_seq();
-        if (simSeq != s_horseReinSimRolledSeq) {
-            s_horseReinSimRolledSeq = simSeq;
-            if (s_horseReinSimCurrValid && s_horseReinSimNumCurr > 0) {
-                memcpy(s_horseReinSimPrev, s_horseReinSimCurr, s_horseReinSimNumCurr * sizeof(cXyz));
-                s_horseReinSimNumPrev = s_horseReinSimNumCurr;
-                s_horseReinSimPrevValid = true;
-            }
-        }
-        memcpy(s_horseReinSimCurr, m_reinLine.getPos(0), field_0x1204 * sizeof(cXyz));
-        s_horseReinSimNumCurr = field_0x1204;
-        s_horseReinSimCurrValid = true;
-    } else {
-        s_horseReinSimCurrValid = false;
-    }
-#endif
 }
 
 void daHorse_c::setReinPosHandSubstance(int param_0) {
@@ -3161,30 +3126,6 @@ void daHorse_c::setReinPosNormalSubstance() {
 
     copyReinPos();
 }
-
-#if TARGET_PC
-void daHorse_c::lerpControlPoints(f32 alpha) {
-    // FRAME INTERP NOTE: Currently only lerping points for Epona's reins. Need a more global solution.
-    if (!dusk::frame_interp::is_enabled() || !s_horseReinSimPrevValid || !s_horseReinSimCurrValid) {
-        return;
-    }
-    const int nCurr = s_horseReinSimNumCurr;
-    const int nPrev = s_horseReinSimNumPrev;
-    if (nCurr <= 0) {
-        return;
-    }
-    int n = nPrev < nCurr ? nPrev : nCurr;
-    if (n <= 0 || n > kHorseReinSimMax) {
-        return;
-    }
-    cXyz* dst = m_reinLine.getPos(0);
-    for (int i = 0; i < n; i++) {
-        const cXyz& p0 = s_horseReinSimPrev[i];
-        const cXyz& p1 = s_horseReinSimCurr[i];
-        dst[i] = p0 + (p1 - p0) * alpha;
-    }
-}
-#endif
 
 void daHorse_c::bgCheck() {
     if (m_procID != PROC_LARGE_DAMAGE_e) {
@@ -3344,7 +3285,7 @@ void daHorse_c::setNeckAnimeMorf() {
 
 void daHorse_c::setNeckAnime(u16 i_anmIdx, f32 i_speed, f32 i_startF, s16 i_endF) {
     J3DAnmTransform* bck = (J3DAnmTransform*)dComIfG_getObjectRes(l_arcName, i_anmIdx);
-    
+
     s16 endF;
     if (i_endF < 0) {
         endF = bck->getFrameMax();
@@ -3381,7 +3322,8 @@ void daHorse_c::setLashCnt() {
         if (checkStateFlg0(FLG0_PLAYER_BACK_RIDE_LASH) || m_lashCnt > 0) {
             mDoAud_seStart(Z2SE_WHIP_HORSE, NULL, 0, 0);
 
-            if (!checkStateFlg0(FLG0_PLAYER_BACK_RIDE_LASH)) {
+            if (!checkStateFlg0(FLG0_PLAYER_BACK_RIDE_LASH)
+                    IF_DUSK(&& !dusk::getSettings().game.infiniteEponaStamina)) {
                 m_lashCnt--;
                 if (m_lashCnt == 0) {
                     m_lashRecoverTime = m_hio->m.full_spur_recovery_time;
@@ -3507,26 +3449,26 @@ int daHorse_c::callHorseSubstance(cXyz const* i_pos) {
 
     if (m_path != NULL && (checkStateFlg0(FLG0_NO_DRAW_WAIT) || dist_xz2 > initDistance2)) {
         daAlink_c* player = daAlink_getAlinkActorClass();
-        #if TARGET_PC
+#if TARGET_PC
         Vec farthest_pos;
         Vec path_pnt_pos;
         f32 farthest_sqdist = 0;
-        #else
+#else
         Vec* farthest_pos;
         Vec* path_pnt_pos;
-        #endif
- 
+#endif
+
         for (int i = 0; i < m_path->m_num; i++) {
-            #if TARGET_PC
+#if TARGET_PC
             path_pnt_pos = m_path->m_points[i].m_position;
             f32 x_dist = path_pnt_pos.x - i_pos->x;
             f32 z_dist = path_pnt_pos.z - i_pos->z;
-            #else
+#else
             path_pnt_pos = &m_path->m_points[i].m_position;
             f32 x_dist = path_pnt_pos->x - i_pos->x;
             f32 z_dist = path_pnt_pos->z - i_pos->z;
             f32 farthest_sqdist;
-            #endif
+#endif
 
             f32 sqdist = (x_dist * x_dist) + (z_dist * z_dist);
 
@@ -3536,11 +3478,11 @@ int daHorse_c::callHorseSubstance(cXyz const* i_pos) {
             }
         }
 
-        #if TARGET_PC
+#if TARGET_PC
         cXyz pos(farthest_pos.x, farthest_pos.y, farthest_pos.z);
-        #else
+#else
         cXyz pos(farthest_pos->x, farthest_pos->y, farthest_pos->z);
-        #endif
+#endif
         setHorsePosAndAngle(&pos, shape_angle.y);
         rt = 1;
     } else if (dist_xz2 <= SQUARE(800.0f)) {
@@ -3934,9 +3876,9 @@ int daHorse_c::procStop() {
 
     f32 var_f30;
 
-    #if AVOID_UB
+#if AVOID_UB
     var_f30 = 0;
-    #endif
+#endif
 
     if (frame_ctrl->checkAnmEnd() || checkEndResetStateFlg0(ERFLG0_CUT_TURN_CANCEL)) {
         if (m_demoMode == 8 || m_demoMode == 16) {
@@ -3950,7 +3892,7 @@ int daHorse_c::procStop() {
             } else if (field_0x171a != 0) {
                 setNeckAnime(ANM_HS_WAIT_03, 1.0f, 0.0f, -1);
             }
-            
+
             return procWaitInit();
         }
     } else {
@@ -3958,12 +3900,12 @@ int daHorse_c::procStop() {
             if (checkStateFlg0(FLG0_RODEO_MODE) || checkStateFlg0(FLG0_UNK_200)) {
                 return procTurnInit(0);
             }
-    
+
             if (var_r25 == 0 && checkTurnAfterFastMove(frame_ctrl->getFrame())) {
                 return 1;
             }
         }
-    
+
         if (m_anmIdx[0] == ANM_HS_STOP_STAND) {
             if (frame_ctrl->checkPass(59)) {
                 field_0x16b6 = 1;
@@ -4107,7 +4049,7 @@ int daHorse_c::procTurn() {
                 return 1;
             }
         }
-    
+
         if (frame_ctrl->getFrame() >= field_0x1780 && frame_ctrl->getFrame() < field_0x1774) {
             onResetStateFlg0(RFLG0_TURN_STAND);
             if (!checkStateFlg0(daHorse_FLG0(FLG0_UNK_200000 | FLG0_UNK_100000)) || frame_ctrl->getFrame() < field_0x1774 - 10.0f) {
@@ -4343,7 +4285,7 @@ int daHorse_c::procLargeDamageInit() {
 
     resetNeckAnime();
     setSingleAnime(ANM_HS_STAND, m_hio->m.stand_anm_speed, 0.0f, -1, m_hio->m.stand_interpolation, 0);
-    
+
     current.angle.y = m_cowHitAngle;
     speedF = 60.0f;
     speed.y = 50.0f;
@@ -4401,7 +4343,7 @@ int daHorse_c::procToolDemo() {
                 }
             }
         }
-    
+
         if (demo_actor_p->checkEnable(0x40)) {
             m_anmRatio[0].getAnmTransform()->setFrame(anm_frame);
             demo_actor_p->setAnmFrameMax(m_anmRatio[0].getAnmTransform()->getFrameMax());
@@ -4446,7 +4388,7 @@ int daHorse_c::execute() {
             offStateFlg0(FLG0_NO_DRAW_WAIT);
         } else {
             return 1;
-        } 
+        }
     }
 
     daAlink_c* player_p = daAlink_getAlinkActorClass();
@@ -4716,7 +4658,7 @@ int daHorse_c::draw() {
 
     cXyz shadow_pos(current.pos.x, 100.0f + current.pos.y, current.pos.z);
     m_shadowID = dComIfGd_setShadow(m_shadowID, 0, m_model, &shadow_pos, 1000.0f, 0.0f, current.pos.y, m_acch.GetGroundH(), m_acch.m_gnd, &tevStr, 0, 1.0f, dDlst_shadowControl_c::getSimpleTex());
-    
+
     if (!checkResetStateFlg0(RFLG0_UNK_100) && (!checkStateFlg0(FLG0_UNK_1) || !daAlink_getAlinkActorClass()->checkHorseSubjectivity())) {
         static GXColor reinLineColor = {0x00, 0x00, 0x00, 0xFF};
         m_reinLine.update(field_0x1204, 1.5f, reinLineColor, 0, &tevStr);

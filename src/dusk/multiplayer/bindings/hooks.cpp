@@ -16,7 +16,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 /// What the command line asked for, kept so a later lobby request can be merged under it.
 struct CommandLineRequest {

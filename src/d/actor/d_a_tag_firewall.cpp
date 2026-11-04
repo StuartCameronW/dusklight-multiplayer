@@ -14,15 +14,15 @@
 #include "d/d_s_play.h"
 
 struct Tag_FWall_n {
-    static dCcD_SrcSph cc_sph_src;
-    static u16 game_over_eff_name[];
+    static DUSK_GAME_DATA dCcD_SrcSph cc_sph_src;
+    static DUSK_GAME_DATA u16 game_over_eff_name[];
 };
 
 static int daTag_FWall_Draw(daTag_FWall_c* i_this) {
     return 1;
 }
 
-dCcD_SrcSph Tag_FWall_n::cc_sph_src = {
+DUSK_GAME_DATA dCcD_SrcSph Tag_FWall_n::cc_sph_src = {
     {
         {0x0, {{0x400, 0x1, 0xC}, {0x0, 0x0}, 0x0}},  // mObj
         {dCcD_SE_METAL, 0x0, 0x0, 0x0, 0x0},          // mGObjAt
@@ -34,7 +34,7 @@ dCcD_SrcSph Tag_FWall_n::cc_sph_src = {
     }                                // mSphAttr
 };
 
-u16 Tag_FWall_n::game_over_eff_name[] = {0x84CC, 0x84CD, 0x84CE, 0x84CF};
+DUSK_GAME_DATA u16 Tag_FWall_n::game_over_eff_name[] = {0x84CC, 0x84CD, 0x84CE, 0x84CF};
 
 static daTag_FWall_c* fire_leader;
 
@@ -166,6 +166,12 @@ static int daTag_FWall_IsDelete(daTag_FWall_c* i_this) {
 
 static int daTag_FWall_Delete(daTag_FWall_c* i_this) {
     int id = fopAcM_GetID(i_this);
+#if TARGET_PC
+    if (i_this == fire_leader) {
+        fire_leader = NULL;
+        fire_num = 0;
+    }
+#endif
     return 1;
 }
 

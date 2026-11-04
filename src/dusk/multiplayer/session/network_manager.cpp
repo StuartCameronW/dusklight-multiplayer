@@ -19,7 +19,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 /// Heartbeat cadence, in sim ticks. The sim runs at 30 Hz, so this is roughly once a second.
 constexpr std::uint64_t kHeartbeatIntervalTicks = 30;

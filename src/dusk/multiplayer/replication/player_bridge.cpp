@@ -23,7 +23,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp"};
+constexpr borealis::Log Log{"dusk::mp"};
 
 /*
  * ── Puppet spawn failure policy ──────────────────────────────────────────────────────────────

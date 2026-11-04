@@ -11,7 +11,7 @@
 namespace dusk::mp {
 namespace {
 
-aurora::Module Log{"dusk::mp::enet"};
+constexpr borealis::Log Log{"dusk::mp::enet"};
 
 /**
  * ★ How long a silent peer is given before ENet declares it gone. Set explicitly rather than left

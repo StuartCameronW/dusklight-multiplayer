@@ -44,7 +44,7 @@
 namespace dusk {
 namespace {
 
-aurora::Module Log{"dusk::nametag"};
+constexpr borealis::Log Log{"dusk::nametag"};
 
 /// Height above the head joint's origin (which sits at the base of the skull) to hang the tag,
 /// in world units. Clears Link's cap.

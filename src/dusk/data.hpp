@@ -1,5 +1,7 @@
 #pragma once
 
+#include <borealis/data.hpp>
+
 #include <filesystem>
 #include <string>
 
@@ -15,25 +17,19 @@
 #define DUSK_CAN_OPEN_DATA_FOLDER 0
 #endif
 
-#if (defined(__APPLE__) && TARGET_OS_IOS && !TARGET_OS_MACCATALYST)
-#define DUSK_CAN_CHANGE_DATA_FOLDER 0
-#else
-#define DUSK_CAN_CHANGE_DATA_FOLDER 1
-#endif
-
 namespace dusk::data {
 
-struct Paths {
-    std::filesystem::path userPath;
-    std::filesystem::path cachePath;
-};
+using Paths = borealis::data::Paths;
+
+borealis::data::Manager& manager();
 
 /// Point this process at its own data directory, ignoring the installed one entirely. Must be
 /// called before initialize_data(). Exists so two instances can run side by side without sharing a
-/// memory card, a config file or a log.
+/// memory card, a config file, a cache or a log (borealis's --user-dir moves only the first two).
 void set_data_path_override(const std::filesystem::path& path);
 
-Paths initialize_data();
+Paths initialize_data(const std::filesystem::path& userDirectoryOverride = {});
+std::filesystem::path base_path_relative(const std::filesystem::path& path);
 std::filesystem::path configured_data_path();
 std::filesystem::path cache_path();
 bool open_data_path();
@@ -43,6 +39,9 @@ bool set_portable_data_path();
 bool reset_data_path();
 bool is_default_data_path();
 bool is_data_path_restart_pending();
+std::filesystem::path user_home_path();
+std::filesystem::path normalized_display_path(const std::filesystem::path& path);
+std::string abbreviated_path_string(const std::filesystem::path& path);
 
 /**
  * True when another Dusklight was already using the normal data directory, so this process was
