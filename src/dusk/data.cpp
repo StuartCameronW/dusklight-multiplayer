@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -143,66 +144,146 @@ std::optional<std::filesystem::path> sDataPathOverride;
  *     cloud-synced data directories report locking unreliably in both directions, and an I/O error
  *     must never become a refusal to boot.
  *   - Only "someone else holds it" is treated as a conflict.
- *   - An explicit --data-dir is never redirected. The caller said exactly where to put things, and
- *     silently moving them would break the harness in the confusing direction. It warns instead.
+ *   - An explicit --data-dir / --user-dir is never redirected. The caller said exactly where to put
+ *     things, and silently moving them would break the harness in the confusing direction.
+ *
+ * ★ WHEN THE DIRECTORY CANNOT BE MOVED, SAVING IS DISABLED INSTEAD (2026-11-04). Relocation covers
+ * the default folder, but three cases leave a second process inside a directory another one holds:
+ * an explicit --data-dir, an explicit --user-dir, and every numbered folder being taken. Those used
+ * to log a warning and carry on writing, which is exactly the torn-.gci interleave this lock exists
+ * to prevent. Now they run with saving refused for the life of the process, through the same
+ * refusal machinery a co-op guest uses (multiplayer/session/save_guard.hpp — every card write,
+ * format, Save Manager change and mod sidecar write already asks it, and each refusal COMPLETES
+ * whatever the caller polls, so nothing softlocks). The game still boots and plays; the first
+ * process keeps sole ownership of the card. Refusing the launch outright was the other option, and
+ * it is worse for the one legitimate multi-instance user: a misconfigured harness run would vanish
+ * instead of showing the mistake in both logs.
  */
 constexpr std::string_view kDataLockFileName = ".dusklight.lock";
 
 /// Give up after this many numbered directories rather than looping. Eight simultaneous copies of
-/// Dusklight is far past any real use, and past it the honest answer is to run unlocked.
+/// Dusklight is far past any real use, and past it saving is disabled rather than shared.
 constexpr int kMaxInstanceDirectories = 8;
+
+/// A held lock is retried briefly before it counts as a conflict. Windows releases a dead process's
+/// byte-range locks asynchronously ("the time it takes ... depends upon available system
+/// resources"), so relaunching straight after a crash could otherwise see a lock nobody holds.
+/// A live second instance holds it for its whole life, so the retry never hides a real one.
+constexpr int kLockAttempts = 5;
+constexpr std::chrono::milliseconds kLockRetryDelay{50};
 
 bool sIsSecondaryInstance = false;
 std::filesystem::path sSecondaryInstancePath;
 
+/// Set when this process could not get a directory of its own; see is_data_directory_shared().
+bool sDataDirectoryShared = false;
+std::filesystem::path sSharedDataDirectoryPath;
+
+/// What happened at startup, for log_data_lock_status() to repeat once file logging exists.
+std::string sLockStatusLine;
+
+/// Diagnostics written into the lock file by its holder: never part of the lock mechanism (the OS
+/// lock on the open handle is), only so a refused instance can say WHICH process has the folder.
+std::string lock_diagnostics() {
+#if defined(_WIN32)
+    const unsigned long pid = GetCurrentProcessId();
+#else
+    const long pid = static_cast<long>(::getpid());
+#endif
+    const auto started = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    return "pid " + std::to_string(pid) + "\nstarted " + std::to_string(started) + "\n";
+}
+
+/// The first line of the holder's diagnostics ("pid 1234"), or a placeholder. Best effort only.
+std::string describe_lock_holder(const std::filesystem::path& dataPath) {
+    std::ifstream file(dataPath / kDataLockFileName);
+    std::string line;
+    if (!file || !std::getline(file, line) || line.empty()) {
+        return "pid unknown";
+    }
+    return line;
+}
+
 #if defined(_WIN32)
 
 /// Held for the life of the process. Never closed on purpose — the OS closes it, including on a
-/// crash, which is the entire argument for a handle lock over a pidfile.
+/// crash, which is the entire argument for a handle lock over a pidfile. Not inheritable (null
+/// security attributes), so a child process cannot keep the lock alive after we die.
 void* sDataLockHandle = nullptr;
 
-/// Returns true when this process now owns the directory. `o_conflict` distinguishes "someone else
-/// has it" (try the next directory) from "could not lock for any other reason" (run anyway).
-bool try_lock_data_directory(const std::filesystem::path& dataPath, bool& o_conflict) {
+/// One attempt. Returns true when this process now owns the directory. `o_conflict` distinguishes
+/// "someone else has it" (try the next directory) from "could not lock for any other reason" (run
+/// anyway).
+bool try_lock_data_directory_once(const std::filesystem::path& dataPath, bool& o_conflict) {
     o_conflict = false;
     const auto lockPath = dataPath / kDataLockFileName;
 
+    // ★ Opened SHARED, and locked with LockFileEx. The first version opened with dwShareMode = 0,
+    // which made the open itself the lock — but that also fails if an antivirus scanner, the search
+    // indexer or a backup tool merely has the file open at that instant, and a false conflict now
+    // costs a session with saving disabled. A byte-range lock is only contended by another lock.
+    // No FILE_SHARE_DELETE, deliberately: while we hold it, the file cannot be deleted out from
+    // under us and recreated by a second instance that would then lock a different file.
     HANDLE handle = CreateFileW(lockPath.wstring().c_str(), GENERIC_READ | GENERIC_WRITE,
-        0 /* no sharing: this IS the lock */, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
-
-    if (handle != INVALID_HANDLE_VALUE) {
-        sDataLockHandle = handle;
-        return true;
-    }
-
-    const DWORD error = GetLastError();
-    if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION ||
-        error == ERROR_ACCESS_DENIED)
-    {
-        // ERROR_ACCESS_DENIED is included deliberately even though it is ambiguous — it is what an
-        // antivirus or indexer holding the handle looks like, and treating it as a conflict costs a
-        // numbered directory where treating it as success costs a shared memory card.
-        o_conflict = true;
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        // A sharing violation is what an older build (dwShareMode = 0) holding the file looks like,
+        // so it is still a conflict. Anything else — access denied on a read-only folder, a
+        // pending delete — is an I/O problem, and an I/O problem must never stop the game booting.
+        o_conflict = GetLastError() == ERROR_SHARING_VIOLATION;
         return false;
     }
 
-    return false;
+    // One byte at 4 GiB rather than at 0: locking past end-of-file is allowed, and it leaves the
+    // diagnostics at the start of the file readable by the instance that is refused.
+    OVERLAPPED region{};
+    region.Offset = 0;
+    region.OffsetHigh = 1;
+    if (!LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &region))
+    {
+        const DWORD error = GetLastError();
+        CloseHandle(handle);
+        o_conflict = error == ERROR_LOCK_VIOLATION;
+        return false;
+    }
+
+    const std::string text = lock_diagnostics();
+    LARGE_INTEGER start{};
+    DWORD written = 0;
+    if (SetFilePointerEx(handle, start, nullptr, FILE_BEGIN) && SetEndOfFile(handle)) {
+        WriteFile(handle, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    }
+
+    sDataLockHandle = handle;
+    return true;
 }
 
 #else
 
+/// Held for the life of the process; the kernel drops the flock when the last descriptor closes,
+/// however the process dies. O_CLOEXEC matters: flock belongs to the open file description, so a
+/// child that inherited the descriptor (the file manager open_data_path() launches, say) would
+/// otherwise keep the folder locked after we exit.
 int sDataLockFd = -1;
 
-bool try_lock_data_directory(const std::filesystem::path& dataPath, bool& o_conflict) {
+bool try_lock_data_directory_once(const std::filesystem::path& dataPath, bool& o_conflict) {
     o_conflict = false;
     const auto lockPath = dataPath / kDataLockFileName;
 
-    const int fd = ::open(lockPath.c_str(), O_RDWR | O_CREAT, 0644);
+    const int fd = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
         return false;
     }
 
     if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        const std::string text = lock_diagnostics();
+        if (::ftruncate(fd, 0) == 0) {
+            if (::pwrite(fd, text.data(), text.size(), 0) < 0) {
+                // Diagnostics only; the lock is already held.
+            }
+        }
         sDataLockFd = fd;
         return true;
     }
@@ -216,6 +297,62 @@ bool try_lock_data_directory(const std::filesystem::path& dataPath, bool& o_conf
 }
 
 #endif
+
+bool try_lock_data_directory(const std::filesystem::path& dataPath, bool& o_conflict) {
+    for (int attempt = 1;; ++attempt) {
+        if (try_lock_data_directory_once(dataPath, o_conflict)) {
+            return true;
+        }
+        if (!o_conflict || attempt >= kLockAttempts) {
+            return false;
+        }
+        std::this_thread::sleep_for(kLockRetryDelay);
+    }
+}
+
+void note_lock_taken(const std::filesystem::path& dataPath) {
+    sLockStatusLine = "Data lock: this process holds '" +
+                      borealis::io::fs_path_to_string(dataPath / kDataLockFileName) +
+                      "'; it is the only Dusklight writing saves there.";
+    Log.info("{}", sLockStatusLine);
+}
+
+void note_lock_unavailable(const std::filesystem::path& dataPath) {
+    sLockStatusLine = "Data lock: could not lock '" + borealis::io::fs_path_to_string(dataPath) +
+                      "' (not held by anyone else — an unlockable filesystem, e.g. a network or "
+                      "cloud-synced folder). Continuing WITHOUT a single-instance guard.";
+    Log.warn("{}", sLockStatusLine);
+}
+
+/**
+ * Another process holds @p dataPath and this one cannot move. Run, but never write a save there.
+ * The refusal itself is enforced by multiplayer/session/save_guard, which asks
+ * is_data_directory_shared(); this only records the fact and says so.
+ */
+void disable_saving_shared_directory(const std::filesystem::path& dataPath, std::string_view why) {
+    sDataDirectoryShared = true;
+    sSharedDataDirectoryPath = dataPath;
+    sLockStatusLine = "Data lock: REFUSED — another Dusklight (" + describe_lock_holder(dataPath) +
+                      ") already holds '" + borealis::io::fs_path_to_string(dataPath) + "' and " +
+                      std::string(why) +
+                      ". Saving is DISABLED for this process so the two cannot tear one memory "
+                      "card; the other instance keeps sole ownership of the saves.";
+    Log.warn("{}", sLockStatusLine);
+}
+
+/// Lock an explicitly chosen directory (--data-dir, --user-dir): never relocated, so a conflict
+/// means saving is disabled rather than shared.
+void lock_explicit_data_directory(const std::filesystem::path& dataPath, std::string_view flag) {
+    bool conflict = false;
+    if (try_lock_data_directory(dataPath, conflict)) {
+        note_lock_taken(dataPath);
+    } else if (conflict) {
+        disable_saving_shared_directory(dataPath,
+            std::string(flag) + " is an explicit choice, so this instance was not moved elsewhere");
+    } else {
+        note_lock_unavailable(dataPath);
+    }
+}
 
 /// Where the Nth instance's data lives: the same directory with a numbered suffix, so it sits
 /// beside the original and is obvious in a file manager rather than hidden somewhere else.
@@ -275,15 +412,14 @@ void seed_instance_directory(const std::filesystem::path& from, const std::files
 std::filesystem::path lock_or_relocate_data_directory(const std::filesystem::path& dataPath) {
     bool conflict = false;
     if (try_lock_data_directory(dataPath, conflict)) {
+        note_lock_taken(dataPath);
         return dataPath;
     }
 
     if (!conflict) {
         // Could not lock, and not because anyone else holds it. Run in the normal directory rather
         // than inventing a problem: an unlockable filesystem is not evidence of a second instance.
-        Log.warn("Could not lock the data directory '{}' — continuing without a single-instance "
-                 "guard. This is expected on some network and cloud-synced folders.",
-            borealis::io::fs_path_to_string(dataPath));
+        note_lock_unavailable(dataPath);
         return dataPath;
     }
 
@@ -295,7 +431,8 @@ std::filesystem::path lock_or_relocate_data_directory(const std::filesystem::pat
         ensure_data_directory(candidate);
 
         bool candidateConflict = false;
-        if (!try_lock_data_directory(candidate, candidateConflict)) {
+        const bool candidateLocked = try_lock_data_directory(candidate, candidateConflict);
+        if (!candidateLocked) {
             if (candidateConflict) {
                 continue;  // A third instance already has this one.
             }
@@ -309,15 +446,22 @@ std::filesystem::path lock_or_relocate_data_directory(const std::filesystem::pat
 
         sIsSecondaryInstance = true;
         sSecondaryInstancePath = candidate;
-        Log.warn("Another Dusklight is already using '{}', so this one is using '{}' instead. Its "
-                 "saves were {} and anything saved from now on goes THERE, not to the original.",
-            borealis::io::fs_path_to_string(dataPath), borealis::io::fs_path_to_string(candidate),
-            existed ? "already there from a previous run" : "copied from the original");
+        sLockStatusLine =
+            "Data lock: another Dusklight (" + describe_lock_holder(dataPath) +
+            ") already holds '" + borealis::io::fs_path_to_string(dataPath) +
+            "', so this one moved to '" + borealis::io::fs_path_to_string(candidate) + "' (" +
+            (candidateLocked ? "locked" : "unlockable, unguarded") + "). Its saves were " +
+            (existed ? "already there from a previous run" : "copied from the original") +
+            " and anything saved from now on goes THERE, not to the original.";
+        Log.warn("{}", sLockStatusLine);
         return candidate;
     }
 
-    Log.warn("Every instance directory up to {} is in use — continuing in '{}' unguarded.",
-        kMaxInstanceDirectories + 1, borealis::io::fs_path_to_string(dataPath));
+    // Nowhere left to go. Sharing the original would be the torn-card race, so stay here and
+    // refuse to write instead.
+    disable_saving_shared_directory(dataPath, "every numbered instance folder (-2 to -" +
+                                                  std::to_string(kMaxInstanceDirectories + 1) +
+                                                  ") is in use too");
     return dataPath;
 }
 
@@ -695,16 +839,13 @@ Paths initialize_data(const std::filesystem::path& userDirectoryOverride) {
         // Locked but never relocated: --data-dir is an explicit instruction about where things go,
         // and silently moving them would break the two-instance harness in the most confusing
         // possible direction. A conflict here means someone pointed two processes at one sandbox,
-        // which is worth a warning and is their business.
-        {
-            bool conflict = false;
-            if (!try_lock_data_directory(userPath, conflict) && conflict) {
-                Log.warn("Another Dusklight already holds '{}'. Honouring --data-dir anyway, but "
-                         "the two processes now share one memory card and can corrupt it.",
-                    borealis::io::fs_path_to_string(userPath));
-            }
+        // so this one runs with saving disabled rather than sharing the card.
+        lock_explicit_data_directory(userPath, "--data-dir");
+        // The startup backup writes into save storage too, and would be reading a .gci the holder
+        // may be halfway through writing. The holder made its own backup when it started.
+        if (!sDataDirectoryShared) {
+            backup_memory_cards(userPath);
         }
-        backup_memory_cards(userPath);
 
         Paths paths = manager().paths();
         paths.cachePath = userPath;
@@ -725,12 +866,7 @@ Paths initialize_data(const std::filesystem::path& userDirectoryOverride) {
     // An explicit --user-dir is treated like --data-dir: locked, never relocated.
     const auto dataPath = manager().paths().userPath;
     if (manager().has_user_directory_override()) {
-        bool conflict = false;
-        if (!try_lock_data_directory(dataPath, conflict) && conflict) {
-            Log.warn("Another Dusklight already holds '{}'. Honouring --user-dir anyway, but the "
-                     "two processes now share one memory card and can corrupt it.",
-                borealis::io::fs_path_to_string(dataPath));
-        }
+        lock_explicit_data_directory(dataPath, "--user-dir");
     } else {
         const auto activePath = lock_or_relocate_data_directory(dataPath);
         if (activePath != dataPath) {
@@ -746,8 +882,10 @@ Paths initialize_data(const std::filesystem::path& userDirectoryOverride) {
     }
 
     // After the directory exists and any migration has landed, and before the game can write a
-    // card.
-    backup_memory_cards(manager().paths().userPath);
+    // card. Skipped when another process holds the directory (see the --data-dir branch).
+    if (!sDataDirectoryShared) {
+        backup_memory_cards(manager().paths().userPath);
+    }
 
     return manager().paths();
 }
@@ -773,6 +911,25 @@ bool is_secondary_instance() {
 
 std::filesystem::path secondary_instance_path() {
     return sSecondaryInstancePath;
+}
+
+bool is_data_directory_shared() {
+    return sDataDirectoryShared;
+}
+
+std::filesystem::path shared_data_directory_path() {
+    return sSharedDataDirectoryPath;
+}
+
+void log_data_lock_status() {
+    if (sLockStatusLine.empty()) {
+        return;
+    }
+    if (sDataDirectoryShared || sIsSecondaryInstance) {
+        Log.warn("{}", sLockStatusLine);
+    } else {
+        Log.info("{}", sLockStatusLine);
+    }
 }
 
 bool open_data_path() {

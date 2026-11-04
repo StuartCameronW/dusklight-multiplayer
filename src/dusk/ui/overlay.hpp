@@ -39,6 +39,8 @@ private:
     bool mPipelineProgressActive = false;
     /// One toast per run telling the player their saves were relocated. See overlay.cpp.
     bool mWarnedSecondaryInstance = false;
+    /// One toast per run telling the player saving is off because the data folder is in use.
+    bool mWarnedSharedDataDirectory = false;
 };
 
 }  // namespace dusk::ui

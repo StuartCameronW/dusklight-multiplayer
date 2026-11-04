@@ -11,6 +11,7 @@
 #include <aurora/card.h>
 #include <borealis/io.hpp>
 
+#include "dusk/data.hpp"
 #include "dusk/logging.h"
 #include "dusk/main.h"
 #include "dusk/save_manager.hpp"
@@ -76,6 +77,28 @@ bool sRefusedFormatPending = false;
 bool sNotifiedSessionEnded = false;
 
 /**
+ * True when every save write must be refused, for either reason: this process joined a co-op
+ * session as a guest (sContaminated), or another Dusklight holds this data directory and this one
+ * could not be moved (dusk/data.cpp, the P0 lock). Both are sticky for the life of the process.
+ */
+bool saving_refused() {
+    return sContaminated || dusk::data::is_data_directory_shared();
+}
+
+/// Only the shared directory is the cause; the guest wording wins when both apply.
+bool refused_for_shared_directory() {
+    return !sContaminated && dusk::data::is_data_directory_shared();
+}
+
+/// Why, for the log. The guest wording is the original one and is kept verbatim for the harness.
+const char* refusal_cause_for_log() {
+    return refused_for_shared_directory() ?
+               "another Dusklight holds this data directory, so this process may not write saves "
+               "there" :
+               "this process joined a co-op session as a guest";
+}
+
+/**
  * The one player-facing toast for every refused write, card or file. Shared rate limit, so a Save
  * Manager click straight after a refused autosave does not stack two identical notices.
  */
@@ -88,7 +111,10 @@ void toast_refusal() {
     sLastToast = now;
     dusk::ui::push_toast({
         .title = "Saving is disabled",
-        .content = "The host owns this world's save. Your own file is untouched.",
+        .content = refused_for_shared_directory() ?
+                       "Another copy of Dusklight is using this save folder and owns its saves. "
+                       "Close it and restart this one to save." :
+                       "The host owns this world's save. Your own file is untouched.",
         .duration = std::chrono::seconds(6),
     });
 }
@@ -117,6 +143,23 @@ bool save_would_be_contaminated() {
     return sContaminated;
 }
 
+bool saving_disabled() {
+    return saving_refused();
+}
+
+const char* saving_disabled_explanation() {
+    if (sContaminated) {
+        return "This run joined a co-op session as a guest, so saves can be viewed and exported "
+               "but not changed. Restart Dusklight to manage them.";
+    }
+    if (dusk::data::is_data_directory_shared()) {
+        return "Another copy of Dusklight is using this save folder, so this one can view and "
+               "export saves but not change them. Close the other copy and restart this one to "
+               "manage them.";
+    }
+    return nullptr;
+}
+
 void mark_save_contaminated(const char* i_reason) {
     if (sContaminated) {
         return;
@@ -130,7 +173,7 @@ void mark_save_contaminated(const char* i_reason) {
 }
 
 bool refuse_card_write() {
-    if (!sContaminated && !test_refusal_forced()) {
+    if (!saving_refused() && !test_refusal_forced()) {
         return false;
     }
 
@@ -138,22 +181,28 @@ bool refuse_card_write() {
     sRefusedWritePending = true;
 
     if (!sToastedOnce || std::chrono::steady_clock::now() - sLastToast >= kToastCooldown) {
-        Log.warn("Refused a memory card write: this process joined a co-op session, so its game "
-                 "state belongs to the host. Nothing was written.");
+        if (refused_for_shared_directory()) {
+            Log.warn("Refused a memory card write: another Dusklight holds this data directory "
+                     "('{}'), and two writers would tear the card. Nothing was written.",
+                borealis::io::fs_path_to_string(dusk::data::shared_data_directory_path()));
+        } else {
+            Log.warn("Refused a memory card write: this process joined a co-op session, so its "
+                     "game state belongs to the host. Nothing was written.");
+        }
     }
     toast_refusal();
     return true;
 }
 
 bool refuse_card_format() {
-    if (!sContaminated) {
+    if (!saving_refused()) {
         return false;
     }
 
     // Both callers poll FormatSync every frame; see consume_refused_card_format.
     sRefusedFormatPending = true;
-    Log.warn("Refused a memory card FORMAT: this process joined a co-op session as a guest. The "
-             "card was not touched.");
+    Log.warn(
+        "Refused a memory card FORMAT: {}. The card was not touched.", refusal_cause_for_log());
     toast_refusal();
     return true;
 }
@@ -168,13 +217,13 @@ bool consume_refused_card_format() {
 }
 
 bool refuse_save_file_write(const char* i_what) {
-    if (!sContaminated) {
+    if (!saving_refused()) {
         return false;
     }
 
-    Log.warn("Refused a save file operation ({}): this process joined a co-op session as a guest, "
-             "so nothing on this machine's card or save folders may change until a restart.",
-        i_what != nullptr ? i_what : "unnamed");
+    Log.warn("Refused a save file operation ({}): {}, so nothing on this machine's card or save "
+             "folders may change until a restart.",
+        i_what != nullptr ? i_what : "unnamed", refusal_cause_for_log());
     toast_refusal();
     return true;
 }
@@ -220,7 +269,7 @@ bool is_save_storage_path(
 }
 
 bool refuse_save_location_write(std::string_view i_location, const char* i_what) {
-    if (!sContaminated || i_location.empty()) {
+    if (!saving_refused() || i_location.empty()) {
         return false;
     }
 
@@ -276,7 +325,7 @@ void log_probe(const char* i_path, const save_manager::Result& i_result) {
 }
 
 void run_save_guard_probe() {
-    const bool guarded = sContaminated;
+    const bool guarded = saving_refused();
     Log.info("SAVE-GUARD PROBE: start, guard {}", guarded ? "ENGAGED" : "not engaged");
 
     const auto& diskId = dusk::version::getDiskID();

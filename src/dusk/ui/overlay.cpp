@@ -15,6 +15,7 @@
 #include "m_Do/m_Do_main.h"
 
 #include <aurora/gfx.h>
+#include <borealis/io.hpp>
 #include <borealis/log.hpp>
 #include <dolphin/pad.h>
 #include <fmt/format.h>
@@ -336,6 +337,23 @@ void Overlay::update() {
             .content = "Another one is already running, so this one saves to " +
                        data::secondary_instance_path().filename().string() +
                        " instead. Your original saves are untouched.",
+            .duration = std::chrono::seconds(12),
+        });
+    }
+
+    /* ★ The other outcome of the same lock: this process could not be moved (explicit --data-dir or
+     * --user-dir, or every numbered folder taken), so it runs with saving disabled rather than
+     * sharing a memory card with the process that holds the folder. Said up front, before the
+     * player has played anything, so the in-game "error might have occurred when saving" later
+     * is not the first they hear of it. */
+    if (!mWarnedSharedDataDirectory && data::is_data_directory_shared()) {
+        mWarnedSharedDataDirectory = true;
+        push_toast({
+            .title = "Saving is disabled",
+            .content = "Another copy of Dusklight is already using the save folder " +
+                       borealis::io::fs_path_to_string(data::shared_data_directory_path()) +
+                       ", so this one will not save. Close the other copy and restart this one to "
+                       "save normally.",
             .duration = std::chrono::seconds(12),
         });
     }

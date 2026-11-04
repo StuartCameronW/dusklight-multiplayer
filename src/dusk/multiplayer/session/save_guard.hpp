@@ -68,6 +68,19 @@ namespace dusk::mp {
 bool save_would_be_contaminated();
 
 /**
+ * True when this process must not write ANY save, for either reason the guard knows: it joined a
+ * co-op session as a guest (save_would_be_contaminated()), or another Dusklight already holds its
+ * data directory and it could not be moved to its own (dusk::data::is_data_directory_shared(), the
+ * 13-save-safety.md P0 lock). Every refuse_*() below refuses when this is true. Pure query; the
+ * silent early-outs (canAutoSave, the deferred mod-save migration) ask this one.
+ */
+bool saving_disabled();
+
+/// One player-facing sentence saying why saves cannot be changed, for the Save Manager's help text,
+/// or nullptr when saving is not disabled.
+const char* saving_disabled_explanation();
+
+/**
  * Latch the contamination flag. Called when this process joins a session as a guest, and the place
  * for the first flag-replication apply path to call when it lands. Idempotent; only the first call
  * logs. @p i_reason is recorded in the log so the cause is visible after the fact.

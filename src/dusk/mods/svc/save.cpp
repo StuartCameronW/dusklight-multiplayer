@@ -333,8 +333,10 @@ save_manager::Result migrate_legacy_sidecar(
     }
     // The migration writes sidecars and renames the legacy file: a save change. A guest defers it
     // to the next run instead of failing the load (no toast; the player asked for nothing).
-    if (mp::save_would_be_contaminated()) {
-        Log.info("legacy mod save migration deferred: this run joined a co-op session as a guest");
+    if (mp::saving_disabled()) {
+        Log.info(
+            "legacy mod save migration deferred: saving is disabled for this run (co-op guest, "
+            "or another Dusklight holds the data directory)");
         return {.ok = true};
     }
 

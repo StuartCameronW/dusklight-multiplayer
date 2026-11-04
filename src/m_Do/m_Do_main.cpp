@@ -694,6 +694,10 @@ int game_main(int argc, char* argv[]) {
     }
 
     log_build_info();
+#if TARGET_PC
+    // initialize_data() decided the data-dir lock before file logging existed.
+    dusk::data::log_data_lock_status();
+#endif
 
     dusk::config::load_from_user_preferences();
     ApplyCVarOverrides(parsed_arg_options["cvar"]);

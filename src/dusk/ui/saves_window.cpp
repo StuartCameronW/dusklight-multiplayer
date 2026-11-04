@@ -956,11 +956,10 @@ void add_save_files_control(Pane& leftPane, Pane& rightPane) {
     }),
         rightPane, [](Pane& pane) {
             pane.add_text("Import, export, back up, and remove saves for the configured disc.");
-            if (mp::save_would_be_contaminated()) {
+            if (const char* why = mp::saving_disabled_explanation()) {
                 // The backend refuses every change (save_manager.cpp ensure_write_allowed); say so
                 // up front rather than only after the player has picked a file.
-                pane.add_text("This run joined a co-op session as a guest, so saves can be viewed "
-                              "and exported but not changed. Restart Dusklight to manage them.");
+                pane.add_text(why);
             }
         });
 }
