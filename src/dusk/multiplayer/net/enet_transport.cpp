@@ -94,6 +94,13 @@ bool EnetTransport::listen(std::uint16_t port, std::size_t maxPeers) {
     address.host = ENET_HOST_ANY;
     address.port = port;
 
+    // Test runs set DUSK_MP_BIND_LOOPBACK=1: a loopback-only socket never triggers the Windows
+    // firewall prompt, which otherwise appears for every fresh build directory's exe.
+    const char* loopbackOnly = std::getenv("DUSK_MP_BIND_LOOPBACK");
+    if (loopbackOnly != nullptr && loopbackOnly[0] == '1') {
+        enet_address_set_host_ip(&address, "127.0.0.1");
+    }
+
     ENetHost* host = enet_host_create(&address, maxPeers, kChannelCount, 0, 0);
     if (host == nullptr) {
         Log.error("Failed to bind UDP port {} — is it already in use?", port);
