@@ -62,6 +62,15 @@ void ReplicationManager::drive_puppets() {
     for (auto& entry : mPlayers) {
         RemotePlayer& player = entry.second;
 
+        // No puppet and nowhere to put one (booting, title demo, stage load): hold the buffer
+        // empty instead of playing it. Played here, it starves against the sender's 30 Hz while
+        // this end ticks faster at boot, and ratchets the delay up before the puppet ever appears
+        // (measured 2 -> 7 ticks). An alive puppet is still driven through cutscenes.
+        if (!player.puppetAlive && !world_is_playable()) {
+            player.buffer.reset();
+            continue;
+        }
+
         PlayerState pose;
         if (!player.buffer.advance(pose)) {
             // Nothing received yet — don't spawn a puppet that would stand at the origin.
