@@ -44,6 +44,26 @@ struct StartupOptions {
  */
 void apply_startup_options(const StartupOptions& options);
 
+/**
+ * Hold the session back until the pre-game menu has been dismissed.
+ *
+ * With a disc already configured the game boots straight away and runs its title scene behind the
+ * prelaunch menu, so the "first tick" that opens the session arrives long before the player has
+ * pressed Host or Join. While held, the tick hooks do nothing at all, so no session is opened and
+ * the startup options can still be changed. Must be called before the first tick.
+ */
+void defer_session_start();
+
+/**
+ * Release the hold placed by defer_session_start(); the session then opens on the next tick.
+ *
+ * `lobby` is what the in-game Multiplayer menu asked for, or null when the player just pressed
+ * Play. It is merged UNDER the command line: any --mp-* flag that was given keeps its value, and
+ * if the command line asked to host or join at all, the menu's choice of host or join is ignored.
+ * Strings are copied, so the caller keeps ownership of them. Safe to call when nothing is held.
+ */
+void begin_deferred_session(const StartupOptions* lobby);
+
 /// Called from fapGm_Before, immediately BEFORE the actor pass runs.
 /// Drains the transport and applies inbound state so actors execute against fresh data.
 /// Cheap and safe to call when multiplayer is inactive.

@@ -1502,6 +1502,8 @@ set(DUSK_FILES
         src/dusk/ui/icon_provider.hpp
         src/dusk/ui/modal.cpp
         src/dusk/ui/modal.hpp
+        src/dusk/ui/multiplayer_window.cpp
+        src/dusk/ui/multiplayer_window.hpp
         src/dusk/ui/nav_types.hpp
         src/dusk/ui/number_button.cpp
         src/dusk/ui/number_button.hpp

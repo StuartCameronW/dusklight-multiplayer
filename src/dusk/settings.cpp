@@ -168,6 +168,13 @@ UserSettings g_userSettings = {
         .enableAdvancedSettings {"backend.enableAdvancedSettings", false},
     },
 
+    .multiplayer = {
+        .nickname {"multiplayer.nickname", ""},
+        .port {"multiplayer.port", 7777},
+        .lastJoinAddress {"multiplayer.lastJoinAddress", ""},
+        .color {"multiplayer.color", ""},
+    },
+
     // Not sure if there's a better way to declare this
     .actionBindings = {
         .firstPersonCamera {
@@ -352,6 +359,11 @@ void registerSettings() {
     Register(g_userSettings.backend.checkForUpdates);
     Register(g_userSettings.backend.cardFileType);
     Register(g_userSettings.backend.enableAdvancedSettings);
+
+    Register(g_userSettings.multiplayer.nickname);
+    Register(g_userSettings.multiplayer.port);
+    Register(g_userSettings.multiplayer.lastJoinAddress);
+    Register(g_userSettings.multiplayer.color);
 
     Register(g_userSettings.actionBindings.firstPersonCamera[0]);
     Register(g_userSettings.actionBindings.firstPersonCamera[1]);
