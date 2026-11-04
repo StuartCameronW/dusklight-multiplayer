@@ -11,6 +11,7 @@
 #include "dusk/main.h"
 #include "dusk/mod_loader.hpp"
 #include "dusk/mods/svc/save.hpp"
+#include "dusk/multiplayer/session/save_guard.hpp"
 #include "dusk/save_manager.hpp"
 #include "dusk/settings.h"
 #include "dusk/utilities.hpp"
@@ -955,6 +956,12 @@ void add_save_files_control(Pane& leftPane, Pane& rightPane) {
     }),
         rightPane, [](Pane& pane) {
             pane.add_text("Import, export, back up, and remove saves for the configured disc.");
+            if (mp::save_would_be_contaminated()) {
+                // The backend refuses every change (save_manager.cpp ensure_write_allowed); say so
+                // up front rather than only after the player has picked a file.
+                pane.add_text("This run joined a co-op session as a guest, so saves can be viewed "
+                              "and exported but not changed. Restart Dusklight to manage them.");
+            }
         });
 }
 

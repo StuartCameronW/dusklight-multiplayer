@@ -351,6 +351,8 @@ void NetworkManager::shutdown() {
 
 void NetworkManager::pre_actor_tick() {
     ensure_initialized();
+    // Test-only knob. Before the early-out, so it also runs after the guest has left.
+    run_save_guard_probe_if_requested();
     if (!mTransport) {
         return;
     }
@@ -368,7 +370,7 @@ void NetworkManager::pre_actor_tick() {
             mLastEndMessage = "You left the session.";
             notify("Left the co-op session", "You are playing on your own now.");
             if (wasJoined) {
-                notify_save_disabled_after_host_left();
+                notify_save_disabled_after_session_end(SessionEnd::LeftByChoice);
             }
         } else {
             mLastEndMessage = "You ended the session.";
@@ -537,7 +539,7 @@ void NetworkManager::end_client_session(const std::string& title, const std::str
     // reason. Only after a session that actually got going: a join that never connected has nothing
     // of the host's in memory to warn about, though the flag stays latched regardless.
     if (wasJoined) {
-        notify_save_disabled_after_host_left();
+        notify_save_disabled_after_session_end(SessionEnd::HostGone);
     }
 }
 

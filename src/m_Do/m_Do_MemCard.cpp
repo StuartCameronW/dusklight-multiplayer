@@ -465,6 +465,15 @@ u32 mDoMemCd_Ctrl_c::getStatus(u32) {
 }
 
 void mDoMemCd_Ctrl_c::command_format() {
+#if TARGET_PC
+    // Dusk (multiplayer): a format erases every save on the card, so a guest may not queue one.
+    // FormatSync reports the refusal as a failed format, so the menu polling it does not wait for a
+    // command that never existed. See src/dusk/multiplayer/session/save_guard.hpp.
+    if (dusk::mp::refuse_card_format()) {
+        return;
+    }
+#endif
+
     if (OSTryLockMutex(&mMutex)) {
         mCardCommand = COMM_FORMAT_e;
         OSUnlockMutex(&mMutex);
@@ -492,6 +501,13 @@ void mDoMemCd_Ctrl_c::format() {
 
 s32 mDoMemCd_Ctrl_c::FormatSync() {
     int ret = 0;
+
+#if TARGET_PC
+    // Dusk (multiplayer): completes a format refused in command_format. See SaveSync.
+    if (dusk::mp::consume_refused_card_format()) {
+        return 2;
+    }
+#endif
 
     if (field_0x1fc8 == 0) {
         return 0;

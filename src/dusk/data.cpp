@@ -362,30 +362,123 @@ bool files_have_same_contents(const std::filesystem::path& a, const std::filesys
 }
 
 /**
- * Collect the memory cards under a data directory.
+ * Recursive content comparison for a sidecar directory. Same file set, same bytes; an unreadable
+ * tree compares unequal, so the worst case is one redundant backup rather than a missed one.
+ */
+bool directories_have_same_contents(
+    const std::filesystem::path& a, const std::filesystem::path& b) {
+    const auto collect = [](const std::filesystem::path& root,
+                             std::vector<std::filesystem::path>& out) {
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+            !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+        {
+            if (it->is_regular_file()) {
+                out.push_back(it->path().lexically_relative(root));
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return !ec;
+    };
+
+    std::vector<std::filesystem::path> filesA;
+    std::vector<std::filesystem::path> filesB;
+    if (!collect(a, filesA) || !collect(b, filesB) || filesA != filesB) {
+        return false;
+    }
+    for (const auto& relative : filesA) {
+        if (!files_have_same_contents(a / relative, b / relative)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * One thing worth backing up. A memory card is not just the .gci any more: upstream added raw card
+ * images (`<dataPath>/MemoryCardA.EUR.raw`, up to 16 MB) and per-save mod sidecars
+ * (`<Card A>/<stem>.mods/` and `<dataPath>/MemoryCardA.EUR.raw.mods/`), which the Save Manager
+ * treats as part of the save. A backup that restores the .gci and loses the randomizer's seed data
+ * is not a backup of the save.
+ */
+struct SaveArtifact {
+    std::filesystem::path path;
+    /// Backups are named `<key>.<YYYYmmdd-HHMMSS><extension>`.
+    std::string key;
+    std::string extension;
+    bool directory = false;
+    std::size_t kept = kSaveBackupsKept;
+};
+
+/// How many backups to keep per raw card image: they are up to 512 times the size of a .gci.
+constexpr std::size_t kRawBackupsKept = 5;
+
+constexpr std::size_t kStampLength = 15;  // YYYYmmdd-HHMMSS
+
+/**
+ * True when @p name is a backup of @p artifact. Parsed exactly rather than by prefix, because the
+ * keys nest: "MemoryCardA.EUR" is a prefix of "MemoryCardA.EUR.raw.mods", and a .gci stem is a
+ * prefix of its own ".mods" directory. A prefix match would let one artifact's pruning delete
+ * another's backups.
+ */
+bool is_backup_of(const std::string& name, const SaveArtifact& artifact) {
+    const std::string prefix = artifact.key + ".";
+    if (name.size() != prefix.size() + kStampLength + artifact.extension.size() ||
+        !name.starts_with(prefix) || !name.ends_with(artifact.extension))
+    {
+        return false;
+    }
+    for (std::size_t i = 0; i < kStampLength; ++i) {
+        const char c = name[prefix.size() + i];
+        if (i == 8 ? c != '-' : (c < '0' || c > '9')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Collect the save artifacts under a data directory.
  *
  * Deliberately NOT a recursive_directory_iterator over the whole tree: in --data-dir mode the data
  * directory also holds caches and logs, and walking those to find a 32 KB file would be paying a
- * lot for nothing. Aurora lays cards out as <dataPath>/<region>/Card A (lib/dolphin/card.cpp:57),
- * so this walks exactly two levels and matches the "Card" prefix rather than hardcoding a region
- * list — a new region then needs no change here.
+ * lot for nothing. Aurora lays cards out as <dataPath>/<region>/Card A (GCI folder) or
+ * <dataPath>/MemoryCardA.<region>.raw (raw image) (lib/dolphin/card.cpp get_card_full_path), so
+ * this walks exactly two levels and matches the "Card" / "MemoryCard" prefixes rather than
+ * hardcoding a region list — a new region then needs no change here.
  */
-std::vector<std::filesystem::path> find_memory_cards(const std::filesystem::path& dataPath) {
-    std::vector<std::filesystem::path> cards;
+std::vector<SaveArtifact> find_save_artifacts(const std::filesystem::path& dataPath) {
+    std::vector<SaveArtifact> artifacts;
     std::error_code ec;
 
-    for (const auto& regionEntry : std::filesystem::directory_iterator(dataPath, ec)) {
-        if (ec || !regionEntry.is_directory()) {
+    for (const auto& topEntry : std::filesystem::directory_iterator(dataPath, ec)) {
+        if (ec) {
             continue;
         }
-        if (regionEntry.path().filename() == kSaveBackupDirName) {
+        const auto topName = topEntry.path().filename().string();
+        if (topName == kSaveBackupDirName) {
+            continue;
+        }
+
+        if (topName.starts_with("MemoryCard")) {
+            if (topEntry.is_regular_file() && topEntry.path().extension() == ".raw") {
+                artifacts.push_back({
+                    .path = topEntry.path(),
+                    .key = topEntry.path().stem().string(),
+                    .extension = ".raw",
+                    .kept = kRawBackupsKept,
+                });
+            } else if (topEntry.is_directory() && topName.ends_with(".raw.mods")) {
+                artifacts.push_back({.path = topEntry.path(), .key = topName, .directory = true});
+            }
+            continue;
+        }
+        if (!topEntry.is_directory()) {
             continue;
         }
 
         std::error_code slotEc;
-        for (const auto& slotEntry :
-            std::filesystem::directory_iterator(regionEntry.path(), slotEc))
-        {
+        for (const auto& slotEntry : std::filesystem::directory_iterator(topEntry.path(), slotEc)) {
             if (slotEc || !slotEntry.is_directory()) {
                 continue;
             }
@@ -397,47 +490,54 @@ std::vector<std::filesystem::path> find_memory_cards(const std::filesystem::path
             for (const auto& fileEntry :
                 std::filesystem::directory_iterator(slotEntry.path(), fileEc))
             {
-                if (fileEc || !fileEntry.is_regular_file()) {
+                if (fileEc) {
                     continue;
                 }
-                if (fileEntry.path().extension() == ".gci") {
-                    cards.push_back(fileEntry.path());
+                const auto fileName = fileEntry.path().filename().string();
+                if (fileEntry.is_regular_file() && fileEntry.path().extension() == ".gci") {
+                    artifacts.push_back({
+                        .path = fileEntry.path(),
+                        .key = fileEntry.path().stem().string(),
+                        .extension = ".gci",
+                    });
+                } else if (fileEntry.is_directory() && fileName.ends_with(".mods")) {
+                    artifacts.push_back(
+                        {.path = fileEntry.path(), .key = fileName, .directory = true});
                 }
             }
         }
     }
 
-    return cards;
+    return artifacts;
 }
 
-void prune_save_backups(const std::filesystem::path& backupDir, const std::string& stem) {
+void prune_save_backups(const std::filesystem::path& backupDir, const SaveArtifact& artifact) {
     std::vector<std::filesystem::path> existing;
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(backupDir, ec)) {
-        if (ec || !entry.is_regular_file()) {
+        if (ec || entry.is_directory() != artifact.directory) {
             continue;
         }
-        const auto name = entry.path().filename().string();
-        if (name.starts_with(stem + ".") && entry.path().extension() == ".gci") {
+        if (is_backup_of(entry.path().filename().string(), artifact)) {
             existing.push_back(entry.path());
         }
     }
 
-    if (existing.size() <= kSaveBackupsKept) {
+    if (existing.size() <= artifact.kept) {
         return;
     }
 
     // Names carry a sortable timestamp, so lexicographic order is chronological order. Cheaper and
     // steadier than asking the filesystem for mtimes, which a copy or a sync client can rewrite.
     std::sort(existing.begin(), existing.end());
-    for (std::size_t i = 0; i + kSaveBackupsKept < existing.size(); ++i) {
+    for (std::size_t i = 0; i + artifact.kept < existing.size(); ++i) {
         std::error_code removeEc;
-        std::filesystem::remove(existing[i], removeEc);
+        std::filesystem::remove_all(existing[i], removeEc);
     }
 }
 
 /**
- * ★ Rolling memory card backup, taken once at startup before the game can write anything.
+ * ★ Rolling save backup, taken once at startup before the game can write anything.
  *
  * Every failure mode in .claude/plan/13-save-safety.md — a torn write from two processes on one
  * data directory (P0), a crash midway through the five open/seek/write/close cycles a single save
@@ -446,13 +546,15 @@ void prune_save_backups(const std::filesystem::path& backupDir, const std::strin
  * asymmetry is why this is worth more than its size, and why it runs unconditionally rather than
  * behind a setting.
  *
+ * Covers .gci files, raw card images and both kinds of mod sidecar directory (see SaveArtifact).
+ *
  * Best-effort by construction. Every error is swallowed with at most a warning: a backup that
  * cannot be written must never be a reason the game will not start, which is the same principle
  * that makes the P0 lock a harder call than this one.
  */
 void backup_memory_cards(const std::filesystem::path& dataPath) {
-    const auto cards = find_memory_cards(dataPath);
-    if (cards.empty()) {
+    const auto artifacts = find_save_artifacts(dataPath);
+    if (artifacts.empty()) {
         return;
     }
 
@@ -473,23 +575,23 @@ void backup_memory_cards(const std::filesystem::path& dataPath) {
     localtime_r(&now, &local);
 #endif
     std::array<char, 32> stamp{};
-    if (std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local) == 0) {
+    if (std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local) != kStampLength) {
         return;
     }
 
-    for (const auto& card : cards) {
-        const auto stem = card.stem().string();
-
+    for (const auto& artifact : artifacts) {
         // Skip a launch that changed nothing: without this, ten backups of an untouched save push
         // the one backup that mattered out of the window.
         bool alreadyHaveIt = false;
         std::error_code scanEc;
         for (const auto& entry : std::filesystem::directory_iterator(backupDir, scanEc)) {
-            if (scanEc || !entry.is_regular_file()) {
+            if (scanEc || entry.is_directory() != artifact.directory ||
+                !is_backup_of(entry.path().filename().string(), artifact))
+            {
                 continue;
             }
-            if (entry.path().filename().string().starts_with(stem + ".") &&
-                files_have_same_contents(card, entry.path()))
+            if (artifact.directory ? directories_have_same_contents(artifact.path, entry.path()) :
+                                     files_have_same_contents(artifact.path, entry.path()))
             {
                 alreadyHaveIt = true;
                 break;
@@ -499,19 +601,29 @@ void backup_memory_cards(const std::filesystem::path& dataPath) {
             continue;
         }
 
-        const auto target = backupDir / (stem + "." + stamp.data() + ".gci");
+        const auto target = backupDir / (artifact.key + "." + stamp.data() + artifact.extension);
         std::error_code copyEc;
-        std::filesystem::copy_file(
-            card, target, std::filesystem::copy_options::overwrite_existing, copyEc);
+        if (artifact.directory) {
+            std::filesystem::copy(artifact.path, target,
+                std::filesystem::copy_options::recursive |
+                    std::filesystem::copy_options::overwrite_existing,
+                copyEc);
+        } else {
+            std::filesystem::copy_file(
+                artifact.path, target, std::filesystem::copy_options::overwrite_existing, copyEc);
+        }
         if (copyEc) {
-            Log.warn("Could not back up memory card '{}': {}", borealis::io::fs_path_to_string(card),
+            Log.warn("Could not back up '{}': {}", borealis::io::fs_path_to_string(artifact.path),
                 copyEc.message());
+            // A half-copied directory would later dedupe against nothing useful; drop it.
+            std::error_code cleanupEc;
+            std::filesystem::remove_all(target, cleanupEc);
             continue;
         }
 
-        Log.info("Backed up memory card '{}' to '{}'", borealis::io::fs_path_to_string(card),
+        Log.info("Backed up '{}' to '{}'", borealis::io::fs_path_to_string(artifact.path),
             borealis::io::fs_path_to_string(target));
-        prune_save_backups(backupDir, stem);
+        prune_save_backups(backupDir, artifact);
     }
 }
 

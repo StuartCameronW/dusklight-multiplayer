@@ -6,6 +6,7 @@
 
 #include "dusk/main.h"
 #include "dusk/mods/loader/loader.hpp"
+#include "dusk/multiplayer/session/save_guard.hpp"
 #include "dusk/save_manager.hpp"
 #include "dusk/utilities.hpp"
 #include "dusk/version.hpp"
@@ -106,6 +107,12 @@ std::optional<std::filesystem::path> mod_sidecar_path(
 
 bool write_mod_sidecar(
     const std::filesystem::path& path, const std::string& modId, const SaveStore& store) {
+    // A sidecar is part of the save: written or removed only next to a card write, which a guest
+    // never makes. Refusing here keeps the mod dirty and its in-memory blobs intact, so nothing a
+    // mod can read changes; only the disk is left alone. See save_guard.hpp.
+    if (mp::refuse_save_file_write("mod save sidecar")) {
+        return false;
+    }
     nlohmann::json slots = nlohmann::json::array();
     bool hasBlobs = false;
     for (const auto& slot : store.slots) {
@@ -322,6 +329,12 @@ void notify(uint32_t slot, SaveEventFn SaveObserverRecord::* which, const char* 
 save_manager::Result migrate_legacy_sidecar(
     const save_manager::Storage& storage, std::string_view maker, std::string_view game) {
     if (s_legacyMigrationChecked) {
+        return {.ok = true};
+    }
+    // The migration writes sidecars and renames the legacy file: a save change. A guest defers it
+    // to the next run instead of failing the load (no toast; the player asked for nothing).
+    if (mp::save_would_be_contaminated()) {
+        Log.info("legacy mod save migration deferred: this run joined a co-op session as a guest");
         return {.ok = true};
     }
 

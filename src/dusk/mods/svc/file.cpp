@@ -8,6 +8,7 @@
 #include <borealis/log.hpp>
 #include "dusk/config.hpp"
 #include "dusk/mods/loader/loader.hpp"
+#include "dusk/multiplayer/session/save_guard.hpp"
 #include "dusk/utilities.hpp"
 #include "mods/svc/file.h"
 
@@ -287,6 +288,9 @@ ModResult file_open(
     try {
         const auto ioMode = static_cast<borealis::io::File::Mode>(mode);
         if (mode != FILE_OPEN_READ) {
+            if (mp::refuse_save_location_write(location, "mod file API: open for writing")) {
+                return MOD_UNAVAILABLE;
+            }
             const auto available = borealis::io::check(location);
             if (available != borealis::io::Status::Ok) {
                 return map_status(available);
@@ -390,6 +394,9 @@ ModResult file_write_all(ModContext* context, const char* location, const void* 
         return MOD_INVALID_ARGUMENT;
     }
     try {
+        if (mp::refuse_save_location_write(location, "mod file API: write_all")) {
+            return MOD_UNAVAILABLE;
+        }
         const auto available = borealis::io::check(location);
         if (available != borealis::io::Status::Ok) {
             return map_status(available);
@@ -552,6 +559,10 @@ ModResult file_create_child(
         return MOD_INVALID_ARGUMENT;
     }
     try {
+        // A child of a save folder is save storage too, so the folder is the thing to check.
+        if (mp::refuse_save_location_write(folderLocation, "mod file API: create_child")) {
+            return MOD_UNAVAILABLE;
+        }
         auto result = borealis::io::create_child(folderLocation, name);
         if (result.status != borealis::io::Status::Ok) {
             return map_status(result.status);
@@ -579,6 +590,10 @@ ModResult copy_picker_override(
     try {
         if (source == destination) {
             return MOD_OK;
+        }
+        if (mp::refuse_save_location_write(destination, "mod file API: export")) {
+            error = "Saves can't be changed after joining a co-op session as a guest.";
+            return MOD_UNAVAILABLE;
         }
         auto input = borealis::io::open(source);
         if (input.status != borealis::io::Status::Ok) {

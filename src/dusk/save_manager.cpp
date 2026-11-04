@@ -6,6 +6,7 @@
 #include "dusk/main.h"
 #include "dusk/mod_loader.hpp"
 #include "dusk/mods/svc/save.hpp"
+#include "dusk/multiplayer/session/save_guard.hpp"
 #include "dusk/utilities.hpp"
 #include "fmt/format.h"
 #include "helpers/bits.hpp"
@@ -38,6 +39,9 @@ constexpr size_t kMaxMetadataSize = 1024 * 1024;
 constexpr size_t kMaxModFileSize = 1024 * 1024;
 constexpr size_t kMaxArtifactSize = 160 * 1024 * 1024;
 constexpr int kSaveFormatVersion = 1;
+constexpr const char* kGuestSaveRefusal =
+    "Saves can't be changed after joining a co-op session as a guest. Restart Dusklight to manage "
+    "your saves.";
 
 std::atomic_uint64_t s_tempSequence = 0;
 
@@ -591,7 +595,15 @@ Result replace_sidecars(const Storage& storage, const SaveIdentity& identity,
     }
 }
 
+// ★ Every Save Manager write and delete (import, raw import, restore, delete save, delete mod data,
+// create backup) funnels through here, and none of them touch the card thread, so the guard on
+// mDoMemCd_Ctrl_c::save never sees them. A guest's save stays untouched for the life of the
+// process; see src/dusk/multiplayer/session/save_guard.hpp. The prelaunch menu is reachable again
+// after a reset, which does not end a session, so this is not dead code.
 Result ensure_write_allowed(const Storage& storage) {
+    if (mp::refuse_save_file_write("Save Manager")) {
+        return failure(kGuestSaveRefusal);
+    }
     if (storage.mounted && !mDoMemCd_isCardCommNone()) {
         return failure("The memory card is busy. Try again after returning to the main menu.");
     }
@@ -1251,6 +1263,11 @@ Result restore_backup(
 Result delete_backup(const Storage& storage, const std::filesystem::path& path) {
     if (path.parent_path() != backup_directory(storage) || path.extension() != ".dusksave") {
         return failure("The backup path is invalid.");
+    }
+    // Not through ensure_write_allowed (it never touches the card), but a backup is the player's
+    // own save, and while the guard is engaged nothing of theirs is deleted.
+    if (mp::refuse_save_file_write("Save Manager: delete backup")) {
+        return failure(kGuestSaveRefusal);
     }
     std::error_code ec;
     if (!std::filesystem::remove(path, ec)) {

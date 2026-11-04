@@ -33,6 +33,14 @@
  * save prompt). Guarding there covers both. canAutoSave() also asks, purely so autosave skips the
  * pointless work silently — an autosave firing on every door must not raise a toast.
  *
+ * ★ BUT THE CARD THREAD IS NOT THE ONLY WAY TO DISK ANY MORE (2026-11, after the upstream merge).
+ * Four other routes write save files, and each is guarded separately: the format request
+ * (mDoMemCd_Ctrl_c::command_format, refuse_card_format), upstream's Save Manager
+ * (save_manager.cpp ensure_write_allowed and delete_backup, refuse_save_file_write), mod save
+ * sidecars (mods/svc/save.cpp write_mod_sidecar, and the legacy migration is deferred), and the mod
+ * file API when a location resolves into save storage (mods/svc/file.cpp,
+ * refuse_save_location_write). A new path that writes under a card folder must join this list.
+ *
  * Do NOT put a guard on dComIfGs_putSave. An earlier draft of this comment said to, and it was
  * wrong in a way that would have been expensive: dComIfGs_putSave (include/d/d_com_inf_game.h:2367)
  * resolves to dSv_info_c::putSave (d_save.cpp:1546), which is pure in-memory bookkeeping — it folds
@@ -45,6 +53,9 @@
  *
  * See .claude/plan/13-save-safety.md for the full audit this implements one item of.
  */
+
+#include <filesystem>
+#include <string_view>
 
 namespace dusk::mp {
 
@@ -97,7 +108,66 @@ bool refuse_card_write();
 bool consume_refused_card_write();
 
 /**
- * Tell the player, once, that losing the host did not give them their save back.
+ * The same refusal as refuse_card_write(), for CARDFormat: mDoMemCd_Ctrl_c::command_format() is the
+ * one place a format is queued (the in-game save prompt and the file select both offer it when a
+ * card reads as damaged). A format destroys every save on the card, so it is the most destructive
+ * write there is. Sets its own completion latch, consumed by FormatSync, for exactly the reason
+ * consume_refused_card_write() exists: both callers poll FormatSync() every frame until it is
+ * non-zero, and a format that was never queued would otherwise leave them waiting forever.
+ */
+bool refuse_card_format();
+
+/// Consumed by mDoMemCd_Ctrl_c::FormatSync. True exactly once per refused format.
+bool consume_refused_card_format();
+
+/**
+ * ★ The guard for every save-file write that does NOT go through the card thread — upstream's
+ * Save Manager (import, restore, delete, backups; src/dusk/save_manager.cpp), mod save sidecars
+ * (src/dusk/mods/svc/save.cpp), and the mod file API when it is pointed at save storage
+ * (src/dusk/mods/svc/file.cpp). Those write the .gci, the raw card image or the .mods sidecars
+ * directly with std::filesystem, so the choke point in mDoMemCd_Ctrl_c::save never sees them.
+ *
+ * Same sticky rule as the card: once this process has joined as a guest, none of them may write or
+ * delete save files for the rest of the process's life. Returns true when the caller must refuse,
+ * having toasted (rate limited, shared with the card toast) and logged @p i_what. The caller must
+ * still finish whatever the player or a mod is waiting on — every call site returns a failure
+ * result rather than skipping a completion.
+ */
+bool refuse_save_file_write(const char* i_what);
+
+/**
+ * True when @p i_path is save storage under the data directory @p i_dataRoot: a memory card folder
+ * (`<root>/<region>/Card *`, which also holds the GCI-mode .mods sidecars and the Save Manager's
+ * backups), a raw card image or its sidecars (`<root>/MemoryCard*`), the raw-mode Save Manager
+ * backups (`<root>/backups`), the startup backups (`<root>/save-backups`) or the legacy
+ * `mod_saves.json`. Everything else under the root — mods' own folders, config, logs, caches —
+ * is not save storage, which is what keeps mods' own writes working while the guard is engaged.
+ *
+ * Pure. Compares lexically after making both paths absolute and normal, case-insensitively on
+ * Windows; a `..` cannot walk out of the check.
+ */
+bool is_save_storage_path(
+    const std::filesystem::path& i_path, const std::filesystem::path& i_dataRoot);
+
+/**
+ * refuse_save_file_write() for the mod file API, whose locations are opaque strings: refuses only
+ * when the guard is engaged AND @p i_location resolves to save storage under dusk::ConfigPath, so a
+ * mod writing its own files keeps working. A location that does not resolve to a filesystem path
+ * (an Android content:// URI) cannot be the app's own card folder and is let through.
+ */
+bool refuse_save_location_write(std::string_view i_location, const char* i_what);
+
+/// How a guest's session came to an end, so the "saving stays disabled" notice says the right
+/// thing.
+enum class SessionEnd {
+    /// The guest chose to leave (the overlay's Leave, or the test knob).
+    LeftByChoice,
+    /// The host went away, refused us, or the connection dropped.
+    HostGone,
+};
+
+/**
+ * Tell the player, once, that the session ending did not give them their save back.
  *
  * Stuart, 2026-08-13: *"if the host is gone, fire the notif that saving wont work."* This is the
  * moment the sticky flag stops being self-explanatory — while the session is up, "I can't save"
@@ -105,8 +175,23 @@ bool consume_refused_card_write();
  * that your own game resumed. It did not: `g_dComIfG_gameInfo` still holds the host's world.
  *
  * No-op unless the flag is actually set, and fires at most once, so a flaky connection cannot turn
- * it into spam.
+ * it into spam. @p i_how only changes the wording: an earlier version said "Host left" to a guest
+ * who had left by choice.
  */
-void notify_save_disabled_after_host_left();
+void notify_save_disabled_after_session_end(SessionEnd i_how);
+
+/**
+ * ★ Test knob DUSK_MP_TEST_SAVE_GUARD_PROBE=<n>: on the n-th call, drive every guarded path once
+ * and log what each one returned, so a scripted two-instance run can prove the refusals — and that
+ * they do not hang — from the logs. Called every frame from NetworkManager::pre_actor_tick, before
+ * the no-transport early-out, so it also runs after the guest has left (the sticky case).
+ *
+ * Destructive on purpose where the guard is engaged: it really asks the Save Manager to delete the
+ * current save and really queues a card format, because a probe that only asked the predicate would
+ * prove nothing about the plumbing. Where the guard is NOT engaged (host, single player) it only
+ * runs the non-destructive Save Manager backup, to prove the guard does not over-block. Never set
+ * in normal play.
+ */
+void run_save_guard_probe_if_requested();
 
 }  // namespace dusk::mp
