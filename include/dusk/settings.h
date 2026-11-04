@@ -295,6 +295,17 @@ struct UserSettings {
         ConfigVar<bool> enableAdvancedSettings;
     } backend;
 
+    struct {
+        /// Shown to the other players. Empty falls back to the session layer's default.
+        ConfigVar<std::string> nickname;
+        /// Port to host on, and to join on when the address does not carry one.
+        ConfigVar<int> port;
+        /// Last address typed into Join Game: "host" or "host:port", IPv4.
+        ConfigVar<std::string> lastJoinAddress;
+        /// "RRGGBB" hex, or empty to let the host assign a colour automatically.
+        ConfigVar<std::string> color;
+    } multiplayer;
+
     // Arrays of size 4 for 4 ports
     struct {
         std::array<ActionBindConfigVar, 4> firstPersonCamera;

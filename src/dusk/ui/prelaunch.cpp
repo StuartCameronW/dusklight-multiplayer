@@ -5,9 +5,11 @@
 #include "dusk/file_select.hpp"
 #include "dusk/iso_validate.hpp"
 #include "dusk/main.h"
+#include "dusk/multiplayer.hpp"
 #include "dusk/settings.h"
 #include "dusk/update_check.hpp"
 #include "modal.hpp"
+#include "multiplayer_window.hpp"
 #include "preset.hpp"
 #include "settings.hpp"
 #include "version.h"
@@ -49,7 +51,7 @@ const Rml::String kDocumentSource = R"RML(
             </hero>
             <div id="menu-list" />
         </menu>
-        <disc-info class="intro-item delay-4">
+        <disc-info class="intro-item delay-5">
             <div id="disc-status">
                 <icon />
                 <span id="disc-status-label" />
@@ -505,6 +507,45 @@ void file_dialog_callback(void*, const char* path, const char* error) {
 
 PrelaunchState sPrelaunchState;
 
+/**
+ * What Play does, shared with the Multiplayer menu's Host and Join: boot the disc and close the
+ * prelaunch menu. With no disc selected yet it opens the picker instead, and returns false.
+ *
+ * `lobby` carries a Host/Join request (null for plain Play); either way this is what lets the
+ * session layer start ticking. `child` is a window stacked on the prelaunch menu that must close
+ * along with it.
+ */
+bool launch_disc(Document& prelaunch, const mp::StartupOptions* lobby, Document* child) {
+    if (prelaunch_state().activeDiscPath.empty()) {
+        open_iso_picker();
+        return false;
+    }
+
+    mDoAud_seStartMenu(kSoundPlay);
+    show_menu_notification();
+
+    if (getSettings().audio.menuSounds) {
+        JAISoundHandle* handle = g_mEnvSeMgr.field_0x144.getHandle();
+        if (*handle) {
+            (*handle)->stop(60);
+            (*handle)->releaseHandle();
+        }
+    }
+
+    if (g_mDoMemCd_control.mCardCommand == mDoMemCd_Ctrl_c::Command_e::COMM_NONE_e) {
+        mDoMemCd_ThdInit();
+    }
+
+    mp::begin_deferred_session(lobby);
+
+    IsGameLaunched = true;
+    if (child != nullptr) {
+        child->hide(true);
+    }
+    prelaunch.pop(false);
+    return true;
+}
+
 }  // namespace
 
 PrelaunchState& prelaunch_state() noexcept {
@@ -688,35 +729,16 @@ Prelaunch::Prelaunch() : Document(kDocumentSource), mRoot(mDocument->GetElementB
     ensure_initialized();
     begin_update_check();
 
+    // The game boots behind this menu as soon as a disc is configured, so without this the
+    // session would open on its first tick, before Host or Join could be chosen.
+    mp::defer_session_start();
+
     if (auto* menuList = mDocument->GetElementById("menu-list")) {
         auto& state = prelaunch_state();
         const bool activeDiscLoaded = !state.activeDiscPath.empty();
         mMenuButtons.push_back(
             std::make_unique<Button>(menuList, activeDiscLoaded ? "Play" : "Select Disc Image"));
-        mMenuButtons.back()->on_pressed([this] {
-            if (prelaunch_state().activeDiscPath.empty()) {
-                open_iso_picker();
-                return;
-            }
-
-            mDoAud_seStartMenu(kSoundPlay);
-            show_menu_notification();
-
-            if (getSettings().audio.menuSounds) {
-                JAISoundHandle* handle = g_mEnvSeMgr.field_0x144.getHandle();
-                if (*handle) {
-                    (*handle)->stop(60);
-                    (*handle)->releaseHandle();
-                }
-            }
-
-            if (g_mDoMemCd_control.mCardCommand == mDoMemCd_Ctrl_c::Command_e::COMM_NONE_e) {
-                mDoMemCd_ThdInit();
-            }
-
-            IsGameLaunched = true;
-            pop(false);
-        });
+        mMenuButtons.back()->on_pressed([this] { launch_disc(*this, nullptr, nullptr); });
         apply_intro_animation(mMenuButtons.back()->root(), "delay-1");
 
         mMenuButtons.push_back(std::make_unique<Button>(menuList, "Settings"));
@@ -726,9 +748,18 @@ Prelaunch::Prelaunch() : Document(kDocumentSource), mRoot(mDocument->GetElementB
         });
         apply_intro_animation(mMenuButtons.back()->root(), "delay-2");
 
+        mMenuButtons.push_back(std::make_unique<Button>(menuList, "Multiplayer"));
+        mMenuButtons.back()->on_pressed([this] {
+            push(std::make_unique<MultiplayerWindow>(
+                [this](Document& self, const mp::StartupOptions& options) {
+                    return launch_disc(*this, &options, &self);
+                }));
+        });
+        apply_intro_animation(mMenuButtons.back()->root(), "delay-3");
+
         mMenuButtons.push_back(std::make_unique<Button>(menuList, "Quit"));
         mMenuButtons.back()->on_pressed([] { IsRunning = false; });
-        apply_intro_animation(mMenuButtons.back()->root(), "delay-3");
+        apply_intro_animation(mMenuButtons.back()->root(), "delay-4");
     }
 
     mDiscStatus = mDocument->GetElementById("disc-status");
