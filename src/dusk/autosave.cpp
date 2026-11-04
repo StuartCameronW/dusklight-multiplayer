@@ -40,8 +40,9 @@ bool canAutoSave() {
     // owns the save (save_guard.hpp). This is the silent early-out; the write itself is refused at
     // the choke point in mDoMemCd_Ctrl_c::save, which is also what covers the in-game save prompt.
     // Silent matters here: autosave fires on every stage entry and every shutter door, and a toast
-    // per door would be worse than useless.
-    if (dusk::mp::save_would_be_contaminated()) {
+    // per door would be worse than useless. Also true when another Dusklight holds this data
+    // directory (the single-instance lock, dusk/data.cpp).
+    if (dusk::mp::saving_disabled()) {
         return false;
     }
 

@@ -595,6 +595,17 @@ Result replace_sidecars(const Storage& storage, const SaveIdentity& identity,
     }
 }
 
+/// The refusal message for whichever reason the guard gave. The guest wording stays verbatim; a
+/// second instance sharing the data folder is told that instead of being told it is a guest.
+Result save_refused() {
+    if (!mp::save_would_be_contaminated()) {
+        if (const char* why = mp::saving_disabled_explanation()) {
+            return failure(why);
+        }
+    }
+    return failure(kGuestSaveRefusal);
+}
+
 // ★ Every Save Manager write and delete (import, raw import, restore, delete save, delete mod data,
 // create backup) funnels through here, and none of them touch the card thread, so the guard on
 // mDoMemCd_Ctrl_c::save never sees them. A guest's save stays untouched for the life of the
@@ -602,7 +613,7 @@ Result replace_sidecars(const Storage& storage, const SaveIdentity& identity,
 // after a reset, which does not end a session, so this is not dead code.
 Result ensure_write_allowed(const Storage& storage) {
     if (mp::refuse_save_file_write("Save Manager")) {
-        return failure(kGuestSaveRefusal);
+        return save_refused();
     }
     if (storage.mounted && !mDoMemCd_isCardCommNone()) {
         return failure("The memory card is busy. Try again after returning to the main menu.");
@@ -1267,7 +1278,7 @@ Result delete_backup(const Storage& storage, const std::filesystem::path& path) 
     // Not through ensure_write_allowed (it never touches the card), but a backup is the player's
     // own save, and while the guard is engaged nothing of theirs is deleted.
     if (mp::refuse_save_file_write("Save Manager: delete backup")) {
-        return failure(kGuestSaveRefusal);
+        return save_refused();
     }
     std::error_code ec;
     if (!std::filesystem::remove(path, ec)) {

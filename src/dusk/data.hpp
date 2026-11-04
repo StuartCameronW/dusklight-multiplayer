@@ -55,4 +55,23 @@ std::string abbreviated_path_string(const std::filesystem::path& path);
 bool is_secondary_instance();
 std::filesystem::path secondary_instance_path();
 
+/**
+ * True when another Dusklight already held this process's data directory and this one could not
+ * be moved to a folder of its own — an explicit --data-dir or --user-dir, or every numbered
+ * instance folder taken. Such a process runs, but must never write a save: the two would tear one
+ * memory card. Sticky for the life of the process.
+ *
+ * Enforced by dusk::mp's save guard (multiplayer/session/save_guard.hpp), which every save write
+ * path already asks, so this is one more reason that guard refuses rather than a second guard.
+ * `shared_data_directory_path()` is the directory the other instance holds.
+ */
+bool is_data_directory_shared();
+std::filesystem::path shared_data_directory_path();
+
+/**
+ * Repeat the startup lock decision into the log. initialize_data() runs before file logging
+ * exists, so its own line reaches only the console; call this once file logging is up.
+ */
+void log_data_lock_status();
+
 }  // namespace dusk::data
