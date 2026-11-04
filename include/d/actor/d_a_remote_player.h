@@ -245,6 +245,8 @@ private:
      */
     void setupEquipModels();
     void setEquipMatrix();
+    /// Advance the puppet's own sword material animations; daAlink_c's setItemMatrix tail.
+    void playEquipAnm();
     void drawEquip();
     /// The sword model this tick's equipment byte selects, or NULL for none. Also reports which
     /// sheath goes with it, since the pairing is not one-to-one.
@@ -566,6 +568,23 @@ private:
      * as the outfit mount, so a puppet deleted mid-spawn has up to four commands in flight at once.
      * readyForDelete() waits for all four. */
     dRes_info_c mShieldRes[3];
+
+    /* This puppet's PRIVATE mount of "Alink", for the ordon and master swords and both sheaths.
+     * Until M3 those four were the local player's own J3DModelData, and everything daAlink_c writes
+     * onto model data leaked onto the puppet: changeWarpMaterial's dissolve, the blade shape he
+     * hides on a sheathe, and the material animators below (whose frame was HIS). A private copy
+     * has one writer. Same teardown rule as mOwnRes and mShieldRes: readyForDelete() waits for it.
+     */
+    dRes_info_c mAlinkRes;
+
+    /* The sword material animations daAlink_c enters on his own copies (d_a_alink.cpp:4583-4599):
+     * the master sword's shimmer BTK + BRK, played every frame from setItemMatrix (:6118-6119), and
+     * the ordon sword's spin-charge BTK, which sits at frame 0 outside a spin. Out of mAlinkRes, so
+     * each puppet owns its anm objects and their frames — never Link's (see the memory on J3D anms
+     * holding their own frame). Any may be NULL; that costs the shimmer, not the sword. */
+    J3DAnmTextureSRTKey* mpOrdonSwordBtk;
+    J3DAnmTextureSRTKey* mpMasterSwordBtk;
+    J3DAnmTevRegKey* mpMasterSwordBrk;
 
     /* The blink. BTP swaps the eyelid texture, BTK slides the texture matrix; they are played in
      * lock-step on the same frame number. Both are this puppet's own copies out of the ARAM

@@ -97,9 +97,9 @@ const int l_defaultOutfit = 1;
  */
 const char l_objectPath[] = "/res/Object/";
 
-/* Link's permanent archive — the swords and both sheaths live here. Mounted once at boot beside
- * "Always" (d_s_logo.cpp:1484) and never freed while a scene exists, which is what makes it safe to
- * read directly instead of mounting privately; see setupEquipModels() for the full argument.
+/* Link's permanent archive — the ordon and master swords, both sheaths and their material
+ * animations live here. The puppet mounts its OWN copy (mAlinkRes) rather than reading the global
+ * one: see setupEquipModels() for why sharing it with the local player was wrong.
  *
  * Spelled out rather than taken from daAlink_c::getArcName() because that returns the OUTFIT
  * archive's name (d_a_alink.cpp:100-102) — a different string that happens to be reachable through
@@ -790,6 +790,9 @@ const u16 l_idleFrameLogTick = 200;
  * moves in step with his, the private mount is not doing what its whole existence rests on — and
  * that is a fact worth a log line rather than an assumption. It should stay silent forever.
  *
+ * M3: the swords and sheaths are now private too (mAlinkRes), so ALL twelve are controls. A drift
+ * line on any of them now means something other than the local player is writing puppet data.
+ *
  * ★ This count, mMaterialSig[] and mWarpMatCount[] in the header, and the names table in
  * checkMaterialDrift() all move TOGETHER. */
 const int l_watchedModelNum = 12;
@@ -863,6 +866,18 @@ void* own_archive_res(dRes_info_c& i_res, const char* i_resName) {
     }
 
     return i_res.getRes(entry - archive->mFiles);
+}
+
+/**
+ * own_archive_res() by file index, for the private "Alink" mount, whose per-region resource header
+ * IS includable (Alink.h's enums are all prefixed). dRes_INDEX_ALINK_* is the file index that
+ * loadResource() fills mRes by, so this is dRes_control_c::getRes's own lookup minus the table.
+ */
+void* own_archive_idx(dRes_info_c& i_res, s32 i_index) {
+    if (i_res.getArchive() == NULL || i_index < 0 || i_index >= i_res.getResNum()) {
+        return NULL;
+    }
+    return i_res.getRes(i_index);
 }
 
 /**
@@ -1720,6 +1735,26 @@ void set_debug_mount_delay(bool i_wanted) {
 #endif
 }
 
+/**
+ * dRes_info_c::setRes() for the puppet's private "Alink" mount, with the room light mask held at
+ * the value it had when the local player's copy was loaded.
+ *
+ * setRes() runs loadResource() on the tick the mount lands, and loaderBasicBmd masks every
+ * material's light mask by g_env_light.light_mask_type (d_resorce.cpp:266-292). The global "Alink"
+ * is loaded once at boot (d_s_logo.cpp:1585), before any stage can set that field - only
+ * d_a_kytag17 ever does, and dKy_setLight_init puts it back to 0 (d_kankyo.cpp:1304-1310). Loading
+ * our copy mid-stage would otherwise bake THIS room's mask into the swords for the puppet's whole
+ * life where Link's carry none. Zero is the boot value. The outfit and shield archives need no
+ * such bracket: Link loads those mid-stage himself, so they see the same mask his do.
+ */
+static int alink_res_set_res(dRes_info_c& i_res) {
+    const u8 maskType = g_env_light.light_mask_type;
+    g_env_light.light_mask_type = 0;
+    const int state = i_res.setRes();
+    g_env_light.light_mask_type = maskType;
+    return state;
+}
+
 int daRemotePlayer_c::mountOwnArchive() {
     if (!mResRequested) {
         /* Raised BEFORE the set() calls so the very first command is already slow — see
@@ -1758,6 +1793,12 @@ int daRemotePlayer_c::mountOwnArchive() {
                     // would only shift which archives the poll below reports as -1.
                 }
             }
+
+            /* The puppet's own "Alink", for the swords and sheaths. Started on the same tick for
+             * the same reason the shields are; see setupEquipModels() for why it is private. */
+            if (!mAlinkRes.set(l_alinkArcName, l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL)) {
+                Log.warn("Puppet could not start a private mount of '{}'", l_alinkArcName);
+            }
         }
     }
 
@@ -1794,6 +1835,16 @@ int daRemotePlayer_c::mountOwnArchive() {
         } else if (shieldState > 0) {
             loading = true;
         }
+    }
+
+    const int alinkState = alink_res_set_res(mAlinkRes);
+    if (alinkState < 0) {
+        failed = true;
+        if (firstFailure == NULL) {
+            firstFailure = l_alinkArcName;
+        }
+    } else if (alinkState > 0) {
+        loading = true;
     }
 
     if (loading) {
@@ -1849,8 +1900,9 @@ int daRemotePlayer_c::create() {
          * legitimately takes many frames. Only the error step is worth recording. */
         if (mountPhase == cPhs_ERROR_e) {
             g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
-            g_daRemotePlayer_lastCreateFail.mReason = "one of the private archive mounts (the "
-                                                      "outfit, or one of the three shields) failed";
+            g_daRemotePlayer_lastCreateFail.mReason =
+                "one of the private archive mounts (the outfit, one of the three shields, or "
+                "Alink) failed";
         }
         return mountPhase;
     }
@@ -1984,6 +2036,10 @@ bool daRemotePlayer_c::readyForDelete() {
         if (mShieldRes[i].setRes() > 0) {
             pending++;
         }
+    }
+
+    if (alink_res_set_res(mAlinkRes) > 0) {
+        pending++;
     }
 
     if (pending == 0) {
@@ -4811,25 +4867,32 @@ bool daRemotePlayer_c::checkWoodSwordEquip() const {
 /**
  * Build every sword, sheath and shield the puppet might need, once, at createHeap time.
  *
- * ★ The ordon and master swords and both sheaths come from the "Alink" archive, which the puppet
- * READS DIRECTLY rather than mounting privately — the one place it does that, and it needs its
- * justification stated because mountOwnArchive() argues at length for the opposite.
+ * ★ The ordon and master swords and both sheaths come from the puppet's OWN mount of "Alink"
+ * (mAlinkRes), not from the global one the local player built his from. They used to be read
+ * directly, on the argument that "Alink" is never freed — true, but lifetime was never the only
+ * hazard. daAlink_c writes per-actor state onto these four J3DModelData, and on shared data every
+ * puppet inherited it:
  *
- * The argument there is about LIFETIME and about the JOINT TREE, and neither applies here:
+ *   - changeWarpMaterial (d_a_alink.cpp:14997-15004) toggles the twilight dissolve on HIS sword and
+ *     sheath data, with setWarpSRT driven from HIS position — so his warp-out dissolved a puppet's
+ *     sword too, and his offWarpMaterial restored whichever pair HE held (worklist 14, P2 #5).
+ *   - offSwordModel/setSwordModel hide and show the blade shape on the data (:4385-4395). The
+ *     old drawEquip() bracket missed the mirror pass, which draws after it closed (14, P2 #6).
+ *   - His sword material animators (:4583-4599) are entered on the data with HIS anm objects, so a
+ *     puppet's master-sword shimmer ran on his frame — and stopped with him.
+ *   - The env-mapped texture matrices of SWM/PODM are camera-derived scratch on the data; the last
+ *     actor to calc before an entry decided both draws. That is what the sheaths' 0x200 and the
+ *     init_model_common predicate fix were fighting, one consequence at a time.
  *
- *   - "Alink" is mounted once at boot, beside "Always" (d_s_logo.cpp:1478-1485), and is excluded
- *     from the per-stage size accounting exactly as "Always" and "Midna" are
- * (d_s_play.cpp:517-523). Nothing frees it while a scene exists. The OUTFIT archive is the opposite
- * case — Link loads it into his own heap and calls freeAll() on a clothes change — which is what
- * that comment is about.
- *   - Sharing model DATA is only dangerous when something per-actor is written onto it: a joint
- *     callback, a matrix calculator, a hidden shape. A sword has none of the first two. It does
- * have the third, and that one is real — see drawEquip(), which brackets it.
+ * A private mount has one writer, so all four stop being races rather than being bracketed. The
+ * cost is one more archive per puppet; `Puppet private Alink` in the log has the measured size.
+ * There is no fallback to the shared copy on a failed mount: a failure fails the spawn exactly as a
+ * failed shield mount does, because a silent fallback is the one path no run would ever exercise.
  *
- * The wooden sword is the exception and comes from the puppet's OWN outfit archive, because that is
- * where daAlink_c gets it (d_a_alink_wolf.inc:415, from mArcName rather than l_arcName). The three
- * SHIELDS are the same kind of exception for a stronger reason; the block over their loop, at the
- * end of this function, has it.
+ * The wooden sword comes from the puppet's own OUTFIT archive, because that is where daAlink_c gets
+ * it (d_a_alink_wolf.inc:415, from mArcName rather than l_arcName). The three SHIELDS have their
+ * own private mounts for the lifetime reason; the block over their loop, at the end of this
+ * function, has it.
  *
  * The flag pairs are daAlink_c's, verbatim (d_a_alink.cpp:4239-4253). They are not decorative:
  * initModelEnv is mdlFlags 0 where init_model is 0x80000, and the master sword additionally carries
@@ -4845,14 +4908,26 @@ void daRemotePlayer_c::setupEquipModels() {
         mpShieldModel[i] = NULL;
     }
 
-    J3DModelData* swaData = static_cast<J3DModelData*>(
-        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_SWA_e));
-    J3DModelData* swmData = static_cast<J3DModelData*>(
-        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_SWM_e));
-    J3DModelData* podaData = static_cast<J3DModelData*>(
-        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_PODA_e));
-    J3DModelData* podmData = static_cast<J3DModelData*>(
-        dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_PODM_e));
+    J3DModelData* swaData =
+        static_cast<J3DModelData*>(own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BMD_AL_SWA_e));
+    J3DModelData* swmData =
+        static_cast<J3DModelData*>(own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BMD_AL_SWM_e));
+    J3DModelData* podaData =
+        static_cast<J3DModelData*>(own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BMD_AL_PODA_e));
+    J3DModelData* podmData =
+        static_cast<J3DModelData*>(own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BMD_AL_PODM_e));
+
+    /* The measurement the cost claim above rests on, and the proof the data is not Link's: a
+     * pointer equal to the global table's would mean this mount is not private at all. */
+    {
+        JKRSolidHeap* dataHeap = mAlinkRes.getDataHeap();
+        const void* globalSwm = dComIfG_getObjectRes(l_alinkArcName, dRes_ID_ALINK_BMD_AL_SWM_e);
+        Log.info("Puppet {} private Alink: {} resources, data heap {} bytes | sword master data {} "
+                 "(local player's {}) -> {}",
+            mPlayerId, mAlinkRes.getResNum(), dataHeap != NULL ? dataHeap->getHeapSize() : 0,
+            static_cast<const void*>(swmData), globalSwm,
+            swmData != NULL && swmData != globalSwm ? "PRIVATE" : "SHARED OR MISSING");
+    }
 
     mpSwordModel[dusk::mp::kPlayerEquipSwordOrdon] = init_model(swaData, 0x200, "sword ordon");
     mpSwordModel[dusk::mp::kPlayerEquipSwordMaster] =
@@ -4887,7 +4962,12 @@ void daRemotePlayer_c::setupEquipModels() {
      * on both instances); this is the mechanism that survives, not one that has been watched to
      * work. If the effect persists, the next step is NOT another flag — it is giving the puppet its
      * own copy of the sheath model data, because sharing is the root and this only stops one of its
-     * consequences. */
+     * consequences.
+     *
+     * M3: that copy now exists (mAlinkRes), so the race this flag was for is gone. The flag is KEPT
+     * rather than reverted to his 0: init_model_common's bracket already ORs a non-zero TexGenNum
+     * field in for every BMWR/BMWE model, so this changes nothing the bracket does not, and
+     * reverting it is a visible-geometry change for no measured gain. */
     J3DModel* podaModel = init_model(podaData, 0x200, "sheath PODA");
     J3DModel* podmModel = init_model_env(podmData, 0x200, "sheath PODM");
 
@@ -4900,6 +4980,35 @@ void daRemotePlayer_c::setupEquipModels() {
     mpSheathModel[dusk::mp::kPlayerEquipSwordOrdon] = podaModel;
     mpSheathModel[dusk::mp::kPlayerEquipSwordMaster] = podmModel;
     mpSheathModel[dusk::mp::kPlayerEquipSwordWood] = podmModel;
+
+    /* daAlink_c's three sword material animations, entered exactly as he enters them
+     * (d_a_alink.cpp:4583-4599) — but out of OUR mount, so the anm objects, and therefore their
+     * frames, are this puppet's. Entering Link's own m_mSwordBtk here would put a second frame
+     * controller on one animation object. Played in playEquipAnm(). */
+    mpOrdonSwordBtk = static_cast<J3DAnmTextureSRTKey*>(
+        own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BTK_AL_SWA_e));
+    mpMasterSwordBtk = static_cast<J3DAnmTextureSRTKey*>(
+        own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BTK_AL_SWM_e));
+    mpMasterSwordBrk =
+        static_cast<J3DAnmTevRegKey*>(own_archive_idx(mAlinkRes, dRes_INDEX_ALINK_BRK_AL_SWM_e));
+    if (mpOrdonSwordBtk != NULL && swaData != NULL) {
+        mpOrdonSwordBtk->searchUpdateMaterialID(swaData);
+        swaData->entryTexMtxAnimator(mpOrdonSwordBtk);
+    }
+    if (swmData != NULL) {
+        if (mpMasterSwordBtk != NULL) {
+            mpMasterSwordBtk->searchUpdateMaterialID(swmData);
+            swmData->entryTexMtxAnimator(mpMasterSwordBtk);
+        }
+        if (mpMasterSwordBrk != NULL) {
+            mpMasterSwordBrk->searchUpdateMaterialID(swmData);
+            swmData->entryTevRegAnimator(mpMasterSwordBrk);
+        }
+    }
+    Log.debug("Puppet {} sword animators: ordon btk {}, master btk {}, master brk {}", mPlayerId,
+        mpOrdonSwordBtk != NULL ? "entered" : "MISSING",
+        mpMasterSwordBtk != NULL ? "entered" : "MISSING",
+        mpMasterSwordBrk != NULL ? "entered" : "MISSING");
 
     /* Not fatal, on the same terms as a missing head: an unarmed puppet is a far better failure
      * than no puppet. Logged per kind, because "which one is missing" is the whole diagnosis — a
@@ -5049,27 +5158,40 @@ void daRemotePlayer_c::setEquipMatrix() {
 
         shield->calc();
     }
+
+    playEquipAnm();
+}
+
+/**
+ * daAlink_c::setItemMatrix's tail: `simpleAnmPlay(m_mSwordBtk); simpleAnmPlay(m_mSwordBrk);`
+ * (d_a_alink.cpp:6118-6119), once a tick and whatever the sword is doing — he does not gate it on
+ * the sword being drawn, so neither does this.
+ *
+ * The ordon sword's BTK is deliberately NOT played. He advances it only during a spin-attack
+ * charge (d_a_alink_cut.inc:1922-1937) and resets it to 0 afterwards (d_a_alink.cpp:15244), and
+ * the charge is not on the wire; frame 0 is what he shows the rest of the time.
+ *
+ * These are the puppet's own anm objects (setupEquipModels()), so this is their ONLY frame
+ * controller. Called from setEquipMatrix() and nowhere else, so once per sim tick.
+ */
+void daRemotePlayer_c::playEquipAnm() {
+    daAlink_c::simpleAnmPlay(mpMasterSwordBtk);
+    daAlink_c::simpleAnmPlay(mpMasterSwordBrk);
 }
 
 /**
  * Draw the sword, its sheath and the shield.
  *
- * ★ The bracket around the blade is the whole reason this is its own function.
- *
  * daAlink_c hides part of the sword model when it is sheathed and shows it when it is drawn —
  * material 0 for a real sword, material 1 for the wooden one (d_a_alink.cpp:4385-4395). He does it
- * on the MODEL DATA, which the puppet shares with him for the two swords that come out of "Alink".
- * So the flag is one variable serving two actors that can disagree about it, and a puppet with a
- * sheathed sword standing next to a local player with a drawn one would otherwise fight over it
- * every frame.
+ * on the MODEL DATA. Every sword the puppet draws is now built from its OWN data (mAlinkRes and the
+ * outfit mount), so the flag is set from the wire and simply LEFT there: there is no second writer
+ * to restore it for.
  *
- * Bracketing works because the flag is consumed at ENTRY time, not at draw time: J3DJoint::entryIn
- * tests it as it builds the packet (J3DJoint.cpp:164-165), and mDoExt_modelEntryDL is what runs
- * that. So setting it, entering, and putting it back leaves the local player's own state exactly as
- * it was by the time he enters his.
- *
- * The wooden sword needs no bracket — it comes from the puppet's private outfit archive — but gets
- * one anyway, because the alternative is a rule that is true for two of three cases.
+ * That is also the fix for the mirror pass (worklist 14, P2 #6). This used to be a set/enter/
+ * restore bracket around SHARED data, which worked for mDoExt_modelEntryDL because the flag is
+ * consumed at entry (J3DJoint::entryIn, J3DJoint.cpp:164-165) — but daMirror_c::entry only stores
+ * the model and draws it later, by which time the bracket had put the LOCAL player's value back.
  *
  * ★ Same structural point as setEquipMatrix(): the sword's "nothing to do" test is a branch, not an
  * early return, because a shield is drawn independently of whether a blade is out. The old return
@@ -5098,13 +5220,9 @@ void daRemotePlayer_c::drawEquip() {
         const bool bladeVisible = kind == dusk::mp::kPlayerEquipSwordWood ? !inHand : inHand;
 
         J3DModelData* swordData = sword->getModelData();
-        J3DShape* blade = NULL;
-        bool bladeWasVisible = false;
         if (swordData != NULL && bladeMatNo < swordData->getMaterialNum()) {
-            blade = swordData->getMaterialNodePointer(bladeMatNo)->getShape();
-            // J3DShpFlag_Visible SET means hidden — hide() turns it on (J3DShape.h:171-172). Read
-            // the flag rather than remembering what we last wrote: the local player writes it too.
-            bladeWasVisible = !blade->checkFlag(J3DShpFlag_Visible);
+            J3DShape* blade = swordData->getMaterialNodePointer(bladeMatNo)->getShape();
+            // J3DShpFlag_Visible SET means hidden — hide() turns it on (J3DShape.h:171-172).
             if (bladeVisible) {
                 blade->show();
             } else {
@@ -5130,14 +5248,6 @@ void daRemotePlayer_c::drawEquip() {
          * comparison could not tell a wooden sword from a master sword at all. */
         if (!checkWoodSwordEquip()) {
             drawModel(sheath);
-        }
-
-        if (blade != NULL) {
-            if (bladeWasVisible) {
-                blade->show();
-            } else {
-                blade->hide();
-            }
         }
 
         if (!mLoggedEquip) {
