@@ -322,6 +322,9 @@ private:
     /// The shield-guard variants of every row m_mainBckShield covers. Non-fatal, once, from
     /// createHeap(), after loadAtnAnimations() because it reuses what that loaded.
     void loadGuardAnimations();
+    /// The standing pivot (STEPL / STEPR and their tired rows). Non-fatal, once, from createHeap(),
+    /// after setupHeldItems() so a short heap costs only this. See selectAnimation().
+    void loadStepTurnAnimations();
     /// i_plain, or its shield-guard variant when the wire says he is guarding and that variant is
     /// resident. getMainBckData's guard branch, which beats the sword one.
     const daRemotePlayer_anm_c& guardOr(u16 i_anmID, const daRemotePlayer_anm_c& i_plain) const;
@@ -741,6 +744,22 @@ private:
     daRemotePlayer_anm_c mWaitBAnm;
     daRemotePlayer_anm_c mServiceWaitAnm;
     daRemotePlayer_anm_c mTiredWaitAnm;
+
+    /* The standing pivot: setBlendMoveAnime's step-turn branch (d_a_alink.cpp:7706-7745) puts one
+     * of these in slot 1 over the wait while Link turns on the spot, and slot 1 then owns the
+     * notes, so these are where his turn-in-place footsteps come from. Indexed by
+     * anm - ANM_STEP_TURN: STEPL, STEPR (misnamed ANM_SMALL_GUARD), and the two tired rows, which
+     * share the plain rows' under objects (never both in the packs) and one WAITD upper of their
+     * own (slot 0 holds mTiredWaitAnm's at the same time). A NULL mpUnder means not resident, and
+     * the puppet then stands through the turn as before. */
+    daRemotePlayer_anm_c mStepTurnAnm[4];
+    /// shape_angle.y as of last tick's selectAnimation(): the puppet's mPrevAngleY.
+    s16 mStepTurnPrevYaw;
+    /// Whether mStepTurnPrevYaw holds a real sample yet. False at spawn via fopAcM_ct's zeroing.
+    bool mStepTurnYawValid;
+    /// 1 + the mStepTurnAnm index played last tick, or 0 for none. A change is a change of loaded
+    /// pair, which setDoubleAnime cross-fades.
+    u8 mStepTurnPrev;
 
     /* --- D3b: the attention (Z-target / lock-on) set. Kept in one block on purpose. ---------
      *
