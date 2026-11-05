@@ -196,6 +196,11 @@ const u16 l_handShapeNum = 11;
  * daAlink_c's own sentinel, tested by name at d_a_alink.cpp:19017 and :19038 and appearing all over
  * m_anmDataTable's hand columns. */
 const u8 l_defaultHandIdx = 0xFE;
+/* The wire's "sender's hands not known" value, dusk::mp::kPlayerHandUnknown (player_state.hpp),
+ * restated because this file does not include the net layer. Sent while his status window is
+ * open. It is also what the puppet holds before the first pose arrives. setDrawHand() then falls
+ * back to its own derivation. */
+const u8 l_unknownHandIdx = 0xFF;
 
 /**
  * One-shot dump of where a model's texture matrices actually ARE.
@@ -3872,10 +3877,15 @@ bool daRemotePlayer_c::selectAtnAnimation() {
  * a "neutral" pair means the puppet cannot be holding something the animation is not shaped for,
  * and it stays right for free when equipment replication starts driving other animations.
  *
- * What is NOT reproduced is daAlink_c's item override chain (field_0x2f94-0x2f97, the 0x64 and 0xFB
- * demo cases). Those are all "the hand is holding a specific item", and a puppet has no replicated
- * equipment yet; every one of them falls through to mLeftHandIndex/mRightHandIndex, which is
- * exactly what this reads.
+ * ★ Since protocol 17 the table pair and the sword/shield grips below are only the FALLBACK. The
+ * sender now sends the pair he is SHOWING on every tick (block 2's actHandL/R: field_0x06d0/06d4
+ * resolved back to an index). That is the output of his whole override chain: field_0x2f94-0x2f97
+ * written by the held item (lantern, bottle, bow 0x67, boomerang, clawshot, canoe 0x65), the 0x64
+ * cut cases, the cut-type right hand and the shield pass flag. The puppet takes it as is.
+ * Rebuilding that chain from the replicated heldItem would mean re-deriving a dozen proc and item
+ * branches, and missing one is the usual way these comparisons go wrong. The fallback runs only
+ * before the first pose and while the sender's status window is open (l_unknownHandIdx). The 0xFB
+ * demo-hand case still resolves to the body's hand: the puppet has no demo hand models.
  */
 void daRemotePlayer_c::setDrawHand() {
     for (int i = 0; i < 2; i++) {
@@ -3927,11 +3937,32 @@ void daRemotePlayer_c::setDrawHand() {
     if ((mNetEquip & dusk::mp::kPlayerEquipShieldInHand) != 0) {
         handIdx[1] = l_shieldGripHandIdx;
     }
-    /* During an action override the pair is the sender's SHOWN pair, already through his whole
-     * resolution chain, grips included — the answer, not the table row it started from. */
-    if (mActActive) {
-        handIdx[0] = mNetActHand[0];
-        handIdx[1] = mNetActHand[1];
+    /* The sender's SHOWN pair, already through his whole resolution chain, grips and held items
+     * included. That is the answer, not the table row it started from. Since protocol 17 it is sent
+     * in every state, not only during an action override, so it is taken whenever it is known. This
+     * also covers the iron-boots ANM_WAIT_B idle: there the puppet's own table read takes the
+     * dominant WALK_HEAVY row (0xFE/0xFE), while Link shows WAIT_B's grip. */
+    const u8 fallbackIdx[2] = {handIdx[0], handIdx[1]};
+    for (int i = 0; i < 2; i++) {
+        if (mNetActHand[i] != l_unknownHandIdx) {
+            handIdx[i] = mNetActHand[i];
+        }
+    }
+    /* Capped and on change, so one run shows each held item's pair. It is the proof that the wire
+     * pair is in use: a line appears only when the sender's pair differs from what the puppet would
+     * have picked on its own. No line in a run where he held a lantern or a bow means the wire pair
+     * never arrived. */
+    if (handIdx[0] != fallbackIdx[0] || handIdx[1] != fallbackIdx[1]) {
+        const u32 state = ((u32)fallbackIdx[0] << 24) | ((u32)fallbackIdx[1] << 16) |
+                          ((u32)handIdx[0] << 8) | (u32)handIdx[1];
+        if (state != mLastWireHandState && mLoggedWireHands < 16) {
+            mLastWireHandState = state;
+            mLoggedWireHands++;
+            Log.debug("Puppet {} hands from wire: anim {} would show L={} R={}, sender shows L={} "
+                      "R={} (act {:d})",
+                mPlayerId, mCurrentAnm, fallbackIdx[0], fallbackIdx[1], handIdx[0], handIdx[1],
+                mActActive);
+        }
     }
 
     J3DModelData* handData = mpHandModel != NULL ? mpHandModel->getModelData() : NULL;
@@ -5716,8 +5747,8 @@ void daRemotePlayer_c::setupActionAnimation() {
     mNetActUpper = l_actNone;
     mActPrevNetUnder = l_actNone;
     mActPrevNetFrame = -1.0f;
-    mNetActHand[0] = l_defaultHandIdx;
-    mNetActHand[1] = l_defaultHandIdx;
+    mNetActHand[0] = l_unknownHandIdx;
+    mNetActHand[1] = l_unknownHandIdx;
     // Block (4).
     mpActUnder1Bck = NULL;
     mpActUpper1Bck = NULL;

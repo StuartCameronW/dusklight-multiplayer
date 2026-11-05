@@ -574,6 +574,11 @@ private:
     bool mLoggedShadow;
     /// Same for the first hand pose actually taken off the hands model; see setDrawHand().
     bool mLoggedHands;
+    /// How many "the sender's hands overrode the puppet's own pick" lines have been printed
+    /// (capped, on change), and the last (fallback, wire) pair printed. Zeroed by fopAcM_ct. See
+    /// setDrawHand().
+    u16 mLoggedWireHands;
+    u32 mLastWireHandState;
     /// And once for the first tick the puppet holds a drawn sword, printing its hand pair next to
     /// the local player's. Either alone proves nothing; the pair is only wrong relative to what he
     /// is showing on the same tick. See setDrawHand().

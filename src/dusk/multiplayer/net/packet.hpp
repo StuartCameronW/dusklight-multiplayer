@@ -106,7 +106,15 @@ namespace dusk::mp {
  * room this end is not drawing. A size change: a v15 peer's read() would under-run and drop
  * every pose.
  */
-inline constexpr std::uint32_t kProtocolVersion = 16;
+/*
+ * 17: no size change (still 76 bytes), but block (2)'s actHandL / actHandR change meaning. They
+ * used to be filled only while the action override was on (kPlayerActBodyHand otherwise). Now
+ * they carry the hand shapes the sender is SHOWING on every tick, and kPlayerHandUnknown (0xFF)
+ * while his status window is open. The receiver draws them in every state. A v16 sender would
+ * send 0xFE outside actions, and a v17 puppet would take that as "the body's plain hands" and
+ * drop the sword and shield grips.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 17;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
