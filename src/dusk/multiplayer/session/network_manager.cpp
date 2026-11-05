@@ -1,5 +1,6 @@
 #include "network_manager.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iterator>
 #include <string>
@@ -55,6 +56,17 @@ constexpr std::size_t kSpareConnectionSlots = 2;
 /// is answered once per peer; keeping it around until it ages out is what lets every peer's reply
 /// produce an RTT, not just the first one.
 constexpr std::chrono::seconds kHeartbeatExpiry{10};
+
+/**
+ * The most one frame may add to the silence watchdog's clock (mAttentiveTime). Above any frame a
+ * live session produces — 200 ms at the 5 Hz the sim falls to under load — so a slow sim still
+ * times out on schedule, but far below a real stall, so our own 3 s hitch charges peers 1 s, not 3.
+ */
+constexpr std::chrono::seconds kMaxAttentiveStep{1};
+
+/// The watchdog's deadline. The same number the transport is configured with, so the two agree on
+/// what "gone" means; only the watchdog actually meets it.
+constexpr std::chrono::milliseconds kPeerSilenceTimeout{kPeerSilenceTimeoutMs};
 
 /**
  * ★ Test knobs for the two refusals, which a scripted run otherwise cannot reach: "full" needs
@@ -348,6 +360,8 @@ void NetworkManager::shutdown() {
     world_clock().clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
+    mAttentiveTime = {};
+    mLastPollAt = {};
     mRole = Role::Inactive;
     mJoined = false;
     mHostNickname.clear();
@@ -393,6 +407,15 @@ void NetworkManager::pre_actor_tick() {
 
     ++mSimTick;
 
+    // Advance the watchdog's clock before draining, so packets that queued up while we were away
+    // are stamped with the time we came back.
+    const auto pollAt = std::chrono::steady_clock::now();
+    if (mLastPollAt != std::chrono::steady_clock::time_point{}) {
+        mAttentiveTime +=
+            std::min<std::chrono::steady_clock::duration>(pollAt - mLastPollAt, kMaxAttentiveStep);
+    }
+    mLastPollAt = pollAt;
+
     mEventScratch.clear();
     mTransport->poll(mEventScratch);
     for (const TransportEvent& event : mEventScratch) {
@@ -405,6 +428,12 @@ void NetworkManager::pre_actor_tick() {
     }
 
     check_handshake_deadlines();
+    if (!mTransport) {
+        return;
+    }
+
+    // After the drain, so a peer is judged on everything that reached us this frame.
+    check_peer_silence();
     if (!mTransport) {
         return;
     }
@@ -444,6 +473,7 @@ void NetworkManager::handle_event(const TransportEvent& event) {
         session.id = event.peer;
         session.connectedAt = std::chrono::steady_clock::now();
         session.lastHeard = session.connectedAt;
+        session.heardAtAttentive = mAttentiveTime;
         mPeers[event.peer] = session;
         Log.info("Peer {} connected ({} total)", event.peer, mPeers.size());
         // The client speaks first so the host can vet its protocol version.
@@ -458,6 +488,7 @@ void NetworkManager::handle_event(const TransportEvent& event) {
     case TransportEventType::Data:
         if (auto it = mPeers.find(event.peer); it != mPeers.end()) {
             it->second.lastHeard = std::chrono::steady_clock::now();
+            it->second.heardAtAttentive = mAttentiveTime;
         }
         handle_packet(event.peer, event.data.data(), event.data.size());
         break;
@@ -591,6 +622,39 @@ void NetworkManager::check_handshake_deadlines() {
             now - session.connectedAt > kHelloTimeout)
         {
             refuse_peer(session, DisconnectReason::HandshakeTimeout);
+        }
+    }
+}
+
+void NetworkManager::check_peer_silence() {
+    // Collected first: handle_disconnect erases from mPeers, and on a client it tears the whole
+    // session down.
+    std::vector<PeerId> silent;
+    for (const auto& [id, session] : mPeers) {
+        if (mAttentiveTime - session.heardAtAttentive > kPeerSilenceTimeout) {
+            silent.push_back(id);
+        }
+    }
+
+    for (const PeerId id : silent) {
+        const auto it = mPeers.find(id);
+        if (it == mPeers.end()) {
+            continue;
+        }
+        Log.warn("Peer {} silent for {} ms; dropping (watchdog)", id,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                mAttentiveTime - it->second.heardAtAttentive)
+                .count());
+        // Transport first, and without waiting: a dropped peer produces no Disconnected event, so
+        // the handle_disconnect below is the only one this peer ever gets — one PeerLeft, one
+        // notice. On a client, shutdown()'s hang-up then has nobody left to wait on.
+        const auto reason = static_cast<std::uint32_t>(DisconnectReason::ConnectionLost);
+        mTransport->drop(id, reason);
+        // The same path a transport timeout takes: host despawns the puppet and broadcasts
+        // PeerLeft; client ends the session as "stopped responding".
+        handle_disconnect(id, reason);
+        if (!mTransport) {
+            return;
         }
     }
 }

@@ -19,6 +19,15 @@ using PeerId = std::uint32_t;
 
 inline constexpr PeerId kInvalidPeer = 0xFFFFFFFFu;
 
+/**
+ * How long a peer may go without a single packet before the session drops it. The transport is
+ * configured with this as its own maximum, but ENet only checks that maximum when a reliable
+ * command's retransmit timer expires, and that timer doubles every retry, so its real detection
+ * lands anywhere from this to roughly twice this. NetworkManager's silence watchdog enforces it
+ * exactly. See kPeerTimeout* in enet_transport.cpp.
+ */
+inline constexpr std::uint32_t kPeerSilenceTimeoutMs = 12000;
+
 enum class TransportEventType {
     Connected,
     Disconnected,
@@ -65,6 +74,11 @@ public:
     /// go out first, so a refusal can be explained before the line drops. A Disconnected event for
     /// the peer follows once the far end acknowledges (or the attempt times out).
     virtual void disconnect(PeerId peer, std::uint32_t reason, bool afterQueued) = 0;
+
+    /// Forget one peer immediately, with a single best-effort goodbye carrying @p reason and no
+    /// wait for an acknowledgement. Unlike disconnect(), NO Disconnected event follows: the caller
+    /// has already decided the peer is gone and handles that itself, exactly once.
+    virtual void drop(PeerId peer, std::uint32_t reason) = 0;
 
     /// Hang up on everyone and close, blocking briefly so the far ends hear it rather than having
     /// to time out. No Disconnected events are produced: the caller is the one leaving.

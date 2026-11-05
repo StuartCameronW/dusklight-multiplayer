@@ -33,6 +33,7 @@ public:
     std::uint32_t rtt_ms(PeerId peer) const override;
     std::size_t peer_count() const override;
     void disconnect(PeerId peer, std::uint32_t reason, bool afterQueued) override;
+    void drop(PeerId peer, std::uint32_t reason) override;
     void disconnect_all(std::uint32_t reason) override;
 
 private:
