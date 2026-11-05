@@ -21,9 +21,11 @@ constexpr std::uint32_t kRoomHideDebounceTicks = 15;
 /// remote_location() can only answer Here for that, and spawning on it put the puppet up for
 /// 4 ticks + the debounce above before the real room hid it again: a 17-tick flash and a full
 /// respawn on every far-room warp (measured, D_MN05). So an unknown room keeps the last
-/// decision and does not spawn a puppet, for at most this long; a stage that never reports a
-/// room still gets its puppet.
-constexpr std::uint32_t kRoomUnknownHoldTicks = 10;
+/// decision and does not spawn a puppet, for at most this many SENDER ticks; a stage that never
+/// reports a room still gets its puppet. Counted in the sender's ticks, not ours: a sender
+/// crawling after a big load took 1.6 s over its 4 room -1 ticks, which a starved receiver
+/// replayed for ~64 of its own ticks (measured, F_SP121 with the PC shared).
+constexpr std::uint64_t kRoomUnknownHoldTicks = 10;
 
 const char* location_name(RemoteLocation where) {
     switch (where) {
@@ -142,13 +144,19 @@ void ReplicationManager::drive_puppets() {
          * tag, the shadow and the sounds with it (all three hang off the actor). It comes back
          * through ensure_puppet() at the pose of the moment: a snap, never a slide. */
         const RemoteLocation where = remote_location(pose);
-        const bool roomUnknown = where == RemoteLocation::Here && pose.stageHash != 0 &&
-                                 pose.roomNo < 0 && player.roomUnknownTicks < kRoomUnknownHoldTicks;
-        if (roomUnknown) {
-            player.roomUnknownTicks++;
-            player.roomWasUnknown = true;
+        bool roomUnknown = false;
+        if (where == RemoteLocation::Here && pose.stageHash != 0 && pose.roomNo < 0) {
+            if (!player.roomUnknownActive) {
+                player.roomUnknownActive = true;
+                player.roomUnknownSince = player.buffer.played_tick();
+            }
+            roomUnknown =
+                player.buffer.played_tick() - player.roomUnknownSince < kRoomUnknownHoldTicks;
+            if (roomUnknown) {
+                player.roomWasUnknown = true;
+            }
         } else if (pose.roomNo >= 0) {
-            player.roomUnknownTicks = 0;
+            player.roomUnknownActive = false;
         }
         RemoteLocation hide = RemoteLocation::Here;
         if (roomUnknown) {

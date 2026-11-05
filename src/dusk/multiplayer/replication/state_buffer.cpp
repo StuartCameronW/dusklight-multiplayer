@@ -157,6 +157,7 @@ bool StateBuffer::advance(PlayerState& out) {
         // Still filling the buffer after a (re)start. Hold the first pose rather than extrapolate
         // from a single sample, which would be a guess with nothing behind it.
         out = mSamples.front().state;
+        mPlayedTick = mSamples.front().tick;
         on_clean(newest);
         return true;
     }
@@ -165,6 +166,7 @@ bool StateBuffer::advance(PlayerState& out) {
         // Nothing left to interpolate towards: the sender's data has not arrived. Hold the last
         // known pose. Extrapolating here is what makes puppets skate into walls under packet loss.
         out = mSamples.back().state;
+        mPlayedTick = mSamples.back().tick;
         on_starved(newest);
         return true;
     }
@@ -185,6 +187,7 @@ bool StateBuffer::advance(PlayerState& out) {
     const double span = static_cast<double>(b.tick - a.tick);
     const double t = span > 0.0 ? (mPlaybackTick - static_cast<double>(a.tick)) / span : 0.0;
     out = lerp_state(a.state, b.state, static_cast<float>(t));
+    mPlayedTick = a.tick;
 
     // Keep one sample behind the cursor so the next tick still has something to interpolate from.
     while (mSamples.size() > 2 && static_cast<double>(mSamples[1].tick) < mPlaybackTick) {

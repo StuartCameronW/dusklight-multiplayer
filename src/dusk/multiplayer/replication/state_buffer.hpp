@@ -89,6 +89,9 @@ public:
     double delay_ticks() const { return mDelayTicks; }
     std::uint32_t starvation_count() const { return mStarvations; }
     std::uint32_t snap_count() const { return mSnaps; }
+    /// Sender tick of the sample the last advance() played (the earlier of the two it blended).
+    /// Stands still while starved, so it measures the sender's time, not ours.
+    std::uint64_t played_tick() const { return mPlayedTick; }
 
 private:
     struct Sample {
@@ -116,6 +119,7 @@ private:
     double mStarveWidened = 0.0;
     std::uint32_t mStarvations = 0;
     std::uint32_t mSnaps = 0;
+    std::uint64_t mPlayedTick = 0;
 };
 
 }  // namespace dusk::mp
