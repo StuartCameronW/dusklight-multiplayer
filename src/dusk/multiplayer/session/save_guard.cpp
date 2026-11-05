@@ -14,6 +14,7 @@
 #include "dusk/data.hpp"
 #include "dusk/logging.h"
 #include "dusk/main.h"
+#include "dusk/mods/svc/file.hpp"
 #include "dusk/save_manager.hpp"
 #include "dusk/ui/ui.hpp"
 #include "dusk/version.hpp"
@@ -314,8 +315,8 @@ bool is_save_storage_path(
     return second == "card a" || second == "card b";
 }
 
-bool refuse_save_location_write(std::string_view i_location, const char* i_what) {
-    if (!saving_refused() || i_location.empty()) {
+bool is_save_storage_location(std::string_view i_location) {
+    if (i_location.empty()) {
         return false;
     }
 
@@ -323,7 +324,11 @@ bool refuse_save_location_write(std::string_view i_location, const char* i_what)
     // that does not resolve to a filesystem path cannot be the app's own card folder, which always
     // is one, so it is let through.
     const auto access = borealis::io::access_path(i_location);
-    if (!access || !is_save_storage_path(access.path(), dusk::ConfigPath)) {
+    return access && is_save_storage_path(access.path(), dusk::ConfigPath);
+}
+
+bool refuse_save_location_write(std::string_view i_location, const char* i_what) {
+    if (!saving_refused() || !is_save_storage_location(i_location)) {
         return false;
     }
     return refuse_save_file_write(i_what);
@@ -399,6 +404,8 @@ void run_save_guard_probe() {
             log_probe("save_manager::create_backup",
                 save_manager::create_backup(storage.value, identity));
         }
+        // The stale handle must still work here: the guard does not over-block.
+        dusk::mods::svc::file_probe_use_stale_save_handle();
         Log.info("SAVE-GUARD PROBE: done");
         return;
     }
@@ -442,6 +449,9 @@ void run_save_guard_probe() {
     Log.info("SAVE-GUARD PROBE: mod file write to its own folder -> {}",
         refuse_save_location_write(modLocation, "probe: mod own file") ? "REFUSED" : "ALLOWED");
 
+    // 4. A mod file API handle opened before the session started, used now that the guard is on.
+    dusk::mods::svc::file_probe_use_stale_save_handle();
+
     // 2. The card thread: a write and a format, each followed by the poll its callers make. A
     // return of 0 here would be the softlock.
     static u8 sProbeBuffer[4] = {};
@@ -456,6 +466,15 @@ void run_save_guard_probe() {
 }
 
 }  // namespace
+
+void prepare_save_guard_probe_if_requested() {
+    static bool sPrepared = false;
+    if (probe_frame() == 0 || sPrepared) {
+        return;
+    }
+    sPrepared = true;
+    dusk::mods::svc::file_probe_open_stale_save_handle();
+}
 
 void run_save_guard_probe_if_requested() {
     static std::uint64_t sCalls = 0;
