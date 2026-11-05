@@ -11,6 +11,7 @@
 #include "../net/transport.hpp"
 #include "../replication/player_state.hpp"
 #include "dusk/multiplayer.hpp"
+#include "mod_check.hpp"
 
 namespace dusk::mp {
 
@@ -187,6 +188,9 @@ private:
     std::string mEndpoint;
     std::string mHostNickname;
     std::string mLastEndMessage;
+    /// Client: the mod list we sent in our Hello, kept so a refusal can be explained against
+    /// exactly what the host saw rather than a list that changed in the meantime.
+    ModFingerprint mSentMods;
 
     std::string mLocalNickname;
     std::uint32_t mLocalColor = 0xFFFFFF;

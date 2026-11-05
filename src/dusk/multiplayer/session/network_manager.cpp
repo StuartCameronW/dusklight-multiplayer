@@ -13,6 +13,7 @@
 #include "dusk/logging.h"
 #include "dusk/ui/ui.hpp"
 #include "fmt/format.h"
+#include "mod_check.hpp"
 #include "save_guard.hpp"
 #include "trace.hpp"
 
@@ -118,6 +119,8 @@ const char* reason_text(std::uint32_t reason) {
         return "session full";
     case DisconnectReason::HandshakeTimeout:
         return "handshake timed out";
+    case DisconnectReason::ModMismatch:
+        return "gameplay mods differ";
     }
     return "unknown reason";
 }
@@ -486,6 +489,14 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
             end_client_session("Couldn't join", "The host stopped waiting for us to introduce "
                                                 "ourselves. Try joining again.");
             break;
+        case DisconnectReason::ModMismatch:
+            // Normally the HelloAck that precedes this hang-up has already ended the session with
+            // the specific mods named, and this never runs. It is the fallback for an ack that
+            // could not be read.
+            end_client_session("Couldn't join",
+                "Your gameplay mods don't match the host's. Both players need the same gameplay "
+                "mods, at the same versions, enabled.");
+            break;
         case DisconnectReason::ConnectionLost:
         default:
             if (mJoined) {
@@ -638,6 +649,9 @@ void NetworkManager::send_hello(PeerId peer) {
     w.write_string(mLocalNickname);
     w.write_u8(mColorExplicit ? 1 : 0);
     w.write_u32(mLocalColor);
+    mSentMods = local_mod_fingerprint();
+    write_mod_fingerprint(w, mSentMods);
+    Log.info("Mods sent in Hello: {}", describe_mod_fingerprint(mSentMods));
     mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
 }
 
@@ -700,11 +714,45 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             }
         }
         const bool versionOk = version == kProtocolVersion;
+
+        // ★ Mods, compared only once the versions agree: a peer on another protocol may lay the
+        // rest of its Hello out differently, and is being refused for that anyway. Ours is
+        // rebuilt per Hello rather than cached, because mods can be toggled while hosting.
+        const ModFingerprint ourMods = local_mod_fingerprint();
+        bool modsOk = true;
+        if (versionOk) {
+            ModFingerprint theirMods;
+            if (!read_mod_fingerprint(r, theirMods)) {
+                Log.warn("Malformed Hello from peer {} (mod list)", peer);
+                return;
+            }
+            const ModDiff diff = diff_mod_fingerprints(ourMods, theirMods, "we", nickname);
+            Log.info("Mods: ours {}", describe_mod_fingerprint(ourMods));
+            Log.info(
+                "Mods: peer {} ('{}') {}", peer, nickname, describe_mod_fingerprint(theirMods));
+            for (const auto& line : diff.cosmeticLines) {
+                Log.info("Mods: cosmetic difference (allowed): {}", line);
+            }
+            if (diff.gameplayMismatch) {
+                modsOk = false;
+                for (const auto& line : diff.gameplayLines) {
+                    Log.warn("Mods: gameplay difference: {}", line);
+                }
+            } else {
+                Log.info("Mods: gameplay mods match ({} mod(s), hash 0x{:08X})",
+                    ourMods.gameplayTotal, ourMods.gameplayHash);
+            }
+        }
+
         // The host is one of the kMaxPlayers.
         const bool roomOk = admitted + 1 < max_players();
-        const bool accepted = versionOk && roomOk;
+        const bool accepted = versionOk && modsOk && roomOk;
         if (!versionOk) {
             Log.warn("Rejecting peer {}: protocol v{} != our v{}", peer, version, kProtocolVersion);
+        } else if (!modsOk) {
+            Log.warn("Rejecting peer {} ('{}'): gameplay mods differ", peer, nickname);
+            notify(fmt::format("{} couldn't join", nickname),
+                "Their gameplay mods don't match yours. The log lists the differences.", 6);
         } else if (!roomOk) {
             Log.warn("Rejecting peer {}: session full ({} players)", peer, max_players());
         }
@@ -729,13 +777,15 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         w.write_u32(assignedColor);
         w.write_string(mLocalNickname);
         w.write_u32(mLocalColor);
+        write_mod_fingerprint(w, ourMods);
         mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
 
         if (!accepted) {
             // Hang up, not just say no. A refused peer left connected holds a player slot and keeps
             // a puppet-less ghost in the transport until it gives up on its own.
-            refuse_peer(peerIt->second,
-                versionOk ? DisconnectReason::SessionFull : DisconnectReason::VersionMismatch);
+            refuse_peer(peerIt->second, !versionOk ? DisconnectReason::VersionMismatch :
+                                        !modsOk    ? DisconnectReason::ModMismatch :
+                                                     DisconnectReason::SessionFull);
             break;
         }
 
@@ -771,21 +821,53 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             return;
         }
 
+        // The host's mod list. Only from a host on our own protocol: an older one never sends it,
+        // and a mismatched one is being reported as exactly that.
+        ModFingerprint hostMods;
+        bool haveHostMods = false;
+        ModDiff modDiff;
+        if (version == advertised_protocol_version()) {
+            haveHostMods = read_mod_fingerprint(r, hostMods);
+            if (!haveHostMods) {
+                Log.warn("HelloAck from peer {} has no readable mod list", peer);
+            } else {
+                modDiff = diff_mod_fingerprints(mSentMods, hostMods, "you", "the host");
+                Log.info("Mods: host {}", describe_mod_fingerprint(hostMods));
+                for (const auto& line : modDiff.cosmeticLines) {
+                    Log.info("Mods: cosmetic difference (allowed): {}", line);
+                }
+                for (const auto& line : modDiff.gameplayLines) {
+                    Log.warn("Mods: gameplay difference: {}", line);
+                }
+            }
+        }
+
         if (accepted == 0) {
             Log.error("Host rejected us (host protocol v{}, ours v{})", version,
                 advertised_protocol_version());
             // Leave now rather than wait for the host's hang-up: a pre-v11 host never sends one,
             // and would leave us connected to nothing until the transport gave up. The host
-            // states its own version, so a matching one means the refusal was for room.
+            // states its own version and its mods, so with both matching the refusal was for
+            // room.
             if (version != advertised_protocol_version()) {
                 end_client_session("Couldn't join",
                     fmt::format("The host is running a different version of Dusklight (protocol "
                                 "v{}, you have v{}). Both players need the same build.",
                         version, advertised_protocol_version()));
+            } else if (haveHostMods && modDiff.gameplayMismatch) {
+                end_client_session(
+                    "Couldn't join: mods don't match", summarize_mod_mismatch(modDiff));
             } else {
                 end_client_session("Couldn't join", "The session is full.");
             }
             return;
+        }
+        if (haveHostMods && modDiff.gameplayMismatch) {
+            // The host compared the same two lists and admitted us anyway, so the two ends
+            // disagree about the rule itself. Not refused here (the host owns admission), but
+            // loud, because it means the session may desync.
+            Log.error("Host admitted us although our gameplay mods differ; the two builds "
+                      "classify mods differently");
         }
         if (mJoined) {
             Log.warn("Ignoring repeated HelloAck from peer {}", peer);
