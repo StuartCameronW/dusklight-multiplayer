@@ -7751,7 +7751,7 @@ int daRemotePlayer_c::draw() {
      * daRemotePlayer_c::draw -> settingTevStruct -> setLight_actor ->
      * daPy_py_c::checkNowWolfPowerUp.
      *
-     * That last one is `daAlink_getAlinkActorClass()->checkWolfEyeUp()` (d_a_player.cpp:471-473) —
+     * That last one is `daAlink_getAlinkActorClass()->checkWolfEyeUp()` (d_a_player.cpp:494-496) —
      * an UNCHECKED dereference of the local player. 0x4200 is mWolfEyeUp's offset from a NULL
      * `this`. During a stage transition the local Link is destroyed while this actor is still in
      * the draw list, so the pointer is NULL and the read lands in the first page.
@@ -7768,8 +7768,22 @@ int daRemotePlayer_c::draw() {
      * nothing", which is what every other early-out in this function returns.
      *
      * ⚠ Do NOT relax this to a test on the puppet's own state. What is missing is somebody else's
-     * actor, and nothing this actor knows about itself can predict it. */
-    if (daAlink_getAlinkActorClass() == NULL) {
+     * actor, and nothing this actor knows about itself can predict it.
+     *
+     * This one early-out covers EVERY unchecked local-player read that settingTevStruct(10) makes
+     * (audited 2026-11-05), so none of them is guarded in d_kankyo.cpp:
+     *  - setLight_actor's daPy_py_c::checkNowWolfPowerUp() (d_kankyo.cpp:3005-3118) — reached for
+     *    every non-BG tevStr type, not only 10; it is the crash measured above.
+     *  - settingTevStruct_plightcol_plus's `daPy_getPlayerActorClass()` (:3272), dereferenced for
+     *    type 9/10 at :3592 and :3663-3669 (getSinkShapeOffset, checkSinkDead, checkSwimUp,
+     *    checkMagneBootsOn).
+     * The two read DIFFERENT pointers — the link slot (mPlayerPtr[0]) and player 0
+     * (mPlayerInfo[0].mpPlayer). daAlink_c sets and clears them together (d_a_alink.cpp:4937-4938,
+     * :19903-19904), as does the play scene (d_s_play.cpp:1482-1484), so either test is enough
+     * today; both are tested so the guard matches what is actually dereferenced and cannot drift.
+     * Everything else lighting-related that the puppet calls (drawModel's setLightTevColorType_MAJI,
+     * shadowDraw, drawEquip) runs below this line and reads no player pointer. */
+    if (daAlink_getAlinkActorClass() == NULL || daPy_getPlayerActorClass() == NULL) {
         if (!mLoggedNoLocalPlayer) {
             mLoggedNoLocalPlayer = true;
             Log.debug("Puppet {} skipped a draw with no local player actor — a stage or room "
