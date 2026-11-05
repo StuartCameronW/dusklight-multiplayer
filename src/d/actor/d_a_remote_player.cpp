@@ -5462,6 +5462,25 @@ void daRemotePlayer_c::setupActionAnimation() {
     mActPrevNetFrame = -1.0f;
     mNetActHand[0] = l_defaultHandIdx;
     mNetActHand[1] = l_defaultHandIdx;
+    // Block (4).
+    mpActUnder1Bck = NULL;
+    mpActUpper1Bck = NULL;
+    mActShownUnder1 = l_actNone;
+    mActShownUpper1 = l_actNone;
+    mActFailedUnder1 = l_actNone;
+    mActFailedUpper1 = l_actNone;
+    mNetActUnder1 = l_actNone;
+    mNetActUpper1 = l_actNone;
+    mNetActPhase1 = 0.0f;
+    mNetActRatio1 = 0.0f;
+    mNetActRootRotX = 0;
+    mNetActRootRotZ = 0;
+    mNetActYawOff = 0;
+    mNetActPitch = 0;
+    mActAppliedRootRotX = 0;
+    mActAppliedRootRotZ = 0;
+    mActAppliedYawOff = 0;
+    mActAppliedPitch = 0;
 
     /* ★ The spec's warning, honoured: daPy_anmHeap_c's constructor leaves mAnimeHeap/mBuffer alone
      * and its destructor destroys a non-NULL mAnimeHeap. On the first run they are zero (the actor
@@ -5574,6 +5593,18 @@ void daRemotePlayer_c::setNetworkAction(u16 i_under, u16 i_upper, f32 i_frame, f
     mNetActRoot = i_rootTrans;
 }
 
+void daRemotePlayer_c::setNetworkActionSlot1(u16 i_under1, u16 i_upper1, f32 i_phase1,
+    f32 i_ratio1, s16 i_rootRotX, s16 i_rootRotZ, s16 i_yawOff, s16 i_pitch) {
+    mNetActUnder1 = i_under1;
+    mNetActUpper1 = i_upper1;
+    mNetActPhase1 = i_phase1 < 0.0f ? 0.0f : (i_phase1 > 1.0f ? 1.0f : i_phase1);
+    mNetActRatio1 = i_ratio1 < 0.0f ? 0.0f : (i_ratio1 > 1.0f ? 1.0f : i_ratio1);
+    mNetActRootRotX = i_rootRotX;
+    mNetActRootRotZ = i_rootRotZ;
+    mNetActYawOff = i_yawOff;
+    mNetActPitch = i_pitch;
+}
+
 /**
  * daAlink_c::setBasAnime's anm-heap branch (d_a_alink.cpp:14012-14036): copy the sound block out of
  * the BCK just loaded into mActUnderHeap[0]. True when there are notes to play.
@@ -5649,6 +5680,13 @@ void daRemotePlayer_c::exitActionAnimation(const char* i_why) {
     mActShownUnder = l_actNone;
     mActShownUpper = l_actNone;
     mActStarved = false;
+    /* Block (4). The packs are left to selectAnimation, whose every branch re-installs slot 1 (or
+     * clears it) before animePlay runs; only the "installed" record is dropped, so the next entry
+     * re-seats the slot-1 controllers instead of trusting what locomotion did to them. */
+    mActShownUnder1 = l_actNone;
+    mActShownUpper1 = l_actNone;
+    mActAppliedRootRotX = 0;
+    mActAppliedRootRotZ = 0;
     /* Not slip and not the fidget, so selectAnimation's "if it is not already playing" tests
      * re-install their animation this tick instead of trusting packs the override overwrote. */
     mCurrentAnm = static_cast<u16>(l_idleAnm);
@@ -5690,6 +5728,11 @@ bool daRemotePlayer_c::selectActionAnimation() {
         bool underReloaded = false;
         J3DAnmTransform* underBck = loadActionBck(
             mActUnderHeap[0], under, l_actUnderLoadSize, mpActUnderBck, &underReloaded);
+        if (underReloaded) {
+            // A failed attempt has written into the buffer too (loadActionBck's memset and a
+            // partial read), so it invalidates slot 1 the same as a successful one.
+            invalidateActionSlot1();
+        }
         if (underBck == NULL) {
             /* The attempt may have freed the heap the last override was drawing from and written
              * over the upper region of the shared buffer, so both cached halves are dropped. The
@@ -5736,6 +5779,10 @@ bool daRemotePlayer_c::selectActionAnimation() {
             bool upperReloaded = false;
             upperBck = loadActionBck(
                 mActUpperHeap[0], upper, l_actUpperLoadSize, mpActUpperBck, &upperReloaded);
+            if (upperReloaded) {
+                // Upper slot 0's 0x8400 region runs over upper slot 1 (+0xB000).
+                invalidateActionSlot1();
+            }
             if (upperBck == NULL && mActFailLogCount < l_actFailLogMax) {
                 mActFailLogCount++;
                 Log.warn("Puppet {} override upper half {} did not load (under {}); its arms will "
@@ -5823,6 +5870,10 @@ bool daRemotePlayer_c::selectActionAnimation() {
     mActPrevNetUnder = under;
     mActPrevNetFrame = mNetActFrame;
 
+    // Block (4): the second animation of a double anime, after slot 0 is installed and seated
+    // (setAnm clears slot 1 on every slot-0 install, and the seat reads mActStarved).
+    selectActionSlot1();
+
     /* Foot IK off for the whole override. daAlink_c turns it off himself for jumps, climbs and
      * swims (that is already on the wire as NoFootIk); for the rest, an IK solved against a pose
      * the puppet did not choose would fight the root translation the sender sent. Re-written every
@@ -5843,9 +5894,60 @@ void daRemotePlayer_c::applyActionRoot() {
      * anything else jointControll does to the root — so the morf OUT of this pose starts from the
      * cleared root rather than a body length ahead of it. */
     J3DTransformInfo* oldTrans = mpOldFrame->getOldFrameTransInfo(l_underRootJointNo);
+    // Block (4) needs the pre-overwrite values, as jointControll copies them at entry (:2138).
+    const J3DTransformInfo rootTrans = *oldTrans;
     oldTrans->mTranslate.x = mNetActRoot.x;
     oldTrans->mTranslate.y = mNetActRoot.y;
     oldTrans->mTranslate.z = mNetActRoot.z;
+
+    mActAppliedRootRotX = mNetActRootRotX;
+    mActAppliedRootRotZ = mNetActRootRotZ;
+    if (mNetActRootRotX != 0 || mNetActRootRotZ != 0) {
+        /* Block (4): jointControll's joint-0 rotation arm, `sp18.set(field_0x3080, 0,
+         * field_0x3082); sp10.set(2, 0, 1)` (d_a_alink.cpp:2231-2232), and its quaternion tail
+         * (:2260-2335), transcribed the way neckJointControl() transcribes joint 4's. sp18.y is
+         * always 0 here, so the tail starts from the old frame's quaternion; sp18.x goes about
+         * local Z (sp10.x == 2) and then sp18.z about local Y (sp10.z == 1). The translation is
+         * the sender's measured root, which is jointControll's jointTrans after its clear. */
+        const Quaternion sp20 = *mpOldFrame->getOldFrameQuaternion(l_underRootJointNo);
+        Quaternion sp50;
+        Quaternion sp40;
+        Quaternion sp30 = sp20;
+        if (mNetActRootRotX != 0) {
+            sp50 = sp30;
+            JMAEulerToQuat(0, 0, mNetActRootRotX, &sp40);
+            mDoMtx_QuatConcat(&sp50, &sp40, &sp30);
+        }
+        if (mNetActRootRotZ != 0) {
+            sp50 = sp30;
+            JMAEulerToQuat(0, mNetActRootRotZ, 0, &sp40);
+            mDoMtx_QuatConcat(&sp50, &sp40, &sp30);
+        }
+
+        MtxP jointMtx = model->getAnmMtx(l_underRootJointNo);
+        mDoMtx_stack_c::transS(
+            rootTrans.mTranslate.x, rootTrans.mTranslate.y, rootTrans.mTranslate.z);
+        mDoMtx_stack_c::quatM(&sp20);
+        mDoMtx_stack_c::inverse();
+        cMtx_concat(jointMtx, mDoMtx_stack_c::get(), J3DSys::mCurrentMtx);
+
+        MTXQuat(jointMtx, &sp30);
+        jointMtx[0][3] = mNetActRoot.x;
+        jointMtx[1][3] = mNetActRoot.y;
+        jointMtx[2][3] = mNetActRoot.z;
+
+        cMtx_concat(J3DSys::mCurrentMtx, jointMtx, J3DSys::mCurrentMtx);
+        cMtx_copy(J3DSys::mCurrentMtx, jointMtx);
+
+        if (!mLoggedActRootRot) {
+            // Latched: the first tick the swim pitch / damage tilt is actually drawn.
+            mLoggedActRootRot = true;
+            Log.debug("Puppet {} action root rotation live: field_0x3080 {} field_0x3082 {} on bck "
+                      "{}",
+                mPlayerId, mNetActRootRotX, mNetActRootRotZ, mActShownUnder);
+        }
+        return;
+    }
 
     /* And the matrix this calc is producing. Joint 0's anm matrix is base * local, so its world
      * translation is the base transform applied to the local one; rotation is untouched. Written
@@ -5868,6 +5970,212 @@ void daRemotePlayer_c::applyActionRoot() {
         Log.debug("Puppet {} action root overwrite live: joint 0 local ({:.1f}, {:.1f}, {:.1f})",
             mPlayerId, mNetActRoot.x, mNetActRoot.y, mNetActRoot.z);
     }
+}
+
+/* ═══ Action slot 1 / swim (wire block 4) ═════════════════════════════════════════════════════
+ *
+ * Block 2 plays daAlink_c's slot 0. Every proc that moves on setBlendMoveAnime /
+ * setBlendAtnMoveAnime (the step-turn, the item aim-walks, carrying) plays a DOUBLE anime instead —
+ * two BCKs blended by weight, commonDoubleAnime (d_a_alink.cpp:7022-7079) — and with slot 0 alone
+ * the puppet drew whichever half was slot 0 at full weight. This adds the second half, loaded into
+ * mActUnderHeap[1] / mActUpperHeap[1] exactly where his double anime loads it (getUnderUpperAnime
+ * with 0x2C00, :7097-7098).
+ *
+ * Swimming itself is NOT a double anime (setSwimMoveAnime only ever calls setSingleAnime*,
+ * d_a_alink_swim.inc:783-791); what it was missing is the joint-0 pitch (applyActionRoot) and the
+ * bob (folded into the root translation by the sender). */
+
+/// setDoubleAnime's per-slot buffer size (d_a_alink.cpp:7097-7098).
+const u32 l_actDoubleLoadSize = 0x2C00;
+
+/// The size of the BCK file a heap's buffer holds, from its own header — 0 if there is no buffer.
+static u32 act_loaded_file_size(daPy_anmHeap_c& i_heap) {
+    if (i_heap.getBuffer() == NULL) {
+        return 0;
+    }
+    return reinterpret_cast<const JUTDataFileHeader*>(i_heap.getBuffer())->mFileSize;
+}
+
+void daRemotePlayer_c::clearActionSlot1() {
+    mAnmPackUnder[1].setAnmTransform(NULL);
+    mAnmPackUpper[1].setAnmTransform(NULL);
+    mAnmPackUnder[1].setRatio(0.0f);
+    mAnmPackUpper[1].setRatio(0.0f);
+    mAnmPackUnder[0].setRatio(1.0f);
+    mAnmPackUpper[0].setRatio(1.0f);
+    mActShownUnder1 = l_actNone;
+    mActShownUpper1 = l_actNone;
+}
+
+void daRemotePlayer_c::invalidateActionSlot1() {
+    /* The packs may still name these objects for the rest of this tick; selectActionSlot1() runs
+     * later in the same selectActionAnimation() and either reloads or clears them before animePlay.
+     */
+    mActUnderHeap[1].resetIdx();
+    mActUpperHeap[1].resetIdx();
+    mpActUnder1Bck = NULL;
+    mpActUpper1Bck = NULL;
+    mActShownUnder1 = l_actNone;
+    mActShownUpper1 = l_actNone;
+}
+
+void daRemotePlayer_c::selectActionSlot1() {
+    const u16 under1 = mNetActUnder1;
+    const u16 upper1 = mNetActUpper1;
+
+    if (under1 == l_actNone || mpActUnderBck == NULL) {
+        if (mActShownUnder1 != l_actNone || mAnmPackUnder[1].getAnmTransform() != NULL) {
+            clearActionSlot1();
+        }
+        mActFailedUnder1 = l_actNone;
+        mActFailedUpper1 = l_actNone;
+        return;
+    }
+
+    if (under1 == mActFailedUnder1 && upper1 == mActFailedUpper1) {
+        clearActionSlot1();
+        return;
+    }
+
+    if (mActShownUnder1 != under1 || mActShownUpper1 != upper1) {
+        /* ★ Refused, not loaded, when the slot-0 BCK resident in the shared buffer is bigger than
+         * one slot: slot 1's region starts at +0x2C00 and the read would overwrite its tail. Link
+         * cannot get here — his double anime loads slot 0 with the same 0x2C00 limit — so this is
+         * a defence against a peer's bad data, not a case the game has. */
+        if (act_loaded_file_size(mActUnderHeap[0]) > l_actSlotStride) {
+            if (mActFailLogCount < l_actFailLogMax) {
+                mActFailLogCount++;
+                Log.warn("Puppet {} slot-1 bck {} refused: slot-0 bck {} is {} bytes and would be "
+                         "overwritten",
+                    mPlayerId, under1, mActShownUnder, act_loaded_file_size(mActUnderHeap[0]));
+            }
+            mActFailedUnder1 = under1;
+            mActFailedUpper1 = upper1;
+            clearActionSlot1();
+            return;
+        }
+
+        bool reloaded = false;
+        J3DAnmTransform* bck1 = loadActionBck(
+            mActUnderHeap[1], under1, l_actDoubleLoadSize, mpActUnder1Bck, &reloaded);
+        if (bck1 == NULL) {
+            mpActUnder1Bck = NULL;
+            mActFailedUnder1 = under1;
+            mActFailedUpper1 = upper1;
+            if (mActFailLogCount < l_actFailLogMax) {
+                mActFailLogCount++;
+                Log.warn("Puppet {} slot-1 load failed idx={} (upper {}); slot 0 plays alone",
+                    mPlayerId, under1, upper1);
+            }
+            clearActionSlot1();
+            return;
+        }
+        mpActUnder1Bck = bck1;
+
+        J3DAnmTransform* upperBck1 = NULL;
+        if (upper1 != l_actNone) {
+            // Same overlap defence for the upper half: upper slot 0 at +0x8400, slot 1 at +0xB000.
+            if (mpActUpperBck != NULL && act_loaded_file_size(mActUpperHeap[0]) > l_actSlotStride) {
+                if (mActFailLogCount < l_actFailLogMax) {
+                    mActFailLogCount++;
+                    Log.warn("Puppet {} slot-1 upper bck {} refused: upper slot 0 is too big; its "
+                             "arms play bck {}",
+                        mPlayerId, upper1, under1);
+                }
+            } else {
+                bool upperReloaded = false;
+                upperBck1 = loadActionBck(mActUpperHeap[1], upper1, l_actDoubleLoadSize,
+                    mpActUpper1Bck, &upperReloaded);
+                if (upperBck1 == NULL && mActFailLogCount < l_actFailLogMax) {
+                    mActFailLogCount++;
+                    Log.warn("Puppet {} slot-1 upper half {} did not load (under {}); its arms "
+                             "play the lower body's",
+                        mPlayerId, upper1, under1);
+                }
+            }
+        }
+        mpActUpper1Bck = upperBck1;
+
+        // Each half on its own BCK's play mode, as commonDoubleAnime's setFrameCtrl calls do
+        // (:7043-7064). The frame and rate are seated below, every tick.
+        set_gait_frame_ctrl(
+            &mUnderFrameCtrl[1], bck1, bck1->getAttribute(), mNetActRate, 0.0f, -1);
+        if (upperBck1 != NULL) {
+            set_gait_frame_ctrl(
+                &mUpperFrameCtrl[1], upperBck1, upperBck1->getAttribute(), mNetActRate, 0.0f, -1);
+        }
+
+        mActShownUnder1 = under1;
+        mActShownUpper1 = upper1;
+        mActFailedUnder1 = l_actNone;
+        mActFailedUpper1 = l_actNone;
+
+        if (!mLoggedActSlot1) {
+            // Latched: if this is missing from a session, no double anime was ever drawn.
+            mLoggedActSlot1 = true;
+            Log.info("Puppet {} action slot 1 live: bck {} + bck {} (upper {}) at ratio {:.2f}",
+                mPlayerId, mActShownUnder, under1, upper1, mNetActRatio1);
+        }
+    }
+
+    /* setDoubleAnimeBlendRatio (d_a_alink.cpp:7015-7020): both halves of both slots, every tick —
+     * setAnm() resets slot 0 to full weight whenever slot 0 changes, and the ratio moves anyway.
+     * Upper slot 2 is not touched (it is daAlink_c's overlay and somebody else's). */
+    const f32 ratio = mNetActRatio1;
+    mAnmPackUnder[0].setRatio(1.0f - ratio);
+    mAnmPackUpper[0].setRatio(1.0f - ratio);
+    mAnmPackUnder[1].setRatio(ratio);
+    mAnmPackUpper[1].setRatio(ratio);
+    mAnmPackUnder[1].setAnmTransform(mpActUnder1Bck);
+    // No distinct upper: both packs on one object, which animePlay() then steps only once.
+    mAnmPackUpper[1].setAnmTransform(mpActUpper1Bck != NULL ? mpActUpper1Bck : mpActUnder1Bck);
+
+    /* The frame, seated like slot 0's (selectActionAnimation): animePlay's ONE updateFrame lands
+     * on the wire frame. The rate is commonDoubleAnime's — slot 0's, scaled by the two lengths
+     * (:7040-7047) — and the upper half is wound to the under half's phase, which is all the
+     * sender's upper controller ever is (:7055-7060). Skipped while starved, like slot 0. */
+    if (!mActStarved) {
+        const f32 max0 = mpActUnderBck->getFrameMax();
+        const f32 max1 = mpActUnder1Bck->getFrameMax();
+        const f32 rate1 = max0 != 0.0f ? mNetActRate * max1 / max0 : mNetActRate;
+        mUnderFrameCtrl[1].setRate(rate1);
+        mUnderFrameCtrl[1].setFrame(mNetActPhase1 * max1 - rate1);
+        if (mpActUpper1Bck != NULL) {
+            const f32 maxU = mpActUpper1Bck->getFrameMax();
+            const f32 rateU = max1 != 0.0f ? rate1 * maxU / max1 : rate1;
+            mUpperFrameCtrl[1].setRate(rateU);
+            mUpperFrameCtrl[1].setFrame(mNetActPhase1 * maxU - rateU);
+        }
+    }
+}
+
+u16 daRemotePlayer_c::getActDrawnUnder1() const {
+    return mActActive && mpActUnder1Bck != NULL ? mActShownUnder1 : l_actNone;
+}
+
+u16 daRemotePlayer_c::getActDrawnUpper1() const {
+    return mActActive && mpActUnder1Bck != NULL && mpActUpper1Bck != NULL ? mActShownUpper1 :
+                                                                            l_actNone;
+}
+
+f32 daRemotePlayer_c::getActDrawnFrame1() const {
+    return mActActive && mpActUnder1Bck != NULL ? mpActUnder1Bck->getFrame() : 0.0f;
+}
+
+f32 daRemotePlayer_c::getActDrawnPhase1() const {
+    if (!mActActive || mpActUnder1Bck == NULL || mpActUnder1Bck->getFrameMax() <= 0) {
+        return 0.0f;
+    }
+    return mpActUnder1Bck->getFrame() / mpActUnder1Bck->getFrameMax();
+}
+
+f32 daRemotePlayer_c::getActDrawnRatio1() const {
+    // Off the pack itself (getRatio is not const, so read through a copy): what the blend uses.
+    if (!mActActive || mpActUnder1Bck == NULL) {
+        return 0.0f;
+    }
+    mDoExt_AnmRatioPack pack = mAnmPackUnder[1];
+    return pack.getAnmTransform() != NULL ? pack.getRatio() : 0.0f;
 }
 
 u16 daRemotePlayer_c::getActDrawnUnder() const {
@@ -6906,10 +7214,20 @@ void daRemotePlayer_c::drawEquip() {
 
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
-    /* daAlink_c's own rotation order (d_a_alink.cpp:5776), minus field_0x308c, which is a horse and
-     * demo offset. shape_angle.x is never set on a puppet and shape_angle.z is the sender's run
-     * bank (setNetworkJointAim), so with no bank this is exactly the YrotM it used to be. */
-    mDoMtx_stack_c::ZXYrotM(shape_angle.x, shape_angle.y, shape_angle.z);
+    /* daAlink_c's own rotation order (d_a_alink.cpp:5776). shape_angle.z is the sender's run bank
+     * (setNetworkJointAim); with no bank and no action override this is exactly the YrotM it used
+     * to be. */
+    /* Block (4): his shape_angle.x (the roll-jump flip, crawl and wall-hang pitch) and
+     * field_0x308c (the wall-hang / climb yaw offset), but only while the action override plays —
+     * the procs the puppet reconstructs keep both at 0 (commonProcInit, :15232-15238) — and the
+     * sender measured the root translation against exactly this base. shape_angle.x is written
+     * here and nowhere else on a puppet, so the foot-local matrix below and in setBodySinkOffset
+     * picks it up the same way his does. */
+    mActAppliedPitch = mActActive ? mNetActPitch : 0;
+    mActAppliedYawOff = mActActive ? mNetActYawOff : 0;
+    shape_angle.x = mActAppliedPitch;
+    mDoMtx_stack_c::ZXYrotM(
+        shape_angle.x, (s16)(shape_angle.y + mActAppliedYawOff), shape_angle.z);
     model->setBaseTRMtx(mDoMtx_stack_c::get());
 
     /* The world→model matrices the foot IK solves in, built here for the same reason daAlink_c

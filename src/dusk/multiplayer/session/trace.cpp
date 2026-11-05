@@ -55,7 +55,12 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << static_cast<unsigned>(state.actMorf) << ',' << static_cast<unsigned>(state.actHandL)
           << ',' << static_cast<unsigned>(state.actHandR) << ',' << state.act_root_x() << ','
           << state.act_root_y() << ',' << state.act_root_z() << ',' << rootWX << ',' << rootWY
-          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms() << '\n';
+          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms();
+    // block (4): action slot 1 / swim, after absMs. Phase and ratio decoded to 0..1, the three
+    // angles as s16 binary angles. Local row: what Link draws; actor row: what the puppet draws.
+    sFile << ',' << state.act1Under << ',' << state.act1Upper << ',' << state.act1_phase() << ','
+          << state.act1_ratio() << ',' << state.actRootRotX << ',' << state.actRootRotZ << ','
+          << state.actYawOff << ',' << state.actPitch << '\n';
 }
 
 }  // namespace
@@ -78,7 +83,9 @@ void open(const std::string& path, const char* role) {
              "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
              // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
-             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs\n";
+             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs,"
+             // block (4): action slot 1 / swim. act1Under 65535 = single anime.
+             "act1Under,act1Upper,act1Phase,act1Ratio,rootRotX,rootRotZ,yawOff,pitch\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

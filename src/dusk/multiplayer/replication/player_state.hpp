@@ -203,6 +203,32 @@ constexpr float kPlayerActRateScale = 32.0f;
 constexpr float kPlayerActRootScale = 8.0f;
 /// The hand-pose sentinel for "the body's own hand" — daAlink_c's 0xFE (setDrawHand).
 constexpr std::uint8_t kPlayerActBodyHand = 0xFE;
+/// Block (4)'s unit-interval bytes (the slot-1 phase and blend weight): u8 x 255, so 0 and 1 are
+/// both exact.
+constexpr float kPlayerActUnitScale = 255.0f;
+
+/// Saturating [0, 1] -> u8 x kPlayerActUnitScale, rounded to nearest.
+inline std::uint8_t act_encode_unit(float value) {
+    if (!(value > 0.0f)) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return 255;
+    }
+    return static_cast<std::uint8_t>(value * kPlayerActUnitScale + 0.5f);
+}
+
+/// A full-circle binary angle -> one byte (256 units a step, 1.4 degrees), rounded to nearest and
+/// wrapping. For the body pitch, which a flip carries all the way round.
+inline std::uint8_t act_encode_turn(std::int16_t v) {
+    return static_cast<std::uint8_t>(((static_cast<std::uint32_t>(static_cast<std::uint16_t>(v)) +
+                                          0x80u) >>
+                                         8) &
+                                     0xFFu);
+}
+inline std::int16_t act_decode_turn(std::uint8_t v) {
+    return static_cast<std::int16_t>(static_cast<std::uint16_t>(static_cast<std::uint32_t>(v) << 8));
+}
 
 /// Saturating float -> fixed point, rounded to nearest. Engine-free so both ends share it.
 inline std::uint16_t act_encode_u16(float value, float scale) {
@@ -238,9 +264,9 @@ inline std::int8_t act_encode_s8(float value, float scale) {
     return static_cast<std::int8_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
 }
 
-/// 48 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), then
-/// the 1-byte `gear` (offset 47, always LAST). Sent unreliably at the sim rate, so it has to
-/// stay small.
+/// 60 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), the
+/// 1-byte `gear` (offset 47), then 12 bytes of action slot 1 / swim (block 4, offset 48). Sent
+/// unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -389,9 +415,65 @@ struct PlayerState {
     float act_root_z() const { return static_cast<float>(actRootZ) / kPlayerActRootScale; }
 
     /// Worn equipment other than the sword and shield. See PlayerGearFlags. Protocol 14. Discrete,
-    /// so lerp_state takes it whole from the newer sample. ★ The LAST field on the wire (offset 47,
-    /// after block 2), in write(), read() and lerp_state alike.
+    /// so lerp_state takes it whole from the newer sample. Offset 47, after block 2, in write(),
+    /// read() and lerp_state alike.
     std::uint8_t gear = 0;
+
+    // block (4): action slot 1 / swim
+    /**
+     * The rest of what daAlink_c draws while block 2 is active. Only meaningful while
+     * act_active(); zero / kPlayerActNone otherwise. 12 bytes:
+     *
+     *   act1Under / act1Upper  mUnderAnmHeap[1] / mUpperAnmHeap[1].getIdx(): the SECOND animation of
+     *                          a double anime (commonDoubleAnime, d_a_alink.cpp:7022-7079), which
+     *                          every setBlendMoveAnime / setBlendAtnMoveAnime caller uses — the
+     *                          step-turn (PROC_WAIT_TURN), the bow / boomerang / clawshot / copy-rod
+     *                          aim-walk, carrying. kPlayerActNone when he is playing a single anime
+     *                          (commonSingleAnime resets the slot, :7163). act1Upper kPlayerActNone
+     *                          = follows act1Under, the same encoding as actUpper.
+     *   act1Phase              mUnderFrameCtrl[1].getFrame() / getEnd(), u8 x kPlayerActUnitScale
+     *                          (0.12 frames on a 60-frame cycle). A PHASE, not a frame, so it fits
+     *                          one byte. The slot-1 upper frame is not sent at all:
+     *                          commonDoubleAnime winds every controller to one phase at
+     *                          proportional rates (:7043-7066), so the receiver puts the upper
+     *                          half on this phase too.
+     *   act1Ratio              mNowAnmPackUnder[1].getRatio(), u8 x kPlayerActUnitScale — the blend
+     *                          weight setDoubleAnimeBlendRatio gives slot 1 (:7015-7020).
+     *   actRootRotX / Z        field_0x3080 / field_0x3082: the extra joint-0 rotation
+     *                          jointControll applies in EVERY proc (`sp18.set(field_0x3080, 0,
+     *                          field_0x3082)`, d_a_alink.cpp:2231). It is not in any BCK. The
+     *                          underwater swim pitch (-0x3800, d_a_alink_swim.inc:828-845) and the
+     *                          large-damage tumble / wall-hit tilt (d_a_alink_damage.inc:1499-1538)
+     *                          live here. Full s16: the wall-hit values reach 0x4000 and beyond.
+     *   actYawOff              field_0x308c: the yaw offset setMatrix adds to the whole model
+     *                          (:5776) — the wall-hang / climb shape alignment
+     *                          (setClimbShapeOffset, d_a_alink_hang.inc:1728). An s16 here,
+     *                          quantised to s8 x kJointAimWireScale on the wire like block 1.
+     *   actPitch               shape_angle.x: the whole-model pitch setMatrix applies (:5776) — the
+     *                          roll-jump flip (procRollJump turns it a full circle,
+     *                          d_a_alink.cpp:17048 and on), crawling, the clawshot wall-hang,
+     *                          slopes under setShapeAngleOnGround. An s16 here, ONE byte on the wire
+     *                          (x256, full circle, 1.4 degrees) because the flip goes all the way
+     *                          round.
+     *
+     * ★ Block 2's actRoot* changes meaning WITH this block: it is now joint 0 relative to the base
+     * the RECEIVER builds — pos, then ZXYrot(actPitch, angleY + actYawOff, bankZ), each as
+     * quantised as the puppet sees it — not relative to Link's own base. That folds the base Y offsets setMatrix adds and the wire does not carry — the swim bob
+     * field_0x2b98 (d_a_alink_swim.inc:893), the stair offset field_0x2b9c, the sink field_0x2ba0
+     * (d_a_alink.cpp:5774) — into the root, so the puppet's body bobs where his does.
+     */
+    std::uint16_t act1Under = kPlayerActNone;
+    std::uint16_t act1Upper = kPlayerActNone;
+    std::uint8_t act1Phase = 0;
+    std::uint8_t act1Ratio = 0;
+    std::int16_t actRootRotX = 0;
+    std::int16_t actRootRotZ = 0;
+    std::int16_t actYawOff = 0;
+    std::int16_t actPitch = 0;
+
+    bool act1_active() const { return act1Under != kPlayerActNone; }
+    float act1_phase() const { return static_cast<float>(act1Phase) / kPlayerActUnitScale; }
+    float act1_ratio() const { return static_cast<float>(act1Ratio) / kPlayerActUnitScale; }
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
@@ -444,13 +526,24 @@ struct PlayerState {
         w.write_s16(actRootX);
         w.write_s16(actRootY);
         w.write_s16(actRootZ);
-        // After block (2): `gear` is always the last byte.
+        // After block (2): `gear`.
         w.write_u8(gear);
+        // block (4): action slot 1 / swim
+        w.write_u16(act1Under);
+        w.write_u16(act1Upper);
+        w.write_u8(act1Phase);
+        w.write_u8(act1Ratio);
+        w.write_s16(actRootRotX);
+        w.write_s16(actRootRotZ);
+        w.write_u8(joint_aim_to_wire(actYawOff));
+        w.write_u8(act_encode_turn(actPitch));
     }
 
     bool read(Reader& r) {
         std::uint8_t aim[6] = {};
         std::uint8_t rate = 0;
+        std::uint8_t yawOff = 0;
+        std::uint8_t pitch = 0;
         if (!(r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
                 r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
                 r.read_u8(idleKind) && r.read_u8(atnKind) &&
@@ -462,11 +555,17 @@ struct PlayerState {
                 r.read_u16(actUpperFrame) && r.read_u8(rate) && r.read_u8(actMorf) &&
                 r.read_u8(actHandL) && r.read_u8(actHandR) && r.read_s16(actRootX) &&
                 r.read_s16(actRootY) && r.read_s16(actRootZ) &&
-                // after block (2): gear, always last
-                r.read_u8(gear)))
+                // after block (2): gear
+                r.read_u8(gear) &&
+                // block (4): action slot 1 / swim
+                r.read_u16(act1Under) && r.read_u16(act1Upper) && r.read_u8(act1Phase) &&
+                r.read_u8(act1Ratio) && r.read_s16(actRootRotX) && r.read_s16(actRootRotZ) &&
+                r.read_u8(yawOff) && r.read_u8(pitch)))
         {
             return false;
         }
+        actYawOff = joint_aim_from_wire(yawOff);
+        actPitch = act_decode_turn(pitch);
         neckX = joint_aim_from_wire(aim[0]);
         neckY = joint_aim_from_wire(aim[1]);
         bodyX = joint_aim_from_wire(aim[2]);
@@ -586,6 +685,36 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
 
     // gear: a bit set, like `flags`: never blended.
     out.gear = b.gear;
+
+    // block (4): action slot 1 / swim. Same rules as block 2: ids discrete, the frame lerps only
+    // across forward play of one slot-1 animation under one slot-0 animation.
+    out.act1Under = b.act1Under;
+    out.act1Upper = b.act1Upper;
+    out.act1Phase = b.act1Phase;
+    out.act1Ratio = b.act1Ratio;
+    out.actRootRotX = b.actRootRotX;
+    out.actRootRotZ = b.actRootRotZ;
+    out.actYawOff = b.actYawOff;
+    out.actPitch = b.actPitch;
+    const bool sameSlot1 = sameUnder && a.act1_active() && a.act1Under == b.act1Under;
+    if (sameSlot1 && b.act1Phase >= a.act1Phase) {
+        out.act1Phase = act_encode_unit(a.act1_phase() + (b.act1_phase() - a.act1_phase()) * t);
+    }
+    if (sameSlot1) {
+        // The weight is continuous but bounded: t clamped like the joint aim, and the encoder
+        // saturates, so a starved extrapolation cannot push it outside 0..1.
+        out.act1Ratio = act_encode_unit(a.act1_ratio() + (b.act1_ratio() - a.act1_ratio()) * aimT);
+    }
+    /* The joint-0 rotation and the yaw offset are angles and continuous within one animation (the
+     * swim pitch eases with cLib_addCalcAngleS, d_a_alink_swim.inc:845). Across an animation change
+     * they can jump (a wall hit sets the tilt outright), so b is taken whole there. t clamped, as
+     * for the joint aim: these reverse. */
+    if (sameUnder) {
+        out.actRootRotX = lerp_angle(a.actRootRotX, b.actRootRotX, aimT);
+        out.actRootRotZ = lerp_angle(a.actRootRotZ, b.actRootRotZ, aimT);
+        out.actYawOff = lerp_angle(a.actYawOff, b.actYawOff, aimT);
+        out.actPitch = lerp_angle(a.actPitch, b.actPitch, aimT);
+    }
     return out;
 }
 
