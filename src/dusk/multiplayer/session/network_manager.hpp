@@ -35,6 +35,9 @@ struct PeerSession {
     /// Host: we have refused this peer and are waiting for the hang-up to land. Nothing it sends
     /// is acted on from here, and it is never refused twice.
     bool refused = false;
+    /// Host: the admitted peer's latest mod fingerprint (Hello, then each ModsUpdate), so a change
+    /// on EITHER end can be re-checked without asking again.
+    ModFingerprint mods;
     std::uint32_t lastRttMs = 0;
     /// When the transport connected, so a peer that never says Hello can be timed out.
     std::chrono::steady_clock::time_point connectedAt{};
@@ -151,6 +154,14 @@ private:
     std::string player_name(std::uint32_t playerId) const;
     void handle_packet(PeerId peer, const std::uint8_t* data, std::size_t size);
     void send_hello(PeerId peer);
+    /// Rebuild this end's mod fingerprint every kModRecheckTicks and, if it changed since the
+    /// handshake (a save loaded and so a randomizer seed became known, or a mod was toggled), tell
+    /// the other end. The host also re-checks every admitted guest against its new list.
+    void check_mod_changes();
+    void send_mods_update(PeerId peer, const ModFingerprint& fp);
+    /// Host: compare an admitted guest's list with ours and remove it on a gameplay difference.
+    /// Returns false if the guest was removed.
+    bool recheck_peer_mods(PeerSession& session, const ModFingerprint& ours);
     void send_heartbeats();
     void report_tick_rate();
 
@@ -196,9 +207,13 @@ private:
     std::string mEndpoint;
     std::string mHostNickname;
     std::string mLastEndMessage;
-    /// Client: the mod list we sent in our Hello, kept so a refusal can be explained against
-    /// exactly what the host saw rather than a list that changed in the meantime.
+    /// The mod list we last told the other end(s): the Hello (client) or the start of hosting
+    /// (host), then each ModsUpdate. A refusal is explained against exactly what the other end saw.
     ModFingerprint mSentMods;
+    /// Client: the host's list, from HelloAck and each ModsUpdate, so being removed mid-session
+    /// can name what differs.
+    ModFingerprint mHostMods;
+    bool mHaveHostMods = false;
 
     std::string mLocalNickname;
     std::uint32_t mLocalColor = 0xFFFFFF;

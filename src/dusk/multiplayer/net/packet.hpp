@@ -114,7 +114,15 @@ namespace dusk::mp {
  * send 0xFE outside actions, and a v17 puppet would take that as "the body's plain hands" and
  * drop the sword and shield grips.
  */
-inline constexpr std::uint32_t kProtocolVersion = 17;
+/*
+ * 18: the ModFingerprint block (Hello, HelloAck) grew a trailing session-value list,
+ * [u8 k]{string modId, string label, u8 known, string value}*k — per-save state a mod declares
+ * must match, the randomizer's seed hash first among them. A v17 peer would stop reading before it
+ * and admit two players on different seeds. Also adds ModsUpdate (11, either direction), which
+ * re-sends the fingerprint when it changes mid-session (a save loaded, a mod toggled) so the host
+ * can re-check an admitted guest; a v17 peer would log it as an unknown id and never re-check.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 18;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -187,6 +195,13 @@ enum class PacketId : std::uint8_t {
     ///
     /// Reliable, because these are rare, discrete, and losing one loses the event's whole point.
     TimeOverride = 10,
+
+    /// Either direction, reliable, only between admitted ends. [ModFingerprint]
+    /// Sent when this end's fingerprint changes after the handshake: a save was loaded (which is
+    /// when a randomizer seed becomes known), or a mod was enabled or disabled. The host re-checks
+    /// the guest against its own and, on a gameplay difference, sends its own ModsUpdate (so the
+    /// guest can name what differs) and hangs up with ModMismatch. A guest only records the host's.
+    ModsUpdate = 11,
 };
 
 /**
@@ -210,6 +225,7 @@ enum class DisconnectReason : std::uint32_t {
     HandshakeTimeout = 4,
     /// Host -> client: the two ends run different gameplay mods (session/mod_check.hpp). The
     /// HelloAck before the hang-up carries the host's list, so the client can say which ones.
+    /// Since v18 also sent mid-session, after a ModsUpdate, when the two ends stop matching.
     ModMismatch = 5,
 };
 

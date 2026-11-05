@@ -3,13 +3,18 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <exception>
 #include <map>
 #include <string_view>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "../net/serializer.hpp"
 #include "dusk/logging.h"
 #include "dusk/mod_loader.hpp"
 #include "dusk/mods/loader/loader.hpp"
+#include "dusk/mods/svc/save.hpp"
 #include "fmt/format.h"
 
 namespace dusk::mp {
@@ -20,7 +25,39 @@ constexpr borealis::Log Log{"dusk::mp"};
 /// How many difference lines a toast shows before "and N more". The log always gets all of them.
 constexpr std::size_t kToastLines = 3;
 
-bool has_gameplay_files(mods::LoadedMod& mod) {
+/// A save blob whose current-slot value must match on both ends (see SessionValue).
+struct SessionBlobDecl {
+    std::string blob;
+    std::string label;
+};
+
+/**
+ * Built-in declarations for mods whose mod.json predates the "multiplayer" key. The randomizer
+ * keeps the active seed's hash in its "seed_hash" blob (session.cpp: written on new save and on
+ * every save write, read back on load to re-activate the seed), and that hash names the seed
+ * directory whose seed.dat holds the settings too — so one string covers seed and settings.
+ */
+struct BuiltinDecl {
+    std::string_view modId;
+    std::string_view blob;
+    std::string_view label;
+};
+constexpr BuiltinDecl kBuiltinSessionBlobs[] = {
+    {"dev.twilitrealm.randomizer", "seed_hash", "Randomizer seed"},
+};
+
+/// What the bundle says about a mod, which only changes when the bundle does. Cached because the
+/// fingerprint is rebuilt about once a second in a session (NetworkManager::check_mod_changes)
+/// and getFileNames() can walk a directory on disk.
+struct BundleFacts {
+    std::uint32_t generation = 0;
+    std::string version;
+    bool gameplayFiles = false;
+    std::vector<SessionBlobDecl> sessionBlobs;
+};
+std::map<std::string, BundleFacts> s_bundleFacts;
+
+bool scan_gameplay_files(mods::LoadedMod& mod) {
     if (mod.bundle == nullptr) {
         return false;
     }
@@ -34,8 +71,130 @@ bool has_gameplay_files(mods::LoadedMod& mod) {
     return false;
 }
 
+std::vector<SessionBlobDecl> read_session_blobs(mods::LoadedMod& mod) {
+    std::vector<SessionBlobDecl> out;
+    if (mod.bundle != nullptr) {
+        try {
+            const auto bytes = mod.bundle->readFile("mod.json");
+            const auto j = nlohmann::json::parse(bytes.begin(), bytes.end());
+            const auto mp = j.find("multiplayer");
+            if (mp != j.end() && mp->is_object()) {
+                const auto blobs = mp->find("session_blobs");
+                if (blobs != mp->end() && blobs->is_array()) {
+                    for (const auto& entry : *blobs) {
+                        if (!entry.is_object()) {
+                            continue;
+                        }
+                        SessionBlobDecl decl;
+                        decl.blob = entry.value("blob", "");
+                        const std::string label = entry.value("label", decl.blob);
+                        const std::string& name =
+                            mod.metadata.name.empty() ? mod.metadata.id : mod.metadata.name;
+                        decl.label = fmt::format("{} {}", name, label);
+                        if (!decl.blob.empty()) {
+                            out.push_back(std::move(decl));
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            Log.warn("Mod check: could not read the multiplayer block of {}'s mod.json: {}",
+                mod.metadata.id, e.what());
+        }
+    }
+    if (out.empty()) {
+        for (const auto& builtin : kBuiltinSessionBlobs) {
+            if (builtin.modId == mod.metadata.id) {
+                out.push_back({std::string(builtin.blob), std::string(builtin.label)});
+            }
+        }
+    }
+    return out;
+}
+
+const BundleFacts& bundle_facts(mods::LoadedMod& mod) {
+    auto& facts = s_bundleFacts[mod.metadata.id];
+    if (facts.generation != mod.cacheGeneration + 1 || facts.version != mod.metadata.version) {
+        // +1 so a default-constructed entry never matches generation 0.
+        facts.generation = mod.cacheGeneration + 1;
+        facts.version = mod.metadata.version;
+        facts.gameplayFiles = scan_gameplay_files(mod);
+        facts.sessionBlobs = read_session_blobs(mod);
+    }
+    return facts;
+}
+
 bool is_gameplay_mod(mods::LoadedMod& mod) {
-    return mod.native != nullptr || mod.runtime.has_value() || has_gameplay_files(mod);
+    return mod.native != nullptr || mod.runtime.has_value() || bundle_facts(mod).gameplayFiles;
+}
+
+std::uint32_t fnv1a(std::uint32_t h, std::string_view bytes);
+
+/// Short printable ASCII travels as itself (a randomizer hash is shown to the player as text);
+/// anything else as a stable digest, identical on both ends for identical bytes.
+std::string session_value_text(const std::vector<std::uint8_t>& bytes) {
+    const bool printable = bytes.size() <= kMaxModStringBytes &&
+                           std::all_of(bytes.begin(), bytes.end(),
+                               [](std::uint8_t c) { return c >= 0x20 && c < 0x7F; });
+    if (printable) {
+        return std::string(bytes.begin(), bytes.end());
+    }
+    const std::string_view view{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+    return fmt::format("#{:08X}", fnv1a(2166136261u, view));
+}
+
+/**
+ * ★ Test knob: DUSK_MP_TEST_FAKE_SESSION = "modId|label|value[|always][,...]".
+ *
+ * Adds a session value, or overrides a real one with the same modId and label, so a seed
+ * mismatch can be forced between two instances without generating two randomizer seeds. Like a
+ * real one it is known only while a save slot is active, so it exercises the mid-session
+ * ModsUpdate path; "|always" makes it known from boot, for the refusal at Hello. Only the
+ * handshake's view changes; no mod sees it. Logged loudly when set.
+ */
+bool s_loggedFakeSession = false;
+
+void inject_fake_session(std::vector<SessionValue>& out) {
+    const char* env = std::getenv("DUSK_MP_TEST_FAKE_SESSION");
+    if (env == nullptr || env[0] == '\0') {
+        return;
+    }
+    std::string_view rest{env};
+    while (!rest.empty()) {
+        const auto comma = rest.find(',');
+        const std::string_view item = rest.substr(0, comma);
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+        const auto bar1 = item.find('|');
+        const auto bar2 = bar1 == std::string_view::npos ? bar1 : item.find('|', bar1 + 1);
+        if (bar2 == std::string_view::npos) {
+            continue;
+        }
+        SessionValue v;
+        v.modId = std::string(item.substr(0, bar1));
+        v.label = std::string(item.substr(bar1 + 1, bar2 - bar1 - 1));
+        std::string_view value = item.substr(bar2 + 1);
+        bool always = false;
+        if (value.ends_with("|always")) {
+            value.remove_suffix(std::string_view{"|always"}.size());
+            always = true;
+        }
+        v.value = std::string(value);
+        // An empty mod id names no mod, so this answers only "is a save slot active".
+        std::vector<std::uint8_t> unused;
+        v.known = always || mods::svc::peek_current_slot_blob({}, "x", unused);
+        if (v.modId.empty() || v.label.empty()) {
+            continue;
+        }
+        // Once per process: the fingerprint is rebuilt every second in a session.
+        if (!s_loggedFakeSession) {
+            Log.warn(
+                "TEST: DUSK_MP_TEST_FAKE_SESSION sets {} '{}' = '{}'", v.modId, v.label, v.value);
+        }
+        std::erase_if(
+            out, [&](const SessionValue& s) { return s.modId == v.modId && s.label == v.label; });
+        out.push_back(std::move(v));
+    }
+    s_loggedFakeSession = true;
 }
 
 /**
@@ -45,11 +204,14 @@ bool is_gameplay_mod(mods::LoadedMod& mod) {
  * two otherwise identical instances without building and installing a real mod. Only the list sent
  * in the handshake changes; nothing is loaded. Never set in normal play; logged loudly when set.
  */
-void inject_fake_mods(const char* envName, std::vector<ModEntry>& out) {
+void inject_fake_mods(const char* envName, std::vector<ModEntry>& out, bool& logged) {
     const char* env = std::getenv(envName);
     if (env == nullptr || env[0] == '\0') {
         return;
     }
+    // Once per process: the fingerprint is rebuilt every second in a session.
+    const bool log = !logged;
+    logged = true;
     std::string_view rest{env};
     while (!rest.empty()) {
         const auto comma = rest.find(',');
@@ -66,7 +228,9 @@ void inject_fake_mods(const char* envName, std::vector<ModEntry>& out) {
         if (entry.id.empty()) {
             continue;
         }
-        Log.warn("TEST: {} injects fake mod '{}' v{}", envName, entry.id, entry.version);
+        if (log) {
+            Log.warn("TEST: {} injects fake mod '{}' v{}", envName, entry.id, entry.version);
+        }
         out.push_back(std::move(entry));
     }
 }
@@ -165,12 +329,35 @@ ModFingerprint local_mod_fingerprint() {
     std::vector<ModEntry> gameplay;
     std::vector<ModEntry> cosmetic;
 
+    std::vector<SessionValue> session;
+    std::vector<std::uint8_t> blob;
+
     for (auto& mod : mods::ModLoader::instance().active_mods()) {
         ModEntry entry{mod.metadata.id, mod.metadata.version};
         (is_gameplay_mod(mod) ? gameplay : cosmetic).push_back(std::move(entry));
+        for (const auto& decl : bundle_facts(mod).sessionBlobs) {
+            SessionValue v;
+            v.modId = clamp_string(mod.metadata.id);
+            v.label = clamp_string(decl.label);
+            v.known = mods::svc::peek_current_slot_blob(mod.metadata.id, decl.blob, blob);
+            if (v.known) {
+                v.value = session_value_text(blob);
+            }
+            session.push_back(std::move(v));
+        }
     }
-    inject_fake_mods("DUSK_MP_TEST_FAKE_MOD", gameplay);
-    inject_fake_mods("DUSK_MP_TEST_FAKE_COSMETIC_MOD", cosmetic);
+    static bool s_loggedFakeMod = false;
+    static bool s_loggedFakeCosmetic = false;
+    inject_fake_mods("DUSK_MP_TEST_FAKE_MOD", gameplay, s_loggedFakeMod);
+    inject_fake_mods("DUSK_MP_TEST_FAKE_COSMETIC_MOD", cosmetic, s_loggedFakeCosmetic);
+    inject_fake_session(session);
+    std::sort(session.begin(), session.end(), [](const SessionValue& a, const SessionValue& b) {
+        return a.modId != b.modId ? a.modId < b.modId : a.label < b.label;
+    });
+    if (session.size() > kMaxListedMods) {
+        session.resize(kMaxListedMods);
+    }
+    fp.session = std::move(session);
 
     sort_and_dedupe(gameplay);
     sort_and_dedupe(cosmetic);
@@ -208,11 +395,50 @@ void write_mod_fingerprint(Writer& w, const ModFingerprint& fp) {
     w.write_u32(fp.gameplayHash);
     write_list(w, fp.gameplay, fp.gameplayTotal);
     write_list(w, fp.cosmetic, fp.cosmeticTotal);
+    const std::size_t k = std::min(fp.session.size(), kMaxListedMods);
+    w.write_u8(static_cast<std::uint8_t>(k));
+    for (std::size_t i = 0; i < k; ++i) {
+        const auto& v = fp.session[i];
+        w.write_string(clamp_string(v.modId));
+        w.write_string(clamp_string(v.label));
+        w.write_u8(v.known ? 1 : 0);
+        w.write_string(clamp_string(v.value));
+    }
 }
 
 bool read_mod_fingerprint(Reader& r, ModFingerprint& out) {
-    return r.read_u32(out.gameplayHash) && read_list(r, out.gameplay, out.gameplayTotal) &&
-           read_list(r, out.cosmetic, out.cosmeticTotal) && r.ok();
+    if (!r.read_u32(out.gameplayHash) || !read_list(r, out.gameplay, out.gameplayTotal) ||
+        !read_list(r, out.cosmetic, out.cosmeticTotal))
+    {
+        return false;
+    }
+    std::uint8_t k = 0;
+    if (!r.read_u8(k) || k > kMaxListedMods) {
+        return false;
+    }
+    out.session.clear();
+    out.session.reserve(k);
+    for (std::uint8_t i = 0; i < k; ++i) {
+        SessionValue v;
+        std::uint8_t known = 0;
+        if (!r.read_string(v.modId) || !r.read_string(v.label) || !r.read_u8(known) ||
+            !r.read_string(v.value) || v.modId.size() > kMaxModStringBytes ||
+            v.label.size() > kMaxModStringBytes || v.value.size() > kMaxModStringBytes)
+        {
+            return false;
+        }
+        v.known = known != 0;
+        out.session.push_back(std::move(v));
+    }
+    return r.ok();
+}
+
+bool same_mod_fingerprint(const ModFingerprint& a, const ModFingerprint& b) {
+    Writer wa;
+    Writer wb;
+    write_mod_fingerprint(wa, a);
+    write_mod_fingerprint(wb, b);
+    return wa.data() == wb.data();
 }
 
 ModDiff diff_mod_fingerprints(const ModFingerprint& ours, const ModFingerprint& theirs,
@@ -247,7 +473,28 @@ ModDiff diff_mod_fingerprints(const ModFingerprint& ours, const ModFingerprint& 
     // collision. Either one differing is a mismatch.
     const bool totalsDiffer = ours.gameplayTotal != theirs.gameplayTotal;
     const bool hashDiffers = ours.gameplayHash != theirs.gameplayHash;
-    diff.gameplayMismatch = !diff.gameplayLines.empty() || hashDiffers || totalsDiffer;
+
+    // Session values, after the mod lines (a missing mod is the more basic difference). Only where
+    // BOTH ends have a save loaded: before that there is no seed to disagree about, and refusing
+    // would kick every guest the moment the host reached its file select first. An entry only one
+    // side lists belongs to a mod the other lacks, which the lines above already name.
+    bool sessionDiffers = false;
+    for (const auto& o : theirs.session) {
+        for (const auto& m : ours.session) {
+            if (m.modId != o.modId || m.label != o.label || !m.known || !o.known ||
+                m.value == o.value)
+            {
+                continue;
+            }
+            sessionDiffers = true;
+            diff.gameplayLines.push_back(capitalize(fmt::format("{} differs: {} has {}, {} have {}",
+                o.label, theirLabel, o.value.empty() ? "none" : o.value, ourLabel,
+                m.value.empty() ? "none" : m.value)));
+        }
+    }
+
+    diff.gameplayMismatch =
+        !diff.gameplayLines.empty() || hashDiffers || totalsDiffer || sessionDiffers;
     if (diff.gameplayMismatch && diff.gameplayLines.empty()) {
         diff.gameplayLines.push_back(capitalize(
             fmt::format("{} gameplay mods on {} end and {} on {}'s, and they differ past the first "
@@ -259,12 +506,20 @@ ModDiff diff_mod_fingerprints(const ModFingerprint& ours, const ModFingerprint& 
 }
 
 std::string describe_mod_fingerprint(const ModFingerprint& fp) {
-    return fmt::format("{} gameplay [{}{}], {} cosmetic [{}{}], hash 0x{:08X}", fp.gameplayTotal,
-        join_entries(fp.gameplay),
+    std::string session;
+    for (const auto& v : fp.session) {
+        if (!session.empty()) {
+            session += ", ";
+        }
+        session += v.known ? fmt::format("{} '{}'", v.label, v.value) :
+                             fmt::format("{} (no save loaded)", v.label);
+    }
+    return fmt::format("{} gameplay [{}{}], {} cosmetic [{}{}], hash 0x{:08X}, session [{}]",
+        fp.gameplayTotal, join_entries(fp.gameplay),
         static_cast<std::size_t>(fp.gameplayTotal) > fp.gameplay.size() ? ", ..." : "",
         fp.cosmeticTotal, join_entries(fp.cosmetic),
         static_cast<std::size_t>(fp.cosmeticTotal) > fp.cosmetic.size() ? ", ..." : "",
-        fp.gameplayHash);
+        fp.gameplayHash, session);
 }
 
 std::string summarize_mod_mismatch(const ModDiff& diff) {
