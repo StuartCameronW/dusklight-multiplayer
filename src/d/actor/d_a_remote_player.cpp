@@ -17,12 +17,12 @@
 #include "JSystem/JKernel/JKRArchive.h"
 #include "JSystem/JKernel/JKRExpHeap.h"
 #include "JSystem/JMath/JMath.h"
+#include "SSystem/SComponent/c_counter.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_mirror.h"
 #include "d/actor/d_a_npc4.h"
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_bg_s.h"
-#include "SSystem/SComponent/c_counter.h"
 #include "dusk/game_clock.h"
 #include "dusk/interp/frame_interpolation.h"
 #include "dusk/logging.h"
@@ -5745,8 +5745,8 @@ void daRemotePlayer_c::setNetworkAction(u16 i_under, u16 i_upper, f32 i_frame, f
     mNetActRoot = i_rootTrans;
 }
 
-void daRemotePlayer_c::setNetworkActionSlot1(u16 i_under1, u16 i_upper1, f32 i_phase1,
-    f32 i_ratio1, s16 i_rootRotX, s16 i_rootRotZ, s16 i_yawOff, s16 i_pitch) {
+void daRemotePlayer_c::setNetworkActionSlot1(u16 i_under1, u16 i_upper1, f32 i_phase1, f32 i_ratio1,
+    s16 i_rootRotX, s16 i_rootRotZ, s16 i_yawOff, s16 i_pitch) {
     mNetActUnder1 = i_under1;
     mNetActUpper1 = i_upper1;
     mNetActPhase1 = i_phase1 < 0.0f ? 0.0f : (i_phase1 > 1.0f ? 1.0f : i_phase1);
@@ -6208,8 +6208,8 @@ void daRemotePlayer_c::selectActionSlot1() {
         }
 
         bool reloaded = false;
-        J3DAnmTransform* bck1 = loadActionBck(
-            mActUnderHeap[1], under1, l_actDoubleLoadSize, mpActUnder1Bck, &reloaded);
+        J3DAnmTransform* bck1 =
+            loadActionBck(mActUnderHeap[1], under1, l_actDoubleLoadSize, mpActUnder1Bck, &reloaded);
         if (bck1 == NULL) {
             mpActUnder1Bck = NULL;
             mActFailedUnder1 = under1;
@@ -6236,8 +6236,8 @@ void daRemotePlayer_c::selectActionSlot1() {
                 }
             } else {
                 bool upperReloaded = false;
-                upperBck1 = loadActionBck(mActUpperHeap[1], upper1, l_actDoubleLoadSize,
-                    mpActUpper1Bck, &upperReloaded);
+                upperBck1 = loadActionBck(
+                    mActUpperHeap[1], upper1, l_actDoubleLoadSize, mpActUpper1Bck, &upperReloaded);
                 if (upperBck1 == NULL && mActFailLogCount < l_actFailLogMax) {
                     mActFailLogCount++;
                     Log.warn("Puppet {} slot-1 upper half {} did not load (under {}); its arms "
@@ -6250,8 +6250,7 @@ void daRemotePlayer_c::selectActionSlot1() {
 
         // Each half on its own BCK's play mode, as commonDoubleAnime's setFrameCtrl calls do
         // (:7043-7064). The frame and rate are seated below, every tick.
-        set_gait_frame_ctrl(
-            &mUnderFrameCtrl[1], bck1, bck1->getAttribute(), mNetActRate, 0.0f, -1);
+        set_gait_frame_ctrl(&mUnderFrameCtrl[1], bck1, bck1->getAttribute(), mNetActRate, 0.0f, -1);
         if (upperBck1 != NULL) {
             set_gait_frame_ctrl(
                 &mUpperFrameCtrl[1], upperBck1, upperBck1->getAttribute(), mNetActRate, 0.0f, -1);
@@ -7378,8 +7377,7 @@ void daRemotePlayer_c::setMatrix() {
     mActAppliedPitch = mActActive ? mNetActPitch : 0;
     mActAppliedYawOff = mActActive ? mNetActYawOff : 0;
     shape_angle.x = mActAppliedPitch;
-    mDoMtx_stack_c::ZXYrotM(
-        shape_angle.x, (s16)(shape_angle.y + mActAppliedYawOff), shape_angle.z);
+    mDoMtx_stack_c::ZXYrotM(shape_angle.x, (s16)(shape_angle.y + mActAppliedYawOff), shape_angle.z);
     model->setBaseTRMtx(mDoMtx_stack_c::get());
 
     /* The world→model matrices the foot IK solves in, built here for the same reason daAlink_c
@@ -7792,8 +7790,9 @@ int daRemotePlayer_c::draw() {
      *
      * With frame interpolation on, every actor is legitimately drawn TWICE per presentation frame
      * (m_Do_main.cpp, the separatePresentation branch): once inside fapGm_Execute with
-     * game_clock::is_sim_frame() true, and once from fpcM_DrawIterater with it false. That is safe, because mDoExt_modelEntryDL
-     * early-outs to J3DModel::diff() on the second (m_Do_ext.cpp) and never re-enters.
+     * game_clock::is_sim_frame() true, and once from fpcM_DrawIterater with it false. That is safe,
+     * because mDoExt_modelEntryDL early-outs to J3DModel::diff() on the second (m_Do_ext.cpp) and
+     * never re-enters.
      *
      * The puppet was getting TWO draws with is_sim_frame() TRUE, both on the SAME sim tick. It is
      * measured rather than reasoned — the two ends of one run, at the puppet's first draw:

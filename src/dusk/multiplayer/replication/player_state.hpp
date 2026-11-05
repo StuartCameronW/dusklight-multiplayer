@@ -222,13 +222,12 @@ inline std::uint8_t act_encode_unit(float value) {
 /// A full-circle binary angle -> one byte (256 units a step, 1.4 degrees), rounded to nearest and
 /// wrapping. For the body pitch, which a flip carries all the way round.
 inline std::uint8_t act_encode_turn(std::int16_t v) {
-    return static_cast<std::uint8_t>(((static_cast<std::uint32_t>(static_cast<std::uint16_t>(v)) +
-                                          0x80u) >>
-                                         8) &
-                                     0xFFu);
+    return static_cast<std::uint8_t>(
+        ((static_cast<std::uint32_t>(static_cast<std::uint16_t>(v)) + 0x80u) >> 8) & 0xFFu);
 }
 inline std::int16_t act_decode_turn(std::uint8_t v) {
-    return static_cast<std::int16_t>(static_cast<std::uint16_t>(static_cast<std::uint32_t>(v) << 8));
+    return static_cast<std::int16_t>(
+        static_cast<std::uint16_t>(static_cast<std::uint32_t>(v) << 8));
 }
 
 /// Saturating float -> fixed point, rounded to nearest. Engine-free so both ends share it.
@@ -448,11 +447,10 @@ struct PlayerState {
      * The rest of what daAlink_c draws while block 2 is active. Only meaningful while
      * act_active(); zero / kPlayerActNone otherwise. 12 bytes:
      *
-     *   act1Under / act1Upper  mUnderAnmHeap[1] / mUpperAnmHeap[1].getIdx(): the SECOND animation of
-     *                          a double anime (commonDoubleAnime, d_a_alink.cpp:7022-7079), which
-     *                          every setBlendMoveAnime / setBlendAtnMoveAnime caller uses — the
-     *                          step-turn (PROC_WAIT_TURN), the bow / boomerang / clawshot / copy-rod
-     *                          aim-walk, carrying. kPlayerActNone when he is playing a single anime
+     *   act1Under / act1Upper  mUnderAnmHeap[1] / mUpperAnmHeap[1].getIdx(): the SECOND animation
+     * of a double anime (commonDoubleAnime, d_a_alink.cpp:7022-7079), which every setBlendMoveAnime
+     * / setBlendAtnMoveAnime caller uses — the step-turn (PROC_WAIT_TURN), the bow / boomerang /
+     * clawshot / copy-rod aim-walk, carrying. kPlayerActNone when he is playing a single anime
      *                          (commonSingleAnime resets the slot, :7163). act1Upper kPlayerActNone
      *                          = follows act1Under, the same encoding as actUpper.
      *   act1Phase              mUnderFrameCtrl[1].getFrame() / getEnd(), u8 x kPlayerActUnitScale
@@ -476,14 +474,14 @@ struct PlayerState {
      *   actPitch               shape_angle.x: the whole-model pitch setMatrix applies (:5776) — the
      *                          roll-jump flip (procRollJump turns it a full circle,
      *                          d_a_alink.cpp:17048 and on), crawling, the clawshot wall-hang,
-     *                          slopes under setShapeAngleOnGround. An s16 here, ONE byte on the wire
-     *                          (x256, full circle, 1.4 degrees) because the flip goes all the way
-     *                          round.
+     *                          slopes under setShapeAngleOnGround. An s16 here, ONE byte on the
+     * wire (x256, full circle, 1.4 degrees) because the flip goes all the way round.
      *
      * ★ Block 2's actRoot* changes meaning WITH this block: it is now joint 0 relative to the base
      * the RECEIVER builds — pos, then ZXYrot(actPitch, angleY + actYawOff, bankZ), each as
-     * quantised as the puppet sees it — not relative to Link's own base. That folds the base Y offsets setMatrix adds and the wire does not carry — the swim bob
-     * field_0x2b98 (d_a_alink_swim.inc:893), the stair offset field_0x2b9c, the sink field_0x2ba0
+     * quantised as the puppet sees it — not relative to Link's own base. That folds the base Y
+     * offsets setMatrix adds and the wire does not carry — the swim bob field_0x2b98
+     * (d_a_alink_swim.inc:893), the stair offset field_0x2b9c, the sink field_0x2ba0
      * (d_a_alink.cpp:5774) — into the root, so the puppet's body bobs where his does.
      */
     std::uint16_t act1Under = kPlayerActNone;

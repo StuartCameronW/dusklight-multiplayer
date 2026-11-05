@@ -143,8 +143,8 @@ public:
     void setNetworkAtn(u8 i_atnKind) { mNetAtnKind = i_atnKind; }
     u8 getNetAtnKind() const { return mNetAtnKind; }
     /// The sender's daAlink_c::checkUpperGuardAnime(), pushed in every tick like the attention
-    /// byte. While set, the gait and attention rows below ANM_SWIM_WAIT play getMainBckData's shield
-    /// table (m_mainBckShield) instead of the plain or sword pair.
+    /// byte. While set, the gait and attention rows below ANM_SWIM_WAIT play getMainBckData's
+    /// shield table (m_mainBckShield) instead of the plain or sword pair.
     void setNetworkUpperGuard(bool i_guard) { mNetUpperGuard = i_guard; }
     bool getNetUpperGuard() const { return mNetUpperGuard; }
     /// The sender's daPy_py_c::checkEquipHeavyBoots() (kPlayerGearHeavyBoots), pushed in every tick
