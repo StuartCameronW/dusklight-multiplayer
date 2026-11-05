@@ -167,8 +167,15 @@ PeerId EnetTransport::acquire_id(_ENetPeer* peer) {
 }
 
 void EnetTransport::apply_timeouts(_ENetPeer* peer) {
-    enet_peer_timeout(reinterpret_cast<ENetPeer*>(peer), kPeerTimeoutLimit, kPeerTimeoutMinimumMs,
-        kPeerTimeoutMaximumMs);
+    // Test knob: DUSK_MP_TEST_ENET_TIMEOUT_SCALE=<n> stretches ENet's own timeouts n-fold so only
+    // NetworkManager's silence watchdog can drop a dead peer at kPeerSilenceTimeoutMs.
+    static const enet_uint32 scale = [] {
+        const char* v = std::getenv("DUSK_MP_TEST_ENET_TIMEOUT_SCALE");
+        const long n = v != nullptr ? std::strtol(v, nullptr, 10) : 1;
+        return static_cast<enet_uint32>(n > 1 && n <= 100 ? n : 1);
+    }();
+    enet_peer_timeout(reinterpret_cast<ENetPeer*>(peer), kPeerTimeoutLimit * scale,
+        kPeerTimeoutMinimumMs * scale, kPeerTimeoutMaximumMs * scale);
 }
 
 _ENetPeer* EnetTransport::lookup(PeerId id) const {
