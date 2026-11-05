@@ -86,12 +86,18 @@ namespace dusk::mp {
  *     checkEquipHeavyBoots() (iron boots on), because `flags` and `equip` were both full.
  *     23 -> 48 bytes in all. Still 14: none of it has shipped.
  *
- * (Pending, for the v15 bump at merge:) Hello and HelloAck each grew a trailing ModFingerprint
- * block, and DisconnectReason gained ModMismatch = 5. A v14 host would ignore the block and admit
- * a guest with different gameplay mods; a v14 client would read the block as trailing junk and
- * report a mod refusal as "unknown reason". So this needs the bump, not just the append.
+ * 15: three changes, each enough on its own. Hello and HelloAck each grew a trailing
+ * ModFingerprint block, and DisconnectReason gained ModMismatch = 5: a v14 host would ignore the
+ * block and admit a guest with different gameplay mods, and a v14 client would report the refusal
+ * as "unknown reason". PlayerState grew 48 -> 70 bytes, all after `gear`, in this order:
+ * `locPhase` (offset 48, the sender's stride phase), block (4) action slot 1 / swim (12 bytes:
+ * the second animation of a double anime, the joint-0 rotation, the climb yaw offset and the
+ * whole-model pitch), then block (3) held item (9 bytes: the item model in his hands and its
+ * UPPER_2 arm overlay). Block (2)'s actRoot* also changed meaning in this version: it is now
+ * measured against the base the RECEIVER builds, not Link's own, so a v14 puppet would misplace
+ * the body even if the sizes matched.
  */
-inline constexpr std::uint32_t kProtocolVersion = 14;
+inline constexpr std::uint32_t kProtocolVersion = 15;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
