@@ -38,6 +38,10 @@ enum PlayerAtnKind : std::uint8_t {
     kPlayerAtnLeftLock = 6,     ///< ATN_WAIT_LEFT + ATN_LOCK_WALK_LEFT/RUN_LEFT (0x10, 0x07, 0x0B)
     kPlayerAtnRight = 7,        ///< ATN_WAIT_RIGHT + ATN_WALK_RIGHT/RUN_RIGHT (0x11, 0x08, 0x0C)
     kPlayerAtnRightLock = 8,  ///< ATN_WAIT_RIGHT + ATN_LOCK_WALK_RIGHT/RUN_RIGHT (0x11, 0x09, 0x0D)
+    /// ATN_WAIT_RIGHT + ATN_BACK_WALK_HEAVY as both walk and run (0x11, 0x0F): backing off in iron
+    /// boots, setBlendAtnBackMoveAnime's first branch (d_a_alink.cpp:8092-8102). A receiver that
+    /// predates this value treats it as kPlayerAtnNone, which is what the sender used to send.
+    kPlayerAtnBackHeavy = 9,
 };
 
 }  // namespace dusk::mp

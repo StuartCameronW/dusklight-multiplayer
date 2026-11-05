@@ -2,6 +2,7 @@
 #define D_A_REMOTE_PLAYER_H
 
 #include "Z2AudioLib/Z2Creature.h"
+#include "Z2AudioLib/Z2SoundStarter.h"
 #include "d/actor/d_a_player.h"
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
@@ -47,6 +48,28 @@ struct daRemotePlayer_anm_c {
  * replicated, and it is left in place rather than trimmed because that is where it will go.
  */
 const int daRemotePlayer_anmSlotNum = 3;
+
+/**
+ * Puppet sound, the iron-boots part of slice 2 (.claude/future-plans/puppet-sound.md §2): the
+ * footstep swap from Z2LinkSoundStarter::startSound (Z2LinkMgr.cpp:578-601), keyed on the
+ * SENDER's boots rather than on Z2GetLink(), which is the local player.
+ *
+ * ★ Constructed with `false`, as Z2LinkSoundStarter is (Z2LinkMgr.cpp:528). `true` would register
+ * this as the global starter and take every sound in the game through a puppet.
+ *
+ * Not reproduced from that function: the magnetised mapinfo (magne-boot stick, not on the wire),
+ * the water, sinking-pitch and equipment-jingle decoration, and the foot-miss voice.
+ */
+struct daRemotePlayer_soundStarter_c : public Z2SoundStarter {
+    daRemotePlayer_soundStarter_c() : Z2SoundStarter(false), mHeavyBoots(false) {}
+    using Z2SoundStarter::startSound;
+    virtual bool startSound(JAISoundID i_soundID, JAISoundHandle* i_handle,
+        const JGeometry::TVec3<f32>* i_pos, u32 i_mapinfo, f32 i_fxMix, f32 i_pitch, f32 i_volume,
+        f32 i_pan, f32 i_dolby, u32 i_moveSteps);
+
+    /// The sender's kPlayerGearHeavyBoots, i.e. his Z2CreatureLink boots type == 1.
+    bool mHeavyBoots;
+};
 
 /**
  * Per-leg state for the foot IK. daAlink_c::daAlink_footData_c (d_a_alink.h:181), with its
@@ -148,13 +171,20 @@ public:
     void setNetworkUpperGuard(bool i_guard) { mNetUpperGuard = i_guard; }
     bool getNetUpperGuard() const { return mNetUpperGuard; }
     /// The sender's daPy_py_c::checkEquipHeavyBoots() (kPlayerGearHeavyBoots), pushed in every tick
-    /// like the guard bit. Stored only, for now: the puppet draws no boot models (daAlink_c's
-    /// mpLinkBootModels, d_a_alink.cpp:5995/:19832) and has no heavy gait or heavy-boots attention
-    /// rows (see loadAtnAnimations). Its first consumer is the sound pass's footstep swap,
-    /// WALK/JUMP_DUMMY -> _HEAVY (Z2LinkMgr.cpp:585-597; .claude/future-plans/puppet-sound.md
-    /// slice 2).
-    void setNetworkHeavyBoots(bool i_heavyBoots) { mNetHeavyBoots = i_heavyBoots; }
+    /// like the guard bit. It drives the footstep swap WALK/JUMP_DUMMY -> _HEAVY, which is
+    /// Z2LinkSoundStarter's test on the same flag's boots type (Z2LinkMgr.cpp:578-601); see
+    /// daRemotePlayer_soundStarter_c. It does NOT pick the gait. The gait is mNetHeavyGait, a
+    /// separate fact (kPlayerGearHeavyGait). The puppet still draws no boot models (daAlink_c's
+    /// mpLinkBootModels, d_a_alink.cpp:5995/:19832).
+    void setNetworkHeavyBoots(bool i_heavyBoots) {
+        mNetHeavyBoots = i_heavyBoots;
+        mSoundStarter.mHeavyBoots = i_heavyBoots;
+    }
     bool getNetHeavyBoots() const { return mNetHeavyBoots; }
+    /// kPlayerGearHeavyGait: the sender's slot 1 is ANM_WALK_HEAVY, so his legs are on
+    /// setBlendMoveAnime's booted branch. selectAnimation() plays that branch while it is set.
+    void setNetworkHeavyGait(bool i_heavyGait) { mNetHeavyGait = i_heavyGait; }
+    bool getNetHeavyGait() const { return mNetHeavyGait; }
     /// The sender's locomotion phase (wire `locPhase`): where in the blended stride his under slot
     /// 0 is, 0..255 for one cycle. i_valid is false while the action override is on, when the byte
     /// means nothing. Pushed every tick alongside setNetworkPose(); setDoubleAnm() locks onto it.
@@ -710,9 +740,12 @@ private:
     /* --- D3b: the attention (Z-target / lock-on) set. Kept in one block on purpose. ---------
      *
      * Indexed by daAlink_c's own animation id, 0x00 (ANM_ATN_RETURN_FROM_WALK) through 0x11
-     * (ANM_ATN_WAIT_RIGHT). 0x0E (ANM_WALK_HEAVY) and 0x0F (ANM_ATN_BACK_WALK_HEAVY) are never
-     * loaded and stay NULL. Every entry is OPTIONAL, on the terms the alert idles are:
-     * selectAtnAnimation() falls back to the ordinary gait for any kind whose pair is missing.
+     * (ANM_ATN_WAIT_RIGHT). Two rows are not attention rows but iron-boots ones and live here
+     * because the ids do: 0x0E (ANM_WALK_HEAVY) is the booted gait selectAnimation() plays under
+     * mNetHeavyGait, and 0x0F (ANM_ATN_BACK_WALK_HEAVY) is kPlayerAtnBackHeavy's walk and run.
+     * Every entry is OPTIONAL, on the terms the alert idles are: selectAtnAnimation() falls back to
+     * the ordinary gait for any kind whose pair is missing, and selectAnimation() to the plain walk
+     * if 0x0E is.
      *
      * Each row is loaded as its own object, including the two stances' shared upper half AT
      * (0x0E). A J3DAnmTransform holds its own frame, so two rows sharing one object would have two
@@ -735,6 +768,9 @@ private:
     /// Last ordinary-gait tick's guard state, so a guard flip in the gait cross-fades as
     /// daAlink_c's setDoubleAnime does when the loaded pair changes.
     bool mGaitPrevGuard;
+    /// The same for the heavy gait: boots on or off mid-walk swaps the walk slot's resource
+    /// (WALKS <-> WALKH), which setDoubleAnime cross-fades rather than snapping.
+    bool mGaitPrevHeavy;
     /// Last attention tick's guard state, for the change log.
     bool mAtnPrevGuard;
     /// Whether last tick's animation came from selectAtnAnimation(). Entering or leaving the set
@@ -1037,6 +1073,11 @@ private:
     /// kPlayerGearHeavyBoots as received. False at spawn via fopAcM_ct's zeroing. See
     /// setNetworkHeavyBoots().
     bool mNetHeavyBoots;
+    /// kPlayerGearHeavyGait as received. False at spawn via fopAcM_ct's zeroing. See
+    /// setNetworkHeavyGait().
+    bool mNetHeavyGait;
+    /// Latches the one-shot "the heavy gait is being drawn" line; see selectAnimation().
+    bool mLoggedHeavyGait;
     /* The SENDER's idle byte, whole, for exactly the same reason: which idle he is in is not a fact
      * about the world at all. It is sampled off his own animation heap — what he is genuinely
      * PLAYING, every substitution already applied — so there is nothing here to re-derive and no
@@ -1081,6 +1122,10 @@ private:
      * Constructed by fopAcM_ct's placement new; init()'d only on the last lines of create(), so a
      * puppet whose create failed never owns a sound handle. Handles come from the global
      * Z2SoundHandlePool allocator, not the solid heap. */
+    /* The starter mSound's objects start their notes through (installed in initSound()). Declared
+     * BEFORE mSound so it is destroyed after it: ~Z2Creature stops the handles while the starter
+     * they were started through still exists. */
+    daRemotePlayer_soundStarter_c mSoundStarter;
     Z2Creature mSound;
     /// The BAS block currently driving mSound (daAlink_c field_0x2d80), and the frame controller
     /// that drives it (field_0x2d7c). mBasCtrl NULL means "no notes": nothing calls updateAnime.
