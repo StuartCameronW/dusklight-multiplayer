@@ -12,6 +12,8 @@
 #include <dolphin/pad.h>
 
 #include "d/d_com_inf_game.h"
+#include "d/actor/d_a_player.h"
+#include "d/d_meter2_info.h"
 #include "dusk/logging.h"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 
@@ -49,6 +51,9 @@ enum class Op {
     End,
     Say,
     Warp,
+    Give,
+    Equip,
+    Clothes,
     Quit,
 };
 
@@ -150,7 +155,11 @@ s8 stick_value(double value) {
 bool parse_int(const std::string& token, int& out) {
     try {
         std::size_t consumed = 0;
-        const int value = std::stoi(token, &consumed);
+        // Decimal, or hex with an explicit 0x (item numbers read better that way). Not base 0,
+        // which would quietly read a leading-zero number as octal.
+        const bool hex =
+            token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X');
+        const int value = std::stoi(token, &consumed, hex ? 16 : 10);
         if (consumed != token.size()) {
             return false;
         }
@@ -230,6 +239,40 @@ void publish(const PADStatus& status) {
     PADSetVirtualStatus(kPort, &status);
 }
 
+/**
+ * Test setup that no button sequence can reach: the item and outfit a script needs, so a run can
+ * exercise a held item or the Zora-armor dive on any save. The same calls the Editor makes
+ * (dusk/ui/editor.cpp: the item-slot picker, Equip X / Y, the clothes picker). They change the
+ * save in memory, so they belong in test scripts only; a script run's save is a scratch copy.
+ */
+void run_setup_command(const Command& command) {
+    if (dComIfGs_getSaveData() == nullptr || daPy_getPlayerActorClass() == nullptr) {
+        Log.error(
+            "[{}] line {}: give / equip / clothes need the world; skipped", sTicks, command.line);
+        return;
+    }
+    switch (command.op) {
+    case Op::Give:
+        dComIfGs_setItem(command.point, static_cast<u8>(command.room));
+        dComIfGs_onItemFirstBit(static_cast<u8>(command.room));
+        Log.info("[{}] gave item 0x{:02X} in slot {}", sTicks, command.room, command.point);
+        break;
+    case Op::Equip:
+        dComIfGs_setSelectItemIndex(command.point, static_cast<u8>(command.room));
+        dComIfGp_setSelectItem(command.point);
+        Log.info("[{}] equipped slot {} on {} (item 0x{:02X})", sTicks, command.room,
+            command.point == 0 ? "X" : "Y", dComIfGp_getSelectItem(command.point));
+        break;
+    case Op::Clothes:
+        dMeter2Info_setCloth(static_cast<u8>(command.room), false);
+        daPy_getPlayerActorClass()->setClothesChange(0);
+        Log.info("[{}] wearing outfit item 0x{:02X}", sTicks, command.room);
+        break;
+    default:
+        break;
+    }
+}
+
 /// Runs every command that takes no time (say/repeat/end/quit), leaving sPc on a timed one.
 /// Returns false once the program is over.
 bool settle_program_counter() {
@@ -285,6 +328,13 @@ bool settle_program_counter() {
                 command.point, command.room, command.layer);
             dComIfGp_setNextStage(command.text.c_str(), static_cast<s16>(command.point),
                 static_cast<s8>(command.room), static_cast<s8>(command.layer));
+            sPc++;
+            continue;
+
+        case Op::Give:
+        case Op::Equip:
+        case Op::Clothes:
+            run_setup_command(command);
             sPc++;
             continue;
 
@@ -400,6 +450,22 @@ void load_script(const std::filesystem::path& path) {
             command.text = a;
             ok = !a.empty() && parse_int(b, command.point) && parse_int(c, command.room) &&
                  (d.empty() || parse_int(d, command.layer));
+        } else if (verb == "GIVE") {
+            // "give 9 0x44": item number into an inventory slot (d_save.h SLOT_*, dItemNo_*).
+            command.op = Op::Give;
+            ok = parse_int(a, command.point) && parse_int(b, command.room) && command.point >= 0 &&
+                 command.point < 24 && command.room >= 0 && command.room <= 0xFF;
+        } else if (verb == "EQUIP") {
+            // "equip X 9": put the item in that slot on X (or Y).
+            command.op = Op::Equip;
+            const std::string button = to_upper(a);
+            command.point = button == "X" ? 0 : (button == "Y" ? 1 : -1);
+            ok = command.point >= 0 && parse_int(b, command.room) && command.room >= 0 &&
+                 command.room < 24;
+        } else if (verb == "CLOTHES") {
+            // "clothes 0x31": wear that outfit item (dItemNo_WEAR_*, dItemNo_ARMOR_e).
+            command.op = Op::Clothes;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
         } else if (verb == "QUIT") {
             command.op = Op::Quit;
         } else {
