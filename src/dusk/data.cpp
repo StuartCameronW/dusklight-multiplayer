@@ -446,7 +446,7 @@ SeedResult seed_file_stably(const std::filesystem::path& src, const std::filesys
             // Written moments ago: a save may still be in flight. Wait out the window, re-check.
             const auto wait =
                 std::chrono::duration_cast<std::chrono::milliseconds>(kSeedQuietWindow - age);
-            std::this_thread::sleep_for(std::max(wait, kSeedRereadDelay));
+            std::this_thread::sleep_for((std::max)(wait, kSeedRereadDelay));
             ++changes;
             continue;
         }
