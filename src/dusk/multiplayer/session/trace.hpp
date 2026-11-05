@@ -41,6 +41,12 @@
  * `gear` is the PlayerGearFlags byte (bit 0 = iron boots on): as sent on `local`, as pushed on
  * `applied`, and as the puppet holds it on `actor`. `absMs`, the last column, is the raw steady
  * clock: machine-wide, so two instances on one PC align exactly by it (absMs - ms is constant).
+ *
+ * v16 appends `stageHash,roomNo,locEpoch,hidden,locResets` as the LAST five columns: the sender's
+ * location as sent on `local`, as the buffer played it on `applied` (even while hidden), as last
+ * pushed onto the puppet on `actor`. `hidden` (applied rows) is why the puppet is despawned: 0 not
+ * hidden, 1 sender in another stage, 2 sender in a room this end is not displaying. `locResets`
+ * (applied rows) counts buffer resets caused by a sender epoch change.
  */
 
 namespace dusk::mp::trace {

@@ -264,10 +264,25 @@ inline std::int8_t act_encode_s8(float value, float scale) {
     return static_cast<std::int8_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
 }
 
-/// 70 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), the
+/**
+ * FNV-1a of a stage name (dStage_startStage_c::mName: a char[8], NUL-padded but not necessarily
+ * NUL-terminated), so two ends can compare "which stage" in four bytes. Never 0: 0 on the wire
+ * means "no location reported", which the receiver reads as "don't hide".
+ */
+inline std::uint32_t location_stage_hash(const char* name) {
+    std::uint32_t hash = 2166136261u;
+    for (int i = 0; i < 8 && name[i] != '\0'; i++) {
+        hash ^= static_cast<std::uint8_t>(name[i]);
+        hash *= 16777619u;
+    }
+    return hash != 0 ? hash : 1u;
+}
+
+/// 76 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), the
 /// 1-byte `gear` (offset 47), then the protocol-15 fields, in order: `locPhase` (offset 48),
 /// 12 bytes of action slot 1 / swim (block 4, offset 49), 9 bytes of held item (block 3,
-/// offset 61). Sent unreliably at the sim rate, so it has to stay small.
+/// offset 61), then the protocol-16 location (offset 70: u32 stageHash, s8 roomNo at 74,
+/// u8 locEpoch at 75). Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -523,6 +538,28 @@ struct PlayerState {
     std::uint8_t upper2Morf = 0;
 
     bool upper2_active() const { return upper2Idx != kPlayerActNone; }
+
+    // v16: where the sender is
+    /**
+     * Which stage and room the sender's Link is in, and a counter of his scene loads. 6 bytes:
+     *
+     *   stageHash  location_stage_hash(dComIfGp_getStartStageName()). 0 = never reported (no
+     *              pose yet), which the receiver treats as "show".
+     *   roomNo     fopAcM_GetRoomNo(Link): the room he is standing in. -1 = unknown.
+     *   locEpoch   +1 every time the sender's Link actor is RE-CREATED (its process id changes),
+     *              which the engine does on every scene load: a stage change, a same-stage warp,
+     *              a void-out respawn. Wraps; only inequality means anything. Walking across a
+     *              room boundary does NOT bump it: Link is not rebuilt and his position is
+     *              continuous, so there is nothing to snap.
+     *
+     * The receiver resets its interpolation buffer when the epoch changes, so the puppet snaps to
+     * the new spawn instead of gliding there from the old room (measured once as a 1,034-unit
+     * jump), and despawns the puppet while the sender is in a stage, or a room, this end is not
+     * drawing. All three are discrete, and lerp_state never blends across an epoch change.
+     */
+    std::uint32_t stageHash = 0;
+    std::int8_t roomNo = -1;
+    std::uint8_t locEpoch = 0;
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
 
@@ -598,6 +635,10 @@ struct PlayerState {
         w.write_u16(upper2Frame);
         w.write_u8(upper2Ratio);
         w.write_u8(upper2Morf);
+        // v16: location
+        w.write_u32(stageHash);
+        w.write_u8(static_cast<std::uint8_t>(roomNo));
+        w.write_u8(locEpoch);
     }
 
     bool read(Reader& r) {
@@ -605,6 +646,7 @@ struct PlayerState {
         std::uint8_t rate = 0;
         std::uint8_t yawOff = 0;
         std::uint8_t pitch = 0;
+        std::uint8_t room = 0;
         if (!(r.read_f32(posX) && r.read_f32(posY) && r.read_f32(posZ) && r.read_s16(angleY) &&
                 r.read_f32(moveRate) && r.read_u8(outfit) && r.read_u8(flags) && r.read_u8(equip) &&
                 r.read_u8(idleKind) && r.read_u8(atnKind) &&
@@ -627,10 +669,13 @@ struct PlayerState {
                 // block (3): held item
                 r.read_u8(heldItem) && r.read_u8(heldFlags) && r.read_u8(heldMat) &&
                 r.read_u16(upper2Idx) && r.read_u16(upper2Frame) && r.read_u8(upper2Ratio) &&
-                r.read_u8(upper2Morf)))
+                r.read_u8(upper2Morf) &&
+                // v16: location
+                r.read_u32(stageHash) && r.read_u8(room) && r.read_u8(locEpoch)))
         {
             return false;
         }
+        roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
         actPitch = act_decode_turn(pitch);
         neckX = joint_aim_from_wire(aim[0]);
@@ -678,6 +723,13 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     // meaningful when both endpoints have it; when they disagree the discrete state wins and the
     // newer sample is taken whole.
     if (a.in_world() != b.in_world()) {
+        return b;
+    }
+    // The same rule across a scene load on the sender (v16 locEpoch): the two samples are in
+    // different places, and a blend between them is a glide through walls. The buffer is also
+    // reset when the epoch changes (ReplicationManager::record_remote), so this only catches a
+    // reordered packet.
+    if (a.locEpoch != b.locEpoch) {
         return b;
     }
 
@@ -818,6 +870,11 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
         out.upper2Ratio = static_cast<std::uint8_t>(
             ratio <= 0.0f ? 0.0f : (ratio >= 1.0f ? 255.0f : ratio * 255.0f + 0.5f));
     }
+
+    // v16: location. Discrete; the epochs are equal by the check at the top.
+    out.stageHash = b.stageHash;
+    out.roomNo = b.roomNo;
+    out.locEpoch = b.locEpoch;
     return out;
 }
 

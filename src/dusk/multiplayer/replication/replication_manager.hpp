@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "player_bridge.hpp"
 #include "player_state.hpp"
 #include "state_buffer.hpp"
 
@@ -43,6 +44,23 @@ struct RemotePlayer {
     /// "packets are arriving" and "the puppet is moving" are different claims and only the second
     /// one is the milestone.
     PlayerState lastApplied;
+
+    /* --- v16: the sender's location. --- */
+    /// The last pose the buffer played, whether or not it reached a puppet. While the puppet is
+    /// hidden lastApplied stops moving; this is what the trace reads the sender's location from.
+    PlayerState lastPlayed;
+    /// The newest locEpoch received and the sender tick it came on, so a reordered packet from
+    /// before a scene load cannot read as a second load. See record_remote().
+    std::uint8_t epoch = 0;
+    std::uint64_t epochTick = 0;
+    bool epochKnown = false;
+    /// How many times an epoch change reset the buffer. For --mp-trace.
+    std::uint32_t epochResets = 0;
+    /// Why the puppet is being kept despawned, or Here when it is not.
+    RemoteLocation hiddenBy = RemoteLocation::Here;
+    /// Consecutive ticks the sender has been in a room this end does not display. See
+    /// kRoomHideDebounceTicks.
+    std::uint32_t roomHiddenTicks = 0;
 };
 
 class ReplicationManager {

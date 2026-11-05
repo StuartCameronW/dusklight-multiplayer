@@ -3,9 +3,33 @@
 #include <algorithm>
 
 #include "../policy/mp_policy.hpp"
+#include "dusk/logging.h"
 #include "player_bridge.hpp"
 
 namespace dusk::mp {
+namespace {
+
+constexpr borealis::Log Log{"dusk::mp"};
+
+/// How long a LIVE puppet's sender must stay in a room this end is not displaying before the
+/// puppet is despawned (~0.5 s at 30 Hz). Despawning costs a respawn (an archive mount and a
+/// 0x20000 solid heap), so a sender pacing along a room boundary must not churn it every tick. A
+/// puppet that is not alive yet is held back at once: there is nothing to churn.
+constexpr std::uint32_t kRoomHideDebounceTicks = 15;
+
+const char* location_name(RemoteLocation where) {
+    switch (where) {
+    case RemoteLocation::Here:
+        return "here";
+    case RemoteLocation::OtherStage:
+        return "another stage";
+    case RemoteLocation::RoomNotShown:
+        return "a room not displayed here";
+    }
+    return "?";
+}
+
+}  // namespace
 
 void ReplicationManager::add_player(
     std::uint32_t playerId, const std::string& nickname, std::uint32_t color) {
@@ -42,7 +66,32 @@ void ReplicationManager::record_remote(
         // snapshot after the roster arrives will have it.
         return;
     }
-    it->second.buffer.push(tick, state);
+    RemotePlayer& player = it->second;
+    /* v16: a scene load on the sender. Reset the buffer rather than interpolate from the old room's
+     * last pose to the new spawn: that blend is the glide across the map (measured 1,034 units).
+     * After the reset the first new sample is held until the cursor reaches it, i.e. a snap.
+     *
+     * Judged only on a sample NEWER than the one the current epoch was learned from, so a reordered
+     * packet from before the load does not count as a second load. A tick far behind is a sender
+     * that restarted its counter (StateBuffer::push treats it as a new origin too), and counts. */
+    const bool newer =
+        !player.epochKnown || tick > player.epochTick ||
+        static_cast<double>(tick) + StateBuffer::kSnapTicks < static_cast<double>(player.epochTick);
+    if (newer) {
+        if (player.epochKnown && state.locEpoch != player.epoch) {
+            player.buffer.reset();
+            player.epochResets++;
+            Log.info("Player {} location epoch {} -> {} (stage hash {:08X}, room {}): "
+                     "interpolation reset, the puppet snaps",
+                playerId, static_cast<unsigned>(player.epoch),
+                static_cast<unsigned>(state.locEpoch), state.stageHash,
+                static_cast<int>(state.roomNo));
+        }
+        player.epoch = state.locEpoch;
+        player.epochTick = tick;
+        player.epochKnown = true;
+    }
+    player.buffer.push(tick, state);
     it->second.latest = state;
     it->second.latestTick = tick;
     it->second.hasLatest = true;
@@ -77,9 +126,45 @@ void ReplicationManager::drive_puppets() {
             continue;
         }
 
+        player.lastPlayed = pose;
+
+        /* v16: is the sender somewhere this end is drawing? A puppet for a player in another stage
+         * stood at the last place we saw him, and one in an unloaded room floated over nothing.
+         * Hidden by despawning, the same way as the not-in-world case below, which takes the name
+         * tag, the shadow and the sounds with it (all three hang off the actor). It comes back
+         * through ensure_puppet() at the pose of the moment: a snap, never a slide. */
+        const RemoteLocation where = remote_location(pose);
+        RemoteLocation hide = RemoteLocation::Here;
+        if (where == RemoteLocation::RoomNotShown) {
+            player.roomHiddenTicks++;
+            if (!player.puppetAlive || player.hiddenBy == RemoteLocation::RoomNotShown ||
+                player.roomHiddenTicks >= kRoomHideDebounceTicks)
+            {
+                hide = where;
+            }
+        } else {
+            player.roomHiddenTicks = 0;
+            hide = where;
+        }
+        if (hide != player.hiddenBy) {
+            if (hide == RemoteLocation::Here) {
+                Log.info("Player {}'s puppet shown again: sender is here (stage hash {:08X}, room "
+                         "{}, epoch {})",
+                    player.playerId, pose.stageHash, static_cast<int>(pose.roomNo),
+                    static_cast<unsigned>(pose.locEpoch));
+            } else {
+                Log.info("Player {}'s puppet hidden: sender is in {} (stage hash {:08X}, room {}, "
+                         "epoch {})",
+                    player.playerId, location_name(hide), pose.stageHash,
+                    static_cast<int>(pose.roomNo), static_cast<unsigned>(pose.locEpoch));
+            }
+            player.hiddenBy = hide;
+        }
+
         // tpmp's "optimization level 3" equivalent: stop drawing other players entirely to claw
         // back frames. Checked here rather than at the draw site so the actor isn't even alive.
-        const bool wanted = g_mpPolicy.renderRemotePlayers && pose.in_world();
+        const bool wanted = g_mpPolicy.renderRemotePlayers && pose.in_world() &&
+                            player.hiddenBy == RemoteLocation::Here;
 
         if (!wanted) {
             if (player.puppetAlive) {

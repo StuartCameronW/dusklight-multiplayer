@@ -37,7 +37,8 @@ long long abs_ms() {
 void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     const PlayerState& state, double delayTicks, std::uint32_t starvations, std::uint32_t snaps,
     std::size_t buffered, unsigned anm = 0, const DrawnJointAim& drawn = DrawnJointAim{},
-    float rootWX = 0.0f, float rootWY = 0.0f, float rootWZ = 0.0f, float locPhase = -1.0f) {
+    float rootWX = 0.0f, float rootWY = 0.0f, float rootWZ = 0.0f, float locPhase = -1.0f,
+    const PlayerState* where = nullptr, unsigned hidden = 0, std::uint32_t locResets = 0) {
     sFile << tick << ',' << elapsed_ms() << ',' << sRole << ',' << kind << ',' << playerId << ','
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
           << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
@@ -70,7 +71,14 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     sFile << ',' << static_cast<unsigned>(state.heldItem) << ','
           << static_cast<unsigned>(state.heldFlags) << ',' << static_cast<unsigned>(state.heldMat)
           << ',' << state.upper2Idx << ',' << state.upper2_frame() << ',' << state.upper2_ratio()
-          << ',' << static_cast<unsigned>(state.upper2Morf) << '\n';
+          << ',' << static_cast<unsigned>(state.upper2Morf);
+    // v16: location, last. stageHash 0 = none reported; hidden is the RemoteLocation the puppet is
+    // being kept despawned for (0 here, 1 other stage, 2 room not displayed), on `applied` rows.
+    // On an `applied` row the location is the pose the buffer PLAYED (lastPlayed), because while
+    // hidden nothing is applied and lastApplied stands still.
+    const PlayerState& loc = where != nullptr ? *where : state;
+    sFile << ',' << loc.stageHash << ',' << static_cast<int>(loc.roomNo) << ','
+          << static_cast<unsigned>(loc.locEpoch) << ',' << hidden << ',' << locResets << '\n';
 }
 
 }  // namespace
@@ -99,7 +107,9 @@ void open(const std::string& path, const char* role) {
              // block (4): action slot 1 / swim. act1Under 65535 = single anime.
              "act1Under,act1Upper,act1Phase,act1Ratio,rootRotX,rootRotZ,yawOff,pitch,"
              // block (3): held item. heldItem 0 = none; upper2Idx 65535 = no UPPER_2 overlay.
-             "heldItem,heldFlags,heldMat,upper2Idx,upper2Frame,upper2Ratio,upper2Morf\n";
+             "heldItem,heldFlags,heldMat,upper2Idx,upper2Frame,upper2Ratio,upper2Morf,"
+             // v16: sender location. hidden: 0 shown, 1 other stage, 2 room not displayed.
+             "stageHash,roomNo,locEpoch,hidden,locResets\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
@@ -142,7 +152,8 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
         const RemotePlayer& player = entry.second;
         write_row(tick, "applied", player.playerId, player.lastApplied, player.buffer.delay_ticks(),
             player.buffer.starvation_count(), player.buffer.snap_count(),
-            player.buffer.sample_count());
+            player.buffer.sample_count(), 0, DrawnJointAim{}, 0.0f, 0.0f, 0.0f, -1.0f,
+            &player.lastPlayed, static_cast<unsigned>(player.hiddenBy), player.epochResets);
 
         PlayerState actual;
         if (read_puppet_pose(player.playerId, actual)) {
@@ -157,7 +168,7 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
             float phase = -1.0f;
             read_puppet_loc_phase(player.playerId, phase);
             write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm, drawn, rx, ry, rz,
-                phase);
+                phase, &player.lastApplied);
         }
     }
 

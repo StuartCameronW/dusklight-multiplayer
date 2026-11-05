@@ -1291,6 +1291,38 @@ bool local_pose_is_live() {
     return world_is_playable() || link_acting_in_place();
 }
 
+/**
+ * v16: where the local player is, for the far end's hide and snap decisions.
+ *
+ * The epoch counts re-creations of Link's actor. Every scene load rebuilds him (a stage change, a
+ * same-stage warp, a void-out respawn), and those are exactly the discontinuities a receiver must
+ * not interpolate across; walking into the next room is continuous and does not rebuild him. The
+ * stage hash is checked as well, so a process id that happened to repeat could not hide a stage
+ * change. Static state, so the trace's second call per tick sees the same answer and logs nothing.
+ */
+static void fill_location(fopAc_ac_c* link, PlayerState& out) {
+    static fpc_ProcID s_lastLinkId = fpcM_ERROR_PROCESS_ID_e;
+    static std::uint32_t s_lastStageHash = 0;
+    static std::uint8_t s_epoch = 0;
+
+    const char* stage = dComIfGp_getStartStageName();
+    const std::uint32_t hash = location_stage_hash(stage);
+    const fpc_ProcID id = fopAcM_GetID(link);
+    if (id != s_lastLinkId || hash != s_lastStageHash) {
+        s_lastLinkId = id;
+        s_lastStageHash = hash;
+        s_epoch++;
+        char name[9] = {};
+        std::memcpy(name, stage, 8);
+        Log.info("Local location epoch {}: stage '{}' (hash {:08X}) room {}, Link process {}",
+            s_epoch, static_cast<const char*>(name), hash, static_cast<int>(fopAcM_GetRoomNo(link)),
+            id);
+    }
+    out.stageHash = hash;
+    out.roomNo = static_cast<std::int8_t>(fopAcM_GetRoomNo(link));
+    out.locEpoch = s_epoch;
+}
+
 bool capture_local_player(PlayerState& out) {
     if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
@@ -1444,8 +1476,32 @@ bool capture_local_player(PlayerState& out) {
     fill_loc_phase(alink, out);
     // block (3): held item
     fill_held_item(alink, out);
+    // v16: location
+    fill_location(link, out);
 
     return true;
+}
+
+RemoteLocation remote_location(const PlayerState& pose) {
+    if (pose.stageHash == 0 || dComIfGp_getPlayer(0) == nullptr) {
+        // Nothing reported, or no scene here to compare against. The in-world flag and
+        // world_is_playable() already decide those cases; answering anything else would add a
+        // second, disagreeing gate.
+        return RemoteLocation::Here;
+    }
+    if (pose.stageHash != location_stage_hash(dComIfGp_getStartStageName())) {
+        return RemoteLocation::OtherStage;
+    }
+    const int room = pose.roomNo;
+    /* The game's own "is this room drawn" test, the one the doors use for their own rooms
+     * (d_a_door_shutter.cpp:1439). Flag 8 hides a loaded room, flag 16 marks it displayed
+     * (d_stage.cpp:295-305). Our own room always counts, and an out-of-range number is "don't
+     * know": mStatus has 64 entries and checkStatusFlag only asserts the bound. */
+    if (room < 0 || room >= 64 || room == dComIfGp_roomControl_getStayNo()) {
+        return RemoteLocation::Here;
+    }
+    return dComIfGp_roomControl_checkRoomDisp(room) ? RemoteLocation::Here :
+                                                      RemoteLocation::RoomNotShown;
 }
 
 bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit) {
