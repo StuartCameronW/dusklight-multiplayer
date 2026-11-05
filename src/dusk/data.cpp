@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -365,43 +367,226 @@ std::filesystem::path instance_directory(const std::filesystem::path& dataPath, 
            (normalized.filename().string() + "-" + std::to_string(index));
 }
 
+/// Left in an instance directory whose seed did not finish (a source file never held still long
+/// enough to copy, or an I/O error). While it exists the next relocated launch seeds again, filling
+/// in only what is missing, instead of treating the folder as "used before" and never retrying.
+constexpr std::string_view kSeedIncompleteMarker = ".dusklight-seed-incomplete";
+
+/// How long a source file must have gone unmodified before it is copied. Seeding only ever happens
+/// while the source instance is RUNNING (that is why this process was relocated), and one save is
+/// five open/write/close cycles spread over milliseconds; a second of quiet means none is underway.
+constexpr std::chrono::milliseconds kSeedQuietWindow{1000};
+/// Gap between the two reads that must agree byte for byte.
+constexpr std::chrono::milliseconds kSeedRereadDelay{50};
+/// Attempts per file before giving up on it. Bounds a constantly-writing source to ~10 s per file.
+constexpr int kSeedAttempts = 8;
+
+enum class SeedResult { Copied, AlreadyThere, SourceGone, GaveUp };
+
+bool read_whole_file(const std::filesystem::path& path, std::vector<char>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return !in.bad();
+}
+
+/// Test knob: DUSK_TEST_SEED_CHURN=N makes the first N stability checks of every seeded file
+/// report "the source changed", exercising the re-copy (N < kSeedAttempts) and give-up
+/// (N >= kSeedAttempts) paths without anything having to write to a real save.
+int seed_test_churn() {
+    static const int value = [] {
+        const char* env = std::getenv("DUSK_TEST_SEED_CHURN");
+        return env != nullptr ? std::atoi(env) : 0;
+    }();
+    return value;
+}
+
+/**
+ * Copy one file out of a live instance without ever capturing it mid-write, and without ever
+ * leaving a partial file behind.
+ *
+ * Accepted only when: the source has been quiet for kSeedQuietWindow, two reads kSeedRereadDelay
+ * apart are byte-identical and match the size stat() reported, and size + mtime are unchanged
+ * across the whole attempt. The bytes then go to a temp file beside the target and are renamed
+ * into place, so a crash mid-seed leaves no half-written card under the real name. The source is
+ * only ever opened for reading. (A content check was considered and rejected: a .gci header has no
+ * checksum, and the game's own per-slot checksums already fall back to the mirror on load; the
+ * stability check is what actually rules out a torn copy.)
+ */
+SeedResult seed_file_stably(const std::filesystem::path& src, const std::filesystem::path& dst) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::exists(dst, ec)) {
+        return SeedResult::AlreadyThere;
+    }
+
+    int changes = 0;
+    for (int attempt = 1; attempt <= kSeedAttempts; ++attempt) {
+        if (attempt > 1) {
+            std::this_thread::sleep_for(kSeedRereadDelay);
+        }
+        const auto size1 = fs::file_size(src, ec);
+        const auto time1 = ec ? fs::file_time_type{} : fs::last_write_time(src, ec);
+        if (ec) {
+            std::error_code existsEc;
+            if (!fs::exists(src, existsEc)) {
+                return SeedResult::SourceGone;
+            }
+            Log.warn("Seed: could not stat '{}': {}", borealis::io::fs_path_to_string(src),
+                ec.message());
+            ec.clear();
+            ++changes;
+            continue;
+        }
+
+        const auto age = fs::file_time_type::clock::now() - time1;
+        if (age < kSeedQuietWindow) {
+            // Written moments ago: a save may still be in flight. Wait out the window, re-check.
+            const auto wait =
+                std::chrono::duration_cast<std::chrono::milliseconds>(kSeedQuietWindow - age);
+            std::this_thread::sleep_for(std::max(wait, kSeedRereadDelay));
+            ++changes;
+            continue;
+        }
+
+        std::vector<char> first;
+        std::vector<char> second;
+        const bool read1 = read_whole_file(src, first);
+        std::this_thread::sleep_for(kSeedRereadDelay);
+        const bool read2 = read_whole_file(src, second);
+        const auto size2 = fs::file_size(src, ec);
+        const auto time2 = ec ? fs::file_time_type{} : fs::last_write_time(src, ec);
+        const bool stable = read1 && read2 && !ec && first == second && first.size() == size1 &&
+                            size1 == size2 && time1 == time2 && attempt > seed_test_churn();
+        ec.clear();
+        if (!stable) {
+            ++changes;
+            continue;
+        }
+
+        auto tmp = dst;
+        tmp += ".seed-tmp";
+        fs::remove(tmp, ec);  // A leftover from a seed that crashed; never a real save.
+        ec.clear();
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out.write(first.data(), static_cast<std::streamsize>(first.size()));
+            out.close();
+            if (!out.good()) {
+                Log.warn("Seed: could not write '{}'", borealis::io::fs_path_to_string(tmp));
+                fs::remove(tmp, ec);
+                return SeedResult::GaveUp;
+            }
+        }
+        fs::rename(tmp, dst, ec);
+        if (ec) {
+            Log.warn("Seed: could not move '{}' into place: {}",
+                borealis::io::fs_path_to_string(dst), ec.message());
+            fs::remove(tmp, ec);
+            return SeedResult::GaveUp;
+        }
+        if (changes > 0) {
+            Log.warn("Seed: re-copied '{}' after {} unstable attempt(s) (the source instance was "
+                     "writing it); the copy is a consistent snapshot.",
+                borealis::io::fs_path_to_string(src), changes);
+        } else {
+            Log.info("Seed: copied '{}'", borealis::io::fs_path_to_string(src));
+        }
+        return SeedResult::Copied;
+    }
+
+    Log.warn("Seed: GAVE UP on '{}' — it changed on every one of {} attempts. It was NOT copied "
+             "(a torn card is worse than none); this instance starts without it, and the copy is "
+             "retried on its next launch.",
+        borealis::io::fs_path_to_string(src), kSeedAttempts);
+    return SeedResult::GaveUp;
+}
+
 /**
  * Give a freshly-created instance directory the first one's saves and settings.
  *
  * Copies, never moves or links: the whole point is that the original .gci is not touched. Only done
- * when the target does not already exist, so a second instance that has been used before continues
- * from where IT left off rather than being reset to the primary's progress every launch.
+ * when the target does not already exist (or a previous seed left kSeedIncompleteMarker), so a
+ * second instance that has been used before continues from where IT left off rather than being
+ * reset to the primary's progress every launch. Existing target files are never overwritten.
+ *
+ * The source instance is necessarily running while this happens, so every file goes through
+ * seed_file_stably(). On failure the file is left OUT rather than copied torn: the original is
+ * untouched either way, and an absent card is recoverable (retried next launch) where a corrupt
+ * one silently becomes this instance's progress.
  */
 void seed_instance_directory(const std::filesystem::path& from, const std::filesystem::path& to) {
+    namespace fs = std::filesystem;
     std::error_code ec;
+    bool incomplete = false;
+    int copied = 0;
+
+    const auto seed = [&](const fs::path& src, const fs::path& dst) {
+        switch (seed_file_stably(src, dst)) {
+        case SeedResult::Copied:
+            ++copied;
+            break;
+        case SeedResult::GaveUp:
+            incomplete = true;
+            break;
+        case SeedResult::AlreadyThere:
+        case SeedResult::SourceGone:
+            break;
+        }
+    };
+
+    const auto markerPath = to / kSeedIncompleteMarker;
+    {
+        // Written FIRST, removed last: a crash mid-seed also counts as incomplete.
+        std::ofstream marker(markerPath, std::ios::trunc);
+    }
 
     const auto configSrc = from / "config.json";
-    if (std::filesystem::exists(configSrc, ec)) {
-        std::filesystem::copy_file(
-            configSrc, to / "config.json", std::filesystem::copy_options::skip_existing, ec);
-        if (ec) {
-            Log.warn(
-                "Could not copy config into '{}': {}", borealis::io::fs_path_to_string(to), ec.message());
-            ec.clear();
-        }
+    if (fs::exists(configSrc, ec)) {
+        seed(configSrc, to / "config.json");
     }
+    ec.clear();
 
     // Memory cards only — deliberately NOT kUserDataDirectories, which also lists
     // texture_replacements. That can be gigabytes, and duplicating it per instance would turn a
     // safety measure into a disk-filling one.
     for (const std::string_view region : {"USA", "EUR", "JAP"}) {
         const auto src = from / region;
-        if (!std::filesystem::is_directory(src, ec)) {
+        if (!fs::is_directory(src, ec)) {
+            ec.clear();
             continue;
         }
-        std::filesystem::copy(src, to / region,
-            std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing,
-            ec);
+        for (auto it = fs::recursive_directory_iterator(src, ec);
+            !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+        {
+            const auto dst = to / region / it->path().lexically_relative(src);
+            std::error_code entryEc;
+            if (it->is_directory(entryEc)) {
+                fs::create_directories(dst, entryEc);
+            } else if (it->is_regular_file(entryEc) && it->path().extension() != ".seed-tmp") {
+                fs::create_directories(dst.parent_path(), entryEc);
+                seed(it->path(), dst);
+            }
+        }
         if (ec) {
-            Log.warn("Could not copy '{}' into '{}': {}", region, borealis::io::fs_path_to_string(to),
+            Log.warn("Seed: could not list '{}': {}", borealis::io::fs_path_to_string(src),
                 ec.message());
+            incomplete = true;
             ec.clear();
         }
+    }
+
+    if (incomplete) {
+        Log.warn("Seed of '{}' from '{}' is INCOMPLETE ({} file(s) copied); left '{}' so the next "
+                 "launch into this folder retries the missing files.",
+            borealis::io::fs_path_to_string(to), borealis::io::fs_path_to_string(from), copied,
+            kSeedIncompleteMarker);
+    } else {
+        fs::remove(markerPath, ec);
+        Log.info("Seed of '{}' from '{}' complete: {} file(s) copied.",
+            borealis::io::fs_path_to_string(to), borealis::io::fs_path_to_string(from), copied);
     }
 }
 
@@ -440,7 +625,10 @@ std::filesystem::path lock_or_relocate_data_directory(const std::filesystem::pat
                 borealis::io::fs_path_to_string(candidate));
         }
 
-        if (!existed) {
+        // Re-seed a folder whose first seed did not finish; it only fills in missing files.
+        const bool seedIncomplete =
+            existed && std::filesystem::exists(candidate / kSeedIncompleteMarker, ec);
+        if (!existed || seedIncomplete) {
             seed_instance_directory(dataPath, candidate);
         }
 
