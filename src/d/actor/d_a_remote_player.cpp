@@ -1444,6 +1444,10 @@ int daRemotePlayer_c::createHeap() {
     // heap costs items, never the override. Each load is non-fatal (d_a_remote_player_held.inc).
     setupHeldItems();
 
+    // The standing pivot (turn-in-place). Last, so a short heap costs only the pivot pose and its
+    // footsteps.
+    loadStepTurnAnimations();
+
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
         Log.info("Puppet heap after setup: {} bytes free, largest block {}", heap->getFreeSize(),
@@ -2822,6 +2826,14 @@ void daRemotePlayer_c::selectAnimation() {
      * than create()'s seed, which is what getCurrentAnm() reports on. */
     mAnmChosen = true;
 
+    /* This tick's turn, `shape_angle.y - mPrevAngleY` in setBlendMoveAnime (d_a_alink.cpp:7706).
+     * daAlink_c refreshes mPrevAngleY at the end of every tick (:17926), so it is one tick's
+     * rotation; here it is one tick of the replicated facing. Taken before any early return so a
+     * tick spent in another animation never leaves a stale baseline behind. */
+    const s16 yawStep = mStepTurnYawValid ? static_cast<s16>(shape_angle.y - mStepTurnPrevYaw) : 0;
+    mStepTurnPrevYaw = shape_angle.y;
+    mStepTurnYawValid = true;
+
     /* The action override (wire block 2) beats everything below: the sender is in a proc the
      * puppet does not reconstruct, and what he is drawing came over the wire. */
     if (selectActionAnimation()) {
@@ -3015,6 +3027,8 @@ void daRemotePlayer_c::selectAnimation() {
     f32 speedA;
     f32 speedB;
     f32 blend;
+    // 1 + the mStepTurnAnm index in slot 1 this tick, 0 for none (the standing pivot, band 1).
+    u8 stepTurn = 0;
 
     if (fraction < hio.mWalkChangeRate) {
         blend = fraction / hio.mWalkChangeRate;
@@ -3055,6 +3069,35 @@ void daRemotePlayer_c::selectAnimation() {
          * not read as tired. */
         speedA = tiredIdle ? 1.0f : hio.mWaitAnmSpeed;
         speedB = walkSpeed;
+
+        /* The standing pivot: setBlendMoveAnime's step-turn branch (d_a_alink.cpp:7706-7745).
+         * Standing (checkModeFlg(MODE_IDLE) || checkZeroSpeedF(), i.e. zeroSpeed) and turned more
+         * than 100 this tick, he swaps the WALK out of slot 1 for STEPL (turning left, sp8 > 0) or
+         * STEPR, at a weight of 0.85 + 0.001|turn| capped at 1, played at mRotationASpeed, and
+         * with sp10 = 1 so slot 1 owns the notes. That is where his turn-in-place footsteps come
+         * from; the walk in slot 1 has none to give at the speed it runs at while standing, which
+         * is why the puppet used to stay silent through every pivot.
+         *
+         * His other four tests are on the stick (mStickValue < 0.3, checkInputOnR, last tick's
+         * mMoveValue in (0.05, 0.3)) and checkAttentionLock, none of which is on the wire. The
+         * attention set has already returned above. Reasoned, not measured: a larger push gives
+         * him speed (zeroSpeed clears) within a tick or two, so the most this can misfire is a
+         * tick of pivot at the start of a walk. The guard stance branch (:7672) beats this one,
+         * so a guarding sender never takes it. */
+        const s16 turnAbs = yawStep < 0 ? static_cast<s16>(-yawStep) : yawStep;
+        if (zeroSpeed && !mNetUpperGuard && turnAbs > 100) {
+            const int stepIdx = (yawStep > 0 ? 0 : 1) + (tiredIdle ? 2 : 0);
+            if (mStepTurnAnm[stepIdx].mpUnder != NULL) {
+                stepTurn = static_cast<u8>(stepIdx + 1);
+                anmB = &mStepTurnAnm[stepIdx];
+                idB = static_cast<daAlink_c::daAlink_ANM>(daAlink_c::ANM_STEP_TURN + stepIdx);
+                speedB = daAlinkHIO_basic_c0::m.mRotationASpeed;
+                blend = 0.85f + 0.001f * turnAbs;
+                if (blend > 1.0f) {
+                    blend = 1.0f;
+                }
+            }
+        }
     } else if (fraction < hio.mRunChangeRate) {
         // Never reached on the heavy gait (the clamp above); written on walkAnm all the same.
         blend = (fraction - hio.mWalkChangeRate) / (hio.mRunChangeRate - hio.mWalkChangeRate);
@@ -3195,15 +3238,28 @@ void daRemotePlayer_c::selectAnimation() {
         mCurrentIdleAnm = idleAnmID;
     }
 
+    /* The pivot coming or going swaps slot 1's resource (WALKS <-> STEPL/STEPR), the case
+     * setDoubleAnime turns a caller's -1 into a morf for (d_a_alink.cpp:7099-7104), with the same
+     * WAIT_B exception the idle swap above takes. */
+    if (stepTurn != mStepTurnPrev) {
+        mStepTurnPrev = stepTurn;
+        if (morf < 0.0f) {
+            morf = idleID == l_waitBAnm && mNetModeIdle ?
+                       hio.mWaitBInterpolation :
+                       daAlinkHIO_basic_c0::m.mBasicInterpolation;
+        }
+    }
+
     setDoubleAnm(*anmA, *anmB, blend, speedA, speedB, morf);
     /* Which half of the blend owns the notes is setBlendMoveAnime's last setDoubleAnime argument:
      * 2 (UNDER_0, the wait) while standing in band 1 — checkModeFlg(MODE_IDLE) ||
      * checkZeroSpeedF(), which is exactly what kPlayerStateZeroSpeed carries — and 1 (UNDER_1, the
      * walk or the run) everywhere else (d_a_alink.cpp:7669-7704, :7784, :7799, :7810). Taking the
      * walk's notes while standing would play footsteps on the spot: the walk's controller keeps
-     * advancing at weight 0. */
+     * advancing at weight 0. The standing pivot is the exception inside that: it passes 1, so its
+     * STEPL/STEPR in slot 1 owns the notes (d_a_alink.cpp:7744). */
     {
-        const bool basOnA = fraction < hio.mWalkChangeRate && zeroSpeed;
+        const bool basOnA = fraction < hio.mWalkChangeRate && zeroSpeed && stepTurn == 0;
         setBasSource(basOnA ? *anmA : *anmB, basOnA ? 0 : 1);
     }
 
@@ -3606,6 +3662,64 @@ void daRemotePlayer_c::loadGuardAnimations() {
               "heap ({} -> {} free)",
         mPlayerId, resident, wanted, loadedNum, heap != NULL ? freeBefore - heap->getFreeSize() : 0,
         freeBefore, heap != NULL ? heap->getFreeSize() : 0);
+}
+
+/**
+ * The standing pivot, rows 0x15-0x18 of m_anmDataTable (d_a_alink.cpp:317-320):
+ *
+ *     ANM_STEP_TURN          {STEPL, STEPL}
+ *     ANM_SMALL_GUARD        {STEPR, STEPR}   (the right half; the decomp name is wrong)
+ *     ANM_STEP_TURN_TIRED    {STEPL, WAITD}
+ *     ANM_SMALL_GUARD_TIRED  {STEPR, WAITD}
+ *
+ * All four are outside getMainBckData's sword and guard windows, so equip 0 is the only answer.
+ * The tired rows reuse the plain rows' under objects (and so their notes): a row and its tired
+ * variant are never both in the packs. Their WAITD upper is a NEW object, not mTiredWaitAnm's,
+ * because the tired step plays over the tired wait and slot 0 is stepping that one at the same
+ * time. One WAITD serves both tired rows, which are never both in the packs either.
+ */
+void daRemotePlayer_c::loadStepTurnAnimations() {
+    JKRHeap* heap = JKRGetCurrentHeap();
+    const s32 freeBefore = heap != NULL ? heap->getFreeSize() : 0;
+
+    for (int i = 0; i < 4; i++) {
+        mStepTurnAnm[i].mpUnder = NULL;
+        mStepTurnAnm[i].mpUpper = NULL;
+        mStepTurnAnm[i].mpUnderBas = NULL;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        const daAlink_c::daAlink_ANM anm =
+            static_cast<daAlink_c::daAlink_ANM>(daAlink_c::ANM_STEP_TURN + i);
+        if (!load_gait_anm(&mStepTurnAnm[i], anm, 0)) {
+            mStepTurnAnm[i].mpUnder = NULL;
+            Log.warn("Puppet has no standing-pivot animation {}; it will stand still through a "
+                     "turn on the spot, with no footsteps",
+                static_cast<int>(anm));
+        }
+    }
+
+    const daAlink_BckData& tiredBck = anm_bck_data(daAlink_c::ANM_STEP_TURN_TIRED, 0);
+    J3DAnmTransform* tiredUpper = NULL;
+    if (mStepTurnAnm[0].mpUnder != NULL || mStepTurnAnm[1].mpUnder != NULL) {
+        tiredUpper =
+            static_cast<J3DAnmTransform*>(load_aram_anm(tiredBck.m_upperID, ANM_FAMILY_TRANSFORM));
+    }
+    for (int i = 0; i < 2; i++) {
+        if (mStepTurnAnm[i].mpUnder != NULL && tiredUpper != NULL) {
+            mStepTurnAnm[2 + i] = mStepTurnAnm[i];
+            mStepTurnAnm[2 + i].mpUpper = tiredUpper;
+        }
+    }
+
+    Log.debug("Puppet {} standing pivot: STEPL {} STEPR {} tired {}, notes {}/{}; cost {} bytes "
+              "of heap ({} -> {} free)",
+        mPlayerId, mStepTurnAnm[0].mpUnder != NULL ? "yes" : "no",
+        mStepTurnAnm[1].mpUnder != NULL ? "yes" : "no", tiredUpper != NULL ? "yes" : "no",
+        mStepTurnAnm[0].mpUnderBas != NULL ? "yes" : "no",
+        mStepTurnAnm[1].mpUnderBas != NULL ? "yes" : "no",
+        heap != NULL ? freeBefore - heap->getFreeSize() : 0, freeBefore,
+        heap != NULL ? heap->getFreeSize() : 0);
 }
 
 const daRemotePlayer_anm_c& daRemotePlayer_c::guardOr(
