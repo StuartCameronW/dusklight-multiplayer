@@ -100,6 +100,8 @@ void open(const std::string& path, const char* role) {
              "buffered,anm,flags,equip,idleKind,atnKind,neckX,neckY,bodyX,bodyTwist,bodyZ,bankZ,"
              "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
              // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
+             // actHandL/R: the hand shapes SHOWN, in every state since v17 (254 = the body's own
+             // hand, 255 = sender's status window open), so local vs actor rows compare directly.
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
              "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs,"
              // v15 block (1): stride phase as drawn.

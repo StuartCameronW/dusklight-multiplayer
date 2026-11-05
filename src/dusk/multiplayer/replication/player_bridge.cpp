@@ -974,9 +974,6 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
             }
             out.actMorf = s_latchedMorf;
 
-            out.actHandL = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d0);
-            out.actHandR = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d4);
-
             fill_action_slot1(alink, out);
 
             /* Joint 0's FINAL translation, after jointControll has applied whatever root clear
@@ -1012,6 +1009,30 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
             }
         } else {
             s_latchedUnder = kPlayerActNone;
+        }
+    }
+
+    /* The hands he is SHOWING, on every tick and in every proc (protocol 17), not only during an
+     * override. setDrawHand's chain (d_a_alink.cpp:18944-19016) resolves the held-item overrides
+     * field_0x2f94-0x2f97, the bow's left hand, the canoe paddle, the cut-type right hand and the
+     * shield pass flag. Sending the result means the puppet never has to rebuild that chain from
+     * the held item, and it cannot miss a branch.
+     *
+     * setDrawHand runs in his draw, so this is the pair from the previous frame. The puppet is one
+     * frame late on a hand change, and that is the whole cost.
+     *
+     * While the status window is open, setDrawHand takes the pause-menu branch (:18950-18961): 0 if
+     * he owns a sword, 6 if he owns a shield. That describes the collection-screen model, not his
+     * hands in the world, so "unknown" is sent and the puppet uses its own derivation. The
+     * held-item block makes the same test (fill_held_item). A wolf has no hands model, so he keeps
+     * clear_action_anim's kPlayerActBodyHand. */
+    if (alink != nullptr && !alink->checkWolf()) {
+        if (alink->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW)) {
+            out.actHandL = kPlayerHandUnknown;
+            out.actHandR = kPlayerHandUnknown;
+        } else {
+            out.actHandL = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d0);
+            out.actHandR = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d4);
         }
     }
 

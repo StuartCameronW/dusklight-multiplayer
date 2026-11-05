@@ -218,6 +218,11 @@ constexpr float kPlayerActRateScale = 32.0f;
 constexpr float kPlayerActRootScale = 8.0f;
 /// The hand-pose sentinel for "the body's own hand" — daAlink_c's 0xFE (setDrawHand).
 constexpr std::uint8_t kPlayerActBodyHand = 0xFE;
+/// "The sender's in-world hands are not known this tick": his status window is open, and
+/// setDrawHand is showing the pause-menu grips (d_a_alink.cpp:18950-18961), not what he holds in
+/// the world. The receiver falls back to its own table-plus-grip derivation. Never a hand-model
+/// material index.
+constexpr std::uint8_t kPlayerHandUnknown = 0xFF;
 /// Block (4)'s unit-interval bytes (the slot-1 phase and blend weight): u8 x 255, so 0 and 1 are
 /// both exact.
 constexpr float kPlayerActUnitScale = 255.0f;
@@ -417,6 +422,9 @@ struct PlayerState {
      *                        last changed, latched.
      *   actHandL / actHandR  the hand shapes he is SHOWING (field_0x06d0/06d4 resolved back to a
      *                        hand-model material index), kPlayerActBodyHand for the body's own.
+     *                        Since protocol 17 they are sent on EVERY tick, not only during an
+     *                        override: the output of his whole setDrawHand chain (held item,
+     *                        grips, bow, canoe). kPlayerHandUnknown while his status window is up.
      *   actRootX/Y/Z         joint 0's final model-space translation after jointControll, x
      *                        kPlayerActRootScale — the root-motion clear, as an answer.
      *
