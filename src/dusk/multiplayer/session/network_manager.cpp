@@ -26,6 +26,12 @@ constexpr borealis::Log Log{"dusk::mp"};
 /// Heartbeat cadence, in sim ticks. The sim runs at 30 Hz, so this is roughly once a second.
 constexpr std::uint64_t kHeartbeatIntervalTicks = 30;
 
+/// How often to rebuild our mod fingerprint and look for a change (check_mod_changes): ~1 s. A
+/// guest who loads a save on a different randomizer seed is removed within about a second of the
+/// load. Rebuilding is cheap: the per-bundle facts are cached (mod_check.cpp), the rest is a walk
+/// over the active mods and an in-memory save-blob lookup.
+constexpr std::uint64_t kModRecheckTicks = 30;
+
 /// How often to log the measured tick rate while a session is live.
 constexpr std::uint64_t kRateReportIntervalTicks = 150;
 
@@ -297,7 +303,11 @@ bool NetworkManager::host(std::uint16_t port) {
     mLastEndMessage.clear();
     mRateWindowStart = std::chrono::steady_clock::now();
     mRateWindowStartTick = mSimTick;
+    // The baseline check_mod_changes compares against. Each Hello still builds a fresh list, so a
+    // guest is always judged against what the host is running at that moment.
+    mSentMods = local_mod_fingerprint();
     Log.info("Session started as HOST (protocol v{})", kProtocolVersion);
+    Log.info("Mods: hosting with {}", describe_mod_fingerprint(mSentMods));
     notify("Hosting a co-op session", fmt::format("Waiting for players on UDP port {}.", port));
     return true;
 }
@@ -322,6 +332,7 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
     mEndpoint = fmt::format("{}:{}", address, port);
     mHostNickname.clear();
     mLastEndMessage.clear();
+    mHaveHostMods = false;
     mRateWindowStart = std::chrono::steady_clock::now();
     mRateWindowStartTick = mSimTick;
     // The host owns the save. Latch it here, at the moment we become a guest, rather than at the
@@ -365,6 +376,7 @@ void NetworkManager::shutdown() {
     mRole = Role::Inactive;
     mJoined = false;
     mHostNickname.clear();
+    mHaveHostMods = false;
     mLocalPlayerId = 0;
     mNextPlayerId = 1;
     mLeaveRequested = false;
@@ -434,6 +446,11 @@ void NetworkManager::pre_actor_tick() {
 
     // After the drain, so a peer is judged on everything that reached us this frame.
     check_peer_silence();
+    if (!mTransport) {
+        return;
+    }
+
+    check_mod_changes();
     if (!mTransport) {
         return;
     }
@@ -523,14 +540,30 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
             end_client_session("Couldn't join", "The host stopped waiting for us to introduce "
                                                 "ourselves. Try joining again.");
             break;
-        case DisconnectReason::ModMismatch:
-            // Normally the HelloAck that precedes this hang-up has already ended the session with
-            // the specific mods named, and this never runs. It is the fallback for an ack that
-            // could not be read.
-            end_client_session("Couldn't join",
-                "Your gameplay mods don't match the host's. Both players need the same gameplay "
-                "mods, at the same versions, enabled.");
+        case DisconnectReason::ModMismatch: {
+            // At join, the HelloAck before this hang-up has normally ended the session already
+            // with the mods named, and this is the fallback for an ack that could not be read.
+            // Mid-session (v18), the host's ModsUpdate arrived just before the hang-up, so name
+            // the difference against what we run now — typically a save on another seed.
+            std::string detail;
+            if (mHaveHostMods) {
+                detail = summarize_mod_mismatch(
+                    diff_mod_fingerprints(local_mod_fingerprint(), mHostMods, "you", "the host"));
+            }
+            if (mJoined) {
+                end_client_session("Removed from the session: mods no longer match",
+                    detail.empty() ? std::string("Your gameplay mods or randomizer seed stopped "
+                                                 "matching the host's.") :
+                                     detail);
+            } else {
+                end_client_session("Couldn't join",
+                    detail.empty() ?
+                        std::string("Your gameplay mods don't match the host's. Both players need "
+                                    "the same gameplay mods, at the same versions, enabled.") :
+                        detail);
+            }
             break;
+        }
         case DisconnectReason::ConnectionLost:
         default:
             if (mJoined) {
@@ -568,7 +601,9 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
     world_clock().forget_peer(session.playerId);
     broadcast_peer_left(session.playerId);
 
-    if (reason == static_cast<std::uint32_t>(DisconnectReason::Left)) {
+    if (session.refused) {
+        // We removed them (recheck_peer_mods), and already said why.
+    } else if (reason == static_cast<std::uint32_t>(DisconnectReason::Left)) {
         notify(fmt::format("{} left", session.nickname), "They left the session.", 4);
     } else {
         notify(fmt::format("{} lost connection", session.nickname),
@@ -722,6 +757,75 @@ void NetworkManager::send_hello(PeerId peer) {
     mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
 }
 
+void NetworkManager::send_mods_update(PeerId peer, const ModFingerprint& fp) {
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::ModsUpdate));
+    write_mod_fingerprint(w, fp);
+    mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
+}
+
+bool NetworkManager::recheck_peer_mods(PeerSession& session, const ModFingerprint& ours) {
+    const ModDiff diff = diff_mod_fingerprints(ours, session.mods, "we", session.nickname);
+    if (!diff.gameplayMismatch) {
+        return true;
+    }
+    for (const auto& line : diff.gameplayLines) {
+        Log.warn("Mods: gameplay difference with player {} ('{}'): {}", session.playerId,
+            session.nickname, line);
+    }
+    Log.warn("Removing player {} ('{}'): gameplay mods no longer match", session.playerId,
+        session.nickname);
+    notify(fmt::format("{} was removed", session.nickname),
+        fmt::format("Your gameplay mods no longer match. {}", summarize_mod_mismatch(diff)), 8);
+    // Ours first, on the same reliable channel, so it lands before the hang-up and the guest can
+    // name the difference in its own words.
+    send_mods_update(session.id, ours);
+    refuse_peer(session, DisconnectReason::ModMismatch);
+    return false;
+}
+
+void NetworkManager::check_mod_changes() {
+    if (mSimTick % kModRecheckTicks != 0) {
+        return;
+    }
+    // A client has nothing to report until it is admitted: the host has its Hello list, and a
+    // change before the HelloAck is picked up on the first check after it.
+    if (mRole == Role::Client && !mJoined) {
+        return;
+    }
+    ModFingerprint now = local_mod_fingerprint();
+    if (same_mod_fingerprint(now, mSentMods)) {
+        return;
+    }
+    Log.info("Mods: ours changed to {}", describe_mod_fingerprint(now));
+    mSentMods = std::move(now);
+
+    if (mRole == Role::Client) {
+        for (const auto& [id, session] : mPeers) {
+            send_mods_update(id, mSentMods);
+        }
+        if (mHaveHostMods) {
+            // Logged here too, so a guest-side change shows the comparison the host is about to
+            // make even if the hang-up beats the host's own ModsUpdate.
+            const ModDiff diff = diff_mod_fingerprints(mSentMods, mHostMods, "you", "the host");
+            for (const auto& line : diff.gameplayLines) {
+                Log.warn("Mods: gameplay difference: {}", line);
+            }
+        }
+        return;
+    }
+
+    for (auto& [id, session] : mPeers) {
+        if (!session.handshakeComplete || session.refused) {
+            continue;
+        }
+        // Everyone hears the new list; anyone it no longer matches is removed.
+        if (recheck_peer_mods(session, mSentMods)) {
+            send_mods_update(id, mSentMods);
+        }
+    }
+}
+
 void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::size_t size) {
     Reader r(data, size);
     std::uint8_t rawId = 0;
@@ -787,8 +891,8 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // rebuilt per Hello rather than cached, because mods can be toggled while hosting.
         const ModFingerprint ourMods = local_mod_fingerprint();
         bool modsOk = true;
+        ModFingerprint theirMods;
         if (versionOk) {
-            ModFingerprint theirMods;
             if (!read_mod_fingerprint(r, theirMods)) {
                 Log.warn("Malformed Hello from peer {} (mod list)", peer);
                 return;
@@ -859,6 +963,7 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         peerIt->second.playerId = playerId;
         peerIt->second.nickname = nickname;
         peerIt->second.color = assignedColor;
+        peerIt->second.mods = std::move(theirMods);
         peerIt->second.handshakeComplete = true;
 
         // Order matters: the newcomer must learn the existing roster before anyone is told about
@@ -939,6 +1044,10 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         if (mJoined) {
             Log.warn("Ignoring repeated HelloAck from peer {}", peer);
             return;
+        }
+        if (haveHostMods) {
+            mHostMods = std::move(hostMods);
+            mHaveHostMods = true;
         }
 
         // The host is authoritative on colour and identity, so take what it assigns rather than
@@ -1032,6 +1141,36 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // the flags byte, and it arrives at the sim rate for the same cost as nothing.
         world_clock().set_peer_time_can_pass(
             it->second.playerId, state.time_can_pass(), state.in_world());
+        break;
+    }
+    case PacketId::ModsUpdate: {
+        ModFingerprint theirs;
+        if (!read_mod_fingerprint(r, theirs)) {
+            Log.warn("Malformed ModsUpdate from peer {}", peer);
+            return;
+        }
+        if (mRole == Role::Client) {
+            if (!mJoined) {
+                return;
+            }
+            // Recorded, not judged: the host owns admission and will hang up if we differ. Logged
+            // so both ends' logs show the same comparison.
+            const ModDiff diff =
+                diff_mod_fingerprints(local_mod_fingerprint(), theirs, "you", "the host");
+            Log.info("Mods: host changed to {}", describe_mod_fingerprint(theirs));
+            for (const auto& line : diff.gameplayLines) {
+                Log.warn("Mods: gameplay difference: {}", line);
+            }
+            mHostMods = std::move(theirs);
+            mHaveHostMods = true;
+            break;
+        }
+        // Host. The gate above guarantees an admitted, unrefused peer.
+        auto& session = sender->second;
+        Log.info("Mods: peer {} ('{}') changed to {}", peer, session.nickname,
+            describe_mod_fingerprint(theirs));
+        session.mods = std::move(theirs);
+        recheck_peer_mods(session, local_mod_fingerprint());
         break;
     }
     case PacketId::TimeOverride: {

@@ -506,6 +506,29 @@ void invalidate_save(std::string_view saveName) {
     s_saves.erase(std::string{saveName});
 }
 
+bool peek_current_slot_blob(
+    std::string_view modId, std::string_view name, std::vector<uint8_t>& out) {
+    out.clear();
+    if (s_currentSlot < 0) {
+        return false;
+    }
+    const char* fileName = mDoMemCd_GetFileName();
+    const auto storeIt = s_saves.find(fileName != nullptr ? std::string{fileName} : std::string{});
+    if (storeIt == s_saves.end() || !storeIt->second.loaded) {
+        return false;
+    }
+    const auto& mods = storeIt->second.slots[s_currentSlot].mods;
+    const auto modIt = mods.find(std::string{modId});
+    if (modIt == mods.end()) {
+        return true;
+    }
+    const auto blobIt = modIt->second.find(std::string{name});
+    if (blobIt != modIt->second.end()) {
+        out = blobIt->second;
+    }
+    return true;
+}
+
 namespace {
 
 struct CurrentBlobs {
