@@ -24,6 +24,10 @@ namespace dusk::mp {
 /// several hundred ticks before replication agreed, and the resulting traces were nonsense.
 bool world_is_playable();
 
+/// True from the moment this end queues a scene change (exit, warp, death, void-out) until the new
+/// scene's Link exists. The sender stops claiming to be in the world for that whole stretch.
+bool local_scene_change_queued();
+
 /// Read the local player's pose. False when Link doesn't currently exist (loading, title screen),
 /// in which case nothing should be sent this tick.
 bool capture_local_player(PlayerState& out);

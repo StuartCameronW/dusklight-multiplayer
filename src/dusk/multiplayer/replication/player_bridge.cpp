@@ -2,6 +2,7 @@
 
 #include "world_clock.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1320,8 +1321,44 @@ bool link_acting_in_place() {
     return alink != nullptr && alink->mDemo.getDemoType() == daPy_demo_c::DEMO_TYPE_SPECIAL_e;
 }
 
+bool local_scene_change_queued() {
+    /* Latched: the queued flag clears once the scene request is issued, partway through the load,
+     * and the held pose then went out "in world" again: the far end respawned the puppet frozen at
+     * the exit for ~1.4 s (measured, F_SP103). So "leaving" lasts until a different Link exists,
+     * i.e. the new scene has its player. Capped so a cancelled change can't hide us forever. */
+    static bool s_leaving = false;
+    static fpc_ProcID s_leavingLink = fpcM_ERROR_PROCESS_ID_e;
+    static std::chrono::steady_clock::time_point s_since;
+    constexpr auto kMaxLeaving = std::chrono::seconds(10);
+
+    fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    const auto now = std::chrono::steady_clock::now();
+    if (dComIfGp_isEnableNextStage()) {
+        if (!s_leaving) {
+            s_leaving = true;
+            s_since = now;
+        }
+        s_leavingLink = link != nullptr ? fopAcM_GetID(link) : fpcM_ERROR_PROCESS_ID_e;
+        return true;
+    }
+    if (s_leaving) {
+        const bool newLink = link != nullptr && fopAcM_GetID(link) != s_leavingLink;
+        if (newLink || now - s_since > kMaxLeaving) {
+            s_leaving = false;
+        }
+    }
+    return s_leaving;
+}
+
 /// The gate for reading Link's pose: in play, or acting in place during his own event.
 bool local_pose_is_live() {
+    /* A queued scene change counts as gone. The load that follows can stall this process for
+     * seconds without a tick, so whatever we sent last is what the far end holds: an "in world"
+     * pose left the puppet frozen mid-roll at the exit for ~2 s (measured, F_SP103). Saying "not
+     * in world" here makes that last packet hide it instead. */
+    if (local_scene_change_queued()) {
+        return false;
+    }
     return world_is_playable() || link_acting_in_place();
 }
 

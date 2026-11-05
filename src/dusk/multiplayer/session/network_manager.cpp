@@ -8,6 +8,7 @@
 #include "../net/enet_transport.hpp"
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
+#include "../replication/player_bridge.hpp"
 #include "../replication/player_state.hpp"
 #include "../replication/replication_manager.hpp"
 #include "../replication/world_clock.hpp"
@@ -1379,7 +1380,18 @@ PlayerState NetworkManager::wire_local_state() {
         mHaveLastLocal = true;
         return state;
     }
-    return mHaveLastLocal ? mLastLocalState : PlayerState{};
+    if (!mHaveLastLocal) {
+        return PlayerState{};
+    }
+    PlayerState held = mLastLocalState;
+    /* Leaving the scene is the one gap where holding the pose is wrong: the load that follows can
+     * stall this process for seconds, and the far end would show us frozen at the exit the whole
+     * time (~2 s mid-roll, measured). Cleared in-world flag = the far end despawns the puppet,
+     * the same path it takes for a load it can see. Cutscenes still hold, as above. */
+    if (local_scene_change_queued()) {
+        held.flags &= ~kPlayerStateInWorld;
+    }
+    return held;
 }
 
 void NetworkManager::send_local_state() {
