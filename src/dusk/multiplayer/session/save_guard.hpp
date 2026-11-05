@@ -88,6 +88,18 @@ const char* saving_disabled_explanation();
 void mark_save_contaminated(const char* i_reason);
 
 /**
+ * The join-attempt form of the latch. join() calls begin_guest_join(), so saving is off from the
+ * moment we try. The accepted HelloAck calls confirm_guest_join(), which makes it sticky like
+ * mark_save_contaminated(). A join that ends without that (timeout, refusal, Leave while
+ * connecting) calls abandon_guest_join(), which turns saving back on. That is safe because the
+ * client drops every host packet until the handshake completes, so the host's world never reached
+ * this game. Stuart's call, 2026-11-05.
+ */
+void begin_guest_join();
+void confirm_guest_join();
+void abandon_guest_join();
+
+/**
  * The refuse-a-card-write decision, for the one choke point that reaches disk. Returns true when
  * the caller must drop the write on the floor, having already told the player why (a toast, rate
  * limited so a stuck save loop cannot spam it) and logged it.

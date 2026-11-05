@@ -311,9 +311,10 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
     mRateWindowStartTick = mSimTick;
     // The host owns the save. Latch it here, at the moment we become a guest, rather than at the
     // first applied packet: v1 policy makes the host authoritative over inventory, rupees and quest
-    // flags, so by the time any of that has arrived it is already too late to decide. Sticky for
-    // the life of the process on purpose — see save_guard.hpp.
-    mark_save_contaminated("joined a co-op session as a guest");
+    // flags, so by the time any of that has arrived it is already too late to decide. It becomes
+    // sticky for the life of the process when the host accepts us (HelloAck); a join that never
+    // gets that far gives saving back in shutdown() — see save_guard.hpp.
+    begin_guest_join();
     Log.info("Session started as CLIENT (protocol v{})", kProtocolVersion);
     return true;
 }
@@ -328,6 +329,11 @@ NetworkManager::~NetworkManager() {
 }
 
 void NetworkManager::shutdown() {
+    if (mRole == Role::Client && !mJoined) {
+        // Never accepted, so nothing of the host's was applied (every host packet waits for the
+        // handshake). Saving comes back; a session that did get going stays latched.
+        abandon_guest_join();
+    }
     if (mTransport) {
         mTransport->disconnect_all(static_cast<std::uint32_t>(DisconnectReason::Left));
         mTransport.reset();
@@ -801,6 +807,7 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // The host is a player too, and it is the one player never announced by PeerJoined.
         replication_manager().add_player(kHostPlayerId, hostNickname, hostColor);
 
+        confirm_guest_join();
         mJoined = true;
         mHostNickname = hostNickname;
         Log.info("Handshake complete — we are player {} ('{}', #{:06X}), host is '{}' (#{:06X})",
@@ -840,7 +847,7 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // in send_heartbeats() instead.
         const auto elapsed = std::chrono::steady_clock::now() - it->second;
         const auto rttMs =
-            std::chrono::duration_cast<std::chrono::duration<double, std::milli> >(elapsed).count();
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(elapsed).count();
 
         if (auto peerIt = mPeers.find(peer); peerIt != mPeers.end()) {
             peerIt->second.lastRttMs = static_cast<std::uint32_t>(rttMs);
@@ -905,6 +912,14 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
         if (count > kMaxPlayers) {
             Log.warn("Snapshot claims {} players (max {}) — dropping", count, kMaxPlayers);
+            return;
+        }
+        if (const auto host = mPeers.find(peer);
+            host == mPeers.end() || !host->second.handshakeComplete)
+        {
+            // Before HelloAck: drop it like every other unauthenticated packet. It carries the
+            // host's clock, and a failed join may only give saving back if nothing of the host's
+            // was applied (save_guard.hpp, abandon_guest_join).
             return;
         }
         for (std::uint8_t i = 0; i < count; ++i) {

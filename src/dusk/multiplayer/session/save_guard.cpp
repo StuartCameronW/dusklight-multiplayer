@@ -58,6 +58,14 @@ bool test_refusal_forced() {
 bool sContaminated = false;
 
 /**
+ * True while sContaminated comes ONLY from a join attempt the host has not yet accepted. Nothing of
+ * the host's can have been applied then: every host packet is dropped until the handshake completes
+ * (network_manager.cpp). So if the attempt fails, the world in memory is still this machine's own
+ * and saving can safely come back. Any other cause, or an accepted handshake, makes it sticky.
+ */
+bool sGuestJoinUnconfirmed = false;
+
+/**
  * Rate limit for the player-facing toast. A save that is refused tends to be retried — the in-game
  * save prompt is a menu the player can mash — and a toast per attempt would bury the message it is
  * trying to deliver.
@@ -166,10 +174,48 @@ void mark_save_contaminated(const char* i_reason) {
     }
 
     sContaminated = true;
+    sGuestJoinUnconfirmed = false;
     Log.warn("Save ownership: this machine will not write its own memory card again this run — {}. "
              "The host owns the save for a co-op session; a guest's own .gci is left untouched "
              "rather than overwritten with the host's world. Restart Dusklight to save normally.",
         i_reason != nullptr ? i_reason : "reason not given");
+}
+
+void begin_guest_join() {
+    if (sContaminated) {
+        return;
+    }
+    sContaminated = true;
+    sGuestJoinUnconfirmed = true;
+    Log.info("Save ownership: saving is off while joining a co-op session. It stays off for this "
+             "run once the host accepts us, and comes back if the join fails.");
+}
+
+void confirm_guest_join() {
+    if (!sGuestJoinUnconfirmed) {
+        return;
+    }
+    sGuestJoinUnconfirmed = false;
+    Log.warn("Save ownership: this machine will not write its own memory card again this run — "
+             "joined a co-op session as a guest. The host owns the save for a co-op session; a "
+             "guest's own .gci is left untouched rather than overwritten with the host's world. "
+             "Restart Dusklight to save normally.");
+}
+
+void abandon_guest_join() {
+    if (!sGuestJoinUnconfirmed) {
+        return;
+    }
+    sGuestJoinUnconfirmed = false;
+    sContaminated = false;
+    Log.info(
+        "Save ownership: the join never completed, so nothing of the host's reached this game. "
+        "Saving is back on.");
+    dusk::ui::push_toast({
+        .title = "Saving is back on",
+        .content = "You never joined the session, so your own game and save are as you left them.",
+        .duration = std::chrono::seconds(5),
+    });
 }
 
 bool refuse_card_write() {
