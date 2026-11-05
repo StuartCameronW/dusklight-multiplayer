@@ -17,6 +17,11 @@
 #include "dusk/multiplayer/session/save_guard.hpp"
 #endif
 
+#if TARGET_PC
+#include <cstdlib>
+#include "dusk/logging.h"
+#endif
+
 #if PLATFORM_WII || PLATFORM_SHIELD
 #include <cstring>
 #include <revolution/nand.h>
@@ -102,6 +107,7 @@ void mDoMemCd_Ctrl_c::ThdInit() {
 #if TARGET_PC
     mCardCommand = COMM_ATTACH_e;
     mReattachPending = false;
+    mSaveRefused = false;
     mInitialized = true;
 #else
     mCardCommand = COMM_NONE_e;
@@ -301,8 +307,40 @@ void mDoMemCd_Ctrl_c::save(void* i_buffer, u32 i_size, u32 i_position) {
     if (dusk::mp::refuse_card_write()) {
         return;
     }
-#endif
 
+    // The original OSTryLockMutex drops the save when the mutex is contended, leaving the
+    // caller polling SaveSync() for a write that was never queued. Every holder of mMutex keeps
+    // it for a few instructions only (no card I/O happens under it), so block instead.
+    OSLockMutex(&mMutex);
+
+    // If the card thread has not yet cleared its previous command (e.g. a restore that just set
+    // field_0x1fc8 and is about to reset mCardCommand), give it a moment. Overwriting
+    // mCardCommand here would be reset to COMM_NONE_e by main() and the write lost.
+    for (int i = 0; mCardCommand != COMM_NONE_e && i < 1000; i++) {
+        OSUnlockMutex(&mMutex);
+        OSYieldThread();
+        OSLockMutex(&mMutex);
+    }
+
+    // Test knob: DUSK_TEST_SAVE_REFUSE forces the refusal path below. Read once.
+    static const bool s_testRefuse = std::getenv("DUSK_TEST_SAVE_REFUSE") != NULL;
+
+    if (mCardCommand != COMM_NONE_e || s_testRefuse) {
+        // Still busy: refuse, and make the caller's SaveSync() poll complete with an error.
+        mSaveRefused = true;
+        s32 busyCommand = mCardCommand;
+        OSUnlockMutex(&mMutex);
+        DuskLog.error("MemCard: save refused, card thread busy (command {}); reporting write error",
+            busyCommand);
+        return;
+    }
+
+    memcpy(&mData[i_position], i_buffer, i_size);
+    field_0x1fc8 = 0;
+    mCardCommand = COMM_STORE_e;
+    OSUnlockMutex(&mMutex);
+    OSSignalCond(&mCond);
+#else
     if (OSTryLockMutex(&mMutex)) {
         memcpy(&mData[i_position], i_buffer, i_size);
         field_0x1fc8 = 0;
@@ -310,6 +348,7 @@ void mDoMemCd_Ctrl_c::save(void* i_buffer, u32 i_size, u32 i_position) {
         OSUnlockMutex(&mMutex);
         OSSignalCond(&mCond);
     }
+#endif
 }
 
 #if !PLATFORM_SHIELD
@@ -384,7 +423,12 @@ s32 mDoMemCd_Ctrl_c::SaveSync() {
     // for one would never end — dMenu_save_c polls this every frame until it is non-zero. Report it
     // as the failed write it is; the menu then shows the game's own "An error might have occurred
     // when saving." No card state is touched. See save_guard.hpp.
-    if (dusk::mp::consume_refused_card_write()) {
+    // Same for a save() that could not be queued because the card thread was busy.
+    // save() and SaveSync() both run on the game thread.
+    bool mpRefused = dusk::mp::consume_refused_card_write();
+    bool busyRefused = mSaveRefused;
+    mSaveRefused = false;
+    if (mpRefused || busyRefused) {
         return 2;
     }
 #endif

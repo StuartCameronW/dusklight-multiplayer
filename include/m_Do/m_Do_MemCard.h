@@ -132,6 +132,7 @@ public:
 #ifdef TARGET_PC
     bool mInitialized;
     bool mReattachPending;
+    bool mSaveRefused;  // save() could not queue the write; next SaveSync() reports an error
     std::string mFileName;
 #endif
 

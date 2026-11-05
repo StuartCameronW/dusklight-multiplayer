@@ -13,6 +13,11 @@
 
 #include "dusk/version.hpp"
 
+#if TARGET_PC
+#include <cstdlib>
+#include "dusk/logging.h"
+#endif
+
 #if VERSION == VERSION_GCN_JPN
 #define HEADER_TITLE   "ゼルダの伝説 ﾄﾜｲﾗｲﾄﾌﾟﾘﾝｾｽ"
 #define HEADER_COMMENT "%d月%d日のセーブデータです"
@@ -32,6 +37,30 @@ struct data_s {
 };
 
 static u8 sTmpBuf[SECTOR_SIZE * 2];
+
+#if TARGET_PC
+// Test knob: with DUSK_TEST_SAVE_VERIFY_FAIL set, corrupt the read-back buffer so the
+// verify-failure path can be exercised at runtime. Read once.
+static bool mDoMemCdRWm_TestVerifyFail() {
+    static const bool s_fail = std::getenv("DUSK_TEST_SAVE_VERIFY_FAIL") != NULL;
+    return s_fail;
+}
+
+// The original returns the preceding CARDRead's CARD_RESULT_READY on a checksum mismatch, so a
+// failed verify reports success. Return CARD_RESULT_IOERROR instead: store() passes it to
+// setCardState(), which sets CARD_STATE_FATAL_ERROR_e, and SaveSync() then returns 2 (error).
+static s32 mDoMemCdRWm_VerifyReadBack(u32 checksum, u32 offset) {
+    if (mDoMemCdRWm_TestVerifyFail()) {
+        sTmpBuf[8] ^= 0xFF;
+    }
+    if (checksum != mDoMemCdRWm_CalcCheckSum(sTmpBuf, sizeof(data_s) - 4)) {
+        DuskLog.error(
+            "MemCard: save read-back verify FAILED at offset {:#x}; reporting write error", offset);
+        return CARD_RESULT_IOERROR;
+    }
+    return CARD_RESULT_READY;
+}
+#endif
 
 #if !PLATFORM_SHIELD
 s32 mDoMemCdRWm_Store(CARDFileInfo* file, void* data, u32 length) {
@@ -76,9 +105,16 @@ s32 mDoMemCdRWm_Store(CARDFileInfo* file, void* data, u32 length) {
         return ret;
     }
 
+#if TARGET_PC
+    ret = mDoMemCdRWm_VerifyReadBack(checksum, 0x4000);
+    if (ret != CARD_RESULT_READY) {
+        return ret;
+    }
+#else
     if (checksum != mDoMemCdRWm_CalcCheckSum(sTmpBuf, sizeof(data_s) - 4)) {
         return ret;
     }
+#endif
 
     ret = CARDWrite(file, sTmpBuf, SECTOR_SIZE, 0x6000);
     if (ret != CARD_RESULT_READY) {
@@ -90,9 +126,16 @@ s32 mDoMemCdRWm_Store(CARDFileInfo* file, void* data, u32 length) {
         return ret;
     }
 
+#if TARGET_PC
+    ret = mDoMemCdRWm_VerifyReadBack(checksum, 0x6000);
+    if (ret != CARD_RESULT_READY) {
+        return ret;
+    }
+#else
     if (checksum != mDoMemCdRWm_CalcCheckSum(sTmpBuf, sizeof(data_s) - 4)) {
         return ret;
     }
+#endif
 
 #if TARGET_PC
     return mDoMemCdRWm_SetCardStat(file);
