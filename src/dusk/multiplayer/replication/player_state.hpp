@@ -5,6 +5,7 @@
 
 #include "dusk/player_atn.hpp"
 #include "dusk/player_equip.hpp"
+#include "dusk/player_held.hpp"
 #include "dusk/player_idle.hpp"
 
 #include "../net/serializer.hpp"
@@ -264,10 +265,10 @@ inline std::int8_t act_encode_s8(float value, float scale) {
     return static_cast<std::int8_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
 }
 
-/// 61 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), the
-/// 1-byte `gear` (offset 47), then the protocol-15 fields, in order: `locPhase` (offset 48), then
-/// 12 bytes of action slot 1 / swim (block 4, offset 49). Sent
-/// unreliably at the sim rate, so it has to stay small.
+/// 70 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), the
+/// 1-byte `gear` (offset 47), then the protocol-15 fields, in order: `locPhase` (offset 48),
+/// 12 bytes of action slot 1 / swim (block 4, offset 49), 9 bytes of held item (block 3,
+/// offset 61). Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -498,6 +499,35 @@ struct PlayerState {
     float act1_phase() const { return static_cast<float>(act1Phase) / kPlayerActUnitScale; }
     float act1_ratio() const { return static_cast<float>(act1Ratio) / kPlayerActUnitScale; }
 
+    // block (3): held item
+    /**
+     * The item model the sender's Link is DRAWING in his hands, and the UPPER_2 overlay that poses
+     * his arms around it. 9 bytes, all answers read after daAlink_c's own logic
+     * (player_bridge.cpp fill_held_item):
+     *
+     *   heldItem      PlayerHeldItem: the mHeldItemModel he placed AND checkItemDraw() let through.
+     *   heldFlags     PlayerHeldFlags: lantern, which hand, the bottle cork, the second clawshot.
+     *   heldMat       the held model's material animation frames (see player_held.hpp).
+     *   upper2Idx     mUpperAnmHeap[UPPER_2].getIdx(), the item hold/aim overlay BCK (ALANM only);
+     *                 kPlayerActNone = no overlay.
+     *   upper2Frame   mUpperFrameCtrl[2].getFrame() x kPlayerActFrameScale.
+     *   upper2Ratio   mNowAnmPackUpper[2].getRatio() x 255.
+     *   upper2Morf    the upper cross-fade length in frames, latched on the tick upper2Idx changed.
+     *
+     * Discrete except upper2Frame / upper2Ratio — see lerp_state.
+     */
+    std::uint8_t heldItem = kPlayerHeldNone;
+    std::uint8_t heldFlags = 0;
+    std::uint8_t heldMat = 0;
+    std::uint16_t upper2Idx = kPlayerActNone;
+    std::uint16_t upper2Frame = 0;
+    std::uint8_t upper2Ratio = 0;
+    std::uint8_t upper2Morf = 0;
+
+    bool upper2_active() const { return upper2Idx != kPlayerActNone; }
+    float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
+    float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
+
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
@@ -562,6 +592,14 @@ struct PlayerState {
         w.write_s16(actRootRotZ);
         w.write_u8(joint_aim_to_wire(actYawOff));
         w.write_u8(act_encode_turn(actPitch));
+        // block (3): held item
+        w.write_u8(heldItem);
+        w.write_u8(heldFlags);
+        w.write_u8(heldMat);
+        w.write_u16(upper2Idx);
+        w.write_u16(upper2Frame);
+        w.write_u8(upper2Ratio);
+        w.write_u8(upper2Morf);
     }
 
     bool read(Reader& r) {
@@ -587,7 +625,11 @@ struct PlayerState {
                 // block (4): action slot 1 / swim
                 r.read_u16(act1Under) && r.read_u16(act1Upper) && r.read_u8(act1Phase) &&
                 r.read_u8(act1Ratio) && r.read_s16(actRootRotX) && r.read_s16(actRootRotZ) &&
-                r.read_u8(yawOff) && r.read_u8(pitch)))
+                r.read_u8(yawOff) && r.read_u8(pitch) &&
+                // block (3): held item
+                r.read_u8(heldItem) && r.read_u8(heldFlags) && r.read_u8(heldMat) &&
+                r.read_u16(upper2Idx) && r.read_u16(upper2Frame) && r.read_u8(upper2Ratio) &&
+                r.read_u8(upper2Morf)))
         {
             return false;
         }
@@ -755,6 +797,28 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
         out.actRootRotZ = lerp_angle(a.actRootRotZ, b.actRootRotZ, aimT);
         out.actYawOff = lerp_angle(a.actYawOff, b.actYawOff, aimT);
         out.actPitch = lerp_angle(a.actPitch, b.actPitch, aimT);
+    }
+
+    // block (3): held item. Kind, flags, material frames, overlay id and morf are discrete.
+    out.heldItem = b.heldItem;
+    out.heldFlags = b.heldFlags;
+    out.heldMat = b.heldMat;
+    out.upper2Idx = b.upper2Idx;
+    out.upper2Frame = b.upper2Frame;
+    out.upper2Ratio = b.upper2Ratio;
+    out.upper2Morf = b.upper2Morf;
+    /* The overlay's frame and ratio blend only within one overlay BCK, and the frame only forward —
+     * block 2's rule, for the same reasons (a loop seam or restart takes b whole). t is clamped to
+     * 1 for the ratio: it is a weight, and extrapolating it past the newest sample overshoots. */
+    if (a.upper2_active() && a.upper2Idx == b.upper2Idx) {
+        if (b.upper2Frame >= a.upper2Frame) {
+            out.upper2Frame = act_encode_u16(
+                a.upper2_frame() + (b.upper2_frame() - a.upper2_frame()) * t, kPlayerActFrameScale);
+        }
+        const float ratioT = t > 1.0f ? 1.0f : t;
+        const float ratio = a.upper2_ratio() + (b.upper2_ratio() - a.upper2_ratio()) * ratioT;
+        out.upper2Ratio = static_cast<std::uint8_t>(
+            ratio <= 0.0f ? 0.0f : (ratio >= 1.0f ? 255.0f : ratio * 255.0f + 0.5f));
     }
     return out;
 }

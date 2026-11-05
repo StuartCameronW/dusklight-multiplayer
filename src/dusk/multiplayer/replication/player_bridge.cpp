@@ -1057,6 +1057,187 @@ void fill_loc_phase(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+// block (3): held item
+/**
+ * Fill block (3): the item model Link is DRAWING in his hands, and the UPPER_2 overlay posing his
+ * arms around it.
+ *
+ * Every field is read AFTER his own logic decided it, never re-derived (memory: measure the output,
+ * not the input):
+ *   - the kind is mHeldItemModel non-NULL, setItemMatrix's own status-window gate
+ *     (d_a_alink.cpp:6026), and checkItemDraw() (:19086-19096) — the exact predicate his draw uses
+ *     (:19771) — then mEquipItem only to NAME which model it is;
+ *   - the boomerang is daBoomerang_c's own "in hand" state, fopAcM_GetParam == 0 (procWait,
+ *     d_a_boomerang.cpp:932-935), off the actor he keeps in mItemAcKeep (setItemActor, :14216);
+ *   - the bottle and rod material frames are read off HIS anm objects (field_0x0724 / 072c), which
+ *     is what his model is showing;
+ *   - the overlay is mUpperAnmHeap[UPPER_2] / mUpperFrameCtrl[2] / mNowAnmPackUpper[2].
+ *
+ * Idempotent within a tick (capture runs twice per tick, see fill_action_anim): the only state is
+ * the morf latch, keyed on the overlay idx CHANGING.
+ */
+void fill_held_item(daAlink_c* alink, PlayerState& out) {
+    out.heldItem = kPlayerHeldNone;
+    out.heldFlags = 0;
+    out.heldMat = 0;
+    out.upper2Idx = kPlayerActNone;
+    out.upper2Frame = 0;
+    out.upper2Ratio = 0;
+    out.upper2Morf = 0;
+
+    static std::uint16_t s_latchedUpper2 = kPlayerActNone;
+    static std::uint8_t s_latchedUpper2Morf = 0;
+    static std::uint8_t s_lastSentKind = kPlayerHeldNone;
+    static std::uint16_t s_kindLogCount = 0;
+    static std::uint16_t s_lastSentUpper2 = kPlayerActNone;
+    static std::uint16_t s_upper2LogCount = 0;
+    static bool s_loggedDemoUpper2 = false;
+
+    if (alink == nullptr || alink->checkWolf()) {
+        s_latchedUpper2 = kPlayerActNone;
+        return;
+    }
+
+    const u16 item = alink->mEquipItem;
+    J3DModel* held = alink->mHeldItemModel;
+
+    if (held != nullptr && !alink->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW) &&
+        alink->checkItemDraw())
+    {
+        if (daPy_py_c::checkBottleItem(item)) {
+            out.heldItem = kPlayerHeldBottle;
+            if (alink->checkOilBottleItemNotGet(item)) {
+                out.heldFlags |= kPlayerHeldBottlePour;
+            } else if (alink->mItemMode != 0) {
+                // bottleModelCallBack only runs when the callback is installed, i.e. not pouring
+                // (setBottleModel, d_a_alink_bottle.inc:91-98).
+                out.heldFlags |= kPlayerHeldBottleCork;
+            }
+            std::uint8_t mat = 0;
+            if (alink->field_0x0724 != nullptr) {
+                const f32 brk = alink->field_0x0724->getFrame();
+                const int frame = brk > 0.0f ? static_cast<int>(brk + 0.5f) : 0;
+                mat |= static_cast<std::uint8_t>(
+                    (frame > 15 ? 15 : frame) & kPlayerHeldMatBottleBrkMask);
+            }
+            if (alink->field_0x072c != nullptr) {
+                const f32 btp = alink->field_0x072c->getFrame();
+                const int frame = btp > 0.0f ? static_cast<int>(btp + 0.5f) : 0;
+                mat |= static_cast<std::uint8_t>(
+                    ((frame > 3 ? 3 : frame) << kPlayerHeldMatBottleBtpShift) &
+                    kPlayerHeldMatBottleBtpMask);
+            }
+            J3DModelData* data = held->getModelData();
+            if (data != nullptr && data->getMaterialNum() > 0 &&
+                data->getMaterialNodePointer(0)->getShape()->checkFlag(J3DShpFlag_Visible))
+            {
+                // J3DShpFlag_Visible SET means hidden (J3DShape.h:173-174).
+                mat |= kPlayerHeldMatBottleMat0Hidden;
+            }
+            out.heldMat = mat;
+        } else if (daPy_py_c::checkBowItem(item) || item == dItemNo_PACHINKO_e) {
+            out.heldItem = item == dItemNo_PACHINKO_e ? kPlayerHeldSlingshot : kPlayerHeldBow;
+            if (alink->checkBowGrabLeftHand()) {
+                out.heldFlags |= kPlayerHeldBowLeftHand;
+            }
+        } else if (daPy_py_c::checkHookshotItem(item)) {
+            if (item == dItemNo_W_HOOKSHOT_e) {
+                out.heldItem = kPlayerHeldDoubleClawshot;
+                if (alink->field_0x3020 != 0) {
+                    out.heldFlags |= kPlayerHeldClawRight;
+                }
+                // The draw's own test for the second pair (d_a_alink.cpp:19779-19780).
+                if (!alink->checkPlayerGuardAndAttack() &&
+                    !alink->checkNoResetFlg0(daPy_py_c::FLG0_UNK_2))
+                {
+                    out.heldFlags |= kPlayerHeldClawBoth;
+                }
+            } else {
+                out.heldItem = kPlayerHeldClawshot;
+            }
+        } else if (item == dItemNo_COPY_ROD_e) {
+            out.heldItem = kPlayerHeldCopyRod;
+            if (alink->field_0x0724 != nullptr && alink->field_0x0724->getFrameMax() > 0) {
+                const f32 f = alink->field_0x0724->getFrame() / alink->field_0x0724->getFrameMax();
+                out.heldMat = static_cast<std::uint8_t>(
+                    f <= 0.0f ? 0.0f : (f >= 1.0f ? 255.0f : f * 255.0f + 0.5f));
+            }
+        } else if (item == dItemNo_HORSE_FLUTE_e) {
+            out.heldItem = kPlayerHeldHorseCall;
+        }
+        // Anything else (iron ball, grass whistle, wolf change, fishing) is not reproduced.
+    }
+
+    if (item == dItemNo_BOOMERANG_e) {
+        fopAc_ac_c* boom = alink->mItemAcKeep.getActor();
+        if (boom != nullptr && fopAcM_GetName(boom) == fpcNm_BOOMERANG_e &&
+            fopAcM_GetParam(boom) == 0)
+        {
+            out.heldItem = kPlayerHeldBoomerang;
+        }
+    }
+
+    // The lantern: his draw gate (d_a_alink.cpp:19822) and his placement test (:6098).
+    if (alink->checkNoResetFlg2(daPy_py_c::FLG2_UNK_1)) {
+        out.heldFlags |= kPlayerHeldLanternShown;
+        if (item == dItemNo_KANTERA_e || alink->checkOilBottleItemNotGet(item)) {
+            out.heldFlags |= kPlayerHeldLanternInHand;
+        }
+    }
+
+    // The UPPER_2 overlay. ALANM only: a demo-archive overlay cannot be resolved by the puppet.
+    const daPy_anmHeap_c& upper2 = alink->mUpperAnmHeap[2];
+    if (!upper2.checkNoSetIdx() && upper2.checkNoSetArcNo() &&
+        alink->mNowAnmPackUpper[2].getAnmTransform() != nullptr)
+    {
+        out.upper2Idx = upper2.getIdx();
+        out.upper2Frame =
+            act_encode_u16(alink->mUpperFrameCtrl[2].getFrame(), kPlayerActFrameScale);
+        const f32 ratio = alink->mNowAnmPackUpper[2].getRatio();
+        out.upper2Ratio = static_cast<std::uint8_t>(
+            ratio <= 0.0f ? 0.0f : (ratio >= 1.0f ? 255.0f : ratio * 255.0f + 0.5f));
+    } else if (!upper2.checkNoSetIdx() && !upper2.checkNoSetArcNo() && !s_loggedDemoUpper2) {
+        s_loggedDemoUpper2 = true;
+        Log.debug("Local UPPER_2 overlay {} is from demo arc {}; not replicated (logged once)",
+            upper2.getIdx(), upper2.getArcNo());
+    }
+
+    /* The morf, latched on the tick the overlay idx changed (to another BCK OR to none: his
+     * resetUpperAnime morfs too, d_a_alink.cpp:7440). Same counter+2 reasoning as block 2's actMorf
+     * (fill_action_anim) — REASONED, not measured, and it shares field_0x2060 with the under morf,
+     * so a tick that changes both reads whichever he set last, exactly as his own blend does. */
+    if (out.upper2Idx != s_latchedUpper2) {
+        s_latchedUpper2 = out.upper2Idx;
+        const f32 counter =
+            alink->field_0x2060 != nullptr ? alink->field_0x2060->getOldFrameMorfCounter() : 0.0f;
+        const f32 morf = counter > 0.0f ? counter + 2.0f : 0.0f;
+        s_latchedUpper2Morf = static_cast<std::uint8_t>(morf > 255.0f ? 255.0f : morf + 0.5f);
+    }
+    out.upper2Morf = s_latchedUpper2Morf;
+
+    if (out.heldItem != s_lastSentKind) {
+        if (s_kindLogCount < 100) {
+            s_kindLogCount++;
+            Log.debug("Local held item {} -> {} (mEquipItem 0x{:X}, flags 0x{:02x}, mat 0x{:02x})",
+                static_cast<unsigned>(s_lastSentKind), static_cast<unsigned>(out.heldItem),
+                static_cast<unsigned>(item), static_cast<unsigned>(out.heldFlags),
+                static_cast<unsigned>(out.heldMat));
+        }
+        s_lastSentKind = out.heldItem;
+    }
+    if (out.upper2Idx != s_lastSentUpper2) {
+        if (s_upper2LogCount < 200) {
+            s_upper2LogCount++;
+            Log.debug(
+                "Local UPPER_2 overlay {} -> {} (frame {:.1f}, ratio {}, morf {}), proc 0x{:X}",
+                s_lastSentUpper2, out.upper2Idx, out.upper2_frame(),
+                static_cast<unsigned>(out.upper2Ratio), static_cast<unsigned>(out.upper2Morf),
+                static_cast<unsigned>(alink->mProcID));
+        }
+        s_lastSentUpper2 = out.upper2Idx;
+    }
+}
+
 }  // namespace
 
 /**
@@ -1261,6 +1442,8 @@ bool capture_local_player(PlayerState& out) {
     fill_joint_aim(alink, out);
     fill_action_anim(alink, out);
     fill_loc_phase(alink, out);
+    // block (3): held item
+    fill_held_item(alink, out);
 
     return true;
 }
@@ -1441,6 +1624,9 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     // Block (4): slot 1, the joint-0 rotation and the yaw offset. Same decoding rule.
     puppet->setNetworkActionSlot1(state.act1Under, state.act1Upper, state.act1_phase(),
         state.act1_ratio(), state.actRootRotX, state.actRootRotZ, state.actYawOff, state.actPitch);
+    // block (3): held item
+    puppet->setNetworkHeldItem(state.heldItem, state.heldFlags, state.heldMat, state.upper2Idx,
+        state.upper2_frame(), state.upper2_ratio(), static_cast<f32>(state.upper2Morf));
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -1521,6 +1707,20 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     out.actRootRotZ = puppet->getActDrawnRootRotZ();
     out.actYawOff = puppet->getActDrawnYawOff();
     out.actPitch = puppet->getActDrawnPitch();
+    /* block (3): held item — what the puppet DREW last pass (its own models, which may be absent
+     * if one failed to load), and the overlay installed in its upper slot 2 with that animation
+     * object's own frame and the pack's ratio. Not the wire values. */
+    out.heldItem = puppet->getHeldDrawnKind();
+    out.heldFlags = puppet->getHeldDrawnFlags();
+    out.heldMat = puppet->getHeldDrawnMat();
+    out.upper2Idx = puppet->getUpper2DrawnIdx();
+    out.upper2Frame = act_encode_u16(puppet->getUpper2DrawnFrame(), kPlayerActFrameScale);
+    {
+        const f32 ratio = puppet->getUpper2DrawnRatio();
+        out.upper2Ratio = static_cast<std::uint8_t>(
+            ratio <= 0.0f ? 0.0f : (ratio >= 1.0f ? 255.0f : ratio * 255.0f + 0.5f));
+    }
+    out.upper2Morf = puppet->getUpper2DrawnMorf();
     return true;
 }
 

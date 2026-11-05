@@ -28,6 +28,7 @@
 #include "dusk/logging.h"
 #include "dusk/player_atn.hpp"
 #include "dusk/player_equip.hpp"
+#include "dusk/player_held.hpp"
 #include "dusk/player_idle.hpp"
 #include "f_op/f_op_actor_mng.h"
 #include "m_Do/m_Do_dvd_thread.h"
@@ -1433,6 +1434,10 @@ int daRemotePlayer_c::createHeap() {
      * set, so a short heap costs the override (glide, as before) and never a model or a gait. */
     setupActionAnimation();
 
+    // block (3): held item. Every handheld item model, preloaded; after the override so a short
+    // heap costs items, never the override. Each load is non-fatal (d_a_remote_player_held.inc).
+    setupHeldItems();
+
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
         Log.info("Puppet heap after setup: {} bytes free, largest block {}", heap->getFreeSize(),
@@ -2460,7 +2465,16 @@ int daRemotePlayer_c::create() {
         return mountPhase;
     }
 
-    /* ★ D3b raised this 0x30000 -> 0x50000 for the attention set's 30 BCKs, from a measurement.
+    /* block (3): raised 0x50000 -> 0x80000 to PRELOAD every handheld item model (Stuart's call,
+     * 2026-11-05). Reasoned, NOT measured: the GC staging buffers alone are ~129 KB (bottle 0x5C00,
+     * bow 0x4C00, sling 0x2C00, rod 0x5400, clawshot 0x5C00 + tip 0x3800, pendant 0x3000, three
+     * 0x400 material anims), plus the parsed J3DModelData and ~12 J3DModel instances on top, so
+     * ~250 KB is the working estimate on PC. Before this, `Puppet heap after setup` read ~65 KB
+     * free; +0x30000 of budget is ~+390 KB of real heap by the 1.99x fit below. The heap is trimmed
+     * to fit after create (see below), so the cost per puppet is what is USED, not the budget.
+     * `Puppet N held items: ... bytes of heap` logs the real figure; size this from it.
+     *
+     * ★ D3b raised this 0x30000 -> 0x50000 for the attention set's 30 BCKs, from a measurement.
      * loadAtnAnimations() logs its own cost: 236,832 bytes. Two facts were measured on the way, and
      * the next reader needs both:
      *
@@ -2497,7 +2511,7 @@ int daRemotePlayer_c::create() {
      * standing player's idle ticks (measured: `idle applied: wait 74%, service 26%`), which is
      * worth 55 KB; if a room is ever found where this does not fit, drop ANM_SERVICE_WAIT before
      * dropping the other two — it is 78% of the added weight. */
-    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x50000)) {
+    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x80000)) {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
@@ -2508,7 +2522,7 @@ int daRemotePlayer_c::create() {
          */
         g_daRemotePlayer_lastCreateFail.mPlayerId = mPlayerId;
         g_daRemotePlayer_lastCreateFail.mReason =
-            "the 0x50000 solid heap, or one of the models/animations createHeap() loads into it";
+            "the 0x80000 solid heap, or one of the models/animations createHeap() loads into it";
         return cPhs_ERROR_e;
     }
 
@@ -7414,6 +7428,8 @@ void daRemotePlayer_c::setMatrix() {
     // Last, and after the body's calc for the same reason as the three above: the sword and sheath
     // hang off body joints, which are not final until calc has run.
     setEquipMatrix();
+    // block (3): the held item and the lantern, on the same terms.
+    setHeldItemMatrix();
 }
 
 /// Keep the puppet lit by the floor and the room it is actually standing on.
@@ -7517,6 +7533,10 @@ int daRemotePlayer_c::execute() {
     // row, so it can only be right once the animation for this tick has been chosen.
     traceCalc("setDrawHand");
     setDrawHand();
+    // block (3): the sender's UPPER_2 item overlay, after selectAnimation() (setAnm clears slot 2)
+    // and before animePlay(), which pushes its frame into the animation.
+    traceCalc("applyUpper2Overlay");
+    applyUpper2Overlay();
     traceCalc("animePlay");
     animePlay();
     // Independent of the body: the puppet blinks while standing still as much as while running,
@@ -7855,11 +7875,15 @@ int daRemotePlayer_c::draw() {
     // separate models rather than geometry on the body, and they read their own visibility.
     traceCalc("draw: equipment");
     drawEquip();
+    // block (3): the held item and the lantern, after the equipment as daAlink_c draws them.
+    traceCalc("draw: held item");
+    drawHeldItems();
     // Last, exactly where daAlink_c puts it (d_a_alink.cpp:19849-19853): the shadow projects the
     // models, so it wants them posed and their tevStr settled, and it renders in its own later pass
     // rather than into the draw list we have just filled.
     traceCalc("draw: shadow");
     shadowDraw();
+    addHeldItemShadow();
     traceCalc("draw done");
     return 1;
 }
@@ -7892,3 +7916,7 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
     /* Group        */ fopAc_ACTOR_e,
     /* Cull Type    */ fopAc_CULLBOX_0_e,
 };
+
+// block (3): held item. Last in the file: it uses the helpers above (init_model, own_archive_*,
+// loadActionBck) and keeps this feature out of the functions other work is editing.
+#include "d/actor/d_a_remote_player_held.inc"

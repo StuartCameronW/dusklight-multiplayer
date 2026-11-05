@@ -63,7 +63,14 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     // angles as s16 binary angles. Local row: what Link draws; actor row: what the puppet draws.
     sFile << ',' << state.act1Under << ',' << state.act1Upper << ',' << state.act1_phase() << ','
           << state.act1_ratio() << ',' << state.actRootRotX << ',' << state.actRootRotZ << ','
-          << state.actYawOff << ',' << state.actPitch << '\n';
+          << state.actYawOff << ',' << state.actPitch;
+    // block (3): held item, AFTER absMs. On a `local` row, what Link draws; on an `actor` row, what
+    // the puppet drew (read off the actor, not the wire). heldItem 0 = none; upper2Idx 65535 =
+    // none.
+    sFile << ',' << static_cast<unsigned>(state.heldItem) << ','
+          << static_cast<unsigned>(state.heldFlags) << ',' << static_cast<unsigned>(state.heldMat)
+          << ',' << state.upper2Idx << ',' << state.upper2_frame() << ',' << state.upper2_ratio()
+          << ',' << static_cast<unsigned>(state.upper2Morf) << '\n';
 }
 
 }  // namespace
@@ -90,7 +97,9 @@ void open(const std::string& path, const char* role) {
              // v15 block (1): stride phase as drawn.
              "locPhase,"
              // block (4): action slot 1 / swim. act1Under 65535 = single anime.
-             "act1Under,act1Upper,act1Phase,act1Ratio,rootRotX,rootRotZ,yawOff,pitch\n";
+             "act1Under,act1Upper,act1Phase,act1Ratio,rootRotX,rootRotZ,yawOff,pitch,"
+             // block (3): held item. heldItem 0 = none; upper2Idx 65535 = no UPPER_2 overlay.
+             "heldItem,heldFlags,heldMat,upper2Idx,upper2Frame,upper2Ratio,upper2Morf\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
