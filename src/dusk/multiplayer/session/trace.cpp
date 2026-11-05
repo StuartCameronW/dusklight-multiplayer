@@ -55,7 +55,14 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << static_cast<unsigned>(state.actMorf) << ',' << static_cast<unsigned>(state.actHandL)
           << ',' << static_cast<unsigned>(state.actHandR) << ',' << state.act_root_x() << ','
           << state.act_root_y() << ',' << state.act_root_z() << ',' << rootWX << ',' << rootWY
-          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms() << '\n';
+          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms();
+    // block (3): held item, AFTER absMs. On a `local` row, what Link draws; on an `actor` row, what
+    // the puppet drew (read off the actor, not the wire). heldItem 0 = none; upper2Idx 65535 =
+    // none.
+    sFile << ',' << static_cast<unsigned>(state.heldItem) << ','
+          << static_cast<unsigned>(state.heldFlags) << ',' << static_cast<unsigned>(state.heldMat)
+          << ',' << state.upper2Idx << ',' << state.upper2_frame() << ',' << state.upper2_ratio()
+          << ',' << static_cast<unsigned>(state.upper2Morf) << '\n';
 }
 
 }  // namespace
@@ -78,7 +85,9 @@ void open(const std::string& path, const char* role) {
              "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
              // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
-             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs\n";
+             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs,"
+             // block (3): held item. heldItem 0 = none; upper2Idx 65535 = no UPPER_2 overlay.
+             "heldItem,heldFlags,heldMat,upper2Idx,upper2Frame,upper2Ratio,upper2Morf\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

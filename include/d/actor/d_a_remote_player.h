@@ -211,6 +211,27 @@ public:
     /// no model or no pose.
     bool getDrawnRoot(cXyz* o_local, cXyz* o_world);
 
+    /* --- block (3): held item (d_a_remote_player_held.inc).
+     *
+     * Pushed in every tick alongside setNetworkPose(). i_kind / i_flags / i_mat are the wire's
+     * PlayerHeldItem / PlayerHeldFlags / heldMat bytes (dusk/player_held.hpp); i_upper2Idx 0xFFFF
+     * means no UPPER_2 overlay. Plain values, decoded by the bridge. */
+    void setNetworkHeldItem(u8 i_kind, u8 i_flags, u8 i_mat, u16 i_upper2Idx, f32 i_upper2Frame,
+        f32 i_upper2Ratio, f32 i_upper2Morf);
+    /* What the puppet DREW for --mp-trace's actor row: the kind/flags/mat of the models it entered
+     * last pass (none if the model failed to load), and the overlay installed in upper slot 2 with
+     * that animation object's own frame and the pack's ratio. */
+    u8 getHeldDrawnKind() const { return mHeldDrawnKind; }
+    u8 getHeldDrawnFlags() const { return mHeldDrawnFlags; }
+    u8 getHeldDrawnMat() const { return mHeldDrawnMat; }
+    u16 getUpper2DrawnIdx() const { return mUpper2Shown; }
+    f32 getUpper2DrawnFrame() const;
+    f32 getUpper2DrawnRatio();
+    u8 getUpper2DrawnMorf() const { return mUpper2AppliedMorf; }
+    /// The bottle's joint-1 callback body (daAlink_c::bottleModelCallBack). Public for the static
+    /// trampoline only.
+    int heldBottleCallBack();
+
 private:
     void setMatrix();
     /// Build the two-halves animation rig on the body model. Once, at createHeap time.
@@ -1113,6 +1134,54 @@ private:
     u8* mpActBas;
     bool mActBasValid;
     bool mLoggedActSound;
+
+    /* --- block (3): held item. See d_a_remote_player_held.inc.
+     *
+     * Every handheld model is PRELOADED at createHeap (Stuart, 2026-11-05: no on-demand loading),
+     * each from the archive and with the flags daAlink_c uses, and each optional: a model that did
+     * not load is NULL and costs that item, never the puppet. Indexed by PlayerHeldItem; [0] (none)
+     * is always NULL. The double clawshot reuses the single's two models as its primary pair. */
+    void setupHeldItems();
+    void setHeldItemMatrix();
+    void drawHeldItems();
+    void addHeldItemShadow();
+    void applyUpper2Overlay();
+    void clearUpper2Overlay(f32 i_morf);
+    J3DModel* mpHeldModel[9];
+    /// The second clawshot and the two claw tips (daAlink_c's field_0x0710 / mpHookTipModel /
+    /// field_0x0714).
+    J3DModel* mpHeldClaw2Model;
+    J3DModel* mpHeldClawTip[2];
+    /// mpKanteraModel: from this puppet's outfit archive, as he takes his from mArcName.
+    J3DModel* mpHeldLanternModel;
+    /// The bottle's contents colour (BRK) and stopper pattern (BTP), and the Dominion Rod's glow
+    /// (BRK). This puppet's own anm objects, entered on its own model data.
+    J3DAnmTevRegKey* mpHeldBottleBrk;
+    J3DAnmTexPattern* mpHeldBottleBtp;
+    J3DAnmTevRegKey* mpHeldCopyRodBrk;
+    // The wire's values, as pushed by setNetworkHeldItem().
+    u8 mNetHeldKind;
+    u8 mNetHeldFlags;
+    u8 mNetHeldMat;
+    u16 mNetUpper2Idx;
+    f32 mNetUpper2Frame;
+    f32 mNetUpper2Ratio;
+    f32 mNetUpper2Morf;
+    // What was drawn (trace).
+    u8 mHeldDrawnKind;
+    u8 mHeldDrawnFlags;
+    u8 mHeldDrawnMat;
+    /// The UPPER_2 overlay currently in mAnmPackUpper[2] (0xFFFF none), its animation object (it
+    /// points into mActUpperHeap[2]'s buffer), and a load that failed (not retried until it
+    /// changes).
+    u16 mUpper2Shown;
+    J3DAnmTransform* mpUpper2Bck;
+    u16 mUpper2Failed;
+    u8 mUpper2AppliedMorf;
+    u16 mHeldLogCount;
+    bool mLoggedHeldMissing[9];
+    bool mLoggedHeldDraw[9];
+    bool mLoggedLantern;
 };
 
 /**
