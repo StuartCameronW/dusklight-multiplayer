@@ -238,9 +238,9 @@ inline std::int8_t act_encode_s8(float value, float scale) {
     return static_cast<std::int8_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
 }
 
-/// 48 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), then
-/// the 1-byte `gear` (offset 47, always LAST). Sent unreliably at the sim rate, so it has to
-/// stay small.
+/// 49 bytes on the wire: 23 base, 6 head/torso (block 1), 18 action animation (block 2), the
+/// 1-byte `gear` (offset 47), then the protocol-15 fields, in order: `locPhase` (offset 48). Sent
+/// unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -389,9 +389,31 @@ struct PlayerState {
     float act_root_z() const { return static_cast<float>(actRootZ) / kPlayerActRootScale; }
 
     /// Worn equipment other than the sword and shield. See PlayerGearFlags. Protocol 14. Discrete,
-    /// so lerp_state takes it whole from the newer sample. ★ The LAST field on the wire (offset 47,
-    /// after block 2), in write(), read() and lerp_state alike.
+    /// so lerp_state takes it whole from the newer sample. Offset 47, after block 2; the
+    /// protocol-15 fields follow it.
     std::uint8_t gear = 0;
+
+    /* --- Protocol 15, block (1): locomotion phase. Offset 48, directly after `gear`. --- */
+    /**
+     * Where the sender is in his blended stride: `mUnderFrameCtrl[0].getFrame() / getEnd()`,
+     * 0..1 for one cycle, x256 and wrapped, so 256 would be 0. Every slot of daAlink_c's blended
+     * pair sits at this same normalised phase (commonDoubleAnime, d_a_alink.cpp:7029-7070), so one
+     * value names the whole stride.
+     *
+     * The sender's ANSWER, and it fixes a lag no input could. The puppet used to carry its own
+     * phase from pair to pair (daAlink_c's rule) and so started every walk from wherever its own
+     * idle happened to be. Measured: a constant +75 ms torso-sway lag over a 19 s run.
+     *
+     * 0 whenever it means nothing. That is while the action override is on (act_active()) and
+     * while Link plays a single animation (field_0x2f8c == 0). Zero is not a sentinel. It is
+     * Link's own restart point: commonDoubleAnime starts the next blended pair from phase 0 after a
+     * single animation, so a 0 on the sample before that pair begins lerps into it correctly.
+     *
+     * Continuous, so lerp_state blends it. The blend goes the short way round the cycle, and only
+     * when both samples are locomotion; otherwise it takes the newer sample. */
+    std::uint8_t locPhase = 0;
+
+    float loc_phase() const { return static_cast<float>(locPhase) / 256.0f; }
 
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
@@ -444,8 +466,10 @@ struct PlayerState {
         w.write_s16(actRootX);
         w.write_s16(actRootY);
         w.write_s16(actRootZ);
-        // After block (2): `gear` is always the last byte.
+        // After block (2): `gear`, then the protocol-15 fields in order.
         w.write_u8(gear);
+        // v15 block (1): locomotion phase
+        w.write_u8(locPhase);
     }
 
     bool read(Reader& r) {
@@ -462,8 +486,10 @@ struct PlayerState {
                 r.read_u16(actUpperFrame) && r.read_u8(rate) && r.read_u8(actMorf) &&
                 r.read_u8(actHandL) && r.read_u8(actHandR) && r.read_s16(actRootX) &&
                 r.read_s16(actRootY) && r.read_s16(actRootZ) &&
-                // after block (2): gear, always last
-                r.read_u8(gear)))
+                // after block (2): gear
+                r.read_u8(gear) &&
+                // v15 block (1): locomotion phase
+                r.read_u8(locPhase)))
         {
             return false;
         }
@@ -586,6 +612,20 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
 
     // gear: a bit set, like `flags`: never blended.
     out.gear = b.gear;
+
+    /* v15 block (1): the stride phase, the short way round the cycle. The subtraction wraps in u8
+     * and reads back as s8, exactly as lerp_angle does at 16 bits. t is NOT clamped. The stride
+     * only runs forward, so extrapolating a starved buffer keeps it walking rather than
+     * overshooting a reversal. Only when both samples are locomotion: across an override boundary
+     * one side is the meaningless 0 and the newer sample is the only answer. */
+    out.locPhase = b.locPhase;
+    if (!a.act_active() && !b.act_active()) {
+        const int delta =
+            static_cast<std::int8_t>(static_cast<std::uint8_t>(b.locPhase - a.locPhase));
+        const float stepped = static_cast<float>(delta) * t;
+        const int rounded = static_cast<int>(stepped < 0.0f ? stepped - 0.5f : stepped + 0.5f);
+        out.locPhase = static_cast<std::uint8_t>(a.locPhase + rounded);
+    }
     return out;
 }
 

@@ -97,6 +97,13 @@ bool read_local_root(float& x, float& y, float& z);
 
 /// The same for a puppet: joint 0 as its own calc left it. False when it doesn't exist.
 bool read_puppet_root(std::uint32_t playerId, float& x, float& y, float& z);
+
+/// The stride phase (0..1) the LOCAL player is drawing, unquantised, for --mp-trace's `locPhase`
+/// column: his under slot 0 frame over its end, while a blended pair is playing. -1 (and false)
+/// when it isn't, or there is no playable Link.
+bool read_local_loc_phase(float& out);
+/// The same off a puppet's own animation object. -1 (and false) outside blended locomotion.
+bool read_puppet_loc_phase(std::uint32_t playerId, float& out);
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 
