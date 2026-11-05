@@ -11,11 +11,14 @@
 #include <SDL3/SDL_events.h>
 #include <dolphin/pad.h>
 
-#include "d/d_com_inf_game.h"
 #include "d/actor/d_a_player.h"
+#include "d/d_camera.h"
+#include "d/d_com_inf_game.h"
 #include "d/d_meter2_info.h"
 #include "dusk/logging.h"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
+#include "dusk/settings.h"
+#include "f_op/f_op_camera_mng.h"
 
 /**
  * A tiny interpreter over aurora's virtual pad.
@@ -47,6 +50,7 @@ enum class Op {
     Mash,
     Hold,
     Stick,
+    StickTo,
     Repeat,
     End,
     Say,
@@ -66,6 +70,10 @@ struct Command {
     u32 buttons = 0;
     s8 stickX = 0;
     s8 stickY = 0;
+    /// StickTo only: the world XZ point to steer Link toward.
+    double targetX = 0.0;
+    double targetZ = 0.0;
+    double magnitude = 1.0;
     std::string text;
     /// Warp only: spawn point, room and layer. The destination stage travels in `text`.
     int point = 0;
@@ -85,6 +93,8 @@ std::vector<Command> sProgram;
 std::vector<LoopFrame> sLoops;
 std::size_t sPc = 0;
 int sElapsed = 0;
+/// StickTo: reached the target during the current command; stays let go until the next one.
+bool sStickToArrived = false;
 bool sActive = false;
 bool sFinished = false;
 bool sSawWorld = false;
@@ -427,6 +437,19 @@ void load_script(const std::filesystem::path& path) {
                  command.frames > 0 && (d.empty() || parse_buttons(d, command.buttons));
             command.stickX = stick_value(x);
             command.stickY = stick_value(y);
+        } else if (verb == "STICKTO") {
+            // `stickto X Z frames [buttons]`: steer toward a world point, re-aimed every tick.
+            // Plain `stick` is camera-relative, so a swinging camera curves the path; ledge and
+            // edge tests need to arrive at one spot.
+            // The fourth argument is either a stick magnitude (0..1, for walking off an edge
+            // slowly) or a button combination, told apart by whether it parses as a number.
+            command.op = Op::StickTo;
+            ok = parse_double(a, command.targetX) && parse_double(b, command.targetZ) &&
+                 parse_int(c, command.frames) && command.frames > 0;
+            if (ok && !d.empty() && !parse_double(d, command.magnitude)) {
+                command.magnitude = 1.0;
+                ok = parse_buttons(d, command.buttons);
+            }
         } else if (verb == "REPEAT") {
             command.op = Op::Repeat;
             ok = parse_int(a, command.frames);
@@ -592,6 +615,43 @@ void tick() {
         status.stickY = command.stickY;
         status.button = static_cast<u16>(command.buttons);
         break;
+
+    case Op::StickTo: {
+        status.button = static_cast<u16>(command.buttons);
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        auto* camera = dComIfGp_getCamera(dComIfGp_getPlayerCameraID(0));
+        if (link == nullptr || camera == nullptr) {
+            break;
+        }
+        const double dx = command.targetX - link->current.pos.x;
+        const double dz = command.targetZ - link->current.pos.z;
+        const double distance = std::sqrt(dx * dx + dz * dz);
+        if (sElapsed == 0) {
+            sStickToArrived = false;
+        }
+        // Latched: momentum carries him back out of the radius, and re-aiming from there made him
+        // orbit the point (measured, +-110 units for ~130 ticks at full stick).
+        if (sStickToArrived || distance < 15.0) {
+            sStickToArrived = true;
+            break;
+        }
+        /* Inverse of daAlink_c's own mapping (d_a_alink.cpp:9468-9472): moveAngle = stickAngle +
+         * camera yaw, stickAngle = JUT angle + 0x8000, JUT angle = atan2(x, -y). Mirror mode
+         * negates the JUT angle first (m_Do_controller_pad.cpp:29); negating the wanted angle
+         * here yields exactly the stick that survives that. */
+        const double kToRad = 3.14159265358979 / 32768.0;
+        const double moveAngle = std::atan2(dx, dz);
+        double stickAngle = moveAngle - dCam_getControledAngleY(camera) * kToRad;
+        if (dusk::getSettings().game.enableMirrorMode) {
+            stickAngle = -stickAngle;
+        }
+        // Ease off over the last 100 units, but never below 0.45: under ~0.4 Link only turns on
+        // the spot (measured; the game's own walk threshold).
+        const double magnitude = std::min(command.magnitude, std::max(0.45, distance / 100.0));
+        status.stickX = stick_value(-std::sin(stickAngle) * magnitude);
+        status.stickY = stick_value(std::cos(stickAngle) * magnitude);
+        break;
+    }
 
     default:
         break;
