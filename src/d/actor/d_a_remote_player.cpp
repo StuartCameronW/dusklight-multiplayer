@@ -18,6 +18,7 @@
 #include "JSystem/JKernel/JKRExpHeap.h"
 #include "JSystem/JMath/JMath.h"
 #include "SSystem/SComponent/c_counter.h"
+#include "Z2AudioLib/Z2SeMgr.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_mirror.h"
 #include "d/actor/d_a_npc4.h"
@@ -2398,11 +2399,40 @@ void daRemotePlayer_c::soundFramework() {
     }
 }
 
+/* Z2LinkSoundStarter::startSound's boots case (Z2LinkMgr.cpp:578-601), and nothing else of it: the
+ * same five dummies, swapped on the SENDER's boots. Z2SoundStarter::startSound does the rest (port
+ * 6 material, fog and darkness fx), exactly as it does for every puppet note without boots. */
+bool daRemotePlayer_soundStarter_c::startSound(JAISoundID i_soundID, JAISoundHandle* i_handle,
+    const JGeometry::TVec3<f32>* i_pos, u32 i_mapinfo, f32 i_fxMix, f32 i_pitch, f32 i_volume,
+    f32 i_pan, f32 i_dolby, u32 i_moveSteps) {
+    if (mHeavyBoots) {
+        switch (static_cast<u32>(i_soundID)) {
+        case Z2SE_FN_WALK_DUMMY:
+        case Z2SE_FN_LADDER_CLIMB:
+        case Z2SE_FN_LADDER_DOWN:
+        case Z2SE_GORON_FOOTNOTE:
+        case Z2SE_FN_GOB_JUMP:
+            i_soundID = Z2SE_FN_WALK_HEAVY;
+            break;
+        case Z2SE_FN_JUMP_DUMMY:
+            i_soundID = Z2SE_FN_JUMP_HEAVY;
+            break;
+        default:
+            break;
+        }
+    }
+    return Z2SoundStarter::startSound(i_soundID, i_handle, i_pos, i_mapinfo, i_fxMix, i_pitch,
+        i_volume, i_pan, i_dolby, i_moveSteps);
+}
+
 void daRemotePlayer_c::initSound() {
     /* 6 notes at once on the animation object, 1 on the simple one: Link's own counts
      * (Z2LinkMgr.cpp:95) and the horse's (d_a_horse.cpp:785). Handles are allocated lazily from
      * the global pool as notes overlap, so this is a ceiling, not a reservation. */
     mSound.init(&current.pos, &eyePos, 6, 1);
+    // The sender's iron-boots footstep swap. Its own decoration only; everything else is passed
+    // straight to the global starter's behaviour. See daRemotePlayer_soundStarter_c.
+    mSound.setSoundStarter(&mSoundStarter);
     mSoundReady = true;
     se_trace_register(&mSound.mSoundObjAnime, this);
 
@@ -2775,10 +2805,10 @@ void daRemotePlayer_c::setNetworkJointAim(
  *
  * ★ What remains is equipment, and it is job D: getMainBckData swaps the whole animation pair for a
  * drawn sword, a raised shield, the kandelaar or the fishing rod, and heavy boots or the iron ball
- * pin the rate into band 1 outright (d_a_alink.cpp:7620-7641). The SWORD half of that is done — see
- * anm_bck_data() and runAnm(), which follow his own `mEquipItem == 0x103` test off the wire. The
- * other three are each one more byte of replicated state away, and none of them changes the band
- * arithmetic below; they only change which pair of resources the chosen band plays.
+ * pin the rate into band 1 outright (d_a_alink.cpp:7620-7653). The SWORD half of that is done — see
+ * anm_bck_data() and runAnm(), which follow his own `mEquipItem == 0x103` test off the wire. So is
+ * the shield (guardOr) and the iron boots (kPlayerGearHeavyGait, below), which is the one of these
+ * that DOES change the band arithmetic. The iron ball is still not replicated.
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
@@ -2908,7 +2938,44 @@ void daRemotePlayer_c::selectAnimation() {
      * getMoveGroundAngleSpeedRate(), which has already divided by his mMaxSpeed, already applied
      * the ground-angle cosine, and already taken fabsf (d_a_alink.cpp:7555). Every one of those
      * steps used to happen here instead, and each was a way to disagree with him. */
-    const f32 fraction = mNetMoveRate;
+    f32 fraction = mNetMoveRate;
+
+    /* The iron-boots gait: setBlendMoveAnime's `sp20 && checkBootsMoveAnime(0)` branch
+     * (d_a_alink.cpp:7626-7652), taken when the sender says his slot 1 is ANM_WALK_HEAVY
+     * (kPlayerGearHeavyGait). Three things change and nothing else:
+     *
+     *   - the walk slot is WALKH instead of WALKS;
+     *   - its rate is mWalkAnmSpeedMin..Max of the boots table, interpolated on the rate after
+     *     dividing out mHeavySpeedMultiplier squared (:7629, :7638);
+     *   - the rate is then scaled into band 1 and clamped below mWalkChangeRate (:7650-7653), so a
+     *     booted Link never leaves the wait/walk band and never runs. That clamp is why booted
+     *     Link cannot run, not anything about speed.
+     *
+     * mHeavySpeedMultiplier is not on the wire, and it does not need to be. Whenever this branch
+     * runs, setStickData has set it to mInputFactor: the branch needs checkHeavyStateOn and not
+     * FLG0_WATER_IN_MOVE, which is exactly setStickData's first case (:9538-9545). Its other
+     * values are the wolf's (who has no boots), and 1.0 under enableFastIronBoots, which also turns
+     * this branch off, so the sender never reports the gait then.
+     *
+     * Not reproduced: halving mWalkAnmSpeedMax while sunk past -30 in sand (:7632-7636), which
+     * needs mSinkShapeOffset on the wire. A booted puppet in quicksand walks at the dry-ground
+     * rate.
+     */
+    const bool heavyGait = mNetHeavyGait && mAtnAnm[daAlink_c::ANM_WALK_HEAVY].mpUnder != NULL;
+    f32 walkSpeed = hio.mWalkAnmSpeed;
+    if (heavyGait) {
+        const daAlinkHIO_magneBoots_c1& boots = daAlinkHIO_magneBoots_c0::m;
+        fraction *= 1.0f / (boots.mInputFactor * boots.mInputFactor);
+        walkSpeed =
+            boots.mWalkAnmSpeedMin + (fraction * (boots.mWalkAnmSpeedMax - boots.mWalkAnmSpeedMin));
+        fraction *= hio.mWalkChangeRate;
+        if (fraction >= hio.mWalkChangeRate) {
+            fraction = hio.mWalkChangeRate - 0.001f;
+        }
+    }
+    const daAlink_c::daAlink_ANM walkID = heavyGait ? daAlink_c::ANM_WALK_HEAVY : l_walkAnm;
+    const daRemotePlayer_anm_c& walkAnm =
+        heavyGait ? guardOr(walkID, mAtnAnm[walkID]) : guardOr(l_walkAnm, mWalkAnm);
 
     /* Standing, decided by the SENDER and carried on the wire, because the branch it picks has a
      * step in it rather than a taper — see the remap in band 1 below, and kPlayerStateZeroSpeed.
@@ -2972,9 +3039,9 @@ void daRemotePlayer_c::selectAnimation() {
          * zero to five decimal places whenever the bit is set — the bit means the sender's speed is
          * under 0.001 — so pinning it would only be inventing a rule the game does not have. */
         anmA = &idle;
-        anmB = &guardOr(l_walkAnm, mWalkAnm);
+        anmB = &walkAnm;
         idA = idleID;
-        idB = l_walkAnm;
+        idB = walkID;
         /* ★ 1.0f for the tired idle, NOT mWaitAnmSpeed, and daAlink_c overrides it in exactly this
          * place for exactly this animation (d_a_alink.cpp:7766-7769, alongside ANM_HORSE_WAIT_D_B).
          * WAITD is authored to be played at its own rate; at mWaitAnmSpeed it runs subtly fast, and
@@ -2982,14 +3049,15 @@ void daRemotePlayer_c::selectAnimation() {
          * the BCK and the blend are all still correct. It only shows as a low-health idle that does
          * not read as tired. */
         speedA = tiredIdle ? 1.0f : hio.mWaitAnmSpeed;
-        speedB = hio.mWalkAnmSpeed;
+        speedB = walkSpeed;
     } else if (fraction < hio.mRunChangeRate) {
+        // Never reached on the heavy gait (the clamp above); written on walkAnm all the same.
         blend = (fraction - hio.mWalkChangeRate) / (hio.mRunChangeRate - hio.mWalkChangeRate);
-        anmA = &guardOr(l_walkAnm, mWalkAnm);
+        anmA = &walkAnm;
         anmB = &runAnm();
-        idA = l_walkAnm;
+        idA = walkID;
         idB = l_runAnm;
-        speedA = hio.mWalkAnmSpeed;
+        speedA = walkSpeed;
         speedB = hio.mRunAnmSpeed;
     } else {
         /* daAlink_c passes ANM_RUN on both sides here with a weight of 1; setDoubleAnm() collapses
@@ -3072,6 +3140,24 @@ void daRemotePlayer_c::selectAnimation() {
         mGaitPrevGuard = mNetUpperGuard;
         if (morf < 0.0f) {
             morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+        }
+    }
+
+    /* Boots on or off mid-walk: the walk slot swaps WALKS <-> WALKH at the same weight, the same
+     * getUnderUpperAnime-changed-a-resource case as the guard flip just above, with the same morf.
+     * (Putting the boots on is itself a one-shot equip animation for the sender, so in practice
+     * this mostly fires as the gait resumes after it.) */
+    if (heavyGait != mGaitPrevHeavy) {
+        mGaitPrevHeavy = heavyGait;
+        if (morf < 0.0f) {
+            morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+        }
+        if (heavyGait && !mLoggedHeavyGait) {
+            mLoggedHeavyGait = true;
+            Log.debug("Puppet {} iron-boots gait: walk anm {} (bck {}) at rate {:.3f}, blend "
+                      "fraction {:.3f} from wire rate {:.3f}",
+                mPlayerId, static_cast<int>(walkID), anm_bck_idx(walkID, mNetEquip), walkSpeed,
+                fraction, mNetMoveRate);
         }
     }
 
@@ -3368,18 +3454,25 @@ void daRemotePlayer_c::loadAtnAnimations() {
     const s32 freeBefore = heap != NULL ? heap->getFreeSize() : 0;
     int wanted = 0;
     int loaded = 0;
+    s32 heavyCost = 0;
     for (int i = 0; i < 0x12; i++) {
         mAtnAnm[i].mpUnder = NULL;
         mAtnAnm[i].mpUpper = NULL;
         const daAlink_c::daAlink_ANM anm = static_cast<daAlink_c::daAlink_ANM>(i);
-        // Iron-boots rows. The puppet has no heavy gait, and the sender reports these as "none".
-        if (anm == daAlink_c::ANM_WALK_HEAVY || anm == daAlink_c::ANM_ATN_BACK_WALK_HEAVY) {
-            continue;
-        }
+        /* The iron-boots rows are loaded too: 0x0E {WALKH, WALKH} is the booted gait and 0x0F
+         * {ATRBWH, ATL} the booted back-off (d_a_alink.cpp:310-311). Their cost is logged on its
+         * own so the budget in create() can be checked against it. */
+        const bool heavyRow =
+            anm == daAlink_c::ANM_WALK_HEAVY || anm == daAlink_c::ANM_ATN_BACK_WALK_HEAVY;
+        const s32 freeRow = heap != NULL ? heap->getFreeSize() : 0;
         wanted++;
-        /* Equip 0. Rows 0x00-0x0D are outside the sword window, and the two stances get their
+        /* Equip 0. Rows 0x00-0x0F are outside the sword window, and the two stances get their
          * sword variant just below. */
-        if (load_gait_anm(&mAtnAnm[i], anm, 0)) {
+        const bool rowLoaded = load_gait_anm(&mAtnAnm[i], anm, 0);
+        if (heavyRow && heap != NULL) {
+            heavyCost += freeRow - heap->getFreeSize();
+        }
+        if (rowLoaded) {
             loaded++;
         } else {
             mAtnAnm[i].mpUnder = NULL;
@@ -3404,10 +3497,12 @@ void daRemotePlayer_c::loadAtnAnimations() {
     }
 
     // The cost is printed because the heap budget in create() is sized from it.
-    Log.debug("Puppet {} attention set: {} of {} animations resident; armed stances {}/{}; cost {} "
-              "bytes of heap ({} -> {} free)",
+    Log.debug("Puppet {} attention set: {} of {} animations resident; armed stances {}/{}; "
+              "iron boots walk {} back {} ({} bytes); cost {} bytes of heap ({} -> {} free)",
         mPlayerId, loaded, wanted, mAtnWaitSwordAnm[0].mpUnder != NULL ? "ok" : "MISSING",
         mAtnWaitSwordAnm[1].mpUnder != NULL ? "ok" : "MISSING",
+        mAtnAnm[daAlink_c::ANM_WALK_HEAVY].mpUnder != NULL ? "ok" : "MISSING",
+        mAtnAnm[daAlink_c::ANM_ATN_BACK_WALK_HEAVY].mpUnder != NULL ? "ok" : "MISSING", heavyCost,
         heap != NULL ? freeBefore - heap->getFreeSize() : 0, freeBefore,
         heap != NULL ? heap->getFreeSize() : 0);
 }
@@ -3428,7 +3523,8 @@ void daRemotePlayer_c::loadAtnAnimations() {
  * So resources are resolved by id: first against the plain row's own halves, then against what
  * this function already loaded. One ATLS object therefore sits on the upper half of several rows;
  * walk and run are blended together with it on both upper slots, which animePlay() steps once.
- * Rows 0x0E/0x0F (iron boots) are skipped as loadAtnAnimations() skips them.
+ * Rows 0x0E/0x0F (iron boots) are {WALKH, ATLS} and {ATRBWH, ATLS} (:247-248): the plain row's
+ * under half and the ATLS row 0x02 already loaded, so they cost nothing new.
  *
  * ★ Reusing the plain row's object is safe for the reason load_gait_anm_sword() gives: a row and
  * its guard variant are never both in the ratio packs, because guardOr() picks one of the two.
@@ -3452,9 +3548,6 @@ void daRemotePlayer_c::loadGuardAnimations() {
         mGuardAnm[i].mpUnder = NULL;
         mGuardAnm[i].mpUpper = NULL;
         const daAlink_c::daAlink_ANM anm = static_cast<daAlink_c::daAlink_ANM>(i);
-        if (anm == daAlink_c::ANM_WALK_HEAVY || anm == daAlink_c::ANM_ATN_BACK_WALK_HEAVY) {
-            continue;
-        }
         wanted++;
 
         const daRemotePlayer_anm_c& plain = anm == l_walkAnm ? mWalkAnm :
@@ -3544,8 +3637,8 @@ const daRemotePlayer_anm_c& daRemotePlayer_c::guardOr(
  * sender's trace now reports (his under slot 0), so the two `anm` columns line up tick for tick.
  *
  * The shield-guard substitution (m_mainBckShield) is applied off kPlayerStateUpperGuard; see
- * loadGuardAnimations(). Not reproduced: the fishing-rod one, and iron boots, which the sender
- * reports as "none".
+ * loadGuardAnimations(). Not reproduced: the fishing-rod one. Backing off in iron boots is its own
+ * kind, kPlayerAtnBackHeavy; the other attention kinds have no booted variant in daAlink_c.
  */
 bool daRemotePlayer_c::selectAtnAnimation() {
     const daAlinkHIO_atnMove_c1& lockHio = daAlinkHIO_atnMove_c0::m;
@@ -3585,6 +3678,17 @@ bool daRemotePlayer_c::selectAtnAnimation() {
         idWalk = daAlink_c::ANM_ATN_LOCK_BACK_WALK;
         idRun = daAlink_c::ANM_ATN_LOCK_BACK_RUN;
         band = atn_back_band(lockHio);
+        break;
+    case dusk::mp::kPlayerAtnBackHeavy:
+        /* setBlendAtnBackMoveAnime's booted branch (:8092-8102): the locked table's bands and wait
+         * rate with or without a target, ATN_BACK_WALK_HEAVY as both walk and run, and both played
+         * at a literal 1.0. setDoubleAnm collapses the identical walk/run pair. */
+        idWait = daAlink_c::ANM_ATN_WAIT_RIGHT;
+        idWalk = daAlink_c::ANM_ATN_BACK_WALK_HEAVY;
+        idRun = daAlink_c::ANM_ATN_BACK_WALK_HEAVY;
+        band = atn_back_band(lockHio);
+        band.walkSpeed = 1.0f;
+        band.runSpeed = 1.0f;
         break;
     case dusk::mp::kPlayerAtnLeft:
         idWait = daAlink_c::ANM_ATN_WAIT_LEFT;

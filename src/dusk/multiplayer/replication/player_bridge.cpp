@@ -483,18 +483,27 @@ void fill_equip(daAlink_c* alink, PlayerState& out) {
 }
 
 /**
- * Fill the gear byte. Today that is one bit: the iron boots, as daAlink_c's own
- * checkEquipHeavyBoots() — the flag setHeavyBoots raises together with Z2CreatureLink's boots type,
- * so it is exactly what decides his heavy footstep. See kPlayerGearHeavyBoots for why it is not
- * checkBootsOrArmorHeavy().
+ * Fill the gear byte. Bit 0 is the iron boots, as daAlink_c's own checkEquipHeavyBoots() — the
+ * flag setHeavyBoots raises together with Z2CreatureLink's boots type, so it is exactly what
+ * decides his heavy footstep. See kPlayerGearHeavyBoots for why it is not checkBootsOrArmorHeavy().
  *
  * Read off the same member that sits beside checkMagneBootsOn(), which the foot-IK gate above
  * already calls on this pointer. A wolf never has the flag set, so he sends it clear.
+ *
+ * Bit 1 is the heavy GAIT, read off his animation heap rather than re-derived from the boots.
+ * Slot 1 of setBlendMoveAnime's blend holds ANM_WALK_HEAVY in every band of the booted branch,
+ * standing included (d_a_alink.cpp:7626-7627), and a one-shot resets slot 1 (:7164), so this
+ * matches only while that branch is what his legs are playing. See kPlayerGearHeavyGait.
  */
 void fill_gear(daAlink_c* alink, PlayerState& out) {
     out.gear = 0;
     if (alink != nullptr && alink->checkEquipHeavyBoots()) {
         out.gear |= kPlayerGearHeavyBoots;
+    }
+    if (alink != nullptr && !alink->checkWolf() &&
+        alink->checkUnderMove1BckNoArc(daAlink_c::ANM_WALK_HEAVY))
+    {
+        out.gear |= kPlayerGearHeavyGait;
     }
 }
 
@@ -522,6 +531,7 @@ const AtnSlotAnm l_atnSlot1Anm[] = {
     {daAlink_c::ANM_ATN_RUN_RIGHT, kPlayerAtnRight},
     {daAlink_c::ANM_ATN_LOCK_WALK_RIGHT, kPlayerAtnRightLock},
     {daAlink_c::ANM_ATN_LOCK_RUN_RIGHT, kPlayerAtnRightLock},
+    {daAlink_c::ANM_ATN_BACK_WALK_HEAVY, kPlayerAtnBackHeavy},
 };
 
 /// What may legitimately sit in slot 0 next to one of the above. Checked first, so that a slot-1
@@ -544,6 +554,7 @@ const daAlink_c::daAlink_ANM l_atnSlot0Anm[] = {
     daAlink_c::ANM_ATN_LOCK_RUN_LEFT,
     daAlink_c::ANM_ATN_RUN_RIGHT,
     daAlink_c::ANM_ATN_LOCK_RUN_RIGHT,
+    daAlink_c::ANM_ATN_BACK_WALK_HEAVY,  // bands 2 and 3 of the booted back-off (:8136-8150)
 };
 
 const char* atn_kind_name(std::uint8_t kind) {
@@ -566,6 +577,8 @@ const char* atn_kind_name(std::uint8_t kind) {
         return "right";
     case kPlayerAtnRightLock:
         return "right (lock)";
+    case kPlayerAtnBackHeavy:
+        return "back (iron boots)";
     default:
         return "unnamed";
     }
@@ -599,8 +612,8 @@ const char* atn_kind_name(std::uint8_t kind) {
  * with or without a target, and only the band table differs (:7945-7961). So the lock for forward
  * is read from mTargetedActor, the exact test setBlendAtnMoveAnime makes on that same tick.
  *
- * ATN_BACK_WALK_HEAVY (backing off in iron boots) isn't named. The puppet has no heavy-boots gait
- * to pair it with, so that case reports none and the puppet keeps its ordinary gait.
+ * ATN_BACK_WALK_HEAVY (backing off in iron boots) reports kPlayerAtnBackHeavy. Its stance band
+ * pairs it with ATN_WAIT_RIGHT, which is already in the slot-0 list.
  */
 void fill_atn_kind(daAlink_c* alink, PlayerState& out) {
     out.atnKind = kPlayerAtnNone;
@@ -1668,6 +1681,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkAtn(state.atnKind);
     puppet->setNetworkUpperGuard(state.upper_guard());
     puppet->setNetworkHeavyBoots(state.heavy_boots());
+    puppet->setNetworkHeavyGait(state.heavy_gait());
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.
@@ -1719,7 +1733,8 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
         out.flags |= kPlayerStateUpperGuard;
     }
     // Read back off the puppet, so the trace's `gear` column is the both-ends check for the bit.
-    out.gear = puppet->getNetHeavyBoots() ? kPlayerGearHeavyBoots : 0;
+    out.gear = (puppet->getNetHeavyBoots() ? kPlayerGearHeavyBoots : 0) |
+               (puppet->getNetHeavyGait() ? kPlayerGearHeavyGait : 0);
     // The joint aim values the puppet's callbacks are drawing from this tick, read back off it.
     out.neckX = puppet->getNetNeckX();
     out.neckY = puppet->getNetNeckY();

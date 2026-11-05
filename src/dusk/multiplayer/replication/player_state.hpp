@@ -160,6 +160,20 @@ enum PlayerGearFlags : std::uint8_t {
      * footstep.
      */
     kPlayerGearHeavyBoots = 1 << 0,
+    /**
+     * The sender's legs are on the iron-boots gait: `checkUnderMove1BckNoArc(ANM_WALK_HEAVY)`, read
+     * off his animation heap like fill_idle_kind() and fill_atn_kind() read theirs.
+     *
+     * ★ Not the same fact as kPlayerGearHeavyBoots, which is why it has a bit of its own.
+     * setBlendMoveAnime only takes ANM_WALK_HEAVY under `checkBootsMoveAnime(1) &&
+     * !enableFastIronBoots` (d_a_alink.cpp:7579, :7626-7627). Booted Link in water walks the
+     * ordinary gait, and so does every booted Link whose OWN settings have fast iron boots on,
+     * which the receiver cannot see. Deriving the gait from the boots bit gets both wrong.
+     *
+     * No protocol bump: a sender that predates this bit leaves it clear, and the puppet then plays
+     * the ordinary gait, which is what it did before.
+     */
+    kPlayerGearHeavyGait = 1 << 1,
 };
 
 /**
@@ -584,6 +598,7 @@ struct PlayerState {
             (equip & kPlayerEquipShieldKindMask) >> kPlayerEquipShieldKindShift);
     }
     bool heavy_boots() const { return (gear & kPlayerGearHeavyBoots) != 0; }
+    bool heavy_gait() const { return (gear & kPlayerGearHeavyGait) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);
