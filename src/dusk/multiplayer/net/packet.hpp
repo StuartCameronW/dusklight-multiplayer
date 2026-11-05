@@ -97,7 +97,16 @@ namespace dusk::mp {
  * measured against the base the RECEIVER builds, not Link's own, so a v14 puppet would misplace
  * the body even if the sizes matched.
  */
-inline constexpr std::uint32_t kProtocolVersion = 15;
+/*
+ * 16: PlayerState grew 70 -> 76 bytes, appended after the held-item block: u32 stageHash
+ * (offset 70, FNV-1a of the sender's stage name), s8 roomNo (74, his Link's room) and u8
+ * locEpoch (75, bumped whenever his Link actor is re-created, i.e. every scene load). The
+ * receiver resets the interpolation buffer on an epoch change, so a puppet snaps to the new spawn
+ * instead of gliding across the map, and despawns the puppet while the sender is in a stage or a
+ * room this end is not drawing. A size change: a v15 peer's read() would under-run and drop
+ * every pose.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 16;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

@@ -28,6 +28,21 @@ bool world_is_playable();
 /// in which case nothing should be sent this tick.
 bool capture_local_player(PlayerState& out);
 
+/// Where a remote sender is, relative to what this instance is drawing (v16 location fields).
+enum class RemoteLocation : std::uint8_t {
+    /// Same stage, and in a room this end displays (or the sender has not said where he is).
+    Here = 0,
+    /// A different stage. His puppet has nothing to stand on here.
+    OtherStage = 1,
+    /// Same stage, but in a room this end is not displaying (checkRoomDisp), so not loaded or
+    /// not drawn: his puppet would float over nothing.
+    RoomNotShown = 2,
+};
+
+/// Classify a remote pose's location against the local scene. Safe with no scene: answers Here,
+/// so the existing "no playable world" gates stay the only ones that apply then.
+RemoteLocation remote_location(const PlayerState& pose);
+
 /// Create the puppet actor for `playerId` if it isn't alive yet, wearing the outfit the sender
 /// reported. Returns false when creation isn't possible right now (no scene loaded, allocation
 /// refused) — callers just retry next tick.
