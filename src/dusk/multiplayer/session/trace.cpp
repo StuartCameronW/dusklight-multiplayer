@@ -37,7 +37,7 @@ long long abs_ms() {
 void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     const PlayerState& state, double delayTicks, std::uint32_t starvations, std::uint32_t snaps,
     std::size_t buffered, unsigned anm = 0, const DrawnJointAim& drawn = DrawnJointAim{},
-    float rootWX = 0.0f, float rootWY = 0.0f, float rootWZ = 0.0f) {
+    float rootWX = 0.0f, float rootWY = 0.0f, float rootWZ = 0.0f, float locPhase = -1.0f) {
     sFile << tick << ',' << elapsed_ms() << ',' << sRole << ',' << kind << ',' << playerId << ','
           << state.posX << ',' << state.posY << ',' << state.posZ << ',' << state.angleY << ','
           << state.moveRate << ',' << delayTicks << ',' << starvations << ',' << snaps << ','
@@ -55,7 +55,10 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << static_cast<unsigned>(state.actMorf) << ',' << static_cast<unsigned>(state.actHandL)
           << ',' << static_cast<unsigned>(state.actHandR) << ',' << state.act_root_x() << ','
           << state.act_root_y() << ',' << state.act_root_z() << ',' << rootWX << ',' << rootWY
-          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms() << '\n';
+          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms();
+    // v15 block (1): the stride phase DRAWN, 0..1, -1 outside blended locomotion. On a `local` row
+    // Link's; on an `actor` row the puppet's own. Unquantised, so the compare sees the slew.
+    sFile << ',' << locPhase << '\n';
 }
 
 }  // namespace
@@ -78,7 +81,9 @@ void open(const std::string& path, const char* role) {
              "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
              // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
-             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs\n";
+             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs,"
+             // v15 block (1): stride phase as drawn.
+             "locPhase\n";
     Log.info("Tracing poses to '{}'", path);
 }
 
@@ -107,7 +112,10 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
         float ry = 0.0f;
         float rz = 0.0f;
         read_local_root(rx, ry, rz);
-        write_row(tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm, drawn, rx, ry, rz);
+        float phase = -1.0f;
+        read_local_loc_phase(phase);
+        write_row(
+            tick, "local", localPlayerId, local, 0.0, 0, 0, 0, localAnm, drawn, rx, ry, rz, phase);
     } else {
         // Written rather than skipped: a missing row is ambiguous between "loading" and "the trace
         // stopped", and the first probe run cost real time to that ambiguity.
@@ -130,7 +138,10 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
             float ry = 0.0f;
             float rz = 0.0f;
             read_puppet_root(player.playerId, rx, ry, rz);
-            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm, drawn, rx, ry, rz);
+            float phase = -1.0f;
+            read_puppet_loc_phase(player.playerId, phase);
+            write_row(tick, "actor", player.playerId, actual, 0.0, 0, 0, 0, anm, drawn, rx, ry, rz,
+                phase);
         }
     }
 

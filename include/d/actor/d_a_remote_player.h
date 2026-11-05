@@ -155,6 +155,14 @@ public:
     /// slice 2).
     void setNetworkHeavyBoots(bool i_heavyBoots) { mNetHeavyBoots = i_heavyBoots; }
     bool getNetHeavyBoots() const { return mNetHeavyBoots; }
+    /// The sender's locomotion phase (wire `locPhase`): where in the blended stride his under slot
+    /// 0 is, 0..255 for one cycle. i_valid is false while the action override is on, when the byte
+    /// means nothing. Pushed every tick alongside setNetworkPose(); setDoubleAnm() locks onto it.
+    void setNetworkLocPhase(u8 i_phase, bool i_valid);
+    /// The stride phase the puppet is DRAWING, 0..1, read off the animation object in under slot 0
+    /// — or -1 when no blended locomotion pair is on the body (override, skid, fidget). For
+    /// --mp-trace's `locPhase` column.
+    f32 getDrawnLocPhase();
     /// Worklist 14. The sender's head turn and torso lean, as jointControll's answers: the neck
     /// (field_0x3124.x/.y), joint 1's pitch (`sp8`), the twist (field_0x30c8), joint 1's roll
     /// (mBodyAngle.z), and the whole-model bank (shape_angle.z). Pushed every tick alongside
@@ -591,6 +599,17 @@ private:
      * there is a stride phase worth carrying into the next pair, and whether the next pair needs a
      * cross-fade to get out of what is playing. */
     bool mDoubleAnmSet;
+    /* The wire's locomotion phase (setNetworkLocPhase), this tick's and last tick's. Last tick's is
+     * kept only to recognise a STARVED buffer, which hands back the same sample twice; setDoubleAnm
+     * then lets the stride run free instead of slewing it toward a frozen target. Zero-initialised
+     * by fopAcM_ct like the rest of the actor, so the first pose arrives with mNetLocPhaseValid
+     * false until the network layer says otherwise. */
+    u8 mNetLocPhase;
+    u8 mNetLocPhasePrev;
+    bool mNetLocPhaseValid;
+    /// Capped count of the phase-lock snaps logged so far, so a session's log shows them without
+    /// flooding.
+    u16 mLocPhaseSnapLogCount;
     /* Whether selectAnimation() has ever run. mCurrentAnm carries create()'s seed until it has, and
      * the network layer can resolve this puppet during that window — so getCurrentAnm() reports the
      * no-data sentinel rather than a gait nobody chose. See getCurrentAnm() for the measurement. */

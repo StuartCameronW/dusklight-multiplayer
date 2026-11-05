@@ -1174,6 +1174,37 @@ void gait_anime_play(J3DAnmTransform* i_anm, daPy_frameCtrl_c* i_frameCtrl) {
     }
 }
 
+/* --- The locomotion phase lock (wire `locPhase`). --- */
+
+/// A stride phase folded into [0, 1).
+f32 loc_phase_wrap01(f32 i_phase) {
+    i_phase -= std::floor(i_phase);
+    return i_phase >= 1.0f ? 0.0f : i_phase;
+}
+
+/// The signed shortest way round the cycle from i_from to i_to, in [-0.5, 0.5).
+f32 loc_phase_delta(f32 i_from, f32 i_to) {
+    return loc_phase_wrap01(i_to - i_from + 0.5f) - 0.5f;
+}
+
+/* How much the phase lock may speed up or slow down the stride in one tick, as a fraction of the
+ * stride's own per-tick rate. So the drawn rate stays within [0.5x, 1.5x] of what the puppet would
+ * play on its own.
+ *
+ * ★ It must stay BELOW 1, and that is the footsteps, not the look. Z2SoundObjAnime::updateAnime
+ * reads any frame lower than the last one as a loop wrap and fires every note left in the cycle at
+ * once (Z2SoundObject.cpp:423-432). A slew bounded under 1x can slow the stride but never reverse
+ * it, so the note cursor only ever sees forward steps.
+ *
+ * 0.5 itself is a tuning choice, not the game's (daAlink_c never has to chase anyone's phase). It
+ * clears the worst error, half a cycle, within one cycle of play. In steady state the error is a
+ * small fraction of one tick's advance, so the lock lands on the target exactly every tick and the
+ * bound never bites. */
+const f32 l_locPhaseSlewMax = 0.5f;
+
+/// Capped so a session full of band changes doesn't flood the log.
+const u16 l_locPhaseSnapLogMax = 16;
+
 }  // namespace
 
 int daRemotePlayer_c::createHeap() {
@@ -1586,6 +1617,14 @@ void daRemotePlayer_c::setDoubleAnm(const daRemotePlayer_anm_c& i_anmA,
         phase = mUnderFrameCtrl[0].getFrame() / mUnderFrameCtrl[0].getEnd();
     }
 
+    /* Is this the pair that was on the body last tick? Read BEFORE the packs are overwritten below.
+     * A band crossing, an attention set coming or going, an idle swap or a guard swap all change
+     * it; only the weight moving does not. */
+    const bool pairChanged = !mDoubleAnmSet ||
+                             mAnmPackUnder[0].getAnmTransform() != i_anmA.mpUnder ||
+                             mAnmPackUnder[1].getAnmTransform() !=
+                                 (onePair ? static_cast<J3DAnmTransform*>(NULL) : i_anmB.mpUnder);
+
     if (onePair) {
         i_blendRatio = 0.0f;
     }
@@ -1603,6 +1642,62 @@ void daRemotePlayer_c::setDoubleAnm(const daRemotePlayer_anm_c& i_anmA,
     const f32 rateA = maxA != 0.0f ? i_speedA / maxA : 0.0f;
     const f32 rateB = maxB != 0.0f ? i_speedB / maxB : 0.0f;
     const f32 phaseRate = rateA + i_blendRatio * (rateB - rateA);
+
+    /* ★ The phase lock. Everything above carries the PUPPET's own stride phase from tick to tick,
+     * which is daAlink_c's rule, and it is why the puppet was in step with nobody: its walk started
+     * from wherever its own idle happened to be, and Link's started from his. Measured before this:
+     * a constant +75 ms torso-sway lag against the head over a 19 s run (rms 8 deg, against 1.6 deg
+     * in phase). The sender now sends where his stride is (wire `locPhase`), and the puppet pulls
+     * its own carried phase onto it.
+     *
+     * The target is the phase the sender DREW on the sample being shown — not one ahead of it. The
+     * position, facing and gait rate on this tick are all that same sample, delayTicks old, and
+     * root motion ties the stride to the position (mFootPositionRatio, 0.99 at a walk). A stride
+     * aimed ahead of the body it moves would slide the feet by the whole buffer delay.
+     *
+     * The one lead there is, is ONE TICK, and it is the puppet's own: animePlay() steps every
+     * controller by phaseRate after this, before the body is drawn. The sender's phase was read
+     * after HIS step, so the controller is seated one step behind the target and the step lands
+     * on it. The same seat the action override uses (selectActionAnimation, `frame - rate`).
+     *
+     * Three cases:
+     *  - Close enough for one tick's bounded slew (the steady state): take the target exactly.
+     *    The step it costs is under l_locPhaseSlewMax of the stride's own advance, so the drawn
+     *    frame still moves forward.
+     *  - Further, on a tick the pair changed: SNAP. There is no continuity to keep, and the note
+     *    cursor is re-seated below so the jump neither bursts nor double-fires footsteps.
+     *  - Further, mid-pair: SLEW by the bounded step, never backwards.
+     *
+     * A starved buffer hands back the same sample, so the target stops moving while the stride
+     * should not. Recognised the way the action override recognises it (same value, rate that
+     * should have moved it), and the stride runs free until a fresh sample arrives. One u8 step is
+     * 1/256 of a cycle, so a stride slower than that per tick can't be told from a starved one;
+     * it is only the slowest idle, and it is then slewed as usual. */
+    bool phaseSnapped = false;
+    if (mNetLocPhaseValid) {
+        const f32 rateAbs = phaseRate < 0.0f ? -phaseRate : phaseRate;
+        const bool held = mNetLocPhase == mNetLocPhasePrev && rateAbs * 256.0f >= 1.0f;
+        if (!held || pairChanged) {
+            const f32 target =
+                loc_phase_wrap01(static_cast<f32>(mNetLocPhase) / 256.0f - phaseRate);
+            const f32 err = loc_phase_delta(phase, target);
+            const f32 slewMax = l_locPhaseSlewMax * rateAbs;
+            if (err >= -slewMax && err <= slewMax) {
+                phase = target;
+            } else if (pairChanged) {
+                if (mDoubleAnmSet && mLocPhaseSnapLogCount < l_locPhaseSnapLogMax) {
+                    mLocPhaseSnapLogCount++;
+                    Log.debug("Puppet {} stride phase snapped {:.3f} -> {:.3f} ({:+.3f} of a "
+                              "cycle) on a pair change",
+                        mPlayerId, phase, target, err);
+                }
+                phase = target;
+                phaseSnapped = true;
+            } else {
+                phase = loc_phase_wrap01(phase + (err > 0.0f ? slewMax : -slewMax));
+            }
+        }
+    }
 
     mAnmPackUnder[0].setAnmTransform(i_anmA.mpUnder);
     set_blend_frame_ctrl(&mUnderFrameCtrl[0], i_anmA.mpUnder, phaseRate, phase);
@@ -1629,11 +1724,54 @@ void daRemotePlayer_c::setDoubleAnm(const daRemotePlayer_anm_c& i_anmA,
         }
     }
 
+    /* A snap moved the frame by more than a tick's worth, so re-seat the note cursor at the new
+     * frame, the way a new animation does. Left alone, a backward jump reads as a loop wrap and
+     * fires the rest of the cycle's notes at once, and a forward one fires every note it skipped
+     * in the same tick. Re-seated, the notes in the skipped span are DROPPED. One missing footstep
+     * on a pair change is the least audible of the three outcomes.
+     *
+     * Seated at the controller's current frame, before animePlay() steps it, so the next update
+     * fires only what that step crosses. (setBasSource, which runs after this, re-seats on its own
+     * when the pair change also changed the notes' animation. Seating twice is harmless.) A
+     * collapsed pair leaves slot 1 unset, and setBasSource reads slot 0 then, as here. */
+    if (phaseSnapped && mSoundReady && mBasData != NULL && mBasCtrl != NULL) {
+        daPy_frameCtrl_c* basCtrl = mBasCtrl;
+        if (basCtrl == &mUnderFrameCtrl[1] && mAnmPackUnder[1].getAnmTransform() == NULL) {
+            basCtrl = &mUnderFrameCtrl[0];
+        }
+        mSound.initAnime(const_cast<void*>(mBasData), basCtrl->getRate() >= 0.0f,
+            basCtrl->getLoop(), basCtrl->getFrame());
+    }
+
     if (i_morf >= 0.0f) {
         mpOldFrame->initOldFrameMorf(i_morf, 0, mBodyJointNum);
     }
 
     mDoubleAnmSet = true;
+}
+
+/* The wire's stride phase. Stored only; setDoubleAnm() is the one consumer. The previous value is
+ * kept so setDoubleAnm can recognise a starved buffer, which hands it the same sample twice. */
+void daRemotePlayer_c::setNetworkLocPhase(u8 i_phase, bool i_valid) {
+    mNetLocPhasePrev = mNetLocPhase;
+    mNetLocPhase = i_phase;
+    mNetLocPhaseValid = i_valid;
+}
+
+/* Read off the animation object in under slot 0, which is the frame J3D samples, rather than off
+ * the controller or the wire. Every slot of a blended pair sits at this same phase. Slot 0 is the
+ * one daAlink_c reads his own phase from (commonDoubleAnime, d_a_alink.cpp:7029-7033), and the
+ * sender's half of the trace column comes from there too. */
+f32 daRemotePlayer_c::getDrawnLocPhase() {
+    if (!mDoubleAnmSet || mActActive) {
+        return -1.0f;
+    }
+    J3DAnmTransform* anm = mAnmPackUnder[0].getAnmTransform();
+    const s16 end = mUnderFrameCtrl[0].getEnd();
+    if (anm == NULL || end <= 0) {
+        return -1.0f;
+    }
+    return loc_phase_wrap01(anm->getFrame() / static_cast<f32>(end));
 }
 
 /* See the header. daAlink_c::allAnimePlay (d_a_alink.cpp:7262-7290) with everything the puppet has

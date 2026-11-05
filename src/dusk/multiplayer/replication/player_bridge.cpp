@@ -959,6 +959,45 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+/**
+ * Where Link is in his blended stride, 0..1, or -1 when he is not playing a blended pair.
+ *
+ * His own phase, read where he reads it: commonDoubleAnime takes `mUnderFrameCtrl[0].getFrame() /
+ * getEnd()` as the phase to carry, and only while field_0x2f8c says the last thing set was a
+ * blended pair (d_a_alink.cpp:7029-7033). Every slot of the pair is wound to that same phase and
+ * stepped at a rate scaled to keep it there, so slot 0 speaks for the whole stride. That includes
+ * the run band, where slot 1 carries all the weight.
+ *
+ * Read after his execute, so it is the frame his model is drawn with this tick: allAnimePlay has
+ * already stepped the controller and pushed the frame into the animation.
+ */
+float local_loc_phase(daAlink_c* alink) {
+    if (alink == nullptr || alink->checkWolf() || alink->field_0x2f8c == 0) {
+        return -1.0f;
+    }
+    const daPy_frameCtrl_c& ctrl = alink->mUnderFrameCtrl[0];
+    if (ctrl.getEnd() <= 0) {
+        return -1.0f;
+    }
+    float phase = ctrl.getFrame() / static_cast<float>(ctrl.getEnd());
+    phase -= std::floor(phase);
+    return phase >= 1.0f ? 0.0f : phase;
+}
+
+/// Fill v15 block (1). Runs after fill_action_anim: the phase is sent only while the override is
+/// off. See PlayerState::locPhase for why 0 is the "nothing" value.
+void fill_loc_phase(daAlink_c* alink, PlayerState& out) {
+    out.locPhase = 0;
+    if (out.act_active()) {
+        return;
+    }
+    const float phase = local_loc_phase(alink);
+    if (phase >= 0.0f) {
+        // Rounded, and 256 (a phase of 0.998+) wraps to 0, which is the same point in the cycle.
+        out.locPhase = static_cast<std::uint8_t>(static_cast<int>(phase * 256.0f + 0.5f) & 0xFF);
+    }
+}
+
 }  // namespace
 
 /**
@@ -1162,6 +1201,7 @@ bool capture_local_player(PlayerState& out) {
     fill_upper_guard(alink, out);
     fill_joint_aim(alink, out);
     fill_action_anim(alink, out);
+    fill_loc_phase(alink, out);
 
     return true;
 }
@@ -1337,6 +1377,8 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkAction(state.actUnder, state.actUpper, state.act_frame(),
         state.act_upper_frame(), state.act_rate(), static_cast<f32>(state.actMorf), state.actHandL,
         state.actHandR, rootTrans);
+    // v15 block (1). Meaningless while the override is on, and the puppet is told so.
+    puppet->setNetworkLocPhase(state.locPhase, !state.act_active());
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -1401,7 +1443,33 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
         out.actRootY = act_encode_s16(rootLocal.y, kPlayerActRootScale);
         out.actRootZ = act_encode_s16(rootLocal.z, kPlayerActRootScale);
     }
+    // The stride phase the puppet DRAWS, on the wire's scale. The trace's locPhase column reads the
+    // unquantised value through read_puppet_loc_phase instead.
+    const f32 drawnPhase = puppet->getDrawnLocPhase();
+    out.locPhase = drawnPhase >= 0.0f ? static_cast<std::uint8_t>(
+                                            static_cast<int>(drawnPhase * 256.0f + 0.5f) & 0xFF) :
+                                        0;
     return true;
+}
+
+bool read_local_loc_phase(float& out) {
+    out = -1.0f;
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr || !local_pose_is_live()) {
+        return false;
+    }
+    out = local_loc_phase(alink);
+    return out >= 0.0f;
+}
+
+bool read_puppet_loc_phase(std::uint32_t playerId, float& out) {
+    out = -1.0f;
+    daRemotePlayer_c* puppet = resolve_puppet(playerId);
+    if (puppet == nullptr) {
+        return false;
+    }
+    out = puppet->getDrawnLocPhase();
+    return out >= 0.0f;
 }
 
 bool read_local_joint_aim(DrawnJointAim& out) {
