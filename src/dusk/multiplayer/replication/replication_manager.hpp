@@ -61,6 +61,12 @@ struct RemotePlayer {
     /// Consecutive ticks the sender has been in a room this end does not display. See
     /// kRoomHideDebounceTicks.
     std::uint32_t roomHiddenTicks = 0;
+    /// Consecutive ticks the sender has reported no room (-1) on our stage. See
+    /// kRoomUnknownHoldTicks.
+    std::uint32_t roomUnknownTicks = 0;
+    /// The sender's room was unknown since the last known one: it warped or loaded, it did not
+    /// walk across a room boundary, so a room we don't display hides at once (no debounce).
+    bool roomWasUnknown = false;
 };
 
 class ReplicationManager {

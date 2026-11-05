@@ -17,6 +17,14 @@ constexpr borealis::Log Log{"dusk::mp"};
 /// puppet that is not alive yet is held back at once: there is nothing to churn.
 constexpr std::uint32_t kRoomHideDebounceTicks = 15;
 
+/// A freshly created Link reports room -1 for its first few ticks (~4 measured) after a warp.
+/// remote_location() can only answer Here for that, and spawning on it put the puppet up for
+/// 4 ticks + the debounce above before the real room hid it again: a 17-tick flash and a full
+/// respawn on every far-room warp (measured, D_MN05). So an unknown room keeps the last
+/// decision and does not spawn a puppet, for at most this long; a stage that never reports a
+/// room still gets its puppet.
+constexpr std::uint32_t kRoomUnknownHoldTicks = 10;
+
 const char* location_name(RemoteLocation where) {
     switch (where) {
     case RemoteLocation::Here:
@@ -134,10 +142,21 @@ void ReplicationManager::drive_puppets() {
          * tag, the shadow and the sounds with it (all three hang off the actor). It comes back
          * through ensure_puppet() at the pose of the moment: a snap, never a slide. */
         const RemoteLocation where = remote_location(pose);
+        const bool roomUnknown = where == RemoteLocation::Here && pose.stageHash != 0 &&
+                                 pose.roomNo < 0 && player.roomUnknownTicks < kRoomUnknownHoldTicks;
+        if (roomUnknown) {
+            player.roomUnknownTicks++;
+            player.roomWasUnknown = true;
+        } else if (pose.roomNo >= 0) {
+            player.roomUnknownTicks = 0;
+        }
         RemoteLocation hide = RemoteLocation::Here;
-        if (where == RemoteLocation::RoomNotShown) {
+        if (roomUnknown) {
+            hide = player.hiddenBy;
+        } else if (where == RemoteLocation::RoomNotShown) {
             player.roomHiddenTicks++;
-            if (!player.puppetAlive || player.hiddenBy == RemoteLocation::RoomNotShown ||
+            if (!player.puppetAlive || player.roomWasUnknown ||
+                player.hiddenBy == RemoteLocation::RoomNotShown ||
                 player.roomHiddenTicks >= kRoomHideDebounceTicks)
             {
                 hide = where;
@@ -145,6 +164,9 @@ void ReplicationManager::drive_puppets() {
         } else {
             player.roomHiddenTicks = 0;
             hide = where;
+        }
+        if (!roomUnknown && pose.roomNo >= 0) {
+            player.roomWasUnknown = false;
         }
         if (hide != player.hiddenBy) {
             if (hide == RemoteLocation::Here) {
@@ -164,13 +186,21 @@ void ReplicationManager::drive_puppets() {
         // tpmp's "optimization level 3" equivalent: stop drawing other players entirely to claw
         // back frames. Checked here rather than at the draw site so the actor isn't even alive.
         const bool wanted = g_mpPolicy.renderRemotePlayers && pose.in_world() &&
-                            player.hiddenBy == RemoteLocation::Here;
+                            player.hiddenBy == RemoteLocation::Here &&
+                            !(roomUnknown && !player.puppetAlive);
 
         if (!wanted) {
             if (player.puppetAlive) {
                 destroy_puppet(player.playerId);
                 player.puppetAlive = false;
             }
+            continue;
+        }
+
+        // Room not known yet (a warp or load just re-created the sender's Link): a live puppet
+        // stays where the sender was last seen instead of jumping to a spot that may be in a room
+        // we don't draw. The first pose with a known room either snaps it there or hides it.
+        if (roomUnknown && player.puppetAlive) {
             continue;
         }
 
