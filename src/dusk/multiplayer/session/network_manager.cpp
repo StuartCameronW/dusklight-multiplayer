@@ -359,6 +359,9 @@ void NetworkManager::shutdown() {
 }
 
 void NetworkManager::pre_actor_tick() {
+    // Test-only knob. Before ensure_initialized(), because a join starts there and engages the
+    // save guard, and this half has to open its handle while the guard is still off.
+    prepare_save_guard_probe_if_requested();
     ensure_initialized();
     // Test-only knob. Before the early-out, so it also runs after the guest has left.
     run_save_guard_probe_if_requested();

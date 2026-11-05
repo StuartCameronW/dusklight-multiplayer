@@ -182,6 +182,16 @@ bool is_save_storage_path(
  */
 bool refuse_save_location_write(std::string_view i_location, const char* i_what);
 
+/**
+ * The location half of refuse_save_location_write(), without the guard: true when @p i_location
+ * resolves to save storage under dusk::ConfigPath. It is not cheap (it resolves and normalises the
+ * path), so the mod file API calls it once per writable open and remembers the answer on the
+ * handle. Every later write, flush and close on that handle asks only refuse_save_file_write(),
+ * whose guard check is two flag reads. That is what stops a handle opened BEFORE joining from
+ * writing AFTER it.
+ */
+bool is_save_storage_location(std::string_view i_location);
+
 /// How a guest's session came to an end, so the "saving stays disabled" notice says the right
 /// thing.
 enum class SessionEnd {
@@ -216,7 +226,16 @@ void notify_save_disabled_after_session_end(SessionEnd i_how);
  * prove nothing about the plumbing. Where the guard is NOT engaged (host, single player) it only
  * runs the non-destructive Save Manager backup, to prove the guard does not over-block. Never set
  * in normal play.
+ *
+ * It also covers the stale-handle case: prepare_save_guard_probe_if_requested() opens a mod file
+ * API write handle on save storage before the session starts, and the probe then writes, flushes
+ * and closes it ("SAVE-GUARD PROBE: stale handle ..."). REFUSED on a guest, ALLOWED on the host.
  */
 void run_save_guard_probe_if_requested();
+
+/// The before-the-session half of the probe above. Called every frame from
+/// NetworkManager::pre_actor_tick BEFORE ensure_initialized(), which is where a join starts and
+/// engages the guard; acts once, on the first call.
+void prepare_save_guard_probe_if_requested();
 
 }  // namespace dusk::mp
