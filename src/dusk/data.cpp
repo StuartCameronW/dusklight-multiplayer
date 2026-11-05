@@ -1040,6 +1040,30 @@ Paths initialize_data(const std::filesystem::path& userDirectoryOverride) {
         return paths;
     }
 
+    // Test knob: DUSK_TEST_DEFAULT_DATA_DIR stands in for the system default folder, so the
+    // lock-conflict relocation (<dir>-2, seeded from <dir>) can be exercised in a sandbox without
+    // a running instance ever touching the real saves. The real default is never even resolved.
+    if (const char* testDefault = std::getenv("DUSK_TEST_DEFAULT_DATA_DIR");
+        testDefault != nullptr && *testDefault != '\0' && userDirectoryOverride.empty())
+    {
+        const std::filesystem::path sandbox{testDefault};
+        ensure_data_directory(sandbox);
+        Log.warn("DUSK_TEST_DEFAULT_DATA_DIR: treating '{}' as the default data folder.",
+            borealis::io::fs_path_to_string(sandbox));
+        const auto activePath = lock_or_relocate_data_directory(sandbox);
+        const auto testStatus = manager().initialize(activePath);
+        if (!testStatus) {
+            Log.fatal("Failed to initialize test data folder: {}", status_message(testStatus));
+        }
+        if (!sDataDirectoryShared) {
+            backup_memory_cards(manager().paths().userPath);
+        }
+        // Like --data-dir: logs and dawn_cache.db stay in each instance's own folder too.
+        Paths paths = manager().paths();
+        paths.cachePath = paths.userPath;
+        return paths;
+    }
+
     const auto status = manager().initialize(userDirectoryOverride);
     if (!status && status.code != borealis::data::ErrorCode::MigrationIncomplete) {
         Log.fatal("Failed to initialize data folders: {}", status_message(status));
