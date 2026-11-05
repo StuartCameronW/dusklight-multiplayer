@@ -41,6 +41,9 @@ struct PeerSession {
     /// Last time ANY packet arrived from this peer. Surfaced in the status so a stalling player
     /// reads as "not responding" seconds before the transport gives up on them.
     std::chrono::steady_clock::time_point lastHeard{};
+    /// NetworkManager::mAttentiveTime when lastHeard was last set: the silence watchdog's clock,
+    /// which does not run while this process itself is stalled. See check_peer_silence().
+    std::chrono::steady_clock::duration heardAtAttentive{};
 };
 
 /// One player as the UI should show it. Built fresh by NetworkManager::status(); holds no state.
@@ -140,6 +143,11 @@ private:
     /// Time out connections that are not getting anywhere: a client still waiting on its host, a
     /// host holding a peer that never introduced itself.
     void check_handshake_deadlines();
+
+    /// Drop any connected peer that has sent nothing for kPeerSilenceTimeoutMs, through the same
+    /// path as a transport timeout. ENet's own timeout overshoots (enet_transport.cpp); this does
+    /// not.
+    void check_peer_silence();
     std::string player_name(std::uint32_t playerId) const;
     void handle_packet(PeerId peer, const std::uint8_t* data, std::size_t size);
     void send_hello(PeerId peer);
@@ -212,6 +220,13 @@ private:
     std::uint64_t mSimTick = 0;
     std::uint32_t mHeartbeatSeq = 0;
     std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> mPendingHeartbeats;
+
+    /// The silence watchdog's clock: wall time this process spent listening, advanced once per
+    /// poll by the gap since the previous one, but by no more than a capped amount. A long frame
+    /// of OUR own (shader compile, window drag) is time nobody could have been heard in, so it
+    /// must not count against every peer at once. Zero-based per session.
+    std::chrono::steady_clock::duration mAttentiveTime{};
+    std::chrono::steady_clock::time_point mLastPollAt{};
 
     /// For proving the pump really runs at the 30 Hz sim rate rather than the render rate.
     std::chrono::steady_clock::time_point mRateWindowStart;

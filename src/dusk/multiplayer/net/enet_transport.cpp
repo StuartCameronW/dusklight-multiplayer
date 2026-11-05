@@ -31,13 +31,17 @@ constexpr borealis::Log Log{"dusk::mp::enet"};
  *   - MAXIMUM 12 s, not ENet's 30 s. This is the bound that matters to the person left behind.
  *   - LIMIT 32 (ENet's). Six doublings of the retransmit timeout before the minimum applies.
  *
- * Measured on loopback (2026-11-04), hard-killing one end with Stop-Process: the host noticed a
- * dead client after 8.8 s of silence and a client noticed a dead host after 12.9 s. A clean quit
- * is seen in ~0.3 s, because the destructor hangs up instead of leaving it to this.
+ * ★ The maximum is NOT a bound in practice. ENet tests it only when some reliable command's
+ * retransmit timer expires (protocol.c, enet_protocol_check_timeouts), and that timer doubles on
+ * every retry, so the check that finally sees "over 12 s" can land anywhere up to about twice
+ * that. Measured: 8.8 s and 12.9 s on loopback (2026-11-04), then 23.8 s for a force-killed guest
+ * in a three-peer run (2026-11-05). NetworkManager's silence watchdog is what actually enforces
+ * kPeerSilenceTimeoutMs; this policy is the backstop under it. A clean quit is seen in ~0.3 s,
+ * because the destructor hangs up instead of leaving it to either.
  */
 constexpr enet_uint32 kPeerTimeoutLimit = 32;
 constexpr enet_uint32 kPeerTimeoutMinimumMs = 8000;
-constexpr enet_uint32 kPeerTimeoutMaximumMs = 12000;
+constexpr enet_uint32 kPeerTimeoutMaximumMs = kPeerSilenceTimeoutMs;
 
 /// How long disconnect_all() blocks waiting for the far ends to acknowledge. The disconnect is
 /// sent on the first service call, so a peer on a healthy link hears it almost at once; the wait
@@ -283,6 +287,20 @@ void EnetTransport::disconnect(PeerId peer, std::uint32_t reason, bool afterQueu
     } else {
         enet_peer_disconnect(reinterpret_cast<ENetPeer*>(target), reason);
     }
+}
+
+void EnetTransport::drop(PeerId peer, std::uint32_t reason) {
+    _ENetPeer* target = lookup(peer);
+    if (target == nullptr) {
+        return;
+    }
+    auto* raw = reinterpret_cast<ENetPeer*>(target);
+    // disconnect_now sends one unsequenced goodbye and resets the peer on the spot, and a reset
+    // peer never produces an ENet DISCONNECT event; ENet discards whatever still arrives for it.
+    // Clearing data matters for the slot's next occupant, which must get a fresh id, not this one.
+    raw->data = nullptr;
+    mPeers.erase(peer);
+    enet_peer_disconnect_now(raw, reason);
 }
 
 void EnetTransport::disconnect_all(std::uint32_t reason) {
