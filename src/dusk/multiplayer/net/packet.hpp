@@ -85,6 +85,11 @@ namespace dusk::mp {
  *     Then a trailing `gear` byte after everything else (offset 47), bit 0 the sender's
  *     checkEquipHeavyBoots() (iron boots on), because `flags` and `equip` were both full.
  *     23 -> 48 bytes in all. Still 14: none of it has shipped.
+ *
+ * (Pending, for the v15 bump at merge:) Hello and HelloAck each grew a trailing ModFingerprint
+ * block, and DisconnectReason gained ModMismatch = 5. A v14 host would ignore the block and admit
+ * a guest with different gameplay mods; a v14 client would read the block as trailing junk and
+ * report a mod refusal as "unknown reason". So this needs the bump, not just the append.
  */
 inline constexpr std::uint32_t kProtocolVersion = 14;
 
@@ -103,11 +108,15 @@ enum class PacketId : std::uint8_t {
     /// Client -> host, first thing after connecting. colorExplicit tells the host whether the
     /// player actually chose the colour (and so must keep it) or is just carrying a default.
     /// [u32 protocolVersion][string nickname][u8 colorExplicit][u32 preferredColorRgb]
+    /// [ModFingerprint] — the sender's active mods (session/mod_check.hpp), so the host can refuse
+    /// a guest whose gameplay mods differ from its own. Only parsed when the version matches.
     Hello = 1,
     /// Host -> client. The host assigns the colour authoritatively so no two players collide,
     /// and includes its own identity so both ends know each other after one exchange.
     /// [u8 accepted][u32 protocolVersion][u32 assignedPlayerId][u32 assignedColorRgb]
-    /// [string hostNickname][u32 hostColorRgb]
+    /// [string hostNickname][u32 hostColorRgb][ModFingerprint]
+    /// The host's own mod list rides along whether or not the guest was accepted, so a refused
+    /// guest can name the differences itself, and an accepted one can log cosmetic differences.
     HelloAck = 2,
     /// Either direction. [u32 sequence][u64 senderTick]
     Heartbeat = 3,
@@ -176,6 +185,9 @@ enum class DisconnectReason : std::uint32_t {
     SessionFull = 3,
     /// Host -> client: connected but never introduced itself with a Hello.
     HandshakeTimeout = 4,
+    /// Host -> client: the two ends run different gameplay mods (session/mod_check.hpp). The
+    /// HelloAck before the hang-up carries the host's list, so the client can say which ones.
+    ModMismatch = 5,
 };
 
 /// The host occupies a fixed player id so both ends can name it without a lookup.
