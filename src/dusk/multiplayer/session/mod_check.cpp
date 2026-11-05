@@ -4,13 +4,16 @@
 #include <cctype>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "../net/serializer.hpp"
+#include "dusk/game_mode.hpp"
 #include "dusk/logging.h"
 #include "dusk/mod_loader.hpp"
 #include "dusk/mods/loader/loader.hpp"
@@ -29,6 +32,9 @@ constexpr std::size_t kToastLines = 3;
 struct SessionBlobDecl {
     std::string blob;
     std::string label;
+    /// Built-in only: a file under the mod's data dir that must exist for the value to mean
+    /// anything, with {} standing for the value. Empty for none.
+    std::string requiredFile;
 };
 
 /**
@@ -36,14 +42,21 @@ struct SessionBlobDecl {
  * keeps the active seed's hash in its "seed_hash" blob (session.cpp: written on new save and on
  * every save write, read back on load to re-activate the seed), and that hash names the seed
  * directory whose seed.dat holds the settings too — so one string covers seed and settings.
+ *
+ * ★ The blob is what the SAVE asks for, not what the randomizer managed to load: activateSeed
+ * fails quietly (a log line) when seeds/<hash>/seed.dat under its data dir is not on this machine
+ * (a save file copied from a friend, say), and the game then runs unrandomized while the blob
+ * still names the seed. requiredFile catches that: the value becomes "<hash> (seed file
+ * missing)", which no healthy end can match.
  */
 struct BuiltinDecl {
     std::string_view modId;
     std::string_view blob;
     std::string_view label;
+    std::string_view requiredFile;
 };
 constexpr BuiltinDecl kBuiltinSessionBlobs[] = {
-    {"dev.twilitrealm.randomizer", "seed_hash", "Randomizer seed"},
+    {"dev.twilitrealm.randomizer", "seed_hash", "Randomizer seed", "seeds/{}/seed.dat"},
 };
 
 /// What the bundle says about a mod, which only changes when the bundle does. Cached because the
@@ -105,7 +118,8 @@ std::vector<SessionBlobDecl> read_session_blobs(mods::LoadedMod& mod) {
     if (out.empty()) {
         for (const auto& builtin : kBuiltinSessionBlobs) {
             if (builtin.modId == mod.metadata.id) {
-                out.push_back({std::string(builtin.blob), std::string(builtin.label)});
+                out.push_back({std::string(builtin.blob), std::string(builtin.label),
+                    std::string(builtin.requiredFile)});
             }
         }
     }
@@ -342,9 +356,37 @@ ModFingerprint local_mod_fingerprint() {
             v.known = mods::svc::peek_current_slot_blob(mod.metadata.id, decl.blob, blob);
             if (v.known) {
                 v.value = session_value_text(blob);
+                // One stat a second at most. dataDirUtf8 is filled when the mod first asks for its
+                // data dir, which the randomizer does before it can have activated any seed.
+                if (!decl.requiredFile.empty() && !blob.empty() && !mod.dataDirUtf8.empty()) {
+                    std::string rel = decl.requiredFile;
+                    if (const auto at = rel.find("{}"); at != std::string::npos) {
+                        rel.replace(at, 2, std::string(blob.begin(), blob.end()));
+                    }
+                    const auto path =
+                        std::filesystem::path(
+                            reinterpret_cast<const char8_t*>(mod.dataDirUtf8.c_str())) /
+                        std::filesystem::path(reinterpret_cast<const char8_t*>(rel.c_str()));
+                    std::error_code ec;
+                    if (!std::filesystem::exists(path, ec)) {
+                        v.value = clamp_string(v.value + " (seed file missing)");
+                    }
+                }
             }
             session.push_back(std::move(v));
         }
+    }
+
+    // The game mode decides which rules run at all (and, for the randomizer, which card file is
+    // loaded), so it is a session value of the game itself. Always known: it is chosen before boot.
+    {
+        SessionValue v;
+        v.modId = "dusk";
+        v.label = "Game mode";
+        v.known = true;
+        const auto* mode = gamemode::getGameModeManager().getCurrentGameMode();
+        v.value = clamp_string(mode != nullptr ? mode->getId() : std::string{});
+        session.push_back(std::move(v));
     }
     static bool s_loggedFakeMod = false;
     static bool s_loggedFakeCosmetic = false;
