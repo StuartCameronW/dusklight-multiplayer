@@ -851,6 +851,47 @@ void clear_action_anim(PlayerState& out) {
     out.actRootX = 0;
     out.actRootY = 0;
     out.actRootZ = 0;
+    // block (4): action slot 1 / swim — only ever sent alongside block 2.
+    out.act1Under = kPlayerActNone;
+    out.act1Upper = kPlayerActNone;
+    out.act1Phase = 0;
+    out.act1Ratio = 0;
+    out.actRootRotX = 0;
+    out.actRootRotZ = 0;
+    out.actYawOff = 0;
+    out.actPitch = 0;
+}
+
+/**
+ * Fill block (4): the second animation of a double anime, the joint-0 rotation jointControll adds
+ * and setMatrix's yaw offset. Only called while block 2 is being sent for an ALANM slot 0.
+ *
+ * Slot 1 is read off the pack AND the heap, both of which commonSingleAnime clears (:7163-7169),
+ * so a single anime reads as "no slot 1" even if the heap index lingered. A demo-archive slot 1 is
+ * dropped for the same reason block 2 drops a demo slot 0.
+ */
+void fill_action_slot1(daAlink_c* alink, PlayerState& out) {
+    const daPy_anmHeap_c& under1 = alink->mUnderAnmHeap[1];
+    const daPy_anmHeap_c& upper1 = alink->mUpperAnmHeap[1];
+    if (alink->mNowAnmPackUnder[1].getAnmTransform() != nullptr && !under1.checkNoSetIdx() &&
+        under1.checkNoSetArcNo() && (upper1.checkNoSetIdx() || upper1.checkNoSetArcNo()))
+    {
+        out.act1Under = under1.getIdx();
+        out.act1Upper = upper1.getIdx();  // 0xFFFF: follows under1, as for slot 0
+        const f32 end1 = alink->mUnderFrameCtrl[1].getEnd();
+        out.act1Phase =
+            act_encode_unit(end1 > 0.0f ? alink->mUnderFrameCtrl[1].getFrame() / end1 : 0.0f);
+        out.act1Ratio = act_encode_unit(alink->mNowAnmPackUnder[1].getRatio());
+    }
+
+    // jointControll's joint-0 arm, `sp18.set(field_0x3080, 0, field_0x3082)` (d_a_alink.cpp:2231).
+    // The values his calc this tick consumed: nothing writes them between his calc and here.
+    out.actRootRotX = alink->field_0x3080;
+    out.actRootRotZ = alink->field_0x3082;
+    // setMatrix's yaw offset (:5776). Clamped and counted like the joint aim it is quantised with.
+    out.actYawOff = clamp_joint_aim(alink->field_0x308c, "yawOff");
+    // setMatrix's whole-model pitch (:5776). Full circle on the wire, so no clamp.
+    out.actPitch = alink->shape_angle.x;
 }
 
 /**
@@ -923,17 +964,35 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
             out.actHandL = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d0);
             out.actHandR = shown_hand_index(alink->mpLinkHandModel, alink->field_0x06d4);
 
-            /* Joint 0's FINAL model-space translation, after jointControll has applied whatever
-             * root clear this proc asked for (d_a_alink.cpp:2213-2235, including the 0x60 case).
-             * Read off the matrix his calc produced — this runs after the actor pass, and his
-             * modelCalc is inside execute — and taken back to model space through mInvMtx, the
-             * inverse setMatrix built from the same base (d_a_alink.cpp:5794-5795). Reading it,
-             * not writing it: writes after calc are invisible (memory). */
+            fill_action_slot1(alink, out);
+
+            /* Joint 0's FINAL translation, after jointControll has applied whatever root clear
+             * this proc asked for (d_a_alink.cpp:2213-2235, including the 0x60 case). Read off the
+             * matrix his calc produced — this runs after the actor pass, and his modelCalc is
+             * inside execute. Reading it, not writing it: writes after calc are invisible
+             * (memory).
+             *
+             * ★ Taken back to model space through the base the RECEIVER builds from the wire —
+             * the sent position, then ZXYrot(actPitch, angleY + actYawOff, bankZ), each as
+             * quantised as the puppet will see it — and NOT through his mInvMtx. setMatrix's base
+             * also carries Y offsets that are not on the wire (the swim bob field_0x2b98,
+             * field_0x2b9c, the sink field_0x2ba0, :5774); measured this way they land in the root
+             * translation, and the puppet's joint 0 ends up where his is in WORLD space. The
+             * rotations match his base to the wire's quantisation. Block (4) is filled above, so
+             * its values are already in `out`. */
             if (alink->mpLinkModel != nullptr) {
                 MtxP root = alink->mpLinkModel->getAnmMtx(0);
                 const cXyz world(root[0][3], root[1][3], root[2][3]);
+                const s16 wirePitch = act_decode_turn(act_encode_turn(out.actPitch));
+                const s16 wireYaw = static_cast<s16>(
+                    out.angleY + joint_aim_from_wire(joint_aim_to_wire(out.actYawOff)));
+                const s16 wireBank = joint_aim_from_wire(joint_aim_to_wire(out.bankZ));
+                mDoMtx_stack_c::transS(out.posX, out.posY, out.posZ);
+                mDoMtx_stack_c::ZXYrotM(wirePitch, wireYaw, wireBank);
+                Mtx wireInv;
+                mDoMtx_inverse(mDoMtx_stack_c::get(), wireInv);
                 cXyz local;
-                mDoMtx_multVec(alink->mInvMtx, &world, &local);
+                mDoMtx_multVec(wireInv, &world, &local);
                 out.actRootX = act_encode_s16(local.x, kPlayerActRootScale);
                 out.actRootY = act_encode_s16(local.y, kPlayerActRootScale);
                 out.actRootZ = act_encode_s16(local.z, kPlayerActRootScale);
@@ -1379,6 +1438,9 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
         state.actHandR, rootTrans);
     // v15 block (1). Meaningless while the override is on, and the puppet is told so.
     puppet->setNetworkLocPhase(state.locPhase, !state.act_active());
+    // Block (4): slot 1, the joint-0 rotation and the yaw offset. Same decoding rule.
+    puppet->setNetworkActionSlot1(state.act1Under, state.act1Upper, state.act1_phase(),
+        state.act1_ratio(), state.actRootRotX, state.actRootRotZ, state.actYawOff, state.actPitch);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -1449,6 +1511,16 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     out.locPhase = drawnPhase >= 0.0f ? static_cast<std::uint8_t>(
                                             static_cast<int>(drawnPhase * 256.0f + 0.5f) & 0xFF) :
                                         0;
+    /* Block (4), drawn: the slot-1 animation installed in the packs, its object's own frame, the
+     * ratio on the pack, and the rotation / yaw the callback and setMatrix actually applied. */
+    out.act1Under = puppet->getActDrawnUnder1();
+    out.act1Upper = puppet->getActDrawnUpper1();
+    out.act1Phase = act_encode_unit(puppet->getActDrawnPhase1());
+    out.act1Ratio = act_encode_unit(puppet->getActDrawnRatio1());
+    out.actRootRotX = puppet->getActDrawnRootRotX();
+    out.actRootRotZ = puppet->getActDrawnRootRotZ();
+    out.actYawOff = puppet->getActDrawnYawOff();
+    out.actPitch = puppet->getActDrawnPitch();
     return true;
 }
 

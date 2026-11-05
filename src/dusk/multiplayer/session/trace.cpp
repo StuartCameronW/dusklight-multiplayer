@@ -58,7 +58,12 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms();
     // v15 block (1): the stride phase DRAWN, 0..1, -1 outside blended locomotion. On a `local` row
     // Link's; on an `actor` row the puppet's own. Unquantised, so the compare sees the slew.
-    sFile << ',' << locPhase << '\n';
+    sFile << ',' << locPhase;
+    // block (4): action slot 1 / swim, after absMs. Phase and ratio decoded to 0..1, the three
+    // angles as s16 binary angles. Local row: what Link draws; actor row: what the puppet draws.
+    sFile << ',' << state.act1Under << ',' << state.act1Upper << ',' << state.act1_phase() << ','
+          << state.act1_ratio() << ',' << state.actRootRotX << ',' << state.actRootRotZ << ','
+          << state.actYawOff << ',' << state.actPitch << '\n';
 }
 
 }  // namespace
@@ -83,7 +88,9 @@ void open(const std::string& path, const char* role) {
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
              "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs,"
              // v15 block (1): stride phase as drawn.
-             "locPhase\n";
+             "locPhase,"
+             // block (4): action slot 1 / swim. act1Under 65535 = single anime.
+             "act1Under,act1Upper,act1Phase,act1Ratio,rootRotX,rootRotZ,yawOff,pitch\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

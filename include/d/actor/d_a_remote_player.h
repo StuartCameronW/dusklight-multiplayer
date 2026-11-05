@@ -212,6 +212,22 @@ public:
     f32 getActDrawnUpperFrame() const;
     f32 getActDrawnRate() const;
     f32 getActDrawnMorf() const { return mActAppliedMorf; }
+    /* Block (4): the second animation of a double anime (i_phase1 is its phase, 0..1),
+     * jointControll's extra joint-0 rotation (field_0x3080 / field_0x3082), and setMatrix's yaw
+     * offset (field_0x308c) and pitch (shape_angle.x). Only applied while the block-2 override is
+     * playing. i_under1 == 0xFFFF: single anime. */
+    void setNetworkActionSlot1(u16 i_under1, u16 i_upper1, f32 i_phase1, f32 i_ratio1,
+        s16 i_rootRotX, s16 i_rootRotZ, s16 i_yawOff, s16 i_pitch);
+    /// What the puppet DRAWS for block (4), for --mp-trace's actor row.
+    u16 getActDrawnUnder1() const;
+    u16 getActDrawnUpper1() const;
+    f32 getActDrawnFrame1() const;
+    f32 getActDrawnPhase1() const;
+    f32 getActDrawnRatio1() const;
+    s16 getActDrawnRootRotX() const { return mActAppliedRootRotX; }
+    s16 getActDrawnRootRotZ() const { return mActAppliedRootRotZ; }
+    s16 getActDrawnYawOff() const { return mActAppliedYawOff; }
+    s16 getActDrawnPitch() const { return mActAppliedPitch; }
     /// The hand-model material the puppet is showing on hand i (0 left, 1 right), or 0xFE for the
     /// body's own hand. Resolved back from the shape pointer, which is what is drawn.
     u8 getDrawnHand(int i_hand) const;
@@ -277,6 +293,14 @@ private:
         J3DAnmTransform* i_current, bool* o_reloaded);
     /// Action override: the root-motion overwrite, from the joint-0 callback (inside calc).
     void applyActionRoot();
+    /// Action override, block (4): install / seat / clear the slot-1 blend. Called every tick from
+    /// selectActionAnimation() after slot 0 is installed and seated.
+    void selectActionSlot1();
+    /// Drop slot 1 from the packs and restore slot 0's full weight.
+    void clearActionSlot1();
+    /// Forget what the slot-1 heaps hold: a slot-0 load can overwrite their regions of the shared
+    /// buffer.
+    void invalidateActionSlot1();
     /// Refresh the floor colour and room the puppet is lit by. Must run every tick.
     void groundCheck();
     void setRoomInfo();
@@ -1132,6 +1156,33 @@ private:
     u8* mpActBas;
     bool mActBasValid;
     bool mLoggedActSound;
+
+    /* --- Block (4): action slot 1 / swim. See selectActionSlot1() in the .cpp. Slot 1 loads into
+     * mActUnderHeap[1] / mActUpperHeap[1], daAlink_c's own slot-1 geometry. */
+    /// The animations loaded in mActUnderHeap[1] / mActUpperHeap[1]; invalid once that heap or
+    /// the slot-0 heaps (which can overlap them) reload.
+    J3DAnmTransform* mpActUnder1Bck;
+    J3DAnmTransform* mpActUpper1Bck;
+    /// The slot-1 ids installed in the packs (0xFFFF none), and a pair that failed to load.
+    u16 mActShownUnder1;
+    u16 mActShownUpper1;
+    u16 mActFailedUnder1;
+    u16 mActFailedUpper1;
+    u16 mNetActUnder1;
+    u16 mNetActUpper1;
+    f32 mNetActPhase1;
+    f32 mNetActRatio1;
+    s16 mNetActRootRotX;
+    s16 mNetActRootRotZ;
+    s16 mNetActYawOff;
+    s16 mNetActPitch;
+    /// What applyActionRoot() and setMatrix() last applied, for the trace.
+    s16 mActAppliedRootRotX;
+    s16 mActAppliedRootRotZ;
+    s16 mActAppliedYawOff;
+    s16 mActAppliedPitch;
+    bool mLoggedActSlot1;
+    bool mLoggedActRootRot;
 };
 
 /**
