@@ -1,4 +1,5 @@
 #include "dusk/autosave.h"
+#include "dusk/logging.h"
 #include "dusk/multiplayer/session/save_guard.hpp"
 
 #include "dusk/ui/ui.hpp"
@@ -13,6 +14,62 @@ bool shouldAutoSave = false;
 u8 mSaveBuffer[QUEST_LOG_SIZE * 3];
 u8 mAutoSaveProc = 0;
 int autoSaveWriteState = 0;
+
+// Autosave failures used to be silent: a failed write just reset the state machine, and a card in
+// an error state turned autosave off for the rest of the session with nothing on screen, so the
+// player went on believing they were saving. Each condition is reported once per session, and the
+// latches clear when a later autosave succeeds.
+static bool sToastedWriteFailed = false;
+static bool sToastedCardError = false;
+static bool sLoggedNoFile = false;
+
+static void reportAutoSaveWriteFailed() {
+    // A write refused by the multiplayer save guard (guest session, or another Dusklight holds this
+    // data directory) is refused by design, and refuse_card_write() has already told the player
+    // why. Every other failure, including save() refusing because the card thread was busy, is a
+    // real lost save.
+    if (dusk::mp::saving_disabled()) {
+        DuskLog.info("Autosave: write refused by the save guard; no failure notice shown");
+        return;
+    }
+
+    DuskLog.warn("Autosave: write FAILED (SaveSync=2); progress was not saved");
+    if (sToastedWriteFailed) {
+        return;
+    }
+    sToastedWriteFailed = true;
+    dusk::ui::push_toast({
+        .type = "warning",
+        .title = "Autosave failed",
+        .content = "Your progress was not saved. Try saving manually.",
+        .duration = std::chrono::seconds(8),
+    });
+}
+
+static void reportAutoSaveCardError(u32 cardStatus) {
+    // Status 1 is "no save file yet" (a new game never saved from the menu): autosave has nothing
+    // to write into, which is the game's normal behaviour rather than a card fault.
+    if (cardStatus == 1) {
+        if (!sLoggedNoFile) {
+            sLoggedNoFile = true;
+            DuskLog.info("Autosave: skipped, no save file exists on the card yet");
+        }
+        return;
+    }
+
+    if (sToastedCardError) {
+        return;
+    }
+    sToastedCardError = true;
+    DuskLog.warn("Autosave: skipped, memory card is in an error state (status {}); autosave is off",
+        cardStatus);
+    dusk::ui::push_toast({
+        .type = "warning",
+        .title = "Autosave is off",
+        .content = "The memory card reported an error. Try saving manually.",
+        .duration = std::chrono::seconds(8),
+    });
+}
 
 typedef void (*AutoSaveFuncs)();
 static AutoSaveFuncs AutoSaveFuncsProc[] = {
@@ -109,6 +166,7 @@ void enterAutoSave() {
         case 5:
             break;
         default:
+            reportAutoSaveCardError(cardStatus);
             mAutoSaveProc = 0;
             break;
         }
@@ -119,6 +177,7 @@ void waitingForWrite() {
     autoSaveWriteState = g_mDoMemCd_control.SaveSync();
 
     if (autoSaveWriteState == 2) {
+        reportAutoSaveWriteFailed();
         mAutoSaveProc = 0;
     } else if (autoSaveWriteState == 1) {
         mAutoSaveProc = 4;
@@ -128,6 +187,10 @@ void waitingForWrite() {
 void endAutoSave() {
     const int slot = dComIfGs_getDataNum();
     dusk::mods::svc::save_slot_written(slot);
+
+    // A save went through, so a later failure is news again.
+    sToastedWriteFailed = false;
+    sToastedCardError = false;
 
     dusk::ui::push_toast({
         .type = "autosave",
