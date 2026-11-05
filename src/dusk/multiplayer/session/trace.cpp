@@ -25,6 +25,15 @@ long long elapsed_ms() {
         .count();
 }
 
+/// The raw steady clock in milliseconds. It is machine-wide (QueryPerformanceCounter on Windows,
+/// CLOCK_MONOTONIC elsewhere), so two instances on one PC line up exactly by it. `ms` alone starts
+/// at each process's own trace open, which left the analyzers guessing the offset.
+long long abs_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
     const PlayerState& state, double delayTicks, std::uint32_t starvations, std::uint32_t snaps,
     std::size_t buffered, unsigned anm = 0, const DrawnJointAim& drawn = DrawnJointAim{},
@@ -46,7 +55,7 @@ void write_row(std::uint64_t tick, const char* kind, std::uint32_t playerId,
           << static_cast<unsigned>(state.actMorf) << ',' << static_cast<unsigned>(state.actHandL)
           << ',' << static_cast<unsigned>(state.actHandR) << ',' << state.act_root_x() << ','
           << state.act_root_y() << ',' << state.act_root_z() << ',' << rootWX << ',' << rootWY
-          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << '\n';
+          << ',' << rootWZ << ',' << static_cast<unsigned>(state.gear) << ',' << abs_ms() << '\n';
 }
 
 }  // namespace
@@ -69,7 +78,7 @@ void open(const std::string& path, const char* role) {
              "headYawRel,headPitch,torsoYawRel,fireJ1,fireJ2,fireJ4,aimClamps,"
              // block (2): action anim. actUnder/actUpper 65535 = no override / follows under.
              "actUnder,actUpper,actFrame,actUpperFrame,actRate,actMorf,actHandL,actHandR,"
-             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear\n";
+             "rootTX,rootTY,rootTZ,rootWX,rootWY,rootWZ,gear,absMs\n";
     Log.info("Tracing poses to '{}'", path);
 }
 

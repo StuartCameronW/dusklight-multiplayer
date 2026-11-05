@@ -986,8 +986,34 @@ bool world_is_playable() {
            fopAcM_SearchByName(fpcNm_TITLE_e) == NULL;
 }
 
+/**
+ * An event Link starts on himself and plays out in place: drinking from a bottle, pouring lantern
+ * oil, the grass whistle, catching the boomerang (~23 procs). Each calls event_compulsory() and
+ * setSpecialDemoType(), so world_is_playable() reads false, yet he is standing in the room
+ * animating. Without this the far end froze on the first frame of the drink for ~3.6 s.
+ *
+ * DEMO_TYPE_SPECIAL_e is the game's own label for that case (set by those procs' Init). A queued
+ * scene change (death, lava return, warp) cuts it off before the load starts.
+ *
+ * Capture only: puppet spawning, name tags and the receive side still use world_is_playable().
+ */
+bool link_acting_in_place() {
+    if (dComIfGp_getPlayer(0) == nullptr || fopAcM_SearchByName(fpcNm_TITLE_e) != NULL ||
+        dComIfGp_isEnableNextStage())
+    {
+        return false;
+    }
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    return alink != nullptr && alink->mDemo.getDemoType() == daPy_demo_c::DEMO_TYPE_SPECIAL_e;
+}
+
+/// The gate for reading Link's pose: in play, or acting in place during his own event.
+bool local_pose_is_live() {
+    return world_is_playable() || link_acting_in_place();
+}
+
 bool capture_local_player(PlayerState& out) {
-    if (!world_is_playable()) {
+    if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
         // rather than to the player. See world_is_playable().
         return false;
@@ -1382,7 +1408,7 @@ bool read_local_joint_aim(DrawnJointAim& out) {
     out = DrawnJointAim{};
     out.clamps = s_jointAimClamps;
     daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (alink == nullptr || !world_is_playable()) {
+    if (alink == nullptr || !local_pose_is_live()) {
         return false;
     }
     measure_joint_aim(alink->mpLinkModel, alink->shape_angle.y, out);
@@ -1405,7 +1431,7 @@ bool read_puppet_joint_aim(std::uint32_t playerId, DrawnJointAim& out) {
 bool read_local_anim(std::uint16_t& out) {
     out = 0;
     const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (alink == nullptr || !world_is_playable() || !alink->mUnderAnmHeap[0].checkNoSetArcNo()) {
+    if (alink == nullptr || !local_pose_is_live() || !alink->mUnderAnmHeap[0].checkNoSetArcNo()) {
         return false;
     }
     out = alink->mUnderAnmHeap[0].getIdx();
@@ -1415,7 +1441,7 @@ bool read_local_anim(std::uint16_t& out) {
 bool read_local_root(float& x, float& y, float& z) {
     x = y = z = 0.0f;
     const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
-    if (alink == nullptr || !world_is_playable() || alink->mpLinkModel == nullptr) {
+    if (alink == nullptr || !local_pose_is_live() || alink->mpLinkModel == nullptr) {
         return false;
     }
     MtxP root = alink->mpLinkModel->getAnmMtx(0);

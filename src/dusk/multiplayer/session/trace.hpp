@@ -38,8 +38,9 @@
  * puppet's joint-aim callback arms (actor rows only), `aimClamps` the sender's wire-range clamps
  * (local rows only).
  *
- * `gear` is the PlayerGearFlags byte, last column (bit 0 = iron boots on): as sent on `local`, as
- * pushed on `applied`, and as the puppet holds it on `actor`.
+ * `gear` is the PlayerGearFlags byte (bit 0 = iron boots on): as sent on `local`, as pushed on
+ * `applied`, and as the puppet holds it on `actor`. `absMs`, the last column, is the raw steady
+ * clock: machine-wide, so two instances on one PC align exactly by it (absMs - ms is constant).
  */
 
 namespace dusk::mp::trace {
