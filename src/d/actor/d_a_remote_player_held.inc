@@ -156,10 +156,10 @@ bool held_is_clawshot(u8 i_kind) {
 
 }  // namespace
 
-/* The wire's PlayerHeldItem values index mpHeldModel, which the header sizes as a bare 9 for the
+/* The wire's PlayerHeldItem values index mpHeldModel, which the header sizes as a bare 10 for the
  * same reason mpSwordModel is a bare 3. STATIC_ASSERT is a no-op off the GC target (see the shield
  * one); held_kind() is the real guard. */
-STATIC_ASSERT(dusk::mp::kPlayerHeldKindNum == 9);
+STATIC_ASSERT(dusk::mp::kPlayerHeldKindNum == 10);
 
 /**
  * Build every handheld item model the puppet might need, once, at createHeap time. Called LAST in
@@ -303,6 +303,9 @@ void daRemotePlayer_c::setupHeldItems() {
             init_model_env(static_cast<J3DModelData*>(own_archive_res(mOwnRes, "al_kantera.bmd")),
                 0, "held lantern");
     }
+
+    // The iron ball, its chain data and its carry gait (d_a_remote_player_ironball.inc).
+    mpHeldModel[dusk::mp::kPlayerHeldIronBall] = setupIronBall();
 
     int built = 0;
     for (int i = 1; i < dusk::mp::kPlayerHeldKindNum; i++) {
@@ -457,6 +460,10 @@ void daRemotePlayer_c::setHeldItemMatrix() {
             mDoMtx_stack_c::XYZrotM(cM_deg2s(-4.0f), cM_deg2s(39.0f), cM_deg2s(-9.0f));
             held->setBaseTRMtx(mDoMtx_stack_c::get());
             break;
+        case dusk::mp::kPlayerHeldIronBall:
+            // setIronBallPos (:6070-6071), d_a_remote_player_ironball.inc.
+            setIronBallMatrix(held);
+            break;
         default:
             // The horse call: the default branch, plain left item joint (:6080).
             held->setBaseTRMtx(model->getAnmMtx(l_leftItemJointNo));
@@ -566,7 +573,10 @@ void daRemotePlayer_c::addHeldItemShadow() {
         return;
     }
     const u8 kind = mHeldDrawnKind;
-    if (kind != dusk::mp::kPlayerHeldNone) {
+    // The ball only while it is in his hands; out of them it has its own shadow (drawIronBall).
+    if (kind != dusk::mp::kPlayerHeldNone &&
+        (kind != dusk::mp::kPlayerHeldIronBall || ironBallInHands()))
+    {
         dComIfGd_addRealShadow(mShadowKey, mpHeldModel[kind]);
         if (held_is_clawshot(kind)) {
             dComIfGd_addRealShadow(mShadowKey, mpHeldClawTip[0]);

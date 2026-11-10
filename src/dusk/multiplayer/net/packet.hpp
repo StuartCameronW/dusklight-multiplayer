@@ -122,6 +122,12 @@ namespace dusk::mp {
  * re-sends the fingerprint when it changes mid-session (a save loaded, a mod toggled) so the host
  * can re-check an admitted guest; a v17 peer would log it as an unknown id and never re-check.
  */
+/*
+ * 19 (block B, iron ball): PlayerState grew 12 bytes in a block of its own: the ball's chain end
+ * relative to the sender (3 x s16 at 1/4 unit), its model rotation (2 x s16), the paid-out link
+ * count and the throw state (u8 each). heldItem gained kPlayerHeldIronBall = 9 and gear bit 2 is
+ * kPlayerGearIronBallGait, the carry gait read off his slot 1. A v18 peer's read() would under-run.
+ */
 inline constexpr std::uint32_t kProtocolVersion = 18;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.

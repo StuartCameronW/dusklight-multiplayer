@@ -506,6 +506,12 @@ void fill_gear(daAlink_c* alink, PlayerState& out) {
     {
         out.gear |= kPlayerGearHeavyGait;
     }
+    // Bit 2, the iron-ball carry gait: the same read on the same slot. See kPlayerGearIronBallGait.
+    if (alink != nullptr && !alink->checkWolf() &&
+        alink->checkUnderMove1BckNoArc(daAlink_c::ANM_IRONBALL_WALK))
+    {
+        out.gear |= kPlayerGearIronBallGait;
+    }
 }
 
 /* --- D3b: the attention (Z-target / lock-on) move set. ---------------------------------------- */
@@ -1092,6 +1098,88 @@ void fill_loc_phase(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+// v19 block B: iron ball
+/**
+ * Fill the iron-ball block: where his ball is, read off the members setIronBallPos has just written
+ * this tick (d_a_alink_ironball.inc:465-810), never re-simulated. Gated on heldItem, i.e. on the
+ * very checkItemDraw() that decides whether his ball and chain are drawn at all.
+ *
+ *   - the position is mIronBallChainPos[0], the ball's chain end and its model's origin
+ *     (setBaseTRMtx at :768-770), relative to the position this same sample carries;
+ *   - the rotation is mIronBallChainAngle[0], the ZXY rotation that matrix is built from;
+ *   - the link count is mItemMode, and the state mItemVar0.field_0x3018, whose values
+ *     setIronBallPos and setIronBallChainPos branch on.
+ *
+ * The chain links themselves are not sent: the receiver runs setIronBallChainPos's own relaxation
+ * between its hand and this ball, as he does between his. In state 0 (carried) the receiver also
+ * places the ball off its own left item joint, as he does, and the position is only a fallback.
+ *
+ * Idempotent within a tick (capture runs twice per tick, see fill_action_anim): the statics only
+ * gate logging.
+ */
+void fill_iron_ball(daAlink_c* alink, PlayerState& out) {
+    out.ironBallX = 0;
+    out.ironBallY = 0;
+    out.ironBallZ = 0;
+    out.ironBallAngX = 0;
+    out.ironBallAngY = 0;
+    out.ironBallLinks = 0;
+    out.ironBallState = 0;
+
+    static std::uint8_t s_lastState = 0xFF;
+    static std::uint16_t s_stateLogCount = 0;
+    static bool s_loggedClamp = false;
+
+    if (alink == nullptr || out.heldItem != kPlayerHeldIronBall ||
+        alink->mIronBallChainPos == nullptr || alink->mIronBallChainAngle == nullptr)
+    {
+        s_lastState = 0xFF;
+        return;
+    }
+
+    const cXyz& ball = alink->mIronBallChainPos[0];
+    const float relX = ball.x - out.posX;
+    const float relY = ball.y - out.posY;
+    const float relZ = ball.z - out.posZ;
+    out.ironBallX = act_encode_s16(relX, kPlayerIronBallPosScale);
+    out.ironBallY = act_encode_s16(relY, kPlayerIronBallPosScale);
+    out.ironBallZ = act_encode_s16(relZ, kPlayerIronBallPosScale);
+    const float reach = 32767.0f / kPlayerIronBallPosScale;
+    if (!s_loggedClamp &&
+        (std::fabs(relX) > reach || std::fabs(relY) > reach || std::fabs(relZ) > reach))
+    {
+        s_loggedClamp = true;
+        Log.warn("Local iron ball is ({:.0f}, {:.0f}, {:.0f}) from Link, past the wire's +-{:.0f}; "
+                 "sent clamped (logged once)",
+            relX, relY, relZ, reach);
+    }
+    out.ironBallAngX = alink->mIronBallChainAngle[0].x;
+    out.ironBallAngY = alink->mIronBallChainAngle[0].y;
+
+    const s16 links = alink->mItemMode;
+    out.ironBallLinks = static_cast<std::uint8_t>(links < 0 ? 0 : (links > 255 ? 255 : links));
+    out.ironBallState =
+        static_cast<std::uint8_t>(alink->mItemVar0.field_0x3018 & kPlayerIronBallStateMask);
+    if (alink->mProcID == daAlink_c::PROC_IRON_BALL_SUBJECT ||
+        alink->mProcID == daAlink_c::PROC_IRON_BALL_MOVE)
+    {
+        out.ironBallState |= kPlayerIronBallJointRot;
+    }
+
+    if (out.ironBallState != s_lastState) {
+        if (s_stateLogCount < 100) {
+            s_stateLogCount++;
+            Log.debug("Local iron ball state 0x{:02x} -> 0x{:02x}: {} links, ball ({:.1f}, {:.1f}, "
+                      "{:.1f}) from Link, rot ({}, {}), proc 0x{:X}",
+                static_cast<unsigned>(s_lastState), static_cast<unsigned>(out.ironBallState),
+                static_cast<unsigned>(out.ironBallLinks), relX, relY, relZ,
+                static_cast<int>(out.ironBallAngX), static_cast<int>(out.ironBallAngY),
+                static_cast<unsigned>(alink->mProcID));
+        }
+        s_lastState = out.ironBallState;
+    }
+}
+
 // block (3): held item
 /**
  * Fill block (3): the item model Link is DRAWING in his hands, and the UPPER_2 overlay posing his
@@ -1199,8 +1287,12 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
             }
         } else if (item == dItemNo_HORSE_FLUTE_e) {
             out.heldItem = kPlayerHeldHorseCall;
+        } else if (item == dItemNo_IRONBALL_e) {
+            // The ball AND its chain are drawn under this same checkItemDraw() (d_a_alink.cpp:
+            // 19771, :19793-19798). Where it is: fill_iron_ball().
+            out.heldItem = kPlayerHeldIronBall;
         }
-        // Anything else (iron ball, grass whistle, wolf change, fishing) is not reproduced.
+        // Anything else (grass whistle, wolf change, fishing) is not reproduced.
     }
 
     if (item == dItemNo_BOOMERANG_e) {
@@ -1547,6 +1639,8 @@ bool capture_local_player(PlayerState& out) {
     fill_loc_phase(alink, out);
     // block (3): held item
     fill_held_item(alink, out);
+    // v19 block B: iron ball. After the held item, whose kind it is gated on.
+    fill_iron_ball(alink, out);
     // v16: location
     fill_location(link, out);
 
@@ -1740,6 +1834,10 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkUpperGuard(state.upper_guard());
     puppet->setNetworkHeavyBoots(state.heavy_boots());
     puppet->setNetworkHeavyGait(state.heavy_gait());
+    // v19 block B: iron ball. The carry gait and where the ball is, decoded here.
+    puppet->setNetworkIronBall(state.iron_ball_gait(),
+        cXyz(state.iron_ball_x(), state.iron_ball_y(), state.iron_ball_z()), state.ironBallAngX,
+        state.ironBallAngY, state.ironBallLinks, state.ironBallState);
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.
@@ -1793,6 +1891,9 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     // Read back off the puppet, so the trace's `gear` column is the both-ends check for the bit.
     out.gear = (puppet->getNetHeavyBoots() ? kPlayerGearHeavyBoots : 0) |
                (puppet->getNetHeavyGait() ? kPlayerGearHeavyGait : 0);
+    if (puppet->getNetIronBallGait()) {
+        out.gear |= kPlayerGearIronBallGait;
+    }
     // The joint aim values the puppet's callbacks are drawing from this tick, read back off it.
     out.neckX = puppet->getNetNeckX();
     out.neckY = puppet->getNetNeckY();
