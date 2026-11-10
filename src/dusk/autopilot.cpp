@@ -18,6 +18,7 @@
 #include "d/d_meter2_info.h"
 #include "dusk/logging.h"
 #include "dusk/mods/item.hpp"
+#include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 #include "dusk/settings.h"
 #include "f_op/f_op_actor_mng.h"
@@ -71,6 +72,7 @@ enum class Op {
     Nearest,
     TalkNear,
     GetItem,
+    ObjTest,
     Transform,
 };
 
@@ -593,6 +595,14 @@ bool settle_program_counter() {
             request_quit();
             return false;
 
+        case Op::ObjTest:
+            if (!dusk::mp::objects::start_debug_object(command.frames)) {
+                Log.error("[{}] line {}: objtest: no debug object (no session, or no Link)", sTicks,
+                    command.line);
+            }
+            sPc++;
+            continue;
+
         case Op::Nearest:
             run_nearest(command);
             sPc++;
@@ -786,6 +796,13 @@ void load_script(const std::filesystem::path& path) {
             // "getitem 0x01": the real item-get event for that item (dItemNo_*). See run_getitem.
             command.op = Op::GetItem;
             ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
+        } else if (verb == "OBJTEST") {
+            // "objtest 300": the object channel's phase-0 debug object. One transient spawned 150
+            // units in front of Link orbits him for that many ticks, streamed to the other end,
+            // then despawns. Instant: the script goes on at once, so a `stick` line right after it
+            // tests a moving owner. Logs are "[mp-obj] ..." on both ends.
+            command.op = Op::ObjTest;
+            ok = parse_int(a, command.frames) && command.frames > 1;
         } else if (verb == "TRANSFORM") {
             // "transform [timeout]": human <-> wolf through the game's own request flag, falling
             // back to procCoMetamorphoseInit after the timeout (default 60). See the tick() case.

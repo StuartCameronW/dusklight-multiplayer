@@ -1,0 +1,87 @@
+#ifndef D_A_MP_GHOST_H
+#define D_A_MP_GHOST_H
+
+#include "f_op/f_op_actor.h"
+#include "m_Do/m_Do_ext.h"
+
+class J3DModel;
+
+/**
+ * Dusk-only actor (fpcNm_MP_GHOST_e, 0x319): the receiver's picture of ONE replicated object that
+ * another player's machine simulates — an arrow in flight, a bomb, the boomerang, the Dominion Rod
+ * ball. Spec: .claude/future-plans/mp-object-channel.md §2.
+ *
+ * ★ Never the game's own actor. Every player projectile reads the LOCAL Link each tick (the arrow
+ * re-aims from the local camera, the bomb's destructor decrements the local bomb count, the
+ * boomerang changes the local equipment), and enemies find the boomerang BY NAME
+ * (fopAcM_SearchByName(fpcNm_BOOMERANG_e)). So a ghost has its own procname, draws the game's own
+ * model out of the resident "Alink" archive, and has no AT, TG or CO (friendly fire may add an AT
+ * later, group 0x4 only, spec §3).
+ *
+ * The object channel (src/dusk/multiplayer/replication/object_channel.cpp) owns its lifetime and
+ * pushes a pose every tick through setNetworkState(); the ghost itself decides nothing.
+ *
+ * One class, a per-kind switch in createHeap / execute / draw / onNetworkEvent. Phase-1 kinds each
+ * add one `d_a_mp_ghost_<kind>.inc`, included at the end of d_a_mp_ghost.cpp, plus their own
+ * member block at the end of this class.
+ *
+ * Create parameter: bits 0-7 the kind byte (object_kinds.hpp ObjKind), bits 8-15 the authority's
+ * player id (low byte).
+ */
+class daMpGhost_c : public fopAc_ac_c {
+public:
+    /// Longest kind blob a ghost keeps (object_kinds.hpp kMaxKindBlob).
+    static const int BLOB_MAX = 48;
+
+    daMpGhost_c();
+    ~daMpGhost_c();
+
+    int create();
+    int createHeap();
+    int execute();
+    int draw();
+
+    /// One played-back sample from the channel. Also sets the model matrix immediately, so the
+    /// pose is drawn this frame whichever side of the actor pass the channel ran on.
+    void setNetworkState(const cXyz& i_pos, const csXyz& i_angle, u8 i_flags, bool i_visible,
+        const u8* i_blob, u8 i_blobLen);
+    /// A reliable event (ObjEventId) reached on the authority's timeline.
+    void onNetworkEvent(u8 i_event, const u8* i_blob, u8 i_blobLen);
+
+    /// The end of create() was reached. The ONLY trustworthy "creation succeeded" signal: a create
+    /// that returned cPhs_ERROR_e can still be found by fopAcM_SearchByID for a tick (measured on
+    /// the puppet, player_bridge.cpp look_up_puppet).
+    bool createComplete() const { return mCreateComplete; }
+    u8 getKind() const { return mKind; }
+    u8 getAuthority() const { return mAuthority; }
+
+    static u32 makeParam(u8 i_kind, u8 i_authority) {
+        return static_cast<u32>(i_kind) | (static_cast<u32>(i_authority) << 8);
+    }
+
+private:
+    void updateMatrix();
+
+    /* Debug kind (0x7F): the arrow model, nothing else. */
+    int createHeapDebug();
+    void executeDebug();
+    int drawDebug();
+
+    /// The kind's main model, in this actor's own solid heap. NULL for a kind that draws nothing.
+    J3DModel* mpModel;
+    u8 mKind;
+    u8 mAuthority;
+    /// Last flags byte pushed (kind bits 0-5, kObjPoseHidden).
+    u8 mNetFlags;
+    bool mVisible;
+    bool mHasPose;
+    bool mCreateComplete;
+    u8 mBlobLen;
+    u8 mBlob[BLOB_MAX];
+    u32 mExecuteCount;
+    u32 mEventCount;
+
+    /* --- per-kind member blocks: one per phase-1 .inc, appended below. --- */
+};
+
+#endif /* D_A_MP_GHOST_H */

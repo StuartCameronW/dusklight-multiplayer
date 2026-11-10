@@ -18,7 +18,8 @@
  * mirroring PROCS_NOT_WII above.
  */
 #define PROCS_DUSK \
-/* 0x318 */ X(fpcNm_REMOTE_PLAYER_e)
+/* 0x318 */ X(fpcNm_REMOTE_PLAYER_e) \
+/* 0x319 */ X(fpcNm_MP_GHOST_e)
 #else
 #define PROCS_DUSK
 #endif
