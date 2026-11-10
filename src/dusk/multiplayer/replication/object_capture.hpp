@@ -34,4 +34,10 @@ void reset_boomerang();
 void tick_rodball();
 void reset_rodball();
 
+/* --- batch 7: drops --- */
+/// Pickups dropped by something this machine broke (ObjKind::Drop), and the local copies of the
+/// partners' ones. object_capture_drop.cpp; design in object_drops.hpp.
+void tick_drop();
+void reset_drop();
+
 }  // namespace dusk::mp::objects::capture

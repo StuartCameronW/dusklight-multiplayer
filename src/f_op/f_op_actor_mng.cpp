@@ -28,6 +28,9 @@
 #include "f_op/f_op_scene_mng.h"
 #include "m_Do/m_Do_lib.h"
 #include <cstring>
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"
+#endif
 
 #define MAKE_ITEM_PARAMS(itemNo, itemBitNo, param_2, param_3)                                      \
     ((itemNo & 0xFF) << 0x0 | (itemBitNo & 0xFF) << 0x8 | (param_2 & 0xFF) << 0x10 | (param_3 & 0xF) << 0x18)
@@ -1524,8 +1527,19 @@ fpc_ProcID fopAcM_createItemFromEnemyID(u8 i_enemyID, cXyz const* i_pos, int i_i
         return fopAcM_GetID(actor);
     }
 
+#if TARGET_PC
+    // Dusk (multiplayer batch 7): an enemy's kill drop stays this player's own until the enemies
+    // themselves are shared (M6), or it would pop out of an enemy still alive on the partner's end.
+    dusk::mp::drops_enemy_scope(true);
+    const fpc_ProcID duskItemId = fopAcM_createItemFromTable(i_pos, tableNo, i_itemBitNo, i_roomNo,
+                                                             i_angle, 0, i_scale, i_speedF, i_speedY,
+                                                             false);
+    dusk::mp::drops_enemy_scope(false);
+    return duskItemId;
+#else
     return fopAcM_createItemFromTable(i_pos, tableNo, i_itemBitNo, i_roomNo, i_angle, 0, i_scale,
                                       i_speedF, i_speedY, false);
+#endif
 }
 
 fpc_ProcID fopAcM_createItemFromTable(cXyz const* i_pos, int i_itemNo, int i_itemBitNo,
@@ -1720,11 +1734,22 @@ fpc_ProcID fopAcM_createItem(const cXyz* i_pos, int i_itemNo, int i_itemBitNo, i
         break;
     case dItemNo_TRIPLE_HEART_e:
         for (i = 0; i < 2; i++) {
+#if TARGET_PC
+            // Dusk (multiplayer batch 7): a run-time drop, which may be shared.
+            dusk::mp::drops_note_created(
+                fopAcM_create(fpcNm_ITEM_e, params, i_pos, i_roomNo, &item_angle, i_scale, -1));
+#else
             fopAcM_create(fpcNm_ITEM_e, params, i_pos, i_roomNo, &item_angle, i_scale, -1);
+#endif
             item_angle.y = cM_rndFX(0x7FFF);
         }
     default:
         ret = fopAcM_create(fpcNm_ITEM_e, params, i_pos, i_roomNo, &item_angle, i_scale, -1);
+#if TARGET_PC
+        // Dusk (multiplayer batch 7): a run-time drop (a pot, grass, a rock...), which may be
+        // shared with the other players; a stage-placed item never comes through here.
+        dusk::mp::drops_note_created(ret);
+#endif
         break;
     }
 
@@ -1789,11 +1814,19 @@ fopAc_ac_c* fopAcM_fastCreateItem2(const cXyz* i_pos, int i_itemNo, int i_itemBi
         for (i = 0; i < 2; i++) {
             ret = fopAcM_fastCreate(fpcNm_ITEM_e, params, i_pos, i_roomNo, &item_angle, i_scale, -1,
                                     NULL, NULL);
+#if TARGET_PC
+            // Dusk (multiplayer batch 7): a run-time drop, which may be shared.
+            dusk::mp::drops_note_created(ret != NULL ? fopAcM_GetID(ret) : fpcM_ERROR_PROCESS_ID_e);
+#endif
             item_angle.y = cM_rndFX(0x7FFF);
         }
     default:
         ret = fopAcM_fastCreate(fpcNm_ITEM_e, params, i_pos, i_roomNo, &item_angle, i_scale, -1, NULL,
                                 NULL);
+#if TARGET_PC
+        // Dusk (multiplayer batch 7): a run-time drop, which may be shared.
+        dusk::mp::drops_note_created(ret != NULL ? fopAcM_GetID(ret) : fpcM_ERROR_PROCESS_ID_e);
+#endif
     }
     return ret;
 }
@@ -1862,6 +1895,10 @@ fopAc_ac_c* fopAcM_fastCreateItem(const cXyz* i_pos, int i_itemNo, int i_roomNo,
 
             ret = (fopAc_ac_c*)fopAcM_fastCreate(
                 fpcNm_ITEM_e, params, i_pos, i_roomNo, &angle, i_scale, -1, i_createFunc, NULL);
+#if TARGET_PC
+            // Dusk (multiplayer batch 7): a run-time drop, which may be shared.
+            dusk::mp::drops_note_created(ret != NULL ? fopAcM_GetID(ret) : fpcM_ERROR_PROCESS_ID_e);
+#endif
 
             if (ret != NULL) {
                 if (i_speedF != NULL) {
@@ -1883,6 +1920,11 @@ fopAc_ac_c* fopAcM_fastCreateItem(const cXyz* i_pos, int i_itemNo, int i_roomNo,
 
         ret = fopAcM_fastCreate(fpcNm_ITEM_e, params, i_pos, i_roomNo,
                                                            &angle, i_scale, -1, i_createFunc, NULL);
+#if TARGET_PC
+        // Dusk (multiplayer batch 7): a run-time drop (enemy tables, bosses, bombs...), which may
+        // be shared; the item-for-direct-get callers are filtered out by type later.
+        dusk::mp::drops_note_created(ret != NULL ? fopAcM_GetID(ret) : fpcM_ERROR_PROCESS_ID_e);
+#endif
 
         if (ret != NULL) {
             if (i_speedF != NULL) {

@@ -1721,6 +1721,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/object_capture_bomb.cpp
         src/dusk/multiplayer/replication/object_capture_boom.cpp
         src/dusk/multiplayer/replication/object_capture_crod.cpp
+        src/dusk/multiplayer/replication/object_capture_drop.cpp
+        src/dusk/multiplayer/replication/object_drops.hpp
         src/dusk/multiplayer/replication/object_capture.hpp
         src/dusk/multiplayer/replication/object_channel.hpp
         src/dusk/multiplayer/replication/object_kinds.hpp

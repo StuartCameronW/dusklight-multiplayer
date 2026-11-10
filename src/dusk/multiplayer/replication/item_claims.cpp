@@ -10,6 +10,7 @@
 #include "dusk/logging.h"
 #include "dusk/multiplayer.hpp"
 #include "fmt/format.h"
+#include "object_drops.hpp"  // batch 7: drops
 #include "world_bridge.hpp"
 
 /**
@@ -41,6 +42,9 @@ ClaimTarget target_of(std::uint32_t key) {
 
 /// "tbox 0/60" or "item 0/0x9E" (the item as the save bit scripts and onItem use).
 std::string describe(const ClaimTarget& t) {
+    if (t.kind == ClaimKind::Drop) {
+        return fmt::format("drop T{}:{}", static_cast<int>(t.tbl), static_cast<int>(t.no));
+    }
     if (t.kind == ClaimKind::Item) {
         return fmt::format("item {}/0x{:02X}", static_cast<int>(t.tbl), kFirstSavedItemBit + t.no);
     }
@@ -58,7 +62,8 @@ bool is_host() {
 /// The bit as THIS machine's save has it: mMemory when the table is the live one (where the game
 /// writes it), mSave[tbl] otherwise (world sync writes both; see world_bridge apply_to_engine).
 bool bit_set_here(const ClaimTarget& t) {
-    if (dComIfGs_getSaveData() == nullptr) {
+    // A drop has no save bit: who has it is the host's dropGrants table alone.
+    if (t.kind == ClaimKind::Drop || dComIfGs_getSaveData() == nullptr) {
         return false;
     }
     dSv_info_c& in = g_dComIfG_gameInfo.info;
@@ -108,6 +113,10 @@ struct State {
     std::unordered_map<std::uint32_t, GuestEntry> guest;
     /// Last reason a Denied was returned for, per target (both roles), for last_reason().
     std::unordered_map<std::uint32_t, DenyReason> lastDenied;
+    /* --- batch 7: drops --- */
+    /// Host: drop key -> who it was granted to, and (in `expiry`) the tick it was granted at.
+    /// Final, never a lease.
+    std::unordered_map<std::uint32_t, Lease> dropGrants;
     std::uint32_t nextSerial = 1;
     std::uint64_t lastPruneTick = 0;
 };
@@ -129,6 +138,23 @@ ClaimState host_judge(const ClaimTarget& t, std::uint32_t player, DenyReason& re
     if (!active()) {
         reason = DenyReason::Invalid;
         return ClaimState::Denied;
+    }
+    /* --- batch 7: drops --- */
+    // Judged before the world check: a drop's fate is this table, not the host's save. Exactly
+    // one grant per drop, ever: that is what keeps a shared wallet from counting a rupee twice.
+    if (t.kind == ClaimKind::Drop) {
+        auto grant = s.dropGrants.find(key);
+        if (grant != s.dropGrants.end()) {
+            holder = grant->second.holder;
+            if (holder == player) {
+                return ClaimState::Granted;  // the same player asking again: still theirs
+            }
+            reason = DenyReason::AlreadySet;
+            return ClaimState::Denied;
+        }
+        s.dropGrants[key] = Lease{player, now};
+        objects::drops::host_on_granted(t.tbl, t.no, player);
+        return ClaimState::Granted;
     }
     if (!world_bridge::world_ready()) {
         // Title, file select or mid stage change: nothing reliable to judge against.
@@ -165,7 +191,9 @@ void host_log(const ClaimTarget& t, std::uint32_t player, ClaimState state, Deny
     const std::string who =
         player == kHostPlayerId ? std::string("host") : fmt::format("player {}", player);
     const std::string via = serial != 0 ? fmt::format(" serial={}", serial) : std::string(" local");
-    if (state == ClaimState::Granted) {
+    if (state == ClaimState::Granted && t.kind == ClaimKind::Drop) {
+        Log.info("[mp-claim] granted {} to {}{} (final) tick={}", describe(t), who, via, now_tick());
+    } else if (state == ClaimState::Granted) {
         Log.info("[mp-claim] granted {} to {}{} (lease {} ticks) tick={}", describe(t), who, via,
             kLeaseTicks, now_tick());
     } else if (reason == DenyReason::HeldByOther) {
@@ -291,7 +319,7 @@ void host_on_request(Reader& r, std::uint32_t fromPlayerId) {
     ClaimState verdict = ClaimState::Denied;
     DenyReason reason = DenyReason::Invalid;
     std::uint32_t holder = fromPlayerId;
-    if (kind > static_cast<std::uint8_t>(ClaimKind::Item) || !target_valid(t)) {
+    if (kind > static_cast<std::uint8_t>(ClaimKind::Drop) || !target_valid(t)) {
         Log.warn("[mp-claim] host: player {} asked for an invalid target kind={} tbl={} no={}; "
                  "denied",
             fromPlayerId, static_cast<int>(kind), static_cast<int>(tbl), static_cast<int>(no));
@@ -328,7 +356,7 @@ void guest_on_reply(Reader& r) {
     t.kind = static_cast<ClaimKind>(kind);
     t.tbl = tbl;
     t.no = no;
-    if (kind > static_cast<std::uint8_t>(ClaimKind::Item) || !target_valid(t) || granted > 1 ||
+    if (kind > static_cast<std::uint8_t>(ClaimKind::Drop) || !target_valid(t) || granted > 1 ||
         reasonByte > static_cast<std::uint8_t>(DenyReason::Timeout))
     {
         Log.warn("[mp-claim] ClaimReply out of range kind={} tbl={} no={} granted={} reason={}; "
@@ -389,6 +417,9 @@ void guest_on_reply(Reader& r) {
 // --- public --------------------------------------------------------------------------------------
 
 bool target_valid(const ClaimTarget& t) {
+    if (t.kind == ClaimKind::Drop) {
+        return t.no != 0;  // tbl is a player id; serial 0 is never handed out (object_channel.cpp)
+    }
     if (t.tbl >= kStageTables) {
         return false;
     }
@@ -397,6 +428,8 @@ bool target_valid(const ClaimTarget& t) {
         return t.no < kTboxBits;
     case ClaimKind::Item:
         return t.no < kItemBits;
+    case ClaimKind::Drop:
+        break;
     }
     return false;
 }
@@ -459,6 +492,15 @@ void tick() {
             return;
         }
         s.lastPruneTick = now;
+        /* --- batch 7: drops --- */
+        for (auto it = s.dropGrants.begin(); it != s.dropGrants.end();) {
+            if (now - it->second.expiry >= kDropGrantKeepTicks) {
+                s.hostLogged.erase(it->first);
+                it = s.dropGrants.erase(it);
+            } else {
+                ++it;
+            }
+        }
         for (auto it = s.leases.begin(); it != s.leases.end();) {
             const ClaimTarget t = target_of(it->first);
             const bool expired = now >= it->second.expiry;
@@ -516,6 +558,7 @@ void reset() {
     s.hostLogged.clear();
     s.guest.clear();
     s.lastDenied.clear();
+    s.dropGrants.clear();
     s.lastPruneTick = 0;
     // nextSerial keeps counting: a reply to a request from the previous session can never match.
 }
@@ -551,7 +594,15 @@ const char* reason_name(DenyReason r) {
 }
 
 const char* kind_name(ClaimKind k) {
-    return k == ClaimKind::Tbox ? "tbox" : "item";
+    switch (k) {
+    case ClaimKind::Tbox:
+        return "tbox";
+    case ClaimKind::Item:
+        return "item";
+    case ClaimKind::Drop:
+        return "drop";
+    }
+    return "?";
 }
 
 DenyReason last_reason(const ClaimTarget& t) {

@@ -170,6 +170,15 @@ void release_claim(const ObjRef& ref, std::uint32_t stageHash, std::int8_t room)
 /// Who holds `ref` as far as this end knows, or kNoClaim.
 std::uint32_t claim_holder(const ObjRef& ref);
 
+/* --- batch 7: drops --- */
+
+/// Receiver side: stop playing back the remote object `ref` and forget it at once (tombstoned, so
+/// a late state cannot bring it back; a late despawn is logged as unknown). For a drop whose local
+/// copy was just picked up or taken away: without this the channel would see its actor vanish and
+/// rebuild it. `destroyActor` false leaves the actor alone (it is already on its way out, e.g. in
+/// its pickup animation). No-op for an unknown ref.
+void forget_remote(const ObjRef& ref, bool destroyActor);
+
 /* ---- The engine seam. Declared here, implemented in src/d/actor/d_a_mp_ghost.cpp, the one
  * translation unit on this path that includes actor headers. Every function is safe with no
  * scene, no Link and no ghost. ---- */
@@ -204,6 +213,21 @@ void destroy_ghost(std::uint32_t procId);
 /// becomes playable, log every daObjCarry_c, daCstatue_c and horse with its (stage, room, setID,
 /// procname, home). Called from tick(); keeps its own edge state.
 void census_tick();
+
+/* --- batch 7: drops ---
+ * ObjKind::Drop has no ghost: the receiver's copy is a real daItem_c the local player can pick up.
+ * The channel calls these instead of create_ghost / look_up_ghost / apply_ghost for that kind
+ * (destroy_ghost is generic). Implemented in replication/object_capture_drop.cpp. */
+
+/// Create the local copy of a remote drop (a daItem_c in the local Link's room). `blob` is the
+/// played-back DropBlob. Returns the process id, or 0xFFFFFFFF.
+std::uint32_t create_drop(const ObjRef& ref, const ObjPose& pose, const KindBlob& blob);
+
+GhostLookup look_up_drop(std::uint32_t procId);
+
+/// Put the copy where the owner's drop is on the played-back timeline. Ignored once the local
+/// copy is being picked up or removed.
+void apply_drop(std::uint32_t procId, const ObjPose& pose, bool visible);
 
 }  // namespace engine
 

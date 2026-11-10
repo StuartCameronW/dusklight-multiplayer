@@ -31,6 +31,9 @@ enum class ObjKind : std::uint8_t {
     Explosion = 0x06,  ///< event-only: never streamed, never a ghost of its own
     Boomerang = 0x07,
     RodBall = 0x08,
+    /// Batch 7: a pickup that fell out of something broken (pot, grass, rock...). The receiver's
+    /// copy is a real daItem_c, not a ghost: object_capture_drop.cpp.
+    Drop = 0x09,
     Carry = 0x10,
     Statue = 0x11,
     Horse = 0x12,  ///< only if Q1 = one shared Epona
@@ -193,6 +196,10 @@ inline constexpr ObjKindInfo kObjKinds[] = {
     {ObjKind::Boomerang, "boomerang", 1, 15, 0xC0D0, true},
     // d_a_crod.cpp:81: the ball model + its BCK's J3DMtxCalc, which is all the ghost allocates too.
     {ObjKind::RodBall, "rodball", 1, 15, 0x10C0, true},
+    // Batch 7. No ghost heap: the receiver creates a real daItem_c (fpcNm_ITEM_e), which sizes its
+    // own heap. The forced sample keeps a copy whose last moving sample was lost from resting
+    // mid-bounce; at rest the owner freezes the yaw it reports, so a resting drop sends only that.
+    {ObjKind::Drop, "drop", 1, 15, 0, true},
     {ObjKind::Carry, "carry", 1, 15, 0, false},
     {ObjKind::Statue, "statue", 1, 15, 0, false},
     {ObjKind::Horse, "horse", 1, 15, 0, false},
@@ -235,6 +242,23 @@ inline bool read_debug_blob(Reader& r, DebugBlob& b) {
     return r.read_u16(b.age) && r.read_u16(b.lifetime);
 }
 
+/// Drop kind (0x09), batch 7. Spawn init blob and state blob share the layout: [u8 itemNo]
+/// [u8 reserved, 0]. itemNo is the owner's daItem_c::m_itemNo (dItemNo_*), the item the receiver's
+/// copy is created as.
+struct DropBlob {
+    std::uint8_t itemNo = 0;
+    std::uint8_t reserved = 0;
+};
+
+inline void write_drop_blob(Writer& w, const DropBlob& b) {
+    w.write_u8(b.itemNo);
+    w.write_u8(b.reserved);
+}
+
+inline bool read_drop_blob(Reader& r, DropBlob& b) {
+    return r.read_u8(b.itemNo) && r.read_u8(b.reserved);
+}
+
 /* --- events and despawn reasons (ObjEvent's u8 event, ObjDespawn's u8 reason) --------------- */
 
 enum class ObjEventId : std::uint8_t {
@@ -254,6 +278,7 @@ enum class ObjDespawnReason : std::uint8_t {
     Caught = 3,
     Exploded = 4,
     Released = 5,  ///< a Placed object's claim ended; receivers resume local simulation
+    PickedUp = 6,  ///< batch 7: a drop was picked up (by anyone: the claim decided who)
 };
 
 /// ObjClaim's u8 claimKind (and ObjClaimResult's). Release is a claim kind so one packet id
