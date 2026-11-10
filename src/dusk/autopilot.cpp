@@ -93,6 +93,11 @@ enum class Op {
     ExpectKeys,
     ExpectRupees,
     WaitEvent,
+    /* --- batch 6: arrows --- */
+    Seeds,
+    BombArrows,
+    Ammo,
+    FacePartner,
 };
 
 struct Command {
@@ -825,6 +830,96 @@ bool warp_must_wait_for_world_sync() {
     return true;
 }
 
+/* --- batch 6: arrows --- */
+
+/**
+ * The object-channel arrow test's setup and check verbs (mp-object-channel.md §6 phase 1):
+ *  - `seeds <n>`: the slingshot's pellet count (give the slingshot itself with `give 23 0x4B`).
+ *  - `bombarrows <n>`: n bombs in bomb bag 0 (SLOT_15) and X = that bag mixed with the bow in
+ *    SLOT_4, which is how the item menu makes bomb arrows (dComIfGp_getSelectItem turns BOW + a
+ *    bomb into dItemNo_BOMB_ARROW_e). `bombarrows 0` takes the mix off X again.
+ *  - `ammo [tag]`: log this end's arrows, pellets, bombs and life, so a test can prove a
+ *    partner's volley changed none of them ("[mp-ammo] <tag> ...").
+ *  - `facepartner`: turn Link on the spot to face the nearest remote player's puppet, so the next
+ *    shot flies at him. Written straight into his angles: a test aid, not a game action.
+ */
+void run_arrow_command(const Command& command) {
+    switch (command.op) {
+    case Op::Seeds:
+        dComIfGs_setPachinkoNum(static_cast<u8>(command.room));
+        Log.info("[{}] slingshot pellets set to {}", sTicks, command.room);
+        break;
+    case Op::BombArrows:
+        if (command.room > 0) {
+            if (dComIfGs_getBombMax(dItemNo_NORMAL_BOMB_e) < command.room) {
+                dComIfGs_setBombMax(dItemNo_NORMAL_BOMB_e, static_cast<u8>(command.room));
+            }
+            dComIfGs_setItem(SLOT_15, dItemNo_NORMAL_BOMB_e);
+            dComIfGs_onItemFirstBit(dItemNo_NORMAL_BOMB_e);
+            dComIfGs_setBombNum(0, static_cast<u8>(command.room));
+            dComIfGs_setSelectItemIndex(SELECT_ITEM_X, SLOT_15);
+            dComIfGs_setMixItemIndex(SELECT_ITEM_X, SLOT_4);
+        } else {
+            dComIfGs_setMixItemIndex(SELECT_ITEM_X, 0xFF);
+        }
+        dComIfGp_setSelectItem(SELECT_ITEM_X);
+        Log.info("[{}] bomb arrows: {} bombs, X now item 0x{:02X} (0x{:02X} = bomb arrow)", sTicks,
+            command.room, dComIfGp_getSelectItem(SELECT_ITEM_X),
+            static_cast<unsigned>(dItemNo_BOMB_ARROW_e));
+        break;
+    case Op::Ammo:
+        Log.info("[mp-ammo] {} tick={} arrows={} pellets={} bombs={}/{}/{} life={}",
+            command.text.empty() ? std::string("-") : command.text, sTicks,
+            dComIfGs_getArrowNum(), dComIfGs_getPachinkoNum(), dComIfGs_getBombNum(0),
+            dComIfGs_getBombNum(1), dComIfGs_getBombNum(2), dComIfGs_getLife());
+        break;
+    case Op::FacePartner: {
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        if (link == nullptr) {
+            Log.error("[{}] line {}: facepartner: no Link", sTicks, command.line);
+            break;
+        }
+        struct Nearest {
+            const fopAc_ac_c* from;
+            fopAc_ac_c* best;
+            f32 bestDist;
+        } nearest = {link, nullptr, 0.0f};
+        fopAcM_Search(
+            [](void* i_actor, void* i_data) -> void* {
+                fopAc_ac_c* actor = static_cast<fopAc_ac_c*>(i_actor);
+                Nearest* n = static_cast<Nearest*>(i_data);
+                if (fopAcM_GetName(actor) == fpcNm_REMOTE_PLAYER_e) {
+                    const f32 d = actor->current.pos.abs(n->from->current.pos);
+                    if (n->best == nullptr || d < n->bestDist) {
+                        n->best = actor;
+                        n->bestDist = d;
+                    }
+                }
+                return nullptr;
+            },
+            &nearest);
+        if (nearest.best == nullptr) {
+            Log.error("[{}] line {}: facepartner: no remote player here", sTicks, command.line);
+            break;
+        }
+        // TP yaw: 0 faces +Z and sin drives X, so atan2(dx, dz) (cLib_targetAngleY's convention).
+        const double dx = nearest.best->current.pos.x - link->current.pos.x;
+        const double dz = nearest.best->current.pos.z - link->current.pos.z;
+        const s16 yaw = static_cast<s16>(
+            static_cast<int>(std::lround(std::atan2(dx, dz) * (32768.0 / 3.14159265358979))));
+        link->shape_angle.y = yaw;
+        link->current.angle.y = yaw;
+        Log.info("[{}] facepartner: yaw {} toward the puppet at ({:.0f}, {:.0f}, {:.0f}), {:.0f} "
+                 "units away",
+            sTicks, yaw, nearest.best->current.pos.x, nearest.best->current.pos.y,
+            nearest.best->current.pos.z, nearest.bestDist);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -933,6 +1028,19 @@ bool settle_program_counter() {
         case Op::ExpectKeys:
         case Op::ExpectRupees:
             run_world_command(command);
+            sPc++;
+            continue;
+
+        /* --- batch 6: arrows --- */
+        case Op::Seeds:
+        case Op::BombArrows:
+        case Op::Ammo:
+        case Op::FacePartner:
+            if (!in_world()) {
+                Log.error("[{}] line {}: needs the world; skipped", sTicks, command.line);
+            } else {
+                run_arrow_command(command);
+            }
             sPc++;
             continue;
 
@@ -1213,6 +1321,22 @@ void load_script(const std::filesystem::path& path) {
             command.frames = 1800;
             ok = parse_event_flag(a, command.point) &&
                  (b.empty() || parse_int(b, command.frames)) && command.frames > 0;
+            /* --- batch 6: arrows --- */
+        } else if (verb == "SEEDS") {
+            // "seeds 30": slingshot pellets (the slingshot itself: "give 23 0x4B").
+            command.op = Op::Seeds;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
+        } else if (verb == "BOMBARROWS") {
+            // "bombarrows 10": bombs in bag 0 and X = bow + bombs; "bombarrows 0" unmixes X.
+            command.op = Op::BombArrows;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 99;
+        } else if (verb == "AMMO") {
+            // "ammo before": log arrows, pellets, bombs and life as "[mp-ammo] before ...".
+            command.op = Op::Ammo;
+            command.text = a;
+        } else if (verb == "FACEPARTNER") {
+            // "facepartner": turn on the spot toward the nearest remote player's puppet.
+            command.op = Op::FacePartner;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
