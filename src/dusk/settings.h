@@ -7,8 +7,8 @@
 
 namespace dusk {
 
-using config::ActionBindConfigVar;
 using config::ConfigVar;
+using config::ActionBindConfigVar;
 
 enum class BloomMode : int {
     Off = 0,
@@ -83,9 +83,9 @@ enum class MagicArmorMode : u8 {
 
 enum class AudioOutputMode : u8 {
     StereoSpeakers = 0,
-    StereoHeadphones = 1,  // spatial audio
-    Surround6ch = 2,       // discrete 5.1
-    Surround8ch = 3,       // discrete 7.1
+    StereoHeadphones = 1,   // spatial audio
+    Surround6ch = 2,        // discrete 5.1
+    Surround8ch = 3,        // discrete 7.1
 };
 
 namespace config {
@@ -383,7 +383,8 @@ void applyResampler(Resampler resampler);
 
 inline bool isLetterboxingDisabled(bool inCutscene) {
     const auto mode = getSettings().game.disableLetterboxing.getValue();
-    return mode == LetterboxMode::On || (mode == LetterboxMode::CutsceneOnly && inCutscene) ||
+    return mode == LetterboxMode::On ||
+           (mode == LetterboxMode::CutsceneOnly && inCutscene) ||
            (mode == LetterboxMode::GameplayOnly && !inCutscene);
 }
 

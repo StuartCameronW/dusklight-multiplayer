@@ -10,249 +10,232 @@
 
 namespace dusk {
 
-UserSettings g_userSettings =
-    {.video =
-            {
-                .enableFullscreen{"video.enableFullscreen", false},
-                .enableVsync{"video.enableVsync", true},
-                .lockAspectRatio{"video.lockAspectRatio", false},
-                .enableFpsOverlay{"game.enableFpsOverlay", false},
-                .fpsOverlayCorner{"game.fpsOverlayCorner", 0},
-                .maxFrameRate{"video.maxFrameRate", 240},
-                .rememberWindowSize{"video.rememberWindowSize", false},
-                .lastWindowWidth{"video.lastWindowWidth", 0},
-                .lastWindowHeight{"video.lastWindowHeight", 0},
-                .uiScale{"video.uiScale", 100},
-            },
+UserSettings g_userSettings = {
+    .video = {
+        .enableFullscreen {"video.enableFullscreen", false},
+        .enableVsync {"video.enableVsync", true},
+        .lockAspectRatio {"video.lockAspectRatio", false},
+        .enableFpsOverlay {"game.enableFpsOverlay", false},
+        .fpsOverlayCorner {"game.fpsOverlayCorner", 0},
+        .maxFrameRate {"video.maxFrameRate", 240},
+        .rememberWindowSize {"video.rememberWindowSize", false},
+        .lastWindowWidth {"video.lastWindowWidth", 0},
+        .lastWindowHeight {"video.lastWindowHeight", 0},
+        .uiScale {"video.uiScale", 100},
+    },
 
-        .audio =
-            {
-                .outputMode{"audio.outputMode", AudioOutputMode::StereoSpeakers},
-                .masterVolume{"audio.masterVolume", 60},
-                .mainMusicVolume{"audio.mainMusicVolume", 100},
-                .subMusicVolume{"audio.subMusicVolume", 100},
-                .soundEffectsVolume{"audio.soundEffectsVolume", 100},
-                .fanfareVolume{"audio.fanfareVolume", 100},
-                .enableReverb{"audio.enableReverb", true},
-                .menuSounds{"audio.menuSounds", true},
-            },
+    .audio = {
+        .outputMode {"audio.outputMode", AudioOutputMode::StereoSpeakers},
+        .masterVolume {"audio.masterVolume", 60},
+        .mainMusicVolume {"audio.mainMusicVolume", 100},
+        .subMusicVolume {"audio.subMusicVolume", 100},
+        .soundEffectsVolume {"audio.soundEffectsVolume", 100},
+        .fanfareVolume {"audio.fanfareVolume", 100},
+        .enableReverb {"audio.enableReverb", true},
+        .menuSounds {"audio.menuSounds", true},
+    },
 
-        .game = {.language{"game.language", GameLanguage::English},
+    .game = {
+        .language { "game.language", GameLanguage::English },
 
-            // Quality of Life
-            .enableQuickTransform{"game.enableQuickTransform", false},
-            .hideTvSettingsScreen{"game.hideTvSettingsScreen", true},
-            .biggerWallets{"game.biggerWallets", false},
-            .noReturnRupees{"game.noReturnRupees", false},
-            .disableRupeeCutscenes{"game.disableRupeeCutscenes", false},
-            .fastTransitions{"game.fastTransitions", false},
-            .noSwordRecoil{"game.noSwordRecoil", false},
-            .damageMultiplier{"game.damageMultiplier", 1},
-            .noHeartDrops{"game.noHeartDrops", false},
-            .instantDeath{"game.instantDeath", false},
-            .fastClimbing{"game.fastClimbing", false},
-            .noMissClimbing{"game.noMissClimbing", false},
-            .fastTears{"game.fastTears", false},
-            .no2ndFishForCat{"game.no2ndFishForCat", false},
-            .buttonFishing{"game.buttonFishing", false},
-            .instantSaves{"game.instantSaves", false},
-            .instantText{"game.instantText", false},
-            .holdToMash{"game.holdToMash", false},
-            .sunsSong{"game.sunsSong", false},
-            .autoSave{"game.autoSave", false},
-            .enhancedMapMenus{"game.enhancedMapMenus", false},
-            .aimingReticle{"game.aimingReticle", false},
-            .noHitStun{"game.noHitStun", false},
+        // Quality of Life
+        .enableQuickTransform {"game.enableQuickTransform", false},
+        .hideTvSettingsScreen {"game.hideTvSettingsScreen", true},
+        .biggerWallets {"game.biggerWallets", false},
+        .noReturnRupees {"game.noReturnRupees", false},
+        .disableRupeeCutscenes {"game.disableRupeeCutscenes", false},
+        .fastTransitions {"game.fastTransitions", false},
+        .noSwordRecoil {"game.noSwordRecoil", false},
+        .damageMultiplier {"game.damageMultiplier", 1},
+        .noHeartDrops {"game.noHeartDrops", false},
+        .instantDeath {"game.instantDeath", false},
+        .fastClimbing {"game.fastClimbing", false},
+        .noMissClimbing {"game.noMissClimbing", false},
+        .fastTears {"game.fastTears", false},
+        .no2ndFishForCat {"game.no2ndFishForCat", false},
+        .buttonFishing {"game.buttonFishing", false},
+        .instantSaves {"game.instantSaves", false},
+        .instantText {"game.instantText", false},
+        .holdToMash {"game.holdToMash", false},
+        .sunsSong {"game.sunsSong", false},
+        .autoSave {"game.autoSave", false},
+        .enhancedMapMenus {"game.enhancedMapMenus", false},
+        .aimingReticle {"game.aimingReticle", false},
+        .noHitStun {"game.noHitStun", false},
 
-            // Preferences
-            .enableMirrorMode{"game.enableMirrorMode", false},
-            .minimalHUD{"game.minimalHUD", false},
-            .hudScale{"game.hudScale", 1.0f},
-            .pauseOnFocusLost{"game.pauseOnFocusLost", false},
-            .enableLinkDollRotation{"game.enableLinkDollRotation", false},
-            .enableAchievementToasts{"game.enableAchievementToasts", true},
-            .enableControllerToasts{"game.enableControllerToasts", true},
-            .enableDiscordPresence{"game.enableDiscordPresence", true},
-            .menuScalingMode{"game.menuScalingMode", MenuScaling::Wii},
+        // Preferences
+        .enableMirrorMode {"game.enableMirrorMode", false},
+        .minimalHUD {"game.minimalHUD", false},
+        .hudScale {"game.hudScale", 1.0f},
+        .pauseOnFocusLost {"game.pauseOnFocusLost", false},
+        .enableLinkDollRotation {"game.enableLinkDollRotation", false},
+        .enableAchievementToasts {"game.enableAchievementToasts", true},
+        .enableControllerToasts {"game.enableControllerToasts", true},
+        .enableDiscordPresence {"game.enableDiscordPresence", true},
+        .menuScalingMode {"game.menuScalingMode", MenuScaling::Wii},
 
-            // Graphics
-            .bloomMode{"game.bloomMode", BloomMode::Dusk},
-            .bloomMultiplier{"game.bloomMultiplier", 1.0f},
-            .depthOfFieldMode{"game.depthOfFieldMode", DepthOfFieldMode::Dusk},
-            .disableWaterRefraction{"game.disableWaterRefraction", false},
-            .enableTextureReplacements{"game.enableTextureReplacements", true},
-            .enableFrameInterpolation{"game.enableFrameInterpolation", FrameInterpMode::Off},
-            .internalResolutionScale{"game.internalResolutionScale", 0},
-            .shadowResolutionMultiplier{"game.shadowResolutionMultiplier", 1},
-            .resampler{"game.resampler", Resampler::Bilinear},
-            .enableMapBackground{"game.enableMapBackground", true},
-            .disableCutscenePillarboxing{"game.disableCutscenePillarboxing", false},
-            .disableLetterboxing{"game.disableLetterboxing", LetterboxMode::Off},
-            .enableHighQualityMinimapTextures{"game.enableHighQualityMinimapTextures", true},
+        // Graphics
+        .bloomMode {"game.bloomMode", BloomMode::Dusk},
+        .bloomMultiplier {"game.bloomMultiplier", 1.0f},
+        .depthOfFieldMode{"game.depthOfFieldMode", DepthOfFieldMode::Dusk},
+        .disableWaterRefraction {"game.disableWaterRefraction", false},
+        .enableTextureReplacements {"game.enableTextureReplacements", true},
+        .enableFrameInterpolation {"game.enableFrameInterpolation", FrameInterpMode::Off},
+        .internalResolutionScale {"game.internalResolutionScale", 0},
+        .shadowResolutionMultiplier {"game.shadowResolutionMultiplier", 1},
+        .resampler {"game.resampler", Resampler::Bilinear},
+        .enableMapBackground {"game.enableMapBackground", true},
+        .disableCutscenePillarboxing {"game.disableCutscenePillarboxing", false},
+        .disableLetterboxing {"game.disableLetterboxing", LetterboxMode::Off},
+        .enableHighQualityMinimapTextures {"game.enableHighQualityMinimapTextures", true},
 
-            // Audio
-            .noLowHpSound{"game.noLowHpSound", false},
-            .midnasLamentNonStop{"game.midnasLamentNonStop", false},
+        // Audio
+        .noLowHpSound {"game.noLowHpSound", false},
+        .midnasLamentNonStop {"game.midnasLamentNonStop", false},
 
-            // Input
-            .enableGyroAim{"game.enableGyroAim", false},
-            .enableGyroRollgoal{"game.enableGyroRollgoal", false},
-            .gyroSensitivityX{"game.gyroSensitivityX", 1.0f},
-            .gyroSensitivityY{"game.gyroSensitivityY", 1.0f},
-            .gyroSensitivityRollgoal{"game.gyroSensitivityRollgoal", 1.0f},
-            .gyroSmoothing{"game.gyroSmoothing", 0.65f},
-            .gyroDeadband{"game.gyroDeadband", 0.04f},
-            .gyroInvertPitch{"game.gyroInvertPitch", false},
-            .gyroInvertYaw{"game.gyroInvertYaw", false},
-            .enableMouseCamera{"game.enableMouseCamera", false},
-            .enableMouseAim{"game.enableMouseAim", false},
-            .mouseAimSensitivity{"game.mouseAimSensitivity", 1.0f},
-            .mouseCameraSensitivity{"game.mouseCameraSensitivity", 1.0f},
-            .invertMouseY{"game.invertMouseY", false},
-            .freeCamera{"game.freeCamera", false},
-            .enableTouchControls{"game.enableTouchControls", false},
-            .touchTargeting{"game.touchTargeting", TouchTargeting::Hybrid},
-            .enableMenuPointer{"game.enableMenuPointer", true},
-            .touchControlsLayout{"game.touchControlsLayout", ui::ControlLayout{}},
-            .invertCameraXAxis{"game.invertCameraXAxis", false},
-            .invertCameraYAxis{"game.invertCameraYAxis", false},
-            .invertFirstPersonXAxis{"game.invertFirstPersonXAxis", false},
-            .invertFirstPersonYAxis{"game.invertFirstPersonYAxis", false},
-            .invertAirSwimX{"game.invertAirSwimX", false},
-            .invertAirSwimY{"game.invertAirSwimY", false},
-            .freeCameraXSensitivity{"game.freeCameraXSensitivity", 1.0f},
-            .freeCameraYSensitivity{"game.freeCameraYSensitivity", 1.0f},
-            .touchCameraXSensitivity{"game.touchCameraXSensitivity", 1.0f},
-            .touchCameraYSensitivity{"game.touchCameraYSensitivity", 1.0f},
-            .debugFlyCam{"game.debugFlyCam", false},
-            .debugFlyCamLockEvents{"game.debugFlyCamLockEvents", true},
-            .allowBackgroundInput{"game.allowBackgroundInput", true},
-            .enableLED{
-                ConfigVar<bool>{"game.enableLED_port0", true},
-                ConfigVar<bool>{"game.enableLED_port1", true},
-                ConfigVar<bool>{"game.enableLED_port2", true},
-                ConfigVar<bool>{"game.enableLED_port3", true},
-            },
-            .swapDirectSelect{"game.swapDirectSelect", false},
+        // Input
+        .enableGyroAim {"game.enableGyroAim", false},
+        .enableGyroRollgoal {"game.enableGyroRollgoal", false},
+        .gyroSensitivityX {"game.gyroSensitivityX", 1.0f},
+        .gyroSensitivityY {"game.gyroSensitivityY", 1.0f},
+        .gyroSensitivityRollgoal {"game.gyroSensitivityRollgoal", 1.0f},
+        .gyroSmoothing {"game.gyroSmoothing", 0.65f},
+        .gyroDeadband {"game.gyroDeadband", 0.04f},
+        .gyroInvertPitch {"game.gyroInvertPitch", false},
+        .gyroInvertYaw {"game.gyroInvertYaw", false},
+        .enableMouseCamera {"game.enableMouseCamera", false},
+        .enableMouseAim {"game.enableMouseAim", false},
+        .mouseAimSensitivity {"game.mouseAimSensitivity", 1.0f},
+        .mouseCameraSensitivity {"game.mouseCameraSensitivity", 1.0f},
+        .invertMouseY {"game.invertMouseY", false},
+        .freeCamera {"game.freeCamera", false},
+        .enableTouchControls {"game.enableTouchControls", false},
+        .touchTargeting {"game.touchTargeting", TouchTargeting::Hybrid},
+        .enableMenuPointer {"game.enableMenuPointer", true},
+        .touchControlsLayout {"game.touchControlsLayout", ui::ControlLayout{}},
+        .invertCameraXAxis {"game.invertCameraXAxis", false},
+        .invertCameraYAxis {"game.invertCameraYAxis", false},
+        .invertFirstPersonXAxis {"game.invertFirstPersonXAxis", false},
+        .invertFirstPersonYAxis {"game.invertFirstPersonYAxis", false},
+        .invertAirSwimX {"game.invertAirSwimX", false},
+        .invertAirSwimY {"game.invertAirSwimY", false},
+        .freeCameraXSensitivity {"game.freeCameraXSensitivity", 1.0f},
+        .freeCameraYSensitivity {"game.freeCameraYSensitivity", 1.0f},
+        .touchCameraXSensitivity {"game.touchCameraXSensitivity", 1.0f},
+        .touchCameraYSensitivity {"game.touchCameraYSensitivity", 1.0f},
+        .debugFlyCam {"game.debugFlyCam", false},
+        .debugFlyCamLockEvents {"game.debugFlyCamLockEvents", true},
+        .allowBackgroundInput {"game.allowBackgroundInput", true},
+        .enableLED {
+            ConfigVar<bool>{"game.enableLED_port0", true},
+            ConfigVar<bool>{"game.enableLED_port1", true},
+            ConfigVar<bool>{"game.enableLED_port2", true},
+            ConfigVar<bool>{"game.enableLED_port3", true},
+        },
+        .swapDirectSelect {"game.swapDirectSelect", false},
 
-            // Cheats
-            .infiniteHearts{"game.infiniteHearts", false},
-            .infiniteArrows{"game.infiniteArrows", false},
-            .infiniteSeeds{"game.infiniteSeeds", false},
-            .infiniteBombs{"game.infiniteBombs", false},
-            .infiniteOil{"game.infiniteOil", false},
-            .infiniteOxygen{"game.infiniteOxygen", false},
-            .infiniteRupees{"game.infiniteRupees", false},
-            .enableIndefiniteItemDrops{"game.enableIndefiniteItemDrops", false},
-            .moonJump{"game.moonJump", false},
-            .superClawshot{"game.superClawshot", false},
-            .alwaysGreatspin{"game.alwaysGreatspin", AlwaysGreatspinMode::OFF},
-            .enableFastIronBoots{"game.enableFastIronBoots", false},
-            .canTransformAnywhere{"game.canTransformAnywhere", false},
-            .fastRoll{"game.fastRoll", false},
-            .fastSpinner{"game.fastSpinner", false},
-            .armorRupeeDrain{"game.armorRupeeDrain", MagicArmorMode::NORMAL},
-            .invincibleEnemies{"game.invincibleEnemies", false},
-            .easyQuickSpin{"game.easyQuickSpin", false},
-            .infiniteEponaStamina{"game.infiniteEponaStamina", false},
+        // Cheats
+        .infiniteHearts {"game.infiniteHearts", false},
+        .infiniteArrows {"game.infiniteArrows", false},
+        .infiniteSeeds {"game.infiniteSeeds", false},
+        .infiniteBombs {"game.infiniteBombs", false},
+        .infiniteOil {"game.infiniteOil", false},
+        .infiniteOxygen {"game.infiniteOxygen", false},
+        .infiniteRupees {"game.infiniteRupees", false},
+        .enableIndefiniteItemDrops {"game.enableIndefiniteItemDrops", false},
+        .moonJump {"game.moonJump", false},
+        .superClawshot {"game.superClawshot", false},
+        .alwaysGreatspin {"game.alwaysGreatspin", AlwaysGreatspinMode::OFF},
+        .enableFastIronBoots {"game.enableFastIronBoots", false},
+        .canTransformAnywhere {"game.canTransformAnywhere", false},
+        .fastRoll {"game.fastRoll", false},
+        .fastSpinner {"game.fastSpinner", false},
+        .armorRupeeDrain {"game.armorRupeeDrain", MagicArmorMode::NORMAL},
+        .invincibleEnemies {"game.invincibleEnemies", false},
+        .easyQuickSpin {"game.easyQuickSpin", false},
+        .infiniteEponaStamina {"game.infiniteEponaStamina", false},
 
-            // Technical
-            .restoreWiiGlitches{"game.restoreWiiGlitches", false},
+        // Technical
+        .restoreWiiGlitches {"game.restoreWiiGlitches", false},
 
-            // Controls
-            .enableTurboKeybind{"game.enableTurboKeybind", false},
-            .enableResetKeybind{"game.enableResetKeybind", false},
+        // Controls
+        .enableTurboKeybind {"game.enableTurboKeybind", false},
+        .enableResetKeybind {"game.enableResetKeybind", false},
 
-            // Tools
-            .speedrunMode{"game.speedrunMode", false},
-            .liveSplitEnabled{"game.liveSplitEnabled", false},
-            .showSpeedrunRTATimer{"game.showSpeedrunRTATimer", true},
-            .recordingMode{"game.recordingMode", false},
-            .removeQuestMapMarkers{"game.removeQuestMapMarkers", false},
-            .showInputViewer{"game.showInputViewer", false},
-            .showInputViewerGyro{"game.showInputViewerGyro", false},
-            .enableMoveLinkCombo{"game.enableMoveLinkCombo", false},
-            .enableTeleportCombo{"game.enableTeleportCombo", false},
-            .lastSelectedGameModeId{"game.lastSelectedGameModeId", gamemode::kVanillaGameModeId}},
+        // Tools
+        .speedrunMode {"game.speedrunMode", false},
+        .liveSplitEnabled {"game.liveSplitEnabled", false},
+        .showSpeedrunRTATimer {"game.showSpeedrunRTATimer", true},
+        .recordingMode {"game.recordingMode", false},
+        .removeQuestMapMarkers {"game.removeQuestMapMarkers", false},
+        .showInputViewer {"game.showInputViewer", false},
+        .showInputViewerGyro {"game.showInputViewerGyro", false},
+        .enableMoveLinkCombo {"game.enableMoveLinkCombo", false},
+        .enableTeleportCombo {"game.enableTeleportCombo", false},
+        .lastSelectedGameModeId {"game.lastSelectedGameModeId", gamemode::kVanillaGameModeId}
+    },
 
-        .backend =
-            {
-                .isoPath{"backend.isoPath", ""},
-                .isoVerification{"backend.isoVerification", DiscVerificationState::Unknown},
-                .graphicsBackend{"backend.graphicsBackend", "auto"},
-                .skipPreLaunchUI{"backend.skipPreLaunchUI", false},
-                .showPipelineCompilation{"backend.showPipelineCompilation", true},
-                .wasPresetChosen{"backend.wasPresetChosen", false},
-                .checkForUpdates{"backend.checkForUpdates", true},
-                .checkForModUpdates{"backend.checkForModUpdates", true},
-                .cardFileType{"backend.cardFileType", static_cast<int>(CARD_GCIFOLDER)},
-                .enableAdvancedSettings{"backend.enableAdvancedSettings", false},
-            },
+    .backend = {
+        .isoPath {"backend.isoPath", ""},
+        .isoVerification {"backend.isoVerification", DiscVerificationState::Unknown},
+        .graphicsBackend {"backend.graphicsBackend", "auto"},
+        .skipPreLaunchUI {"backend.skipPreLaunchUI", false},
+        .showPipelineCompilation {"backend.showPipelineCompilation", true},
+        .wasPresetChosen {"backend.wasPresetChosen", false},
+        .checkForUpdates {"backend.checkForUpdates", true},
+        .checkForModUpdates {"backend.checkForModUpdates", true},
+        .cardFileType {"backend.cardFileType", static_cast<int>(CARD_GCIFOLDER)},
+        .enableAdvancedSettings {"backend.enableAdvancedSettings", false},
+    },
 
-        .multiplayer =
-            {
-                .nickname{"multiplayer.nickname", ""},
-                .port{"multiplayer.port", 7777},
-                .lastJoinAddress{"multiplayer.lastJoinAddress", ""},
-                .color{"multiplayer.color", ""},
-                .friendlyFire{"multiplayer.friendlyFire", false},
-            },
+    .multiplayer = {
+        .nickname {"multiplayer.nickname", ""},
+        .port {"multiplayer.port", 7777},
+        .lastJoinAddress {"multiplayer.lastJoinAddress", ""},
+        .color {"multiplayer.color", ""},
+        .friendlyFire {"multiplayer.friendlyFire", false},
+    },
 
-        // Not sure if there's a better way to declare this
-        .actionBindings = {
-            .firstPersonCamera{
-                ActionBindConfigVar{
-                    "actionBindings.firstPersonCamera_port0", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.firstPersonCamera_port1", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.firstPersonCamera_port2", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.firstPersonCamera_port3", PAD_NATIVE_BUTTON_INVALID},
-            },
-            .callMidna{
-                ActionBindConfigVar{"actionBindings.callMidna_port0", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{"actionBindings.callMidna_port1", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{"actionBindings.callMidna_port2", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{"actionBindings.callMidna_port3", PAD_NATIVE_BUTTON_INVALID},
-            },
-            .openMapScreen{
-                ActionBindConfigVar{
-                    "actionBindings.openMapScreen_port0", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.openMapScreen_port1", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.openMapScreen_port2", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.openMapScreen_port3", PAD_NATIVE_BUTTON_INVALID},
-            },
-            .toggleMinimap{
-                ActionBindConfigVar{
-                    "actionBindings.toggleMinimap_port0", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.toggleMinimap_port1", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.toggleMinimap_port2", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.toggleMinimap_port3", PAD_NATIVE_BUTTON_INVALID},
-            },
-            .openDusklightMenu{
-                ActionBindConfigVar{
-                    "actionBindings.openDusklightMenu_port0", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.openDusklightMenu_port1", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.openDusklightMenu_port2", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{
-                    "actionBindings.openDusklightMenu_port3", PAD_NATIVE_BUTTON_INVALID},
-            },
-            .turboSpeedButton{
-                ActionBindConfigVar{"actionBindings.turboButton_port0", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{"actionBindings.turboButton_port1", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{"actionBindings.turboButton_port2", PAD_NATIVE_BUTTON_INVALID},
-                ActionBindConfigVar{"actionBindings.turboButton_port3", PAD_NATIVE_BUTTON_INVALID},
-            },
-        }};
+    // Not sure if there's a better way to declare this
+    .actionBindings = {
+        .firstPersonCamera {
+            ActionBindConfigVar{"actionBindings.firstPersonCamera_port0", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.firstPersonCamera_port1", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.firstPersonCamera_port2", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.firstPersonCamera_port3", PAD_NATIVE_BUTTON_INVALID},
+        },
+        .callMidna {
+            ActionBindConfigVar{"actionBindings.callMidna_port0", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.callMidna_port1", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.callMidna_port2", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.callMidna_port3", PAD_NATIVE_BUTTON_INVALID},
+        },
+        .openMapScreen {
+            ActionBindConfigVar{"actionBindings.openMapScreen_port0", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.openMapScreen_port1", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.openMapScreen_port2", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.openMapScreen_port3", PAD_NATIVE_BUTTON_INVALID},
+        },
+        .toggleMinimap {
+            ActionBindConfigVar{"actionBindings.toggleMinimap_port0", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.toggleMinimap_port1", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.toggleMinimap_port2", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.toggleMinimap_port3", PAD_NATIVE_BUTTON_INVALID},
+        },
+        .openDusklightMenu {
+            ActionBindConfigVar{"actionBindings.openDusklightMenu_port0", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.openDusklightMenu_port1", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.openDusklightMenu_port2", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.openDusklightMenu_port3", PAD_NATIVE_BUTTON_INVALID},
+        },
+        .turboSpeedButton {
+            ActionBindConfigVar{"actionBindings.turboButton_port0", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.turboButton_port1", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.turboButton_port2", PAD_NATIVE_BUTTON_INVALID},
+            ActionBindConfigVar{"actionBindings.turboButton_port3", PAD_NATIVE_BUTTON_INVALID},
+        },
+    }
+};
 
 UserSettings& getSettings() {
     return g_userSettings;
@@ -285,7 +268,8 @@ void registerSettings() {
     Register(g_userSettings.video.rememberWindowSize);
     Register(g_userSettings.video.lastWindowWidth);
     Register(g_userSettings.video.lastWindowHeight);
-    Register(g_userSettings.video.uiScale, [](const int&, const int&) { dusk::ui::apply_scale(); });
+    Register(g_userSettings.video.uiScale,
+        [](const int&, const int&) { dusk::ui::apply_scale(); });
 
     // Audio
     Register(g_userSettings.audio.outputMode);
@@ -467,33 +451,31 @@ void registerSettings() {
 // Transient settings
 
 static TransientSettings g_transientSettings = {
-    .collisionView =
-        {
-            .enableTerrainView = false,
-            .enableWireframe = false,
-            .enableAtView = false,
-            .enableTgView = false,
-            .enableCoView = false,
-            .terrainViewOpacity = 50.0f,
-            .colliderViewOpacity = 50.0f,
-            .drawRange = 100.0f,
-        },
-    .triggerView =
-        {
-            .loadZones = false,
-            .eventAreas = false,
-            .switchAreas = false,
-            .eventTags = false,
-            .midnaStops = false,
-            .twilightGates = false,
-            .checkpoints = false,
-            .paths = false,
-            .transformDists = false,
-            .attentionDists = false,
-            .purpleMistAvoid = false,
-            .leevers = false,
-            .opacity = 75.0f,
-        },
+    .collisionView = {
+        .enableTerrainView = false,
+        .enableWireframe = false,
+        .enableAtView = false,
+        .enableTgView = false,
+        .enableCoView = false,
+        .terrainViewOpacity = 50.0f,
+        .colliderViewOpacity = 50.0f,
+        .drawRange = 100.0f,
+    },
+    .triggerView = {
+        .loadZones = false,
+        .eventAreas = false,
+        .switchAreas = false,
+        .eventTags = false,
+        .midnaStops = false,
+        .twilightGates = false,
+        .checkpoints = false,
+        .paths = false,
+        .transformDists = false,
+        .attentionDists = false,
+        .purpleMistAvoid = false,
+        .leevers = false,
+        .opacity = 75.0f,
+    },
     .turboMode = false,
 };
 
@@ -501,4 +483,4 @@ TransientSettings& getTransientSettings() {
     return g_transientSettings;
 }
 
-}  // namespace dusk
+}
