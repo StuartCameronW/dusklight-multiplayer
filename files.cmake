@@ -1689,6 +1689,7 @@ set(DUSK_FILES
         src/dusk/player_atn.hpp
         src/dusk/player_equip.hpp
         src/dusk/player_held.hpp
+        src/dusk/player_fx.hpp
         src/dusk/player_idle.hpp
         src/dusk/multiplayer/policy/mp_policy.hpp
         src/dusk/multiplayer/net/packet.hpp

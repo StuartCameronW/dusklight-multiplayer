@@ -371,6 +371,9 @@ void daRemotePlayer_c::setupHeldItems() {
             init_model_env(static_cast<J3DModelData*>(own_archive_res(mOwnRes, "al_kantera.bmd")),
                 0, "held lantern");
     }
+    // Its glow, BTK and swing callback (d_a_remote_player_fx.inc). Called with no lantern too:
+    // it also resets the puppet's particle-emitter slots.
+    setupLanternFx();
 
     // The iron ball, its chain data and its carry gait (d_a_remote_player_ironball.inc).
     mpHeldModel[dusk::mp::kPlayerHeldIronBall] = setupIronBall();
@@ -681,6 +684,8 @@ void daRemotePlayer_c::drawHeldItems() {
 
     if ((mNetHeldFlags & dusk::mp::kPlayerHeldLanternShown) != 0 && mpHeldLanternModel != NULL) {
         drawModel(mpHeldLanternModel);
+        // preKandelaarDraw and the glow, right after the lantern as his are (:19822-19825).
+        drawLanternGlow();
         mHeldDrawnFlags |= static_cast<u8>(mNetHeldFlags & (dusk::mp::kPlayerHeldLanternShown |
                                                                dusk::mp::kPlayerHeldLanternInHand));
         if (!mLoggedLantern) {
