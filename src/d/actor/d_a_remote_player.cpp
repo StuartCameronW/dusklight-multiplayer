@@ -8630,6 +8630,8 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 // block (3): held item. Last in the file: it uses the helpers above (init_model, own_archive_*,
 // loadActionBck) and keeps this feature out of the functions other work is editing.
 #include "d/actor/d_a_remote_player_held.inc"
+// The bottle's contents model and its BTK slots (agent H), after the held loaders it uses.
+#include "d/actor/d_a_remote_player_bottle.inc"
 // The iron ball and chain, after the held-item file whose loaders it uses.
 #include "d/actor/d_a_remote_player_ironball.inc"
 // The damage tint, the lantern glow and flame, and the puppet's particle emitters (agent D).

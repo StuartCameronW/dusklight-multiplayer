@@ -1451,7 +1451,7 @@ private:
     void setHeldItemBck(J3DModel* i_held, u8 i_kind);
     void setHeldArrowMatrix();
     void drawHeldArrow();
-    J3DAnmTransform* mpHeldItemBckAnm[11];
+    J3DAnmTransform* mpHeldItemBckAnm[14];
     mDoExt_bckAnm mHeldItemBck;
     bool mHeldItemBckReady;
     u8 mHeldItemBckShown;
@@ -1676,7 +1676,43 @@ private:
     s16 mNetClawTipAng[4];
     u16 mClawLogCount;
     bool mLoggedClawChain;
-};
+    // --- bottle contents (agent H) ---
+    /* What is IN the held bottle — daAlink_c's mpHookTipModel for a bottle: the fairy, worm or bee
+     * larva — and the bottle's own texture animations, his three BTK slots. Wire: heldBck ids
+     * 11-13 + bits 5-7, frame in heldBckFrame (dusk/player_held.hpp). See
+     * d_a_remote_player_bottle.inc. Indexed by PlayerBottleContents ([0] unused) and by the
+     * file's BTK order (YURE, D_YURE, D_NOMU, NUKU, DASU). */
+public:
+    /// read_puppet_pose: overwrite the heldBck / heldBckFrame echo with the bottle's BTK, set and
+    /// contents as last DRAWN. Leaves both alone unless the bottle was drawn last pass.
+    void getBottleDrawnWire(u8& io_bck, u8& io_frame) const;
+    /// Sender side (fill_held_item): which of his three slots (field_0x0718 / 071c / 0720, in that
+    /// order in i_slots) is ENTERED on i_bottle's materials, as a PlayerHeldItemBck id (0 none),
+    /// and that animation object.
+    static u8 bottleBtkEntered(
+        J3DModel* i_bottle, J3DAnmTextureSRTKey* const* i_slots, J3DAnmTextureSRTKey** o_anm);
+
+private:
+    void setupBottleContents();
+    void setBottleMatrix(J3DModel* i_bottle, bool i_inLeftHand);
+    void resetBottleShown();
+    void drawBottleContents();
+    J3DModel* mpBottleContentsModel[4];
+    J3DAnmTransform* mpBottleContentsBckAnm[4];
+    mDoExt_bckAnm mBottleContentsBck[4];
+    J3DAnmTextureSRTKey* mpBottleBtk[5];
+    /// The BTK this puppet entered last (pointer guard: entry only on a change) and the set
+    /// (0 none installed, 1 open, 2 drink, 0xFF no bottle since) whose setBottleModel entries
+    /// were replayed.
+    J3DAnmTextureSRTKey* mpBottleBtkEntered;
+    u8 mBottleBtkSet;
+    /// The wire's BTK id|set and contents last tick (change logs), the contents posed this tick,
+    /// and what the last pass drew.
+    u8 mBottleWantedBtk;
+    u8 mBottleWantedContents;
+    u8 mBottleContentsPosed;
+    u8 mBottleContentsShown;
+    u16 mBottleLogCount;
 
 /**
  * protocol v19 block A: the wire id (PlayerHeldItemBck, dusk/player_held.hpp) of the item BCK

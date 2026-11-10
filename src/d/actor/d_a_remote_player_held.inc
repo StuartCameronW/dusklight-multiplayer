@@ -188,6 +188,12 @@ const HeldItemBckEntry l_heldItemBck[dusk::mp::kPlayerHeldBckNum] = {
     {dRes_ID_ALANM_BCK_PRELORD_e, dusk::mp::kPlayerHeldSlingshot},
     // --- clawshot chain + tip (agent E) ---
     {dRes_ID_ALANM_BCK_HS_SPIN_e, dusk::mp::kPlayerHeldClawshot},
+    // --- bottle contents (agent H) ---
+    /* 11-13 name the bottle's BTK SLOTS, not BCKs: kind None keeps them out of every BCK path here
+     * (load, wire map, setHeldItemBck). d_a_remote_player_bottle.inc resolves them. */
+    {0xFFFF, dusk::mp::kPlayerHeldNone},
+    {0xFFFF, dusk::mp::kPlayerHeldNone},
+    {0xFFFF, dusk::mp::kPlayerHeldNone},
 };
 
 /// daArrow_c::createHeap's models for types 0 and 1 (d_a_arrow.cpp:31-39), in the private mount.
@@ -209,8 +215,8 @@ u8 daRemotePlayer_heldItemBckToWire(u16 i_resIdx, u8 i_kind) {
  * same reason mpSwordModel is a bare 3. STATIC_ASSERT is a no-op off the GC target (see the shield
  * one); held_kind() is the real guard. */
 STATIC_ASSERT(dusk::mp::kPlayerHeldKindNum == 10);
-// Likewise mpHeldItemBckAnm's bare 11; setHeldItemBck bounds the id against the enum at runtime.
-STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 11);
+// Likewise mpHeldItemBckAnm's bare 14; setHeldItemBck bounds the id against the enum at runtime.
+STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 14);
 
 /**
  * Build every handheld item model the puppet might need, once, at createHeap time. Called LAST in
@@ -237,8 +243,8 @@ STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 11);
  * The clawshot's gun spin (HS_SPIN) is in the same BCK table; its tip-open BCK and its chain are
  * built right after this, by setupClawshot (d_a_remote_player_hookshot.inc).
  *
- * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the bomb arrow's
- * fuse smoke particles. (The lantern glow is setupLanternFx, d_a_remote_player_fx.inc.) Every load is individually non-fatal.
+ * The bottle's contents models (fairy / worm / bee) and its five BTKs are setupBottleContents
+ * (d_a_remote_player_bottle.inc, agent H). NOT built: the bomb arrow's fuse smoke particles. (The lantern glow is setupLanternFx, d_a_remote_player_fx.inc.) Every load is individually non-fatal.
  */
 void daRemotePlayer_c::setupHeldItems() {
     for (int i = 0; i < dusk::mp::kPlayerHeldKindNum; i++) {
@@ -422,6 +428,8 @@ void daRemotePlayer_c::setupHeldItems() {
         bckWanted, mHeldItemBckReady ? "ok" : "MISSING",
         mpHeldArrowModel[0] != NULL ? "ok" : "MISSING",
         mpHeldArrowModel[1] != NULL ? "ok" : "MISSING");
+    // --- bottle contents (agent H) --- after every held model: a short heap costs these first.
+    setupBottleContents();
 
     int built = 0;
     for (int i = 1; i < dusk::mp::kPlayerHeldKindNum; i++) {
@@ -492,6 +500,9 @@ void daRemotePlayer_c::setHeldItemMatrix() {
     {
         mHeldItemBckShown = dusk::mp::kPlayerHeldBckNone;
     }
+    if (held == NULL || kind != dusk::mp::kPlayerHeldBottle) {
+        resetBottleShown(); // --- bottle contents (agent H) ---
+    }
 
     if (held != NULL) {
         switch (kind) {
@@ -528,6 +539,8 @@ void daRemotePlayer_c::setHeldItemMatrix() {
                     shape->show();
                 }
             }
+            // --- bottle contents (agent H) --- his BTK slot, and what is in it (bottle.inc).
+            setBottleMatrix(held, (mNetHeldFlags & dusk::mp::kPlayerHeldBottlePour) == 0);
             break;
         }
         case dusk::mp::kPlayerHeldBow:
@@ -620,6 +633,9 @@ void daRemotePlayer_c::drawHeldItems() {
 
     if (held != NULL) {
         drawModel(held);
+        if (kind == dusk::mp::kPlayerHeldBottle) {
+            drawBottleContents(); // --- bottle contents (agent H) --- his mpHookTipModel, next
+        }
         if (held_is_clawshot(kind)) {
             drawModel(mpHeldClawTip[0]);
             if (kind == dusk::mp::kPlayerHeldDoubleClawshot &&

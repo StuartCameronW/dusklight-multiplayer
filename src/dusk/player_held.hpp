@@ -112,19 +112,49 @@ enum PlayerHeldItemBck : std::uint8_t {
     kPlayerHeldBckSlingShoot = 8,       ///< PSHOOT
     kPlayerHeldBckSlingReload = 9,      ///< PRELORD
     kPlayerHeldBckClawSpin = 10,        ///< HS_SPIN: the clawshot gun (v20 clawshot block)
-    kPlayerHeldBckNum = 11,
+    // --- bottle contents (agent H) ---
+    /* BOTTLE only: which of daAlink_c's three bottle BTK slots is ENTERED on the bottle's
+     * materials (setBottleModel loads all three, d_a_alink_bottle.inc:56-64; the procs switch with
+     * entryTexMtxAnimator). Not BCKs: the puppet does not look these up in its BCK table. Which
+     * RESOURCE slots 1 and 2 hold is kPlayerHeldBckBottleDrinkSet. Id 14 is still free. */
+    kPlayerHeldBckBottleYure = 11,      ///< field_0x0718: BOTTLE_YURE, the slosh (both sets)
+    kPlayerHeldBckBottleSlot1 = 12,     ///< field_0x071c: BOTTLE_D_YURE / BOTTLE_NUKU (uncork)
+    kPlayerHeldBckBottleSlot2 = 13,     ///< field_0x0720: BOTTLE_D_NOMU (drink) / BOTTLE_DASU (pour)
+    kPlayerHeldBckNum = 14,
 };
 constexpr std::uint8_t kPlayerHeldBckIdMask = 0x0F;
 /// heldBck bit 4: the nocked arrow (kPlayerHeldArrowNocked) is a bomb arrow — daArrow_c type 1,
 /// AL_ARROWB, rather than type 0, AL_ARROW (daArrow_c::createHeap, d_a_arrow.cpp:24-46).
 constexpr std::uint8_t kPlayerHeldBckBombArrow = 0x10;
 
+// --- bottle contents (agent H) ---
+/* heldBck bits 5-7, meaningful only while heldItem is kPlayerHeldBottle (the bow's bit 4 is never
+ * set then: it needs a nocked arrow). No new bytes and no protocol bump: an older receiver ignores
+ * the bottle's ids and these bits, and an older sender sends 0 (no BTK, no contents), which is
+ * what the puppet drew before. */
+/// Bits 5-6: the contents model daAlink_c is DRAWING in the bottle — his mpHookTipModel, non-NULL
+/// and drawn under checkItemDraw() (d_a_alink.cpp:19775-19777), named by the mEquipItem
+/// setBottleModel built it for (d_a_alink_bottle.inc:66-82).
+constexpr std::uint8_t kPlayerHeldBckBottleContentsShift = 5;
+constexpr std::uint8_t kPlayerHeldBckBottleContentsMask = 0x60;
+enum PlayerBottleContents : std::uint8_t {
+    kPlayerBottleContentsNone = 0,
+    kPlayerBottleContentsFairy = 1,  ///< dItemNo_FAIRY_e: O_GD_NV + its looping BCK
+    kPlayerBottleContentsWorm = 2,   ///< dItemNo_WORM_e: O_GD_WORM + its looping BCK
+    kPlayerBottleContentsBee = 3,    ///< dItemNo_BEE_CHILD_e: O_GD_HK, no BCK
+};
+/// Bit 7: setBottleModel loaded the DRINK set into slots 1/2 (BOTTLE_D_YURE / BOTTLE_D_NOMU), its
+/// `checkDrinkBottleItem || checkOilBottleItemNotGet` (d_a_alink_bottle.inc:56-62); clear = the
+/// open set (BOTTLE_NUKU / BOTTLE_DASU).
+constexpr std::uint8_t kPlayerHeldBckBottleDrinkSet = 0x80;
+
 /* PlayerState::heldBckFrame (v19 block A): the frame that BCK was entered with — mItemBck's
  * animation frame after setItemMatrix clamped field_0x33dc below getFrameMax() — as a fraction of
  * getFrameMax(), x255. 255 is "the end", which the receiver clamps to frameMax - 0.001 as he does.
  * Meaningless while the id is kPlayerHeldBckNone. For a single clawshot drawn swapped
  * (kPlayerHeldClawRight) it is 0: the gun he then draws is field_0x0710, which setHookshotPos
- * enters at frame 0 (d_a_alink_hook.inc:911). */
+ * enters at frame 0 (d_a_alink_hook.inc:911). For a bottle (agent H) it is the entered BTK's own
+ * frame / getFrameMax(), x255. */
 
 /* PlayerState::heldMat, per kind. The material animation frames Link's held model is showing.
  *

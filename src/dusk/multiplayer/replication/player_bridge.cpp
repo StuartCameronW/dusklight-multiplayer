@@ -1376,6 +1376,55 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
                 mat |= kPlayerHeldMatBottleMat0Hidden;
             }
             out.heldMat = mat;
+
+            // --- bottle contents (agent H) ---
+            /* heldBck for a bottle: the BTK slot ENTERED on his bottle's materials, read off the
+             * material animators themselves (not inferred from the proc), with that animation
+             * object's own frame; which set setBottleModel loaded into slots 1/2, by its own test
+             * (d_a_alink_bottle.inc:56); and the contents model he draws in it, mpHookTipModel
+             * (setItemMatrix poses it, d_a_alink.cpp:6053-6057; drawn under the checkItemDraw()
+             * above, :19775-19777), named by the item setBottleModel built it for (:66-82). */
+            {
+                J3DAnmTextureSRTKey* const slots[3] = {
+                    alink->field_0x0718, alink->field_0x071c, alink->field_0x0720};
+                J3DAnmTextureSRTKey* btk = nullptr;
+                const std::uint8_t btkId = daRemotePlayer_c::bottleBtkEntered(held, slots, &btk);
+                std::uint8_t contents = kPlayerBottleContentsNone;
+                if (alink->mpHookTipModel != nullptr) {
+                    if (item == dItemNo_FAIRY_e) {
+                        contents = kPlayerBottleContentsFairy;
+                    } else if (item == dItemNo_WORM_e) {
+                        contents = kPlayerBottleContentsWorm;
+                    } else if (item == dItemNo_BEE_CHILD_e) {
+                        contents = kPlayerBottleContentsBee;
+                    }
+                }
+                const bool drinkSet =
+                    daPy_py_c::checkDrinkBottleItem(item) || alink->checkOilBottleItemNotGet(item);
+                out.heldBck = static_cast<std::uint8_t>(
+                    btkId | (contents << kPlayerHeldBckBottleContentsShift) |
+                    (drinkSet ? kPlayerHeldBckBottleDrinkSet : 0));
+                if (btk != nullptr && btk->getFrameMax() > 0) {
+                    const f32 f = btk->getFrame() / btk->getFrameMax();
+                    out.heldBckFrame = static_cast<std::uint8_t>(
+                        f <= 0.0f ? 0.0f : (f >= 1.0f ? 255.0f : f * 255.0f + 0.5f));
+                }
+
+                static std::uint8_t s_lastBottleBck = 0xFF;
+                static std::uint16_t s_bottleLogCount = 0;
+                const std::uint8_t bottleKey =
+                    static_cast<std::uint8_t>(out.heldBck & ~kPlayerHeldBckBombArrow);
+                if (bottleKey != s_lastBottleBck && s_bottleLogCount < 64) {
+                    s_bottleLogCount++;
+                    Log.info("Local bottle BTK slot {} ({} set), bottle contents {} (mEquipItem "
+                             "0x{:X}, tip model {}, frame {}/255)",
+                        static_cast<unsigned>(btkId), drinkSet ? "drink" : "open",
+                        static_cast<unsigned>(contents), static_cast<unsigned>(item),
+                        alink->mpHookTipModel != nullptr ? "set" : "none",
+                        static_cast<unsigned>(out.heldBckFrame));
+                }
+                s_lastBottleBck = bottleKey;
+            }
         } else if (daPy_py_c::checkBowItem(item) || item == dItemNo_PACHINKO_e) {
             out.heldItem = item == dItemNo_PACHINKO_e ? kPlayerHeldSlingshot : kPlayerHeldBow;
             if (alink->checkBowGrabLeftHand()) {
@@ -2502,6 +2551,7 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
         static_cast<std::uint8_t>((puppet->getHeldItemBckShown() & kPlayerHeldBckIdMask) |
                                   (puppet->getHeldArrowDrawn() == 1 ? kPlayerHeldBckBombArrow : 0));
     out.heldBckFrame = puppet->getHeldItemBckDrawnFrame();
+    puppet->getBottleDrawnWire(out.heldBck, out.heldBckFrame); // bottle contents (agent H)
     return true;
 }
 
