@@ -1843,6 +1843,74 @@ private:
     u8 mNetForm;
     s8 mNetMetaTint;
     u8 mNetFurFrame;
+
+    // --- wolf body (piece B) ---
+    /* A puppet BUILT as a wolf: the private Wmdl mount in place of the outfit archive, the 40-joint
+     * body, eyes, shackle chain and the equipment on its back. Rebuilt (respawned) when the
+     * sender's form flips, as an outfit change is. See d_a_remote_player_wolf.inc and
+     * .claude/future-plans/puppet-wolf.md sections 1, 2 and 6 B. Everything here is zeroed by
+     * fopAcM_ct and set up in createHeapWolf(); a human puppet never touches any of it. */
+public:
+    /// The create parameter's top byte that asks for a wolf (spec section 6). The wire outfit stays
+    /// the human clothes; daRemotePlayer_outfitFromWire maps this to the default outfit.
+    enum { WOLF_OUTFIT_PARAM = 0xFE };
+
+private:
+    /// mOwnRes's archive: "Wmdl" for a wolf, the outfit's otherwise. From mountOwnArchive().
+    const char* ownArcName() const;
+    /// createHeap() for a wolf. Returns createHeap's own 0/1.
+    int createHeapWolf();
+    bool setupWolfAnimation(J3DModelData* i_modelData);
+    bool setupWolfFace(J3DModelData* i_modelData);
+    void setupWolfJointCallBacks(J3DModelData* i_modelData);
+    /// execute()'s pose step for a wolf, from the mHasPose check to the end.
+    void executeWolf();
+    void selectWolfAnimation();
+    void wolfApplyUpper2();
+    void wolfClearUpper2(f32 i_morf);
+    void wolfSetMatrix();
+    void setWolfTailAngle();
+    void setWolfItemMatrix();
+    void setWolfChainPos();
+    void wolfDamageTint();
+    int drawWolf();
+    /// daAlink_c::wolfModelCallBack (d_a_alink.cpp:2530-2540): jointControll's wolf branch, then
+    /// changeWolfBlendRate. From bodyModelCallBack.
+    int wolfBodyModelCallBack(int i_jointNo);
+    void wolfJointControl(int i_jointNo);
+
+    /// Res 15 of Wmdl, four instances on one data (changeWolf, d_a_alink_wolf.inc:169-172).
+    J3DModel* mpWlChainModel[4];
+    /// WANM_WAIT's BCK: the pose before the first override arrives, and the fallback when a failed
+    /// override load has freed what was being drawn. Never the human gait.
+    daRemotePlayer_anm_c mWolfWaitAnm;
+    /// field_0x3094 / field_0x309a: the tail spring on joints 37-39 (setWolfTailAngle).
+    s16 mWolfTailAngle[3];
+    s16 mWolfTailVel[3];
+    s16 mWolfPrevYaw;
+    bool mWolfPrevYawValid;
+    /// field_0x363c / field_0x366c / field_0x3142, and FLG1_UNK_200000 (setWolfChainPos).
+    cXyz mWolfChainPos[4];
+    cXyz mWolfChainVel[4];
+    csXyz mWolfChainAngle[4];
+    bool mWolfChainInit;
+    /// The chain's floor probe. Its own object: mGndChk is read again by the shadow in draw().
+    dBgS_ObjGndChk mWolfChainGndChk;
+    /// The override's joint-0 answer last applied, kept while holding the last pose.
+    cXyz mWolfRoot;
+    s16 mWolfRootRotX;
+    s16 mWolfRootRotZ;
+    s16 mWolfPitch;
+    s16 mWolfYawOff;
+    bool mWolfRootValid;
+    /// actUnder went to none (a demo-archive BCK the puppet cannot load): the last pose is frozen.
+    bool mWolfHolding;
+    /// checkWolfGrabAnime() on the UPPER_2 overlay being drawn (WL_PICKUPA/B).
+    bool mWolfGrab;
+    bool mLoggedWolfSplit;
+    bool mLoggedWolfChain;
+    bool mLoggedWolfGrab;
+    u16 mWolfLogCount;
 };
 
 /**

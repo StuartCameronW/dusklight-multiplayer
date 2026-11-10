@@ -1272,6 +1272,7 @@ const u16 l_locPhaseSnapLogMax = 16;
 }  // namespace
 
 int daRemotePlayer_c::createHeap() {
+    if (isWolf()) { return createHeapWolf(); } // wolf body (piece B): d_a_remote_player_wolf.inc
     J3DModelData* modelData =
         static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_outfits[mOutfit].bodyResName));
     if (modelData == NULL) {
@@ -2076,16 +2077,14 @@ int daRemotePlayer_c::mountOwnArchive() {
          */
         mResRequested = true;
 
-        if (!mOwnRes.set(
-                l_outfits[mOutfit].arcName, l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL))
-        {
+        if (!mOwnRes.set(ownArcName(), l_objectPath, mDoDvd_MOUNT_DIRECTION_HEAD, NULL)) {
             /* ★ Falls THROUGH to the poll below instead of returning cPhs_ERROR_e here. Nothing is
              * in flight for THIS one — set() can only fail before it has a command — but the same
              * shape applies to the shield loop below, where a failure part way through must not
              * abandon the siblings that already have commands out. Written the same way in both
              * places so there is one rule rather than two. A dRes_info_c whose set() failed reports
              * -1 from setRes() for ever (d_resorce.cpp:586-590), which is how the poll notices. */
-            Log.warn("Puppet could not start a private mount of '{}'", l_outfits[mOutfit].arcName);
+            Log.warn("Puppet could not start a private mount of '{}'", ownArcName());
         } else {
             /* Only started when the outfit mount started. If the outfit could not be requested the
              * puppet is already doomed, and three more mounts to drain before saying so is pure
@@ -2127,7 +2126,7 @@ int daRemotePlayer_c::mountOwnArchive() {
     const int outfitState = mOwnRes.setRes();
     if (outfitState < 0) {
         failed = true;
-        firstFailure = l_outfits[mOutfit].arcName;
+        firstFailure = ownArcName();
     } else if (outfitState > 0) {
         loading = true;
     }
@@ -2650,7 +2649,7 @@ int daRemotePlayer_c::create() {
     // first network pose has arrived is both pointless (we'd be posing at the spawn point) and the
     // exact place the original crash happened.
     Log.info("Puppet for player {} wearing '{}' from its own archive copy", mPlayerId,
-        l_outfits[mOutfit].arcName);
+        ownArcName());
     // Only now, so a puppet whose create failed never owns a sound handle.
     initSound();
     initFriendlyFire();
@@ -5650,6 +5649,7 @@ static int daRemotePlayer_bodyModelCallBack(J3DJoint* i_joint, int i_pass) {
 }
 
 int daRemotePlayer_c::bodyModelCallBack(int i_jointNo) {
+    if (isWolf()) { return wolfBodyModelCallBack(i_jointNo); } // wolf body (piece B)
     if (i_jointNo == l_footIkCallBackJointNo) {
         setFootMatrix();
     } else if (i_jointNo == l_underRootJointNo) {
@@ -8214,6 +8214,7 @@ int daRemotePlayer_c::execute() {
             mRunAnm.mpUpper != NULL ? *reinterpret_cast<const uintptr_t*>(mRunAnm.mpUpper) : 0);
     }
 
+    if (isWolf()) { executeWolf(); return 1; } // wolf body (piece B): d_a_remote_player_wolf.inc
     // No guard against the local player owning this model data, and none needed: the puppet's
     // J3DModelData came out of its own private archive mount, so daAlink_c's joint callbacks and
     // mtx calculators are not on it and cannot be.
@@ -8550,6 +8551,8 @@ int daRemotePlayer_c::draw() {
         mHasDrawnSimTick = true;
     }
 
+    if (isWolf()) { return drawWolf(); } // wolf body (piece B): tev type 9, behind both guards
+
     // 10 is the light type daAlink_c uses for human Link (d_a_alink.cpp:19470), so the puppet is
     // lit consistently with the local player rather than as scenery.
     //
@@ -8653,3 +8656,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_gear.inc"
 // Footstep dust, ripples, splashes and wet footprints (agent J). Uses the fx file's emitter slots.
 #include "d/actor/d_a_remote_player_footfx.inc"
+// The wolf body (piece B): the Wmdl build, joint control, chain and draw. Uses all of the above.
+#include "d/actor/d_a_remote_player_wolf.inc"
