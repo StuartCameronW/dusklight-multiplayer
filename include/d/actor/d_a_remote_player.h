@@ -1567,6 +1567,69 @@ private:
     u32 mFxEmitter[PUPPET_FX_NUM];
     bool mLoggedFxFail[PUPPET_FX_NUM];
     u16 mFxLogCount;
+    // --- sword trail + spin/charge fx (agent F) ---
+    /* daAlink_c's m_swordBlur (the trail), setCutTurnEffect (the spin attack's particles) and
+     * setSwordChargeEffect (the charge glow, plus the ordon sword BTK it reads), rebuilt on the
+     * puppet's own sword and joints from protocol v20 fxFlags bits 1-3 and 6-7. See
+     * d_a_remote_player_swordfx.inc. All zeroed by fopAcM_ct. */
+public:
+    /// setCutTurnEffect's four emitter lists (d_a_alink_effect.inc:1034-1061), as decoded by the
+    /// bridge from the wire's spin kind.
+    enum SwordSpinKind_e {
+        SWORD_SPIN_NORMAL_e,
+        SWORD_SPIN_LIGHT_e,
+        SWORD_SPIN_LARGE_e,
+        SWORD_SPIN_WATER_e,
+    };
+    /// fxFlags bits 1-3 and 6-7, decoded by the bridge every tick (dusk::mp::apply_sword_fx).
+    /// i_trail: the sender extended his trail this tick; i_spin: his spin emitted this tick;
+    /// i_charge: his charge BTK frame is above 0.
+    void setNetworkSwordFx(bool i_trail, bool i_trailDash, bool i_trailReversed, bool i_spin,
+        u8 i_spinKind, bool i_charge);
+
+private:
+    void setupSwordFx();
+    void updateSwordFx();
+    void updateSwordTrail(J3DModel* i_sword, bool i_master);
+    void updateSwordSpinFx(bool i_particlesOk);
+    void updateSwordChargeFx(J3DModel* i_sword, bool i_master, bool i_particlesOk);
+    void clearSwordSpinFx();
+    void drawSwordFx();
+    void deleteSwordFx();
+    /// This puppet's own daAlink_blur_c (a J3DPacket subclass, typed as its base here so this
+    /// header needs no d_a_alink.h), on the solid heap. NULL if it did not fit or the texture is
+    /// missing: no trail, nothing else lost.
+    J3DPacket* mpSwordBlurPacket;
+    // The wire's bits, as pushed by setNetworkSwordFx().
+    bool mNetSwordTrail;
+    bool mNetSwordTrailDash;
+    bool mNetSwordTrailReversed;
+    bool mNetSwordSpin;
+    u8 mNetSwordSpinKind;
+    bool mNetSwordCharge;
+    /// What was reproduced last tick: the trail extended, spin emitters set, charge running, and
+    /// the charge reached its full-glow frame (14).
+    bool mSwordTrailOn;
+    bool mSwordSpinOn;
+    bool mSwordChargeOn;
+    bool mSwordChargeFull;
+    /// Last tick's sword base matrix (valid only if a sword was in hand), so a trail that starts
+    /// this tick can be initialised where the sender's initBlur was — one tick earlier.
+    Mtx mSwordFxPrevMtx;
+    bool mSwordFxPrevMtxValid;
+    /// Last tick's position and facing: decSwordBlur's old.pos and mPrevAngleY.
+    cXyz mSwordFxPrevPos;
+    s16 mSwordFxPrevAngleY;
+    bool mSwordFxPrevPosValid;
+    /// His field_0x3204[6] (spin) and field_0x321c / 0x3220 / 0x3224 (charge A/B/C) level ids.
+    u32 mSwordSpinEmitter[6];
+    u32 mSwordChargeEmitter[3];
+    /// g_Counter ticks each effect turned on, for the OFF lines' durations.
+    u32 mSwordTrailOnTick;
+    u32 mSwordSpinOnTick;
+    u32 mSwordChargeOnTick;
+    u16 mSwordFxLogCount;
+    bool mLoggedSwordTrailDraw;
 };
 
 /**

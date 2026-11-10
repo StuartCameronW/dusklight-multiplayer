@@ -1505,6 +1505,7 @@ int daRemotePlayer_c::createHeap() {
     // The standing pivot (turn-in-place). Last, so a short heap costs only the pivot pose and its
     // footsteps.
     loadStepTurnAnimations();
+    setupSwordFx(); // sword trail (agent F): last, so a short heap costs only the trail
 
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
@@ -2663,6 +2664,7 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     // ~Z2Creature after this body, means no sound can outlive the memory it points at.
     deleteSound();
     deletePuppetEmitters(); // no particle emitter outlives its puppet (agent D)
+    deleteSwordFx(); // sword fx (agent F): hide its emitters, free the trail's texture object
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
@@ -7606,9 +7608,10 @@ void daRemotePlayer_c::setEquipMatrix() {
  * (d_a_alink.cpp:6118-6119), once a tick and whatever the sword is doing — he does not gate it on
  * the sword being drawn, so neither does this.
  *
- * The ordon sword's BTK is deliberately NOT played. He advances it only during a spin-attack
- * charge (d_a_alink_cut.inc:1922-1937) and resets it to 0 afterwards (d_a_alink.cpp:15244), and
- * the charge is not on the wire; frame 0 is what he shows the rest of the time.
+ * The ordon sword's BTK is NOT played here. He advances it only during a spin-attack charge
+ * (d_a_alink_cut.inc:1922-1937) and resets it to 0 afterwards (d_a_alink.cpp:15244); since v20 the
+ * charge is on the wire, and updateSwordChargeFx() (d_a_remote_player_swordfx.inc) is that BTK's
+ * only frame controller.
  *
  * These are the puppet's own anm objects (setupEquipModels()), so this is their ONLY frame
  * controller. Called from setEquipMatrix() and nowhere else, so once per sim tick.
@@ -8238,6 +8241,7 @@ int daRemotePlayer_c::execute() {
     setMatrix();
     setHeavyBootsMatrix(); // iron boots: ride the body's leg joints, so after its calc
     updateLanternFx(); // lantern flame + glow: after setMatrix's lantern calc (agent D)
+    updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8588,6 +8592,7 @@ int daRemotePlayer_c::draw() {
     addHeldItemShadow();
     addHeavyBootsShadow();
     drawIronBall();
+    drawSwordFx(); // sword trail (agent F): his blur entry is the last thing his draw does
     traceCalc("draw done");
     return 1;
 }
@@ -8628,3 +8633,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_ironball.inc"
 // The damage tint, the lantern glow and flame, and the puppet's particle emitters (agent D).
 #include "d/actor/d_a_remote_player_fx.inc"
+// Sword trail, spin attack and charge effects (agent F). Uses own_archive_idx and currentSword().
+#include "d/actor/d_a_remote_player_swordfx.inc"
