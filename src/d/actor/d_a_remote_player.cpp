@@ -1505,6 +1505,7 @@ int daRemotePlayer_c::createHeap() {
     // The standing pivot (turn-in-place). Last, so a short heap costs only the pivot pose and its
     // footsteps.
     loadStepTurnAnimations();
+    setupSwordFx(); // sword trail (agent F): last, so a short heap costs only the trail
 
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
@@ -2662,6 +2663,7 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     // actor's solid heap (Z2SoundObject.cpp:529-532); stopping every handle now, rather than in
     // ~Z2Creature after this body, means no sound can outlive the memory it points at.
     deleteSound();
+    deleteSwordFx(); // sword fx (agent F): hide its emitters, free the trail's texture object
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
@@ -8236,6 +8238,7 @@ int daRemotePlayer_c::execute() {
     traceCalc("setMatrix");
     setMatrix();
     setHeavyBootsMatrix(); // iron boots: ride the body's leg joints, so after its calc
+    updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8584,6 +8587,7 @@ int daRemotePlayer_c::draw() {
     addHeldItemShadow();
     addHeavyBootsShadow();
     drawIronBall();
+    drawSwordFx(); // sword trail (agent F): his blur entry is the last thing his draw does
     traceCalc("draw done");
     return 1;
 }
@@ -8622,3 +8626,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_held.inc"
 // The iron ball and chain, after the held-item file whose loaders it uses.
 #include "d/actor/d_a_remote_player_ironball.inc"
+// Sword trail, spin attack and charge effects (agent F). Uses own_archive_idx and currentSword().
+#include "d/actor/d_a_remote_player_swordfx.inc"

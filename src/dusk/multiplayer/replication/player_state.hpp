@@ -208,19 +208,61 @@ constexpr float kPlayerIronBallPosScale = 4.0f;
  *   bit 0       the lantern is lit (its glow, flame and light).
  *   bit 1       a sword trail is live (m_swordBlur).
  *   bit 2       a spin attack's effect is live.
- *   bit 3       the sword charge is ready (charge glow).
+ *   bit 3       the sword is charging (agent F: his m_nSwordBtk frame > 0, see below).
  *   bits 4-5    PlayerState::dmgFlash's tint kind (kPlayerDmgTint*).
- *   bits 6-7    reserved, 0.
+ *   bits 6-7    agent F: the sword-fx variant, read with bit 1 or bit 2 (kPlayerFxVariant*).
  */
 enum PlayerFx : std::uint8_t {
     kPlayerFxLanternLit = 1 << 0,
     kPlayerFxSwordTrail = 1 << 1,
     kPlayerFxSpin = 1 << 2,
-    kPlayerFxChargeReady = 1 << 3,
+    kPlayerFxSwordCharge = 1 << 3,
 };
 constexpr std::uint8_t kPlayerFxDmgTintShift = 4;
 constexpr std::uint8_t kPlayerFxDmgTintMask = 0x30;
-constexpr std::uint8_t kPlayerFxKnownMask = 0x3F;
+constexpr std::uint8_t kPlayerFxKnownMask = 0xFF;
+/**
+ * Agent F's bits (sword trail, spin attack, charge), set by fill_sword_fx (player_bridge.cpp) and
+ * read by d_a_remote_player_swordfx.inc. What each one means on the SENDER:
+ *
+ *   bit 1  kPlayerFxSwordTrail: daAlink_c EXTENDED m_swordBlur this tick (copyBlur,
+ *          d_a_alink.cpp:6626). Read off the blur's own point count (field_0x14): copyBlur is the
+ *          only thing that raises it (+10, capped at 58; d_a_alink_effect.inc:2012-2015),
+ *          decSwordBlur only lowers it and initBlur zeroes it. The decay, and the trail riding the
+ *          body while it decays, are rebuilt on the receiver exactly as decSwordBlur does them.
+ *   bit 2  kPlayerFxSpin: setCutTurnEffect emitted this tick (d_a_alink_effect.inc:944-1096):
+ *          PROC_CUT_TURN / PROC_BOARD_CUT_TURN with his first spin emitter id live. clearCutTurn-
+ *          EffectID zeroes those ids on every proc change (d_a_alink.cpp:15218), so a non-zero id
+ *          in the spin proc means the emitter has been set in it; that already folds in the
+ *          start-frame gate and the out-of-Zora-armour underwater early return.
+ *   bit 3  kPlayerFxSwordCharge: m_nSwordBtk's frame > 0, setSwordChargeEffect's own test
+ *          (d_a_alink_effect.inc:820-821). The frame is NOT on the wire: it is 1 on the first
+ *          charging tick and rises by one a tick (simpleAnmPlay, d_a_alink.cpp:5845; reset to 0 by
+ *          every commonProcInit, :15244), so the receiver plays its own copy of the BTK from the
+ *          rising edge. Never set with the wooden sword (he does not play the BTK for it).
+ *
+ * Bits 6-7 are ONE two-bit field whose meaning depends on which of bits 1 and 2 is set. The two
+ * never are at once: copyBlur is unreachable in the spin procs (setAtCollision sends PROC_CUT_TURN
+ * and PROC_BOARD_CUT_TURN to decSwordBlur, d_a_alink.cpp:6574-6588), and fill_sword_fx gives the
+ * spin precedence regardless. With neither set the field is 0.
+ *   with bit 2: a PlayerFxSpinKind, the emitter list setCutTurnEffect chose (:1034-1061).
+ *   with bit 1: kPlayerFxTrailDash (bit 6): the blur alpha is his mDashBlurAlpha, not mBlurAlpha
+ *               (d_a_alink.cpp:6567-6572). kPlayerFxTrailReversed (bit 7): the blade sweeps along
+ *               its local +Z rather than -Z, i.e. CUT_TYPE_TWIRL / CUT_TYPE_FINISH_RIGHT
+ *               (setSwordPos, :5875-5879), read off the direction the blur actually stored.
+ */
+constexpr std::uint8_t kPlayerFxVariantShift = 6;
+constexpr std::uint8_t kPlayerFxVariantMask = 0xC0;
+constexpr std::uint8_t kPlayerFxTrailDash = 1 << 6;
+constexpr std::uint8_t kPlayerFxTrailReversed = 1 << 7;
+/// The spin's emitter list. A Zora-armour LARGE spin underwater has no value of its own: it goes as
+/// kPlayerFxSpinWater, and the receiver loses only that case's particle scale/volume tweak.
+enum PlayerFxSpinKind : std::uint8_t {
+    kPlayerFxSpinNormal = 0,
+    kPlayerFxSpinLight = 1,
+    kPlayerFxSpinLarge = 2,
+    kPlayerFxSpinWater = 3,
+};
 // The ironBallState byte's layout is in dusk/player_held.hpp, which the puppet can include.
 
 /**

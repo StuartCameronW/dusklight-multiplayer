@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
+#include "SSystem/SComponent/c_counter.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_arrow.h"
 #include "d/actor/d_a_remote_player.h"
@@ -1596,6 +1597,157 @@ void fill_attack(daAlink_c* alink, PlayerState& out) {
     out.atSpl = static_cast<std::uint8_t>(cps[0].GetAtSpl());
 }
 
+/**
+ * v20 fxFlags bits 1-3 and 6-7 (agent F): the sword trail, the spin attack's effect and the sword
+ * charge. What each bit means, and the daAlink_c line it comes from, is in the block under
+ * kPlayerFxKnownMask (player_state.hpp); this is the reading.
+ *
+ * ★ The trail is read off its OUTCOME, m_swordBlur's point count, rather than by re-deriving the
+ * branch in setAtCollision that decides whether to extend it (d_a_alink.cpp:6560-6636). That
+ * decision is a reset flag, four procs, a large-jump sub-state, a no-blur cut-type list and a
+ * collision path that is not reached every tick; each re-derivation of a daAlink_c decision so far
+ * has missed a branch. The count only RISES in copyBlur, so "it rose since the previous tick" is
+ * the answer itself — with one subtlety: at its cap a copy leaves it at 58 while a decay takes it
+ * to 48, so 58 -> 58 is a copy too.
+ *
+ * "The previous tick" is keyed on g_Counter.mCounter0 (bumped once per fapGm_Execute). The session
+ * trace calls capture_local_player a second time in the same tick, and without the key that call
+ * would see "no change" and send the trail as off. A skipped capture (a load, a cutscene) just
+ * leaves the history a tick or more stale, which can cost one trail tick and nothing else.
+ */
+static void fill_sword_fx(daAlink_c* alink, PlayerState& out) {
+    static bool s_haveTick = false;
+    static u32 s_tick = 0;
+    static int s_prevCount = 0;
+    static std::uint8_t s_bits = 0;
+    static std::uint8_t s_loggedBits = 0;
+    static u32 s_onSince[3] = {0, 0, 0};
+    static u16 s_logCount = 0;
+    const u16 logMax = 64;
+
+    if (s_haveTick && g_Counter.mCounter0 == s_tick) {
+        out.fxFlags |= s_bits;
+        return;
+    }
+
+    std::uint8_t bits = 0;
+    int count = 0;
+    if (alink != nullptr && !alink->checkWolf()) {
+        count = alink->m_swordBlur.field_0x14;
+        const bool spinProc = alink->mProcID == daAlink_c::PROC_CUT_TURN ||
+                              alink->mProcID == daAlink_c::PROC_BOARD_CUT_TURN;
+
+        if (spinProc && alink->field_0x3204[0] != 0) {
+            /* setCutTurnEffect's own list choice, in its order (d_a_alink_effect.inc:1034-1061):
+             * underwater first (only reachable here with the Zora armour, or the id would be 0),
+             * then the large spin, then the light sword, then the ordinary one. */
+            std::uint8_t kind = kPlayerFxSpinNormal;
+            if (alink->checkNoResetFlg0(daPy_py_c::FLG0_WATER_IN_MOVE)) {
+                kind = kPlayerFxSpinWater;
+            } else if (alink->mCutType == daPy_py_c::CUT_TYPE_LARGE_TURN_RIGHT ||
+                       alink->mCutType == daPy_py_c::CUT_TYPE_LARGE_TURN_LEFT)
+            {
+                kind = kPlayerFxSpinLarge;
+            } else if (alink->checkNoResetFlg3(daPy_py_c::FLG3_UNK_100000)) {
+                kind = kPlayerFxSpinLight;
+            }
+            bits |= kPlayerFxSpin;
+            bits |= static_cast<std::uint8_t>(kind << kPlayerFxVariantShift);
+        } else if (s_haveTick && (count > s_prevCount || (count == 58 && s_prevCount == 58))) {
+            bits |= kPlayerFxSwordTrail;
+            // The alpha the blur was given on this attack tick (d_a_alink.cpp:6567-6572).
+            if (alink->m_swordBlur.field_0x20 == daAlinkHIO_cut_c0::m.mDashBlurAlpha) {
+                bits |= kPlayerFxTrailDash;
+            }
+            /* The direction copyBlur stored (field_0x2c = its third argument, field_0x34a4)
+             * against the blade's local +Z: setSwordPos makes it +Z for the twirl and the right
+             * finisher and -Z for everything else (d_a_alink.cpp:5875-5879). Read off what the
+             * blur used rather than off mCutType, which the next execute may already have
+             * cleared. */
+            if (alink->mSwordModel != nullptr) {
+                cXyz localZ;
+                mDoMtx_multVecSR(alink->mSwordModel->getBaseTRMtx(), &cXyz::BaseZ, &localZ);
+                if (localZ.inprod(alink->m_swordBlur.field_0x2c) > 0.0f) {
+                    bits |= kPlayerFxTrailReversed;
+                }
+            }
+        }
+
+        if (alink->m_nSwordBtk != nullptr && alink->m_nSwordBtk->getFrame() > 0.0f) {
+            bits |= kPlayerFxSwordCharge;
+        }
+    }
+
+    /* One line per edge, capped. Each names the tick so the receiver's matching line can be lined
+     * up against it; a sender line with no receiver line is the failure this exists to show. */
+    const u32 tick = g_Counter.mCounter0;
+    const std::uint8_t edgeBits[3] = {kPlayerFxSwordTrail, kPlayerFxSpin, kPlayerFxSwordCharge};
+    const char* edgeNames[3] = {"trail", "spin", "charge"};
+    for (int i = 0; i < 3; i++) {
+        const bool on = (bits & edgeBits[i]) != 0;
+        const bool was = (s_loggedBits & edgeBits[i]) != 0;
+        if (on == was) {
+            continue;
+        }
+        if (on) {
+            s_onSince[i] = tick;
+        }
+        if (s_logCount < logMax) {
+            s_logCount++;
+            if (on) {
+                // variant = the spin kind with the spin bit, dash | reversed << 1 with the trail.
+                Log.debug("Local sword fx: {} ON at tick {} (fx 0x{:02X}, variant {}; blur count "
+                          "{}, charge frame {:.0f})",
+                    edgeNames[i], tick, static_cast<unsigned>(bits),
+                    (bits & kPlayerFxVariantMask) >> kPlayerFxVariantShift, count,
+                    alink != nullptr && alink->m_nSwordBtk != nullptr ?
+                        alink->m_nSwordBtk->getFrame() :
+                        0.0f);
+            } else {
+                Log.debug("Local sword fx: {} OFF at tick {} after {} tick(s)", edgeNames[i], tick,
+                    tick - s_onSince[i]);
+            }
+        }
+    }
+
+    s_loggedBits = bits;
+    s_bits = bits;
+    s_prevCount = count;
+    s_tick = tick;
+    s_haveTick = true;
+    out.fxFlags |= bits;
+}
+
+/**
+ * fill_sword_fx's bits, decoded for the puppet, which does not see the wire layout. The two-bit
+ * variant field is read as the spin kind only with the spin bit and as the trail's two flags only
+ * with the trail bit; a (malformed) state with both set is read as a spin, as the sender sends it.
+ */
+static void apply_sword_fx(daRemotePlayer_c* puppet, const PlayerState& state) {
+    const std::uint8_t fx = state.fxFlags;
+    const bool spin = (fx & kPlayerFxSpin) != 0;
+    const bool trail = !spin && (fx & kPlayerFxSwordTrail) != 0;
+
+    u8 spinKind = daRemotePlayer_c::SWORD_SPIN_NORMAL_e;
+    switch ((fx & kPlayerFxVariantMask) >> kPlayerFxVariantShift) {
+    case kPlayerFxSpinLight:
+        spinKind = daRemotePlayer_c::SWORD_SPIN_LIGHT_e;
+        break;
+    case kPlayerFxSpinLarge:
+        spinKind = daRemotePlayer_c::SWORD_SPIN_LARGE_e;
+        break;
+    case kPlayerFxSpinWater:
+        spinKind = daRemotePlayer_c::SWORD_SPIN_WATER_e;
+        break;
+    default:
+        break;
+    }
+
+    puppet->setNetworkSwordFx(trail, trail && (fx & kPlayerFxTrailDash) != 0,
+        trail && (fx & kPlayerFxTrailReversed) != 0, spin, spin ? spinKind : 0,
+        (fx & kPlayerFxSwordCharge) != 0);
+}
+
 bool capture_local_player(PlayerState& out) {
     if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
@@ -1758,6 +1910,7 @@ bool capture_local_player(PlayerState& out) {
     // v20: effects. Each feature ORs in only its own PlayerFx bits.
     out.fxFlags = 0;
     out.dmgFlash = 0;
+    fill_sword_fx(alink, out); // sword trail + spin/charge fx (agent F): bits 1-3, 6-7
 
     return true;
 }
@@ -1953,6 +2106,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkIronBall(state.iron_ball_gait(),
         cXyz(state.iron_ball_x(), state.iron_ball_y(), state.iron_ball_z()), state.ironBallAngX,
         state.ironBallAngY, state.ironBallLinks, state.ironBallState);
+    apply_sword_fx(puppet, state); // v20 fxFlags bits 1-3, 6-7: sword trail + spin/charge (agent F)
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.
