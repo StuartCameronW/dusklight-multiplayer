@@ -18,6 +18,7 @@
 #include "dusk/main.h"
 #include "dusk/mods/svc/ui.hpp"
 #include "dusk/multiplayer/session/network_manager.hpp"
+#include "dusk/multiplayer/session/presence.hpp"
 #include "dusk/settings.h"
 #include "dusk/speedrun.h"
 
@@ -116,6 +117,24 @@ private:
                 mLive[i]->SetInnerRML(text);
             }
         }
+        update_presence();
+    }
+
+    /// Where each player is, and whether "Join" would be allowed. Presence changes never change the
+    /// session's shape, so this is rewritten in place like the RTT.
+    void update_presence() {
+        for (auto& row : mPresence) {
+            const std::string where = escape(mp::presence::describe(row.playerId));
+            if (row.where->GetInnerRML() != where) {
+                row.where->SetInnerRML(where);
+            }
+            const char* blocker = mp::presence::join_partner_blocker(row.playerId);
+            const std::string tooltip = blocker != nullptr ? blocker : "";
+            if (row.join != nullptr && tooltip != row.tooltip) {
+                row.tooltip = tooltip;
+                row.join->set_tooltip(tooltip);
+            }
+        }
     }
 
     static Rml::String friendly_fire_label() {
@@ -139,6 +158,7 @@ private:
 
     void build(Rml::Element* content) {
         mLive.clear();
+        mPresence.clear();
         const mp::SessionStatus s = mp::network_manager().status();
         auto& pane = add_child<Pane>(content, Pane::Type::Uncontrolled);
 
@@ -180,7 +200,31 @@ private:
             Rml::Element* live = found.empty() ? row : found.front();
             live->SetInnerRML(escape(live_text(p)));
             mLive.push_back(live);
+
+            // Spec I.3/I.4 (mp-m4-m5-world.md): where they are, and the join-partner warp.
+            if (!p.handshakeComplete) {
+                continue;
+            }
+            PresenceRow presenceRow;
+            presenceRow.playerId = p.playerId;
+            presenceRow.where = pane.add_text(mp::presence::describe(p.playerId));
+            const std::uint32_t playerId = p.playerId;
+            auto& join = pane.add_button({
+                .text = fmt::format("Join {}", p.nickname),
+                .isDisabled =
+                    [playerId] { return mp::presence::join_partner_blocker(playerId) != nullptr; },
+            });
+            join.on_pressed([playerId] {
+                // Re-checked inside: the state can change between the frame that enabled the
+                // button and the press.
+                if (mp::presence::join_partner(playerId)) {
+                    mDoAud_seStartMenu(kSoundClick);
+                }
+            });
+            presenceRow.join = &join;
+            mPresence.push_back(std::move(presenceRow));
         }
+        update_presence();
 
         pane.add_section("Options");
         add_friendly_fire_toggle(pane);
@@ -224,6 +268,16 @@ private:
     std::string mShape;
     /// One live-text element per entry of status().players, in the same order.
     std::vector<Rml::Element*> mLive;
+
+    /// One per admitted remote player: their location line and their Join button.
+    struct PresenceRow {
+        std::uint32_t playerId = 0;
+        Rml::Element* where = nullptr;
+        Component* join = nullptr;
+        /// What the Join button's tooltip says now, so it is only rebuilt on a change.
+        std::string tooltip;
+    };
+    std::vector<PresenceRow> mPresence;
 };
 
 }  // namespace
