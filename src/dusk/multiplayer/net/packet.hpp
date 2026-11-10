@@ -154,7 +154,14 @@ namespace dusk::mp {
  * furFrame while a transformation runs. flags' kPlayerStateWolf is now set for a wolf sender.
  * 2 bytes idle; a v20 peer's read() would stop two bytes short and drop every pose.
  */
-inline constexpr std::uint32_t kProtocolVersion = 21;
+/*
+ * 22: Batch 5. New packets 12-19 (the shared world, M5: Presence, WorldSync, WorldPropose,
+ * WorldCommit, WorldSyncRequest, WorldDigest; 17/18 reserved for chest/item claims in W-B) and
+ * 20-25 (the replicated-object channel) on a new reliable channel 2. A v21 peer would drop them as
+ * unknown and silently stay in its own world, so this is a refused handshake instead of a quiet
+ * desync. Specs: .claude/future-plans/mp-m4-m5-world.md, mp-object-channel.md.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 22;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -163,7 +170,11 @@ inline constexpr std::uint16_t kDefaultPort = 7777;
 /// (a dropped snapshot is always superseded by the next one, so resending it is wasted latency).
 inline constexpr std::uint8_t kChannelControl = 0;
 inline constexpr std::uint8_t kChannelState = 1;
-inline constexpr std::size_t kChannelCount = 2;
+/// Channel 2 (v22) is reliable/ordered object traffic (spawn, event, despawn, claim). Its own
+/// channel so a burst of object spawns can't head-of-line-block heartbeats or PeerLeft on channel 0,
+/// and so an object's despawn can never overtake its own spawn.
+inline constexpr std::uint8_t kChannelObjects = 2;
+inline constexpr std::size_t kChannelCount = 3;
 
 enum class PacketId : std::uint8_t {
     Invalid = 0,
@@ -234,6 +245,26 @@ enum class PacketId : std::uint8_t {
     /// the guest against its own and, on a gameplay difference, sends its own ModsUpdate (so the
     /// guest can name what differs) and hangs up with ModMismatch. A guest only records the host's.
     ModsUpdate = 11,
+
+    // --- v22: the shared world (M5). Spec: .claude/future-plans/mp-m4-m5-world.md. All reliable on
+    // kChannelControl. Payload layouts are documented where they are written (world_net / presence).
+    Presence = 12,          ///< either way, host relays: where a player is (stage, room, layer, flags)
+    WorldSync = 13,         ///< host -> guest: the whole WorldView
+    WorldPropose = 14,      ///< guest -> host: ops the guest's own diff produced
+    WorldCommit = 15,       ///< host -> all: ops the host accepted, in worldSeq order
+    WorldSyncRequest = 16,  ///< guest -> host: "send me WorldSync" (digest mismatch, join)
+    ClaimRequest = 17,      ///< reserved for Batch W-B (chest / floor-item claims)
+    ClaimReply = 18,        ///< reserved for Batch W-B
+    WorldDigest = 19,       ///< host -> all: [u32 worldSeq][u32 digest], every 60 ticks
+
+    // --- v22: the replicated-object channel. Spec: .claude/future-plans/mp-object-channel.md
+    // (which numbered these 12-17 before the world packets took those ids; same order, +8).
+    ObjSpawn = 20,          ///< owner -> host -> others, kChannelObjects
+    ObjState = 21,          ///< owner -> host -> others, kChannelState, unreliable
+    ObjEvent = 22,          ///< owner -> host -> others, kChannelObjects
+    ObjDespawn = 23,        ///< owner -> host -> others, kChannelObjects
+    ObjClaim = 24,          ///< any -> host, kChannelObjects
+    ObjClaimResult = 25,    ///< host -> all, kChannelObjects
 };
 
 /**

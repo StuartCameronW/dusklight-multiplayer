@@ -1417,6 +1417,8 @@ set(DUSK_FILES
         src/d/actor/d_a_alink_dusk.cpp
         include/d/actor/d_a_remote_player.h
         src/d/actor/d_a_remote_player.cpp
+        include/d/actor/d_a_mp_ghost.h
+        src/d/actor/d_a_mp_ghost.cpp
         src/dusk/OSContext.cpp
         src/dusk/OSMutex.cpp
         src/dusk/OSReport.cpp
@@ -1706,6 +1708,15 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/replication_manager.hpp
         src/dusk/multiplayer/replication/world_clock.cpp
         src/dusk/multiplayer/replication/world_clock.hpp
+        src/dusk/multiplayer/replication/world_state.cpp
+        src/dusk/multiplayer/replication/world_state.hpp
+        src/dusk/multiplayer/replication/world_bridge.cpp
+        src/dusk/multiplayer/replication/world_bridge.hpp
+        src/dusk/multiplayer/replication/object_channel.cpp
+        src/dusk/multiplayer/replication/object_channel.hpp
+        src/dusk/multiplayer/replication/object_kinds.hpp
+        src/dusk/multiplayer/session/presence.cpp
+        src/dusk/multiplayer/session/presence.hpp
         src/dusk/multiplayer/session/mod_check.cpp
         src/dusk/multiplayer/session/mod_check.hpp
         src/dusk/multiplayer/session/network_manager.cpp
