@@ -89,6 +89,45 @@ private:
     void executeArrow();
     int drawArrow();
     void eventArrow(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    /// The friendly-fire collider (dCcD_Stts + dCcD_Cps). Defined in d_a_mp_ghost_arrow.inc and
+    /// allocated in this actor's own solid heap, so this header needs no collision include.
+    struct ArrowFf;
+    void arrowReadBlob();
+    void arrowSyncModel(bool i_drawOnly);
+    void arrowInitSound();
+    void arrowFriendlyFire(bool i_armed);
+    /* All set in createHeapArrow (the shared constructor does not know them). */
+    ArrowFf* mpArrowFf;
+    /// The normal-arrow (Arrow kind) or pellet (Pellet kind) model; mpModel points at it or at
+    /// mpArrowBombModel, whichever the blob's type says.
+    J3DModel* mpArrowPlainModel;
+    /// Arrow kind only: the bomb arrow. Both are loaded because the type arrives in the blob, after
+    /// the heap is made.
+    J3DModel* mpArrowBombModel;
+    Z2SoundObjArrow mArrowSound;
+    /// Model origin at the last execute: the tail of the friendly-fire sweep.
+    cXyz mArrowPrevPos;
+    cXyz mArrowSmokePos;
+    csXyz mArrowSmokeAngle;
+    u32 mArrowBlurId;
+    u32 mArrowSmokeId[2];
+    /// From the latest blob (object_kind_arrow.hpp ArrowBlob).
+    u8 mArrowType;
+    u8 mArrowState;
+    u8 mArrowBits;
+    u8 mArrowScale;
+    u8 mArrowFlash;
+    /// mArrowState as of the previous execute, for the stream-carried cues (rebound SE).
+    u8 mArrowPrevState;
+    bool mArrowSoundReady;
+    bool mArrowHavePrev;
+    /// A Stuck event arrived.
+    bool mArrowStuck;
+    /// Exploded, a pellet that hit, or an arrow that struck the local player: draws nothing more.
+    bool mArrowGone;
+    /// Friendly fire already hit with this projectile (one hit per projectile, spec §3).
+    bool mArrowFfHit;
+    bool mArrowLoggedUp;
     /* ==== end arrow ==== */
 
     /* ==== Bomb, water bomb, bombling (0x03-0x05): d_a_mp_ghost_bomb.inc ==== */

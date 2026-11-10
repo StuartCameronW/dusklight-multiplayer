@@ -174,9 +174,12 @@ struct ObjKindInfo {
 };
 
 inline constexpr ObjKindInfo kObjKinds[] = {
-    // d_a_arrow.cpp:1149: 0x810, 0xEA0 for a bomb arrow (P1a picks per spawn blob).
-    {ObjKind::Arrow, "arrow", 1, 15, 0xEA0, false},
-    {ObjKind::Pellet, "pellet", 1, 15, 0x810, false},
+
+    // d_a_arrow.cpp:1149: 0x810, 0xEA0 for a bomb arrow. The type arrives in the blob after the
+    // heap is made, so an Arrow ghost loads BOTH models (0x810 + 0xEA0) plus its friendly-fire
+    // collider (~0x180, d_a_mp_ghost_arrow.inc ArrowFf), rounded up. A pellet: 0x810 + collider.
+    {ObjKind::Arrow, "arrow", 1, 15, 0x1A00, true},
+    {ObjKind::Pellet, "pellet", 1, 15, 0xC00, true},
     // d_a_nbomb.cpp:210: 0xEB0 / 0x17C0 (bombling). Ghost: d_a_mp_ghost_bomb.inc; owner:
     // object_capture_bomb.cpp; blobs: object_kind_bomb.hpp.
     {ObjKind::Bomb, "bomb", 1, 15, 0xEB0, true},
