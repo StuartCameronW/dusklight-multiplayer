@@ -193,6 +193,43 @@ enum PlayerGearFlags : std::uint8_t {
      * and the pivot wrong, as deriving the boots gait from the boots bit would.
      */
     kPlayerGearIronBallGait = 1 << 2,
+    /**
+     * Bits 3-6 (agent G) are filled by this sender. Set by every sender built with them, whatever
+     * he is wearing; a sender built before them leaves it clear.
+     *
+     * ★ It exists because bit 5's CLEAR state is not the puppet's old look. The Zora outfit hides
+     * material 11 whenever the mask is not drawn, which is all the time on dry land, and a puppet
+     * fed by an older sender kept it shown. With this bit clear the puppet keeps that old look
+     * exactly: no magic armour BRK, mask hidden, material 11 shown. No protocol bump.
+     */
+    kPlayerGearFxReported = 1 << 3,
+    /**
+     * The magic armour BRK the sender last chose: his field_0x2fd7, the status setMagicArmorBrk
+     * stores (d_a_alink.cpp:12720-12745). Set = 1, the ml_*_power_up_a pair (rupees left); clear
+     * = 0, the ml_*_power_down pair. Only while checkMagicArmorWearAbility().
+     *
+     * One bit is the whole range: status 2 (power_up_b) has no caller anywhere in the tree. It is
+     * the stored value rather than the rupee count because Dusk's armorRupeeDrain modes pin it at
+     * 1 with no rupees (d_a_alink_wolf.inc:350-358), which the receiver cannot see.
+     */
+    kPlayerGearMagicArmorPowered = 1 << 4,
+    /**
+     * The sender's `checkZoraWearMaskDraw()` (d_a_alink_swim.inc:10-12): Zora armour and NOT
+     * FLG0_SWIM_UP. That flag is set everywhere except under water (it is on at create,
+     * d_a_alink.cpp:4610), so this is "diving in the Zora armour". setSelectEquipItem shows the
+     * mask (material 9) and material 11 on it and hides both otherwise (d_a_alink.cpp:4417-4449).
+     * The mask also stays hidden under the iron boots; the receiver takes that from bit 0.
+     */
+    kPlayerGearZoraMask = 1 << 5,
+    /**
+     * The sender's wooden shield is burning: his burn timer field_0x2fcb is non-zero. It is set to
+     * 120 on a fire hit (d_a_alink_guard.inc:107-108, d_a_alink_damage.inc:666-667), and then
+     * every tick it either counts down by one or is cleared, never held
+     * (d_a_alink.cpp:18566-18587). So the rising edge gives the receiver the timer's value exactly,
+     * and it runs its own copy for the tint, which would otherwise need 7 bits. See
+     * d_a_remote_player_gear.inc.
+     */
+    kPlayerGearShieldBurning = 1 << 6,
 };
 
 /**

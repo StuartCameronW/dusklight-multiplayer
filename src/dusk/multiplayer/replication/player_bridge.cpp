@@ -517,6 +517,38 @@ void fill_gear(daAlink_c* alink, PlayerState& out) {
     {
         out.gear |= kPlayerGearIronBallGait;
     }
+    // Bits 3-6 (agent G): the outfit's material state and the shield burn, each the value his own
+    // draw code reads. See PlayerGearFlags.
+    if (alink != nullptr) {
+        out.gear |= kPlayerGearFxReported;
+        if (alink->checkMagicArmorWearAbility() && alink->field_0x2fd7 != 0) {
+            out.gear |= kPlayerGearMagicArmorPowered;
+        }
+        if (alink->checkZoraWearMaskDraw()) {
+            out.gear |= kPlayerGearZoraMask;
+        }
+        if (alink->field_0x2fcb != 0) {
+            out.gear |= kPlayerGearShieldBurning;
+        }
+    }
+    // The sender's half of the both-ends check: one capped line per change of bits 3-6. The
+    // puppet logs the same changes as it draws them ("Puppet N magic armour BRK", "Zora mask",
+    // "shield burn").
+    static std::uint8_t sLoggedGearFx = 0;
+    static int sGearFxLogCount = 0;
+    const std::uint8_t gearFx =
+        static_cast<std::uint8_t>(out.gear & (kPlayerGearFxReported | kPlayerGearMagicArmorPowered |
+                                                 kPlayerGearZoraMask | kPlayerGearShieldBurning));
+    if (gearFx != sLoggedGearFx && sGearFxLogCount < 48) {
+        sGearFxLogCount++;
+        Log.info(
+            "Local gear fx: reported {} | armour powered {} | Zora mask {} | shield burning {} "
+            "(timer {})",
+            (gearFx & kPlayerGearFxReported) != 0, (gearFx & kPlayerGearMagicArmorPowered) != 0,
+            (gearFx & kPlayerGearZoraMask) != 0, (gearFx & kPlayerGearShieldBurning) != 0,
+            alink != nullptr ? alink->field_0x2fcb : 0);
+    }
+    sLoggedGearFx = gearFx;
 }
 
 /* --- D3b: the attention (Z-target / lock-on) move set. ---------------------------------------- */
@@ -2366,6 +2398,9 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkUpperGuard(state.upper_guard());
     puppet->setNetworkHeavyBoots(state.heavy_boots());
     puppet->setNetworkHeavyGait(state.heavy_gait());
+    puppet->setNetworkGearFx((state.gear & kPlayerGearFxReported) != 0,
+        (state.gear & kPlayerGearMagicArmorPowered) != 0, (state.gear & kPlayerGearZoraMask) != 0,
+        (state.gear & kPlayerGearShieldBurning) != 0);  // gear bits 3-6 (agent G)
     // v19 block B: iron ball. The carry gait and where the ball is, decoded here.
     puppet->setNetworkIronBall(state.iron_ball_gait(),
         cXyz(state.iron_ball_x(), state.iron_ball_y(), state.iron_ball_z()), state.ironBallAngX,
@@ -2440,6 +2475,11 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
     if (puppet->getNetIronBallGait()) {
         out.gear |= kPlayerGearIronBallGait;
     }
+    // Bits 3-6 as the puppet is DRAWING them, not as received (agent G).
+    out.gear |= (puppet->getGearFxReported() ? kPlayerGearFxReported : 0) |
+                (puppet->getMagicArmorPoweredDrawn() ? kPlayerGearMagicArmorPowered : 0) |
+                (puppet->getZoraMaskDrawn() ? kPlayerGearZoraMask : 0) |
+                (puppet->getShieldBurnDrawn() ? kPlayerGearShieldBurning : 0);
     // The joint aim values the puppet's callbacks are drawing from this tick, read back off it.
     out.neckX = puppet->getNetNeckX();
     out.neckY = puppet->getNetNeckY();

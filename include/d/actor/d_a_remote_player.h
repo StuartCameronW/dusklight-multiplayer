@@ -1511,7 +1511,9 @@ public:
         /// First of the slots reserved for the sword trail / spin / charge effects (agent F):
         /// PUPPET_FX_SWORD_FIRST .. PUPPET_FX_NUM - 1.
         PUPPET_FX_SWORD_FIRST = 1,
-        PUPPET_FX_NUM = 8,
+        /// ZI_J_LK_SH_BURN_A, the burning wooden shield (agent G).
+        PUPPET_FX_SHIELD_FIRE = 8,
+        PUPPET_FX_NUM = 13,
     };
     JPABaseEmitter* setPuppetEmitter(int i_slot, u16 i_name, const cXyz* i_pos,
         const csXyz* i_rot = NULL, const cXyz* i_scale = NULL);
@@ -1676,6 +1678,68 @@ private:
     s16 mNetClawTipAng[4];
     u16 mClawLogCount;
     bool mLoggedClawChain;
+
+    // --- gear fx (agent G) ---
+    /* PlayerState::gear bits 3-6: the magic armour's BRK glow, the Zora helmet's diving mask and
+     * the wooden shield's burn (tint, fire, burn-out). See d_a_remote_player_gear.inc. All zeroed
+     * by fopAcM_ct and set up again by setupGearFx(). */
+public:
+    /// gear bits 3-6, decoded by the bridge every tick (dusk::mp::apply_puppet_state).
+    void setNetworkGearFx(bool i_reported, bool i_armorPowered, bool i_zoraMask, bool i_shieldBurn);
+    /// What the puppet is DRAWING for each bit, for read_puppet_pose's gear column.
+    bool getGearFxReported() const { return mNetGearReported; }
+    bool getMagicArmorPoweredDrawn() const { return mArmorBrkStatus == 1; }
+    bool getZoraMaskDrawn() const { return mZoraShapeState == ZORA_SHAPES_DIVING; }
+    bool getShieldBurnDrawn() const { return mShieldBurnTimer != 0; }
+
+private:
+    /// What the Zora outfit's two shapes are showing. NONE: not applied yet (or not Zora).
+    enum {
+        ZORA_SHAPES_NONE = 0,
+        ZORA_SHAPES_AS_BUILT,  ///< mask hidden, material 11 shown: the pre-bit-3 look
+        ZORA_SHAPES_DRY,       ///< both hidden: his look whenever the mask is not drawn
+        ZORA_SHAPES_DIVING,    ///< material 11 shown, the mask shown unless the iron boots are on
+    };
+    /// createHeap(), after the iron boots: the BRKs and the Zora shapes. No heap.
+    void setupGearFx();
+    /// execute(), after setMatrix(): BRK frames, the Zora shapes, the shield's timer and fire.
+    void updateGearFx();
+    void updateMagicArmorBrk();
+    void updateZoraMask();
+    void updateShieldBurn();
+    /// draw(), right after applyDamageTint(): enter or remove the BRK as his draw() does.
+    void applyMagicArmorBrk();
+    /// drawEquip(), around the shield: his burnt-wood TevColor and its reset.
+    bool beginShieldBurnTint();
+    void endShieldBurnTint(bool i_tinted);
+    /// The destructor: the second burn emitter, which is not in a PUPPET_FX slot.
+    void deleteGearFx();
+    // The wire's values, as pushed by setNetworkGearFx().
+    bool mNetGearReported;
+    bool mNetArmorPowered;
+    bool mNetZoraMask;
+    bool mNetShieldBurn;
+    /// ml_body / ml_head power_down [0] and power_up_a [1], out of this puppet's own Mmdl mount.
+    /// NULL for every other outfit.
+    J3DAnmTevRegKey* mpArmorBodyBrk[2];
+    J3DAnmTevRegKey* mpArmorHeadBrk[2];
+    /// His field_0x2fd7 as the puppet plays it; -1 = no BRK (not reported, or not Mmdl).
+    s8 mArmorBrkStatus;
+    /// The pair currently entered on the body/head model data, so the right one is removed.
+    J3DAnmTevRegKey* mpArmorBodyBrkIn;
+    J3DAnmTevRegKey* mpArmorHeadBrkIn;
+    /// His field_0x06e4 (material 9, the mask) and field_0x06f0 (material 11) for the Zora
+    /// outfit; NULL otherwise.
+    J3DShape* mpZoraMaskShape;
+    J3DShape* mpZoraHoodShape;
+    u8 mZoraShapeState;
+    /// His field_0x2fcb, re-run here from bit 6's rising edge.
+    u8 mShieldBurnTimer;
+    /// ZI_J_LK_SH_BURN_B's level-emitter handle (BURN_A is PUPPET_FX_SHIELD_FIRE).
+    u32 mShieldBurnEmitterB;
+    /// The shield model the fire was last placed on, for the burn-out particles.
+    J3DModel* mpShieldBurnModel;
+    u16 mGearFxLogCount;
 };
 
 /**
