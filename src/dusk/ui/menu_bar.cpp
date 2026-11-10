@@ -12,6 +12,7 @@
 #include "warp.hpp"
 #include "window.hpp"
 
+#include "dusk/config.hpp"
 #include "dusk/game_mode.hpp"
 #include "dusk/livesplit.h"
 #include "dusk/main.h"
@@ -117,6 +118,25 @@ private:
         }
     }
 
+    static Rml::String friendly_fire_label() {
+        return getSettings().multiplayer.friendlyFire.getValue() ? "Friendly fire: On" :
+                                                                    "Friendly fire: Off";
+    }
+
+    /// Each player's own switch: it decides whether OTHER players' swords can hurt them.
+    static void add_friendly_fire_toggle(Pane& pane) {
+        auto& button = pane.add_button(friendly_fire_label());
+        auto* buttonPtr = &button;
+        button.on_pressed([buttonPtr] {
+            mDoAud_seStartMenu(kSoundClick);
+            auto& var = getSettings().multiplayer.friendlyFire;
+            var.setValue(!var.getValue());
+            config::save();
+            buttonPtr->set_text(friendly_fire_label());
+        });
+        pane.add_text("When on, other players' sword attacks can hurt you.");
+    }
+
     void build(Rml::Element* content) {
         mLive.clear();
         const mp::SessionStatus s = mp::network_manager().status();
@@ -128,6 +148,8 @@ private:
             if (!s.lastEndMessage.empty()) {
                 pane.add_text(s.lastEndMessage);
             }
+            pane.add_section("Options");
+            add_friendly_fire_toggle(pane);
             return;
         }
 
@@ -159,6 +181,9 @@ private:
             live->SetInnerRML(escape(live_text(p)));
             mLive.push_back(live);
         }
+
+        pane.add_section("Options");
+        add_friendly_fire_toggle(pane);
 
         pane.add_section("Actions");
         const bool isHost = s.role == mp::Role::Host;
