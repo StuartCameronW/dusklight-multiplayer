@@ -4,7 +4,7 @@
 #include "app_info.hpp"
 #include "logging.h"
 #include "main.h"
-#include "map_loader_definitions.h"
+#include "map_names.hpp"
 
 #include "d/d_com_inf_game.h"
 
@@ -33,19 +33,6 @@ static void on_disconnected(int errorCode, std::string_view message) {
 
 static void on_error(int errorCode, std::string_view message) {
     Log.warn("Error ({}: {})", errorCode, message);
-}
-
-static const char* lookup_map_name(const char* mapFile) {
-    if (!mapFile || mapFile[0] == '\0')
-        return nullptr;
-    for (const auto& region : gameRegions) {
-        for (const auto& map : region.maps) {
-            if (map.mapFile && strcmp(mapFile, map.mapFile) == 0) {
-                return map.mapName;
-            }
-        }
-    }
-    return nullptr;
 }
 
 void initialize() {
