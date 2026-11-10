@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "dusk/multiplayer/net/serializer.hpp"
@@ -174,5 +175,12 @@ bool read_view(Reader& r, WorldView& out);
 
 /// FNV-1a 32 over every byte of the view, counters included (as little-endian s32).
 std::uint32_t digest(const WorldView& v);
+
+// --- self-test -----------------------------------------------------------------------------------
+
+/// Engine-free self-test of everything above (diff/apply round-trip and the shadow update, mask
+/// merge, counter paths and clamps, view transfer + digest, proposal limits, truncated input).
+/// Returns false with a message in `failure` on the first failed check.
+bool selftest(std::string& failure);
 
 } // namespace dusk::mp::world
