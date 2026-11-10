@@ -177,10 +177,13 @@ inline constexpr ObjKindInfo kObjKinds[] = {
     // d_a_arrow.cpp:1149: 0x810, 0xEA0 for a bomb arrow (P1a picks per spawn blob).
     {ObjKind::Arrow, "arrow", 1, 15, 0xEA0, false},
     {ObjKind::Pellet, "pellet", 1, 15, 0x810, false},
-    // d_a_nbomb.cpp:210: 0xEB0 / 0x17C0 (bombling).
-    {ObjKind::Bomb, "bomb", 1, 15, 0xEB0, false},
-    {ObjKind::WaterBomb, "waterbomb", 1, 15, 0xEB0, false},
-    {ObjKind::Bombling, "bombling", 1, 15, 0x17C0, false},
+    // d_a_nbomb.cpp:210: 0xEB0 / 0x17C0 (bombling). Ghost: d_a_mp_ghost_bomb.inc; owner:
+    // object_capture_bomb.cpp; blobs: object_kind_bomb.hpp.
+    {ObjKind::Bomb, "bomb", 1, 15, 0xEB0, true},
+    {ObjKind::WaterBomb, "waterbomb", 1, 15, 0xEB0, true},
+    {ObjKind::Bombling, "bombling", 1, 15, 0x17C0, true},
+    // Event-only: an Explode event on a bomb (or a bomb arrow) replays as a real, masked
+    // explosion-only daNbomb_c (daMpGhost_spawnRemoteExplosion), never a ghost of its own.
     {ObjKind::Explosion, "explosion", 0, 0, 0, false},
     // d_a_boomerang.cpp:1476.
     {ObjKind::Boomerang, "boomerang", 1, 15, 0xC0D0, false},

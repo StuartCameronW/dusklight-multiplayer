@@ -93,6 +93,9 @@ enum class Op {
     ExpectKeys,
     ExpectRupees,
     WaitEvent,
+    /* --- batch 6: bombs --- */
+    Bombs,
+    ExpectBombs,
 };
 
 struct Command {
@@ -765,6 +768,52 @@ void run_world_command(const Command& command) {
     }
 }
 
+/* --- batch 6: bombs --- */
+
+/**
+ * `bombs <n> [normal|water|bombling]`: bomb bag 1 (SLOT_15) holds that bomb, n of them (capped at
+ * the bag's max), as item_func_BOMB_BAG_LV1 / dSv_player_item_c::setEmptyBombBag would fill it
+ * (d_item.cpp:852, d_save.cpp:618-632). `equip X 15` then puts it on X: `tap X` takes one out,
+ * `tap A` standing still sets it down, A with the stick held throws it (checkNextActionGrab,
+ * d_a_alink_grab.inc:510-557).
+ *
+ * `expectbombs <n>`: PASS when bag 1 holds n. Also logs the local Link's live-bomb counters
+ * (mActiveBombNum, the bombling count field_0x2fcf), which a real remote bomb's destructor would
+ * decrement (d_a_nbomb.cpp:397-403): the receiver must never touch either.
+ */
+void run_bomb_command(const Command& command) {
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (dComIfGs_getSaveData() == nullptr || alink == nullptr) {
+        Log.error("[{}] line {}: bombs / expectbombs need the world; skipped", sTicks, command.line);
+        return;
+    }
+    switch (command.op) {
+    case Op::Bombs: {
+        const u8 item = static_cast<u8>(command.point);
+        dComIfGs_onItemFirstBit(dItemNo_BOMB_BAG_LV1_e);
+        dComIfGs_onItemFirstBit(item);
+        dComIfGs_setItem(SLOT_15, item);
+        const int max = dComIfGs_getBombMax(item);
+        const int num = std::min(command.room, max);
+        dComIfGs_setBombNum(0, static_cast<u8>(num));
+        Log.info("[{}] bombs: bag 1 (slot 15) holds {} x item 0x{:02X} (asked {}, max {}); live "
+                 "bombs {} bomblings {}",
+            sTicks, dComIfGs_getBombNum(0), item, command.room, max, alink->mActiveBombNum,
+            alink->field_0x2fcf);
+        break;
+    }
+    case Op::ExpectBombs: {
+        const int got = dComIfGs_getBombNum(0);
+        log_expect(got == command.room, "expectbombs",
+            fmt::format("want={} got={} bag=0x{:02X} liveBombs={} liveBomblings={}", command.room,
+                got, dComIfGs_getItem(SLOT_15, false), alink->mActiveBombNum, alink->field_0x2fcf));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 /// Steer toward a world XZ point: the same mapping as the StickTo case in tick().
 void steer_toward(PADStatus& status, double targetX, double targetZ, double maxMagnitude) {
     fopAc_ac_c* link = dComIfGp_getPlayer(0);
@@ -933,6 +982,13 @@ bool settle_program_counter() {
         case Op::ExpectKeys:
         case Op::ExpectRupees:
             run_world_command(command);
+            sPc++;
+            continue;
+
+        /* --- batch 6: bombs --- */
+        case Op::Bombs:
+        case Op::ExpectBombs:
+            run_bomb_command(command);
             sPc++;
             continue;
 
@@ -1213,6 +1269,22 @@ void load_script(const std::filesystem::path& path) {
             command.frames = 1800;
             ok = parse_event_flag(a, command.point) &&
                  (b.empty() || parse_int(b, command.frames)) && command.frames > 0;
+            /* --- batch 6: bombs --- */
+        } else if (verb == "BOMBS") {
+            // "bombs 10 [normal|water|bombling]": bag 1 (slot 15) with that many of that bomb.
+            // Follow with `equip X 15`. See run_bomb_command.
+            command.op = Op::Bombs;
+            const std::string type = to_upper(b);
+            command.point = type.empty() || type == "NORMAL" ? dItemNo_NORMAL_BOMB_e :
+                            type == "WATER"                  ? dItemNo_WATER_BOMB_e :
+                            type == "BOMBLING"               ? dItemNo_POKE_BOMB_e :
+                                                               -1;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 99 &&
+                 command.point >= 0;
+        } else if (verb == "EXPECTBOMBS") {
+            // "expectbombs 10": PASS/FAIL on bag 1's count (logs the live-bomb counters too).
+            command.op = Op::ExpectBombs;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 99;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;

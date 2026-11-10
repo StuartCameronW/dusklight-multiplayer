@@ -168,6 +168,22 @@ int daNbomb_c::create() {
     fopAcM_GetID(this);
     fopAcM_ct(this, daNbomb_c);
 
+#if TARGET_PC
+    {
+        // Dusk multiplayer: a remote explosion's flags ride the create parameter (d_a_nbomb.h).
+        const u32 duskFlags =
+            fopAcM_GetParam(this) & (DUSK_MP_REMOTE_EXPLODE | DUSK_MP_FRIENDLY_FIRE);
+        if (duskFlags != 0) {
+            fopAcM_SetParam(this, fopAcM_GetParam(this) & ~duskFlags);
+            if (fopAcM_GetParam(this) == PRM_NORMAL_BOMB_EXPLODE ||
+                fopAcM_GetParam(this) == PRM_WATER_BOMB_EXPLODE)
+            {
+                mStateFlg0 |= duskFlags;
+            }
+        }
+    }
+#endif
+
     BOOL is_octaeel_bomb = false;
 
     if (fopAcM_GetParam(this) == PRM_FLOWER_BOMB) {
@@ -684,6 +700,21 @@ BOOL daNbomb_c::procExplodeInit() {
     mCcSph.OffTgSetBit();
     mCcSph.OffCoSetBit();
     mCcSph.OnAtSetBit();
+#if TARGET_PC
+    if (checkDuskMpRemote()) {
+        /* Dusk multiplayer: another player's bomb, already exploding for real on his machine.
+         * Its world effects (rocks, walls, webs, Beamos, enemies — ~30 actors key off
+         * AT_TYPE_BOMB) happen THERE and reach this end through world sync, so this copy must
+         * not apply them a second time. Hit group 0x4 is Link's hurtbox (d_a_alink.cpp:1489) and
+         * nothing else's, as for the puppet's sword (d_a_remote_player.cpp, initFriendlyFire):
+         * with this end's friendly fire on, it can hurt only the local player; with it off,
+         * no attack at all. The TG is already off above, so it cannot set off local bombs. */
+        mCcSph.OffAtSPrmBit(0x1A);
+        if ((mStateFlg0 & DUSK_MP_FRIENDLY_FIRE) == 0) {
+            mCcSph.OffAtSetBit();
+        }
+    }
+#endif
     mCcSph.SetR(player->getBombAtR());
     mCcSph.SetC(current.pos);
     dComIfG_Ccsp()->Set(&mCcSph);
@@ -710,6 +741,16 @@ BOOL daNbomb_c::procExplodeInit() {
 BOOL daNbomb_c::procExplode() {
     camera_process_class* camera = dComIfGp_getCamera(0);
     f32 dist_scale = 0.0f;
+
+#if TARGET_PC
+    // Dusk multiplayer: a remote explosion reached the local Link (the only thing its masked
+    // attack can reach, procExplodeInit). Reported once; one hit per explosion (spec §3).
+    if (checkDuskMpRemote() && mCcSph.ChkAtHit()) {
+        daMpGhost_onRemoteExplosionHit(this, mCcSph.GetAtHitAc());
+        mCcSph.ResetAtHit();
+        mCcSph.OffAtSetBit();
+    }
+#endif
 
     mLightInfluence.mPow = mExplosionStrength * 1500.0f;
     mWindInfluence.mStrength = mExplosionStrength;
