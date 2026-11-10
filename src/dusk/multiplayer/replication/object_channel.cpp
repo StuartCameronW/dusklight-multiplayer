@@ -195,14 +195,13 @@ bool is_host() {
     return network_manager().role() == Role::Host;
 }
 
-/// Send through the session: client -> host, host -> every client. See the report / header for
-/// NetworkManager::send_object_packet, which the coordinator owns.
+/// Send through the session: client -> host, host -> every admitted client.
 void send_packet(const Writer& w, std::uint8_t channel, bool reliable) {
     NetworkManager& nm = network_manager();
-    if (!nm.is_active()) {
+    if (!nm.session_live()) {
         return;
     }
-    nm.send_object_packet(w.data().data(), w.size(), channel, reliable);
+    nm.send_to_session(w, channel, reliable);
 }
 
 bool refresh_local() {
