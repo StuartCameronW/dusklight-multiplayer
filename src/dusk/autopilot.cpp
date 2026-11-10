@@ -10,6 +10,7 @@
 
 #include <SDL3/SDL_events.h>
 #include <dolphin/pad.h>
+#include <fmt/format.h>
 
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_player.h"
@@ -19,6 +20,8 @@
 #include "dusk/logging.h"
 #include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
+#include "dusk/multiplayer/session/presence.hpp"
+#include "dusk/multiplayer/session/world_sync.hpp"
 #include "dusk/settings.h"
 #include "f_op/f_op_actor_mng.h"
 #include "f_op/f_op_camera_mng.h"
@@ -72,6 +75,20 @@ enum class Op {
     TalkNear,
     GetItem,
     Transform,
+    // Shared-world (M5) test verbs: see run_world_command.
+    EvBit,
+    Switch,
+    SwitchOff,
+    StageSwitch,
+    Tbox,
+    Keys,
+    RupeesAdd,
+    WorldLog,
+    JoinPartner,
+    ExpectBit,
+    ExpectKeys,
+    ExpectRupees,
+    WaitEvent,
 };
 
 struct Command {
@@ -493,6 +510,257 @@ void run_getitem(const Command& command) {
         command.room, name);
 }
 
+/* ---- Shared-world (M5) test verbs -------------------------------------------------------------
+ * Flag and counter writes plus PASS/FAIL reads, for two-instance world-sync tests
+ * (future-plans/mp-m4-m5-world.md Part III). Writes go through the same dComIfGs_* / dComIfGp_*
+ * calls actors use, so the world diff sees them exactly as it sees gameplay. Reads go to the
+ * engine directly, never through the multiplayer layer, so a PASS means the flag is really set
+ * where the game will look for it. Like `give`, every write changes the save in memory; a script
+ * run's save is a scratch copy. */
+
+/// The `tbl` argument value meaning "the stage table I am standing in, via the room-aware path".
+constexpr int kLiveTbl = -1;
+/// Number of save stage tables (dSv_save_c::STAGE_MAX).
+constexpr int kStageTables = 32;
+/// Switch numbers dSv_info_c::onSwitch routes (memory 0x00-0x7F, dan, zone, one-zone: to 0xEF).
+constexpr int kSwitchLimit = dSv_info_c::MEMORY_SWITCH + dSv_info_c::DAN_SWITCH +
+                             dSv_info_c::ZONE_SWITCH + dSv_info_c::ONEZONE_SWITCH;
+/// Item bits dSv_info_c::onItem routes (dan 0x00-0x7F, memory 0x80-0x9F, zone, one-zone).
+constexpr int kItemLimit = dSv_info_c::MEMORY_ITEM + dSv_info_c::DAN_ITEM + dSv_info_c::ZONE_ITEM +
+                           dSv_info_c::ONEZONE_ITEM;
+/// dSv_memBit_c::mTbox[2].
+constexpr int kTboxLimit = 64;
+
+int sExpectPass = 0;
+int sExpectFail = 0;
+
+/// An event flag as the decomp writes them (d_save_bit_labels.inc): byte << 8 | mask, in hex,
+/// with or without the 0x.
+bool parse_event_flag(const std::string& token, int& out) {
+    try {
+        std::size_t consumed = 0;
+        const int value = std::stoi(token, &consumed, 16);
+        if (consumed != token.size() || value < 0 || value > 0xFFFF || (value & 0xFF) == 0) {
+            return false;
+        }
+        out = value;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+/// A stage table: 0-31, or `live` for the one this instance is standing in.
+bool parse_stage_table(const std::string& token, int& out) {
+    if (to_upper(token) == "LIVE") {
+        out = kLiveTbl;
+        return true;
+    }
+    return parse_int(token, out) && out >= 0 && out < kStageTables;
+}
+
+/// The stage table mMemory belongs to now, or -1 when there is no stage (title, mid-load).
+int live_stage_table() {
+    stage_stag_info_class* info = dComIfGp_getStageStagInfo();
+    return info != nullptr ? dStage_stagInfo_GetSaveTbl(info) : -1;
+}
+
+int current_room() {
+    return dComIfGp_roomControl_getStayNo();
+}
+
+/// Reads one bit for `expectbit`. Returns false (and says why) for a read that cannot be made.
+bool read_world_bit(const Command& command, bool& got, const char*& source) {
+    const std::string domain = to_upper(command.text);
+    const int tbl = command.room;
+    const int no = command.point;
+    const int live = live_stage_table();
+    dSv_save_c& save = g_dComIfG_gameInfo.info.getSavedata();
+
+    if (domain == "EVENT") {
+        got = dComIfGs_isEventBit(static_cast<u16>(no)) != FALSE;
+        source = "mEvent";
+        return true;
+    }
+    if (domain == "SWITCH") {
+        if (tbl == kLiveTbl) {
+            if (live < 0) {
+                return false;
+            }
+            got = dComIfGs_isSwitch(no, current_room()) != FALSE;
+            source = "live";
+            return true;
+        }
+        // The game's own other-stage reader: mMemory if tbl is the live one, else mSave[tbl].
+        got = dComIfGs_isStageSwitch(tbl, no) != FALSE;
+        source = tbl == live ? "mMemory" : "mSave";
+        return true;
+    }
+    if (domain == "TBOX") {
+        if (tbl == kLiveTbl) {
+            if (live < 0) {
+                return false;
+            }
+            got = dComIfGs_isTbox(no) != FALSE;
+            source = "mMemory";
+            return true;
+        }
+        got = dComIfGs_isStageTbox(tbl, no) != FALSE;
+        source = tbl == live ? "mMemory" : "mSave";
+        return true;
+    }
+    if (domain == "ITEM") {
+        if (tbl == kLiveTbl) {
+            if (live < 0) {
+                return false;
+            }
+            got = dComIfGs_isItem(no, current_room());
+            source = "live";
+            return true;
+        }
+        // A numbered table holds only the saved item bits (0x80-0x9F); the parser enforces it.
+        const int bit = no - dSv_info_c::MEMORY_ITEM;
+        if (tbl == live) {
+            got = dComIfGs_isSaveItem(bit) != FALSE;
+            source = "mMemory";
+        } else {
+            got = save.getSave(tbl).getBit().isItem(bit) != FALSE;
+            source = "mSave";
+        }
+        return true;
+    }
+    return false;
+}
+
+/// One grep-able line per expectation: "[autopilot] <verb> PASS|FAIL <detail> ...".
+void log_expect(bool pass, const char* verb, const std::string& detail) {
+    (pass ? sExpectPass : sExpectFail)++;
+    if (pass) {
+        Log.info("[autopilot] {} PASS {} tick={} (pass {} fail {} so far)", verb, detail, sTicks,
+            sExpectPass, sExpectFail);
+    } else {
+        Log.error("[autopilot] {} FAIL {} tick={} (pass {} fail {} so far)", verb, detail, sTicks,
+            sExpectPass, sExpectFail);
+    }
+}
+
+/**
+ * Every shared-world verb. All are instant (no ticks of their own); a script `wait`s around them.
+ *
+ * Counters (`keys`, `rupeesadd`) go into the pending play counters, as an item get does
+ * (dComIfGp_setItem*Count); dMeter2 commits them into the save a few ticks later (moveKey,
+ * moveRupee), clamped. `expectkeys` / `expectrupees` read the COMMITTED value, so a script should
+ * wait ~30 ticks after a counter write before it expects on it.
+ */
+void run_world_command(const Command& command) {
+    switch (command.op) {
+    case Op::EvBit:
+        if (command.layer != 0) {
+            dComIfGs_onEventBit(static_cast<u16>(command.point));
+        } else {
+            dComIfGs_offEventBit(static_cast<u16>(command.point));
+        }
+        Log.info(
+            "[{}] event flag 0x{:04X} {}", sTicks, command.point, command.layer ? "on" : "off");
+        break;
+
+    case Op::Switch:
+    case Op::SwitchOff: {
+        if (live_stage_table() < 0) {
+            Log.error("[{}] line {}: switch needs a stage; skipped", sTicks, command.line);
+            break;
+        }
+        const int room = command.room >= 0 ? command.room : current_room();
+        if (command.op == Op::Switch) {
+            dComIfGs_onSwitch(command.point, room);
+        } else {
+            dComIfGs_offSwitch(command.point, room);
+        }
+        Log.info("[{}] switch 0x{:02X} {} (room {}, stage table {})", sTicks, command.point,
+            command.op == Op::Switch ? "on" : "off", room, live_stage_table());
+        break;
+    }
+
+    case Op::StageSwitch:
+        // Writes mSave[tbl] always and mMemory too when tbl is the live table
+        // (d_com_inf_game.cpp:1518). Aimed at a table you are NOT in, it is the other-stage path.
+        dComIfGs_onStageSwitch(command.room, command.point);
+        Log.info("[{}] stage switch 0x{:02X} on in stage table {} (live table {})", sTicks,
+            command.point, command.room, live_stage_table());
+        break;
+
+    case Op::Tbox:
+        if (live_stage_table() < 0) {
+            Log.error("[{}] line {}: tbox needs a stage; skipped", sTicks, command.line);
+            break;
+        }
+        dComIfGs_onTbox(command.point);
+        Log.info("[{}] chest {} marked open in stage table {}", sTicks, command.point,
+            live_stage_table());
+        break;
+
+    case Op::Keys:
+        Log.info("[{}] small keys {:+} queued (now {} in stage table {}; dMeter2 commits it)",
+            sTicks, command.point, dComIfGs_getKeyNum(), live_stage_table());
+        dComIfGp_setItemKeyNumCount(static_cast<s16>(command.point));
+        break;
+
+    case Op::RupeesAdd:
+        Log.info("[{}] rupees {:+} queued (now {}; dMeter2 commits it)", sTicks, command.point,
+            dComIfGs_getRupee());
+        dComIfGp_setItemRupeeCount(static_cast<s32>(command.point));
+        break;
+
+    case Op::WorldLog: {
+        const char* tag = command.text.empty() ? "autopilot" : command.text.c_str();
+        Log.info("[{}] worldlog '{}': rupees {}, keys {}, stage table {}, room {}", sTicks, tag,
+            dComIfGs_getRupee(), dComIfGs_getKeyNum(), live_stage_table(), current_room());
+        mp::world_sync::log_state(tag);
+        break;
+    }
+
+    case Op::JoinPartner:
+        Log.info("[{}] joinpartner: asking presence to warp to the first remote player", sTicks);
+        mp::presence::join_partner(mp::presence::first_remote_player_id());
+        break;
+
+    case Op::ExpectBit: {
+        bool got = false;
+        const char* source = "?";
+        const std::string tblName = command.text == "EVENT"  ? std::string("-") :
+                                    command.room == kLiveTbl ? std::string("live") :
+                                                               std::to_string(command.room);
+        if (!read_world_bit(command, got, source)) {
+            log_expect(false, "expectbit",
+                fmt::format("domain={} tbl={} no=0x{:X} want={} got=? (no stage to read from)",
+                    command.text, tblName, command.point, command.layer));
+            break;
+        }
+        log_expect(got == (command.layer != 0), "expectbit",
+            fmt::format("domain={} tbl={} no=0x{:X} want={} got={} src={} live={}", command.text,
+                tblName, command.point, command.layer, got ? 1 : 0, source, live_stage_table()));
+        break;
+    }
+
+    case Op::ExpectKeys: {
+        const int got = dComIfGs_getKeyNum();
+        log_expect(got == command.point, "expectkeys",
+            fmt::format("want={} got={} tbl={}", command.point, got, live_stage_table()));
+        break;
+    }
+
+    case Op::ExpectRupees: {
+        const int got = dComIfGs_getRupee();
+        log_expect(got == command.point, "expectrupees",
+            fmt::format("want={} got={}", command.point, got));
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
 /// Steer toward a world XZ point: the same mapping as the StickTo case in tick().
 void steer_toward(PADStatus& status, double targetX, double targetZ, double maxMagnitude) {
     fopAc_ac_c* link = dComIfGp_getPlayer(0);
@@ -600,6 +868,22 @@ bool settle_program_counter() {
 
         case Op::GetItem:
             run_getitem(command);
+            sPc++;
+            continue;
+
+        case Op::EvBit:
+        case Op::Switch:
+        case Op::SwitchOff:
+        case Op::StageSwitch:
+        case Op::Tbox:
+        case Op::Keys:
+        case Op::RupeesAdd:
+        case Op::WorldLog:
+        case Op::JoinPartner:
+        case Op::ExpectBit:
+        case Op::ExpectKeys:
+        case Op::ExpectRupees:
+            run_world_command(command);
             sPc++;
             continue;
 
@@ -792,6 +1076,87 @@ void load_script(const std::filesystem::path& path) {
             command.op = Op::Transform;
             command.frames = 60;
             ok = (a.empty() || parse_int(a, command.frames)) && command.frames > 0;
+        } else if (verb == "EVBIT") {
+            // "evbit 6380 on": event flag (byte << 8 | mask, hex, d_save_bit_labels.inc) on or off.
+            command.op = Op::EvBit;
+            const std::string state = to_upper(b);
+            command.layer = state == "ON" ? 1 : (state == "OFF" ? 0 : -1);
+            ok = parse_event_flag(a, command.point) && command.layer >= 0;
+        } else if (verb == "SWITCH" || verb == "SWITCHOFF") {
+            // "switch 40 [room]": dComIfGs_onSwitch (or off). Room defaults to the current one; it
+            // only matters for zone switches (0xC0+).
+            command.op = verb == "SWITCH" ? Op::Switch : Op::SwitchOff;
+            command.room = -1;
+            ok = parse_int(a, command.point) && command.point >= 0 &&
+                 command.point < kSwitchLimit &&
+                 (b.empty() ||
+                     (parse_int(b, command.room) && command.room >= 0 && command.room < 64));
+        } else if (verb == "STAGESWITCH") {
+            // "stageswitch 2 7": switch 7 in stage table 2 (dStage_SaveTbl_*), stage or not.
+            command.op = Op::StageSwitch;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room < kStageTables &&
+                 parse_int(b, command.point) && command.point >= 0 &&
+                 command.point < dSv_info_c::MEMORY_SWITCH;
+        } else if (verb == "TBOX") {
+            // "tbox 5": chest 5 of the live stage table marked open.
+            command.op = Op::Tbox;
+            ok = parse_int(a, command.point) && command.point >= 0 && command.point < kTboxLimit;
+        } else if (verb == "KEYS" || verb == "RUPEESADD") {
+            // "keys 1" / "rupeesadd -20": a counter DELTA through the pending play counter.
+            command.op = verb == "KEYS" ? Op::Keys : Op::RupeesAdd;
+            ok = parse_int(a, command.point) &&
+                 (command.op == Op::Keys ? (command.point >= -99 && command.point <= 99) :
+                                           (command.point >= -9999 && command.point <= 9999));
+        } else if (verb == "WORLDLOG") {
+            // "worldlog [tag]": dump the shared-world state so both ends' logs can be diffed.
+            command.op = Op::WorldLog;
+            command.text = a;
+        } else if (verb == "JOINPARTNER") {
+            command.op = Op::JoinPartner;
+        } else if (verb == "EXPECTBIT") {
+            // "expectbit <event|switch|tbox|item> <tbl|live|-> <no> <0|1>". For event, no is the
+            // hex flag and tbl is ignored (write `-`). For item, a numbered tbl takes the saved
+            // item bits 0x80-0x9F only; `live` takes anything onItem routes.
+            command.op = Op::ExpectBit;
+            command.text = to_upper(a);
+            if (command.text == "EVENT") {
+                command.room = 0;
+                ok = parse_event_flag(c, command.point);
+            } else {
+                int limit = 0;
+                if (command.text == "SWITCH") {
+                    limit = kSwitchLimit;
+                } else if (command.text == "TBOX") {
+                    limit = kTboxLimit;
+                } else if (command.text == "ITEM") {
+                    limit = kItemLimit;
+                }
+                ok = limit > 0 && parse_stage_table(b, command.room) &&
+                     parse_int(c, command.point) && command.point >= 0 && command.point < limit;
+                if (ok && command.room != kLiveTbl) {
+                    // A numbered table is a dSv_memBit_c: memory switches and saved item bits only.
+                    if (command.text == "SWITCH") {
+                        ok = command.point < dSv_info_c::MEMORY_SWITCH;
+                    } else if (command.text == "ITEM") {
+                        ok = command.point >= dSv_info_c::MEMORY_ITEM &&
+                             command.point < dSv_info_c::MEMORY_ITEM + dSv_info_c::DAN_ITEM;
+                    }
+                }
+            }
+            ok = ok && (d == "0" || d == "1");
+            command.layer = d == "1" ? 1 : 0;
+        } else if (verb == "EXPECTKEYS" || verb == "EXPECTRUPEES") {
+            // "expectkeys 1" / "expectrupees 150": the committed count, absolute.
+            command.op = verb == "EXPECTKEYS" ? Op::ExpectKeys : Op::ExpectRupees;
+            ok = parse_int(a, command.point) && command.point >= 0;
+        } else if (verb == "WAITEVENT") {
+            // "waitevent 6308 [timeout]": block until that event flag is set (default timeout
+            // 1800 ticks). The rendezvous between two instances: one sets a flag, the world sync
+            // carries it, and the other's script resumes within a few ticks of it.
+            command.op = Op::WaitEvent;
+            command.frames = 1800;
+            ok = parse_event_flag(a, command.point) &&
+                 (b.empty() || parse_int(b, command.frames)) && command.frames > 0;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -1061,6 +1426,19 @@ void tick() {
         }
         break;
     }
+
+    case Op::WaitEvent:
+        if (dComIfGs_isEventBit(static_cast<u16>(command.point))) {
+            Log.info(
+                "[{}] waitevent 0x{:04X}: set after {} tick(s)", sTicks, command.point, sElapsed);
+            duration = sElapsed + 1;
+        } else if (sElapsed + 1 >= command.frames) {
+            // Loud: everything after this runs without the rendezvous it was written against.
+            Log.error("[autopilot] waitevent FAIL flag=0x{:04X} not set after {} ticks; "
+                      "continuing anyway",
+                command.point, command.frames);
+        }
+        break;
 
     default:
         break;
