@@ -20,6 +20,7 @@
 #include "../net/serializer.hpp"
 #include "../replication/item_claims.hpp"
 #include "../replication/object_channel.hpp"
+#include "../replication/object_drops.hpp"  // batch 7: drops
 #include "../replication/player_bridge.hpp"
 #include "../replication/player_state.hpp"
 #include "../replication/replication_manager.hpp"
@@ -1101,6 +1102,14 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
         return;
     }
+    /* --- batch 7: drops --- */
+    // DropTaken is the host's word on who got a drop: client-bound, never relayed.
+    if (id == PacketId::DropTaken && mRole != Role::Client) {
+        if (warn_budget()) {
+            Log.warn("Ignoring packet {} from peer {}: wrong direction for this role", rawId, peer);
+        }
+        return;
+    }
     if (mRole == Role::Host && id != PacketId::Hello && id != PacketId::Heartbeat &&
         id != PacketId::HeartbeatAck &&
         (!sender->second.handshakeComplete || sender->second.refused))
@@ -1613,6 +1622,10 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
     case PacketId::ObjClaim:        // host-bound: judged by the host, never relayed
     case PacketId::ObjClaimResult:  // client-bound: the host's verdict
         objects::on_packet(id, r, sender->second.playerId);
+        break;
+    /* --- batch 7: drops --- */
+    case PacketId::DropTaken:  // client-bound: the host granted a drop to someone
+        objects::drops::on_packet(id, r, sender->second.playerId);
         break;
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);

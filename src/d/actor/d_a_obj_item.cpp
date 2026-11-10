@@ -345,6 +345,12 @@ int daItem_c::_daItem_execute() {
         deleteItem();
         return 1;
     }
+    /* Dusk (multiplayer batch 7, shared drops): a partner's drop copy stops simulating itself
+     * here (it follows the owner's stream), and a pickup claim still waiting on the host is
+     * settled; a denied one removes the item. Outside a session: nothing. */
+    if (dusk::mp::drops_execute(this)) {
+        return 1;
+    }
 #endif
     field_0x950 = speed;
     CountTimer();
@@ -868,6 +874,22 @@ void daItem_c::setTevStr() {
 void daItem_c::itemGetNextExecute() {
     if (!checkFlag(FLAG_DELETE_ITEM_e) && !checkFlag(FLAG_INIT_GET_ITEM_e)) {
 #if TARGET_PC
+        /* Dusk (multiplayer batch 7, shared drops): a drop every player in the room can see goes
+         * to whoever the host grants it to first, the breaker included, so a shared wallet never
+         * counts one rupee twice. Pending: not yet (the item stays and the claim is settled from
+         * execute). Denied: someone else has it; this copy goes without granting anything. An
+         * item that is not a shared drop is granted at once. */
+        {
+            const int dropClaim = dusk::mp::drops_claim_pickup(this);
+            if (dropClaim == dusk::mp::kClaimPending) {
+                return;
+            }
+            if (dropClaim == dusk::mp::kClaimDenied) {
+                hide();
+                deleteItem();
+                return;
+            }
+        }
         /* Dusk (multiplayer W-B, H4/H5): two players touching one bit-tracked item. Ask the host
          * before anything is granted or the bit is set. Pending: not this tick; the item stays and
          * the next contact (the Co/Tg callbacks fire every tick of overlap) asks again. Denied:

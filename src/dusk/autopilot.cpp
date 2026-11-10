@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 
 #include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_obj_item.h"  // batch 7: drops
 #include "d/actor/d_a_player.h"
 #include "d/actor/d_a_tbox.h"
 #include "d/d_camera.h"
@@ -23,6 +24,7 @@
 #include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/item_claims.hpp"
 #include "dusk/multiplayer/replication/object_channel.hpp"
+#include "dusk/multiplayer/replication/object_drops.hpp"  // batch 7: drops
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 #include "dusk/multiplayer/replication/world_bridge.hpp"
 #include "dusk/multiplayer/session/network_manager.hpp"
@@ -122,6 +124,14 @@ enum class Op {
     BombArrows,
     Ammo,
     FacePartner,
+    /* --- batch 7: drops --- */
+    // Shared drops (replication/object_drops.hpp): see run_drop_command and the PickupNear /
+    // TouchNear cases in tick().
+    DropItem,
+    DropNear,
+    ExpectDrops,
+    PickupNear,
+    TouchNear,
 };
 
 struct Command {
@@ -1285,6 +1295,137 @@ void run_arrow_command(const Command& command) {
     }
 }
 
+/* --- batch 7: drops --- */
+
+/**
+ * Shared-drop verbs (replication/object_drops.hpp). Result lines start "[autopilot]", the drop
+ * module's own lines "[mp-drop]" and the claims' "[mp-claim]", on both ends.
+ *   dropitem <itemNo>            a drop 100 units in front of Link, made exactly as a broken pot
+ *                                makes one (fopAcM_createItem, type 0 = launched). 0x01 = green
+ *                                rupee, 0x02 blue, 0x04 red, 0x00 heart (dItemNo_*).
+ *   dropnear [radius]            log every floor item near Link: shared (mine / partner's copy),
+ *                                its ref T<owner>:<serial>, item, pose, consumed / claim pending
+ *   expectdrops <n> [radius]     PASS iff exactly n shared drops near Link are still lying there
+ *   pickupnear [radius] [timeout] walk onto the nearest shared drop until it is gone
+ *   touchnear [radius] [timeout] no walking: touch the nearest shared drop every tick, as Link's
+ *                                collider would, until it resolves. Both ends running it on the
+ *                                same drop at the same moment is the race test.
+ * pickupnear / touchnear end with "result=granted" (this end picked it up), "result=removed" (it
+ * went without this end getting it: the partner had it) or "result=timeout".
+ */
+constexpr double kDropRadius = 3000.0;
+
+/// PickupNear / TouchNear: the drop picked on the command's first tick, and whether this end's
+/// pickup of it was seen to start.
+fpc_ProcID sDropTarget = fpcM_ERROR_PROCESS_ID_e;
+bool sDropSawGet = false;
+std::string sDropDesc;
+
+/// A shared drop that is still lying there (not being picked up, not on its way out).
+bool drop_is_live(daItem_c* item, mp::objects::drops::DropView* o_view) {
+    mp::objects::drops::DropView view;
+    if (!mp::objects::drops::view(fopAcM_GetID(item), view)) {
+        return false;
+    }
+    if (o_view != nullptr) {
+        *o_view = view;
+    }
+    return !view.consumed && !item->checkFlag(daItem_c::FLAG_INIT_GET_ITEM_e) &&
+           !item->checkFlag(daItem_c::FLAG_DELETE_ITEM_e);
+}
+
+std::vector<ActorHit> find_items(double radius) {
+    return find_actors(std::to_string(static_cast<int>(fpcNm_ITEM_e)), radius);
+}
+
+/// The nearest live shared drop, or null.
+daItem_c* nearest_drop(double radius, double* o_distance) {
+    for (const ActorHit& hit : find_items(radius)) {
+        daItem_c* item = static_cast<daItem_c*>(hit.actor);
+        if (drop_is_live(item, nullptr)) {
+            if (o_distance != nullptr) {
+                *o_distance = hit.distance;
+            }
+            return item;
+        }
+    }
+    return nullptr;
+}
+
+std::string describe_drop(daItem_c* item) {
+    mp::objects::drops::DropView view;
+    const bool shared = mp::objects::drops::view(fopAcM_GetID(item), view);
+    return fmt::format("proc {} item 0x{:02X} at ({:.0f}, {:.0f}, {:.0f}) room {} {}{}{}{}{}",
+        fopAcM_GetID(item), item->m_itemNo, item->current.pos.x, item->current.pos.y,
+        item->current.pos.z, static_cast<int>(fopAcM_GetRoomNo(item)),
+        !shared ? std::string("local-only") :
+                  fmt::format("{} {}", view.remote ? "partner's-copy" : "mine", view.ref.str()),
+        shared && view.consumed ? " consumed" : "", shared && view.claimPending ? " claim-pending" : "",
+        item->checkFlag(daItem_c::FLAG_INIT_GET_ITEM_e) ? " getting" : "",
+        item->checkFlag(daItem_c::FLAG_DELETE_ITEM_e) ? " deleting" : "");
+}
+
+void run_drop_command(const Command& command) {
+    switch (command.op) {
+    case Op::DropItem: {
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        if (link == nullptr) {
+            Log.error("[autopilot] dropitem: no Link tick={}", sTicks);
+            break;
+        }
+        const double kToRad = 3.14159265358979 / 32768.0;
+        const double yaw = link->shape_angle.y * kToRad;
+        cXyz pos = link->current.pos;
+        pos.x += static_cast<f32>(std::sin(yaw) * 100.0);
+        pos.z += static_cast<f32>(std::cos(yaw) * 100.0);
+        // A pot's own call (daObjCarry_c::obj_break): no save bit, launched type.
+        const csXyz angle(0, link->shape_angle.y, 0);
+        const fpc_ProcID id = fopAcM_createItem(
+            &pos, command.room, -1, fopAcM_GetRoomNo(link), &angle, NULL, 0);
+        Log.info("[autopilot] dropitem item=0x{:02X} proc={} at ({:.0f}, {:.0f}, {:.0f}) shared "
+                 "drops {} tick={}",
+            command.room, id, pos.x, pos.y, pos.z, mp::item_claims::active() ? "on" : "OFF", sTicks);
+        break;
+    }
+    case Op::DropNear: {
+        const std::vector<ActorHit> hits = find_items(command.radius);
+        if (hits.empty()) {
+            Log.info("[autopilot] dropnear: no floor item within {:.0f} units tick={}",
+                command.radius, sTicks);
+            break;
+        }
+        int live = 0;
+        for (std::size_t i = 0; i < hits.size() && i < 12; i++) {
+            daItem_c* item = static_cast<daItem_c*>(hits[i].actor);
+            if (drop_is_live(item, nullptr)) {
+                live++;
+            }
+            Log.info("[autopilot] dropnear {} {}, {:.0f} units away tick={}", i == 0 ? "nearest" : "  also",
+                describe_drop(item), hits[i].distance, sTicks);
+        }
+        Log.info("[autopilot] dropnear: {} item(s), {} live shared drop(s) within {:.0f} units tick={}",
+            hits.size(), live, command.radius, sTicks);
+        break;
+    }
+    case Op::ExpectDrops: {
+        int live = 0;
+        std::string list;
+        for (const ActorHit& hit : find_items(command.radius)) {
+            daItem_c* item = static_cast<daItem_c*>(hit.actor);
+            if (drop_is_live(item, nullptr)) {
+                live++;
+                list += " [" + describe_drop(item) + "]";
+            }
+        }
+        log_expect(live == command.point, "expectdrops",
+            fmt::format("want={} got={} within {:.0f}{}", command.point, live, command.radius, list));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -1432,6 +1573,18 @@ bool settle_program_counter() {
                 Log.error("[{}] line {}: needs the world; skipped", sTicks, command.line);
             } else {
                 run_arrow_command(command);
+            }
+            sPc++;
+            continue;
+        /* --- batch 7: drops --- */
+        // pickupnear and touchnear take ticks; they are run by tick().
+        case Op::DropItem:
+        case Op::DropNear:
+        case Op::ExpectDrops:
+            if (!in_world()) {
+                Log.error("[{}] line {}: needs the world; skipped", sTicks, command.line);
+            } else {
+                run_drop_command(command);
             }
             sPc++;
             continue;
@@ -1820,6 +1973,31 @@ void load_script(const std::filesystem::path& path) {
         } else if (verb == "FACEPARTNER") {
             // "facepartner": turn on the spot toward the nearest remote player's puppet.
             command.op = Op::FacePartner;
+            /* --- batch 7: drops --- */
+        } else if (verb == "DROPITEM") {
+            // "dropitem 0x01": a green rupee pops out in front of Link as from a broken pot.
+            command.op = Op::DropItem;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFE;
+        } else if (verb == "DROPNEAR") {
+            // "dropnear [radius]": log the floor items near Link and whether each is shared.
+            command.op = Op::DropNear;
+            command.radius = kDropRadius;
+            ok = (a.empty() || parse_double(a, command.radius)) && command.radius > 0.0;
+        } else if (verb == "EXPECTDROPS") {
+            // "expectdrops 0 [radius]": how many shared drops are still lying near Link.
+            command.op = Op::ExpectDrops;
+            command.radius = kDropRadius;
+            ok = parse_int(a, command.point) && command.point >= 0 &&
+                 (b.empty() || parse_double(b, command.radius)) && command.radius > 0.0;
+        } else if (verb == "PICKUPNEAR" || verb == "TOUCHNEAR") {
+            // "pickupnear [radius] [timeout]": walk onto the nearest shared drop until it is gone.
+            // "touchnear [radius] [timeout]": touch it where it lies, every tick (the race test).
+            command.op = verb == "PICKUPNEAR" ? Op::PickupNear : Op::TouchNear;
+            command.radius = kDropRadius;
+            command.frames = 300;
+            ok = (a.empty() || parse_double(a, command.radius)) &&
+                 (b.empty() || parse_int(b, command.frames)) && command.radius > 0.0 &&
+                 command.frames > 0;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -2226,6 +2404,58 @@ void tick() {
             sLastClaimReason = ic::DenyReason::None;
             Log.error("[autopilot] claimtest {} result=pending: unresolved after {} ticks tick={}",
                 sLastClaimDesc, command.frames, sTicks);
+        }
+        break;
+    }
+
+    /* --- batch 7: drops --- */
+    case Op::PickupNear:
+    case Op::TouchNear: {
+        const bool walk = command.op == Op::PickupNear;
+        const char* verb = walk ? "pickupnear" : "touchnear";
+        if (sElapsed == 0) {
+            sDropTarget = fpcM_ERROR_PROCESS_ID_e;
+            sDropSawGet = false;
+            double distance = 0.0;
+            daItem_c* nearest = in_world() ? nearest_drop(command.radius, &distance) : nullptr;
+            if (nearest == nullptr) {
+                Log.warn("[autopilot] {} result=none: no shared drop within {:.0f} units tick={}",
+                    verb, command.radius, sTicks);
+                duration = 1;
+                break;
+            }
+            sDropTarget = fopAcM_GetID(nearest);
+            sDropDesc = describe_drop(nearest);
+            Log.info("[autopilot] {}: going for {}, {:.0f} units away tick={}", verb, sDropDesc,
+                distance, sTicks);
+        }
+        fopAc_ac_c* found = fopAcM_SearchByID(sDropTarget);
+        daItem_c* item = found != nullptr && fopAcM_GetName(found) == fpcNm_ITEM_e ?
+                             static_cast<daItem_c*>(found) :
+                             nullptr;
+        if (item != nullptr && item->checkFlag(daItem_c::FLAG_INIT_GET_ITEM_e)) {
+            sDropSawGet = true;
+        }
+        const bool gone = item == nullptr || item->checkFlag(daItem_c::FLAG_INIT_GET_ITEM_e) ||
+                          item->checkFlag(daItem_c::FLAG_DELETE_ITEM_e);
+        if (gone) {
+            Log.info("[autopilot] {} result={} after {} tick(s): {} tick={}", verb,
+                sDropSawGet ? "granted" : "removed", sElapsed, sDropDesc, sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        if (walk) {
+            steer_toward(status, item->current.pos.x, item->current.pos.z, 1.0);
+        } else if (item->checkPlayerGet()) {
+            // What Link's collider does on every tick of contact (itemGetCoCallBack).
+            item->itemGetNextExecute();
+            if (item->checkFlag(daItem_c::FLAG_INIT_GET_ITEM_e)) {
+                sDropSawGet = true;
+            }
+        }
+        if (sElapsed + 1 >= command.frames) {
+            Log.warn("[autopilot] {} result=timeout after {} ticks: {} tick={}", verb,
+                command.frames, describe_drop(item), sTicks);
         }
         break;
     }

@@ -11,6 +11,9 @@
  * ENet, the STL, or any engine type.
  */
 
+/* --- batch 7: drops --- (a declaration only: no engine header comes with it) */
+class daItem_c;
+
 namespace dusk::mp {
 
 /**
@@ -151,5 +154,27 @@ void claims_note_item_removed(int itemBitNo, bool takenByPartner);
 /// Logging for the hooks: a floor small key (its "taken" state is tbox bit `tboxNo`) removed
 /// because the partner picked it up.
 void claims_note_key_taken(int tboxNo);
+
+/* --- batch 7: drops ---
+ * Shared drops (multiplayer/replication/object_drops.hpp), called from f_op_actor_mng.cpp and
+ * d_a_obj_item.cpp inside #if TARGET_PC. Implemented in object_capture_drop.cpp. Outside a live
+ * session with claims in force every one of them is a no-op that answers "vanilla". */
+
+/// An item helper (fopAcM_createItem / fopAcM_fastCreateItem / fopAcM_fastCreateItem2) just
+/// asked for a daItem_c with this process id: it is a run-time drop, not a stage-placed item, so
+/// it may be shared. Any id is accepted (0xFFFFFFFF and non-items are ignored later).
+void drops_note_created(unsigned int procId);
+
+/// Around fopAcM_createItemFromEnemyID: items created inside stay local (enemy kill drops are
+/// shared from M6, once the enemies are). Nests.
+void drops_enemy_scope(bool enter);
+
+/// Top of daItem_c::_daItem_execute. Switches a partner's copy to follow the network, and settles
+/// a pickup claim that is still out. True: the item removed itself this tick; return at once.
+bool drops_execute(daItem_c* item);
+
+/// Top of daItem_c::itemGetNextExecute, before anything is granted. A ClaimResult: Granted for an
+/// item that is not a shared drop.
+int drops_claim_pickup(daItem_c* item);
 
 }  // namespace dusk::mp

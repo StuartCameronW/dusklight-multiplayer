@@ -34,6 +34,8 @@
  *   ClaimReply    host -> guest  [u8 kind][u8 tbl][u16 no][u32 serial][u8 granted][u8 reason]
  * `no` is the tbox number (0-63) for a chest and the dSv_memBit_c item index (0-31, the save bit
  * dSv_info_c::onItem numbers 0x80 + no) for a floor item. `reason` is a DenyReason.
+ * Batch 7: kind 2 is a shared drop, tbl = its owner's player id, no = its object serial
+ * (object_drops.hpp); its grant is final, see ClaimKind::Drop.
  *
  * Where the hooks are (all TARGET_PC):
  *   - chests, daTbox_c (d_a_tbox.cpp): H3 re-check in actionOpenWait, H4 claim before the chest is
@@ -59,6 +61,12 @@ namespace dusk::mp::item_claims {
 enum class ClaimKind : std::uint8_t {
     Tbox = 0,
     Item = 1,
+    /* --- batch 7: drops --- */
+    /// A shared drop (objects::ObjKind::Drop): tbl = the owner's player id, no = its object
+    /// serial, i.e. the drop's ObjRef T<tbl>:<no>. Unlike Tbox / Item a drop grant is FINAL: the
+    /// host keeps who it went to (kDropGrantKeepTicks), every later claim on it is AlreadySet, and
+    /// the grant is announced to the guests (DropTaken, 27) so every other copy goes at once.
+    Drop = 2,
 };
 
 enum class ClaimState : std::uint8_t {
@@ -79,9 +87,10 @@ enum class DenyReason : std::uint8_t {
 
 struct ClaimTarget {
     ClaimKind kind = ClaimKind::Tbox;
-    /// Stage table, 0..31 (dSv_save_c::STAGE_MAX).
+    /// Stage table, 0..31 (dSv_save_c::STAGE_MAX). Drop: the owner's player id.
     std::uint8_t tbl = 0;
-    /// Tbox number 0..63, or memBit item index 0..31 (see the file comment).
+    /// Tbox number 0..63, or memBit item index 0..31 (see the file comment). Drop: the serial
+    /// (never 0).
     std::uint16_t no = 0;
 };
 
@@ -102,6 +111,9 @@ inline constexpr std::uint64_t kGrantRenewTicks = 45;
 inline constexpr std::uint64_t kTimeoutTicks = 90;
 /// Guest: a denial (or a "host not ready") is remembered this long before asking again.
 inline constexpr std::uint64_t kDeniedRetryTicks = 30;
+/// Host: how long a drop grant is remembered (5 min). A drop lives about a minute before it times
+/// out on its owner; serials only come round again after 65535 more objects from that owner.
+inline constexpr std::uint64_t kDropGrantKeepTicks = 9000;
 
 /// True for a target whose fields are in range.
 bool target_valid(const ClaimTarget& t);

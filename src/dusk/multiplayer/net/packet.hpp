@@ -269,6 +269,12 @@ enum class PacketId : std::uint8_t {
     ObjDespawn = 23,        ///< owner -> host -> others, kChannelObjects
     ObjClaim = 24,          ///< any -> host, kChannelObjects
     ObjClaimResult = 25,    ///< host -> all, kChannelObjects
+
+    /* --- batch 7: drops --- */
+    /// Host -> every guest, reliable on kChannelObjects: [u8 owner][u16 serial][u8 taker]. The
+    /// host granted drop T<owner>:<serial> to player <taker>; everyone else removes their copy
+    /// (replication/object_drops.hpp).
+    DropTaken = 27,
 };
 
 /**

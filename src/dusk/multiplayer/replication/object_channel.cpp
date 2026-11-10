@@ -529,6 +529,16 @@ void prune_samples(RemoteObj& o, std::uint64_t played) {
     }
 }
 
+/* --- batch 7: drops --- */
+/// A drop's local copy is a real daItem_c, not a daMpGhost_c: it has its own seam functions.
+bool is_drop(const RemoteObj& o) {
+    return o.kind == static_cast<std::uint8_t>(ObjKind::Drop);
+}
+
+engine::GhostLookup look_up(const RemoteObj& o) {
+    return is_drop(o) ? engine::look_up_drop(o.ghost) : engine::look_up_ghost(o.ghost);
+}
+
 void upkeep_ghost(RemoteObj& o, bool reached, RemoteLocation loc, bool playable,
     const ObjPose& pose, const KindBlob& blob, std::uint64_t played) {
     State& s = S();
@@ -547,7 +557,8 @@ void upkeep_ghost(RemoteObj& o, bool reached, RemoteLocation loc, bool playable,
         {
             return;
         }
-        o.ghost = engine::create_ghost(o.kind, o.authority, pose);
+        o.ghost = is_drop(o) ? engine::create_drop(o.ref, pose, blob) :
+                               engine::create_ghost(o.kind, o.authority, pose);
         if (o.ghost == kNoGhost) {
             o.ghostFailures++;
             o.ghostRetryAt = s.localTick + kGhostRetryTicks;
@@ -557,16 +568,22 @@ void upkeep_ghost(RemoteObj& o, bool reached, RemoteLocation loc, bool playable,
                 kind_name(o.kind), o.ghost, played);
         }
     } else {
-        switch (engine::look_up_ghost(o.ghost)) {
-        case engine::GhostLookup::Alive:
+        switch (look_up(o)) {
+        case engine::GhostLookup::Alive: {
             if (!o.ghostEverAlive) {
                 o.ghostEverAlive = true;
                 o.ghostAliveSince = s.localTick;
                 Log.info("[mp-obj] ghost alive {} proc={} played={}", o.ref.str(), o.ghost, played);
             }
-            engine::apply_ghost(o.ghost, pose,
-                reached && loc == RemoteLocation::Here && (pose.flags & kObjPoseHidden) == 0, blob);
+            const bool visible =
+                reached && loc == RemoteLocation::Here && (pose.flags & kObjPoseHidden) == 0;
+            if (is_drop(o)) {
+                engine::apply_drop(o.ghost, pose, visible);
+            } else {
+                engine::apply_ghost(o.ghost, pose, visible, blob);
+            }
             break;
+        }
         case engine::GhostLookup::Creating:
             break;
         case engine::GhostLookup::Gone:
@@ -615,13 +632,13 @@ bool deliver_events(RemoteObj& o, std::uint64_t upTo, std::uint64_t played) {
     while (!o.events.empty() && o.events.front().tick <= upTo) {
         const PendingEvent& ev = o.events.front();
         const engine::GhostLookup look =
-            o.ghost != kNoGhost ? engine::look_up_ghost(o.ghost) : engine::GhostLookup::Gone;
+            o.ghost != kNoGhost ? look_up(o) : engine::GhostLookup::Gone;
         if (look == engine::GhostLookup::Creating) {
             return false;
         }
         Log.info("[mp-obj] event {} id={} originTick={} played={}{}", o.ref.str(), ev.event,
             ev.tick, played, look == engine::GhostLookup::Alive ? "" : " (no ghost)");
-        if (look == engine::GhostLookup::Alive) {
+        if (look == engine::GhostLookup::Alive && !is_drop(o)) {
             engine::ghost_event(o.ghost, ev.event, ev.blob);
         }
         o.events.pop_front();
@@ -1101,6 +1118,8 @@ void tick() {
     capture::tick_bomb();
     capture::tick_boomerang();
     capture::tick_rodball();
+    /* --- batch 7: drops --- */
+    capture::tick_drop();
     owner_tick();
     receiver_tick();
     if (s.localTick % 300 == 0 && (s.droppedStates != 0 || !s.remote.empty() || !s.owned.empty())) {
@@ -1151,6 +1170,8 @@ void reset() {
     capture::reset_bomb();
     capture::reset_boomerang();
     capture::reset_rodball();
+    /* --- batch 7: drops --- */
+    capture::reset_drop();
     const std::uint64_t localTick = s.localTick;
     s = State();
     s.localTick = localTick;
@@ -1356,6 +1377,27 @@ std::uint32_t claim_holder(const ObjRef& ref) {
     const auto& claims = S().claims;
     auto it = claims.find(ref);
     return it != claims.end() ? it->second.holder : kNoClaim;
+}
+
+/* --- batch 7: drops --- */
+
+void forget_remote(const ObjRef& ref, bool destroyActor) {
+    State& s = S();
+    auto it = s.remote.find(ref);
+    if (it == s.remote.end()) {
+        // Not created here yet (its spawn may still be in flight): a tombstone keeps a late
+        // ObjState from mattering. A late ObjSpawn would still make it; the owner's despawn,
+        // which follows every pickup, then removes that copy again.
+        tombstone(ref);
+        return;
+    }
+    Log.info("[mp-obj] forget {} kind={} proc={}{} localTick={}", ref.str(),
+        kind_name(it->second.kind), it->second.ghost, destroyActor ? "" : " (actor left running)",
+        s.localTick);
+    if (!destroyActor) {
+        it->second.ghost = kNoGhost;
+    }
+    drop_remote(it);
 }
 
 }  // namespace dusk::mp::objects
