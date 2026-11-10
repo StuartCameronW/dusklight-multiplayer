@@ -320,7 +320,8 @@ void tick_drop() {
         }
         const char* why = not_shareable(item);
         if (why != NULL) {
-            Log.debug("[mp-drop] proc={} item=0x{:02X} stays local: {}", id, item->m_itemNo, why);
+            Log.debug("[mp-drop] proc={} item=0x{:02X} bit=0x{:X} type={} stays local: {}", id,
+                item->m_itemNo, item->mItemBitNo, static_cast<int>(daItem_prm::getType(item)), why);
             continue;
         }
         announce(item, id);
