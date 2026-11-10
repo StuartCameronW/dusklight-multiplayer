@@ -1601,6 +1601,7 @@ DUSK_GAME_EXTERN actor_process_profile_definition DUSK_CONST g_profile_TITLE;
 DUSK_GAME_EXTERN actor_process_profile_definition DUSK_CONST g_profile_WarpBug;
 #if TARGET_PC
 DUSK_GAME_EXTERN actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER;
+DUSK_GAME_EXTERN actor_process_profile_definition DUSK_CONST g_profile_MP_GHOST;
 #endif
 #endif
 

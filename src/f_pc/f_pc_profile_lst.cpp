@@ -1608,6 +1608,7 @@ DUSK_GAME_DATA process_profile_definition DUSK_CONST* DUSK_CONST g_fpcPfLst_Prof
     // Dusk-only, appended last so every original profile keeps its index. fpcPf_Get() indexes this
     // array directly by proc name, so this entry must stay aligned with PROCS_DUSK in f_pc_name.h.
     &g_profile_REMOTE_PLAYER.base.base,
+    &g_profile_MP_GHOST.base.base,  // 0x319, the object channel's ghost (d_a_mp_ghost.cpp)
 #endif
     NULL,
 };
