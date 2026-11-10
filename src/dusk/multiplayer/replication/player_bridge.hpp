@@ -45,6 +45,12 @@ enum class LocalEventKind : std::uint8_t {
 LocalEventKind local_event_kind();
 const char* local_event_kind_name(LocalEventKind kind);
 
+/// v21 (agent EV): fill PlayerState::evt (kind + kPlayerEvtHidden) and, during an item get,
+/// evtItem / evtItemScale, from the local Link as he is NOW. capture_local_player calls it; so does
+/// wire_local_state for the held copy, which then ORs in kPlayerEvtStandIn itself. Never sets the
+/// stand-in bit. Stateless, so the several calls per tick agree.
+void fill_event(PlayerState& out);
+
 /// True when the player actor that exists now is the one the last successful capture read. False
 /// when there is no Link, or when a different one exists, such as a new scene's Link that is not
 /// capturable yet. A held pose from the old Link must not then claim to be in the world.

@@ -1514,6 +1514,14 @@ PlayerState NetworkManager::wire_local_state() {
     if (standIn) {
         make_stand_in_idle(held);
     }
+    /* v21 event byte (agent EV): the event as it is NOW, not as it was on the last live tick, and
+     * the stand-in bit where the stand-in was applied. This is the path a hidden Link (warp,
+     * cannon) and an STB cutscene take, so without the refresh the far end would never see either.
+     */
+    fill_event(held);
+    if (standIn) {
+        held.evt |= kPlayerEvtStandIn;
+    }
     if (standIn != s_standInOn && s_standInLogs < 100) {
         s_standInLogs++;
         Log.info("Local stand-in idle {} at ({:.0f}, {:.0f}, {:.0f})", standIn ? "on" : "off",
