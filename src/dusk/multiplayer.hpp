@@ -77,4 +77,21 @@ void post_actor_tick();
 /// True once a session is live (hosting, or connected to a host).
 bool is_active();
 
+/*
+ * Shared-world (M5) hooks, called from decomp code inside #if TARGET_PC. They only record which
+ * stage table dSv_info_c::mMemory holds and when the save info was bulk-reset, so they are cheap and
+ * safe to call with multiplayer inactive. Implemented in multiplayer/replication/world_bridge.cpp.
+ */
+
+/// d_stage.cpp, right after dComIfGs_getSave(stageNo): mMemory now holds stage table `stageNo`.
+void world_on_memory_loaded(int stageNo);
+
+/// d_stage.cpp dStage_Delete, right after dComIfGs_putSave(...): mMemory was folded back into
+/// stage table `stageNo` and belongs to no table until the next world_on_memory_loaded.
+void world_on_memory_stored(int stageNo);
+
+/// d_save.cpp dSv_info_c::init and card_to_memory: the whole save info was reset or replaced, so
+/// the world sync layer must stop diffing until a game is loaded and resynced.
+void world_on_save_reset();
+
 }  // namespace dusk::mp

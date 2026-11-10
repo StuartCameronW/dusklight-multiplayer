@@ -24,6 +24,7 @@
 
 #if TARGET_PC
 #include "dusk/logging.h"
+#include "dusk/multiplayer.hpp"
 #include "dusk/mods/svc/actor.hpp"
 #include "dusk/mods/svc/stage.hpp"
 #include "helpers/string.hpp"
@@ -2013,6 +2014,11 @@ static int dStage_stagInfoInit(dStage_dt_c* i_stage, void* i_data, int entryNum,
 
     int stageNo = dStage_stagInfo_GetSaveTbl(i_stage->getStagInfo());
     dComIfGs_getSave(stageNo);
+#if TARGET_PC
+    /* Dusk (multiplayer M5): mMemory now holds this stage table. World sync must know exactly
+     * which table mMemory belongs to, or a partner's switch lands in the wrong stage. */
+    dusk::mp::world_on_memory_loaded(stageNo);
+#endif
     g_save_bit_HIO.init();
 #if DEBUG
     OS_REPORT("Save StageNo=%d sizeof(dSv_save_c)=%d\n", stageNo, sizeof(dSv_save_c));
@@ -2904,6 +2910,11 @@ void dStage_Delete() {
     }
 
     dComIfGs_putSave(dStage_stagInfo_GetSaveTbl(dComIfGp_getStageStagInfo()));
+#if TARGET_PC
+    /* Dusk (multiplayer M5): mMemory has been folded back into its stage table and belongs to no
+     * table until the next stage's getSave. */
+    dusk::mp::world_on_memory_stored(dStage_stagInfo_GetSaveTbl(dComIfGp_getStageStagInfo()));
+#endif
     dStage_roomControl_c::removeRoomDzs();
 
     if (mDoRst::isReset() || !dComIfGp_isEnableNextStage() ||
