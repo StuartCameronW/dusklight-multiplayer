@@ -1825,6 +1825,24 @@ private:
     bool mFootFxPrevPosValid;
     bool mFootFxRippling;
     u8 mFootFxLogCount[FOOT_FX_LOG_NUM];
+
+    // --- v21 form (shared API: wolf pieces A, B, C) ---
+    /* PlayerState::form, metaTint and furFrame (dusk/multiplayer/replication/player_state.hpp,
+     * kPlayerFormMetaPhaseMask). The bridge pushes them every tick; the wolf body (B) and the
+     * transform visuals (C) read them. Plain storage, defined here so no piece owns it. */
+public:
+    void setNetworkForm(u8 i_form, s8 i_metaTint, u8 i_furFrame) {
+        mNetForm = i_form;
+        mNetMetaTint = i_metaTint;
+        mNetFurFrame = i_furFrame;
+    }
+    /// This puppet was BUILT as a wolf (create parameter top byte 0xFE). Defined by piece B.
+    bool isWolf() const;
+
+private:
+    u8 mNetForm;
+    s8 mNetMetaTint;
+    u8 mNetFurFrame;
 };
 
 /**
