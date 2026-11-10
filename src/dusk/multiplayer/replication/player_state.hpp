@@ -755,6 +755,14 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     if (a.locEpoch != b.locEpoch) {
         return b;
     }
+    // And out of a fresh Link's first few room -1 samples into his first known room. He is placed
+    // before he settles, so those samples can sit well off the ground (measured 225 units below,
+    // F_SP121 re-warp), and blending from one put the puppet ~110 units low for a tick. The
+    // receiver holds the puppet over the room -1 stretch anyway, so the first known pose is taken
+    // whole. A stage that never reports a room has -1 on both sides and still blends.
+    if (a.roomNo < 0 && b.roomNo >= 0) {
+        return b;
+    }
 
     PlayerState out;
     out.posX = a.posX + (b.posX - a.posX) * t;
