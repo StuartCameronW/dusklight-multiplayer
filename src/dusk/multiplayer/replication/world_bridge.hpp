@@ -57,6 +57,11 @@ void capture(world::WorldView& out);
 /// once each).
 void apply_to_engine(const world::WorldOp& op, std::int32_t value);
 
+/// True when g_mpPolicy makes this saved domain Shared (so it is in the view at all). Always false
+/// for Dan/Zone, which are not in the view. world_sync asks it so an op for a domain that turned
+/// Individual mid-session (in flight across a policy switch) never reaches either shadow.
+bool domain_shared(world::Domain d);
+
 /// Guest join: asserts the save latch is engaged (refuse + log ERROR otherwise), writes the view
 /// into the engine (per-player fields keep the guest's values), then reloads the current stage in
 /// place (setRestartRoom at Link's pos/angle/room + setNextStage(cur stage, -1, cur room, -1)) so

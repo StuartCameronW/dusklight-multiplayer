@@ -1728,6 +1728,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/session/presence.hpp
         src/dusk/multiplayer/session/world_sync.cpp
         src/dusk/multiplayer/session/world_sync.hpp
+        src/dusk/multiplayer/session/policy_sync.cpp
+        src/dusk/multiplayer/session/policy_sync.hpp
         src/dusk/multiplayer/session/mod_check.cpp
         src/dusk/multiplayer/session/mod_check.hpp
         src/dusk/multiplayer/session/network_manager.cpp

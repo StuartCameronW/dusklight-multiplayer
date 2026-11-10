@@ -361,6 +361,10 @@ struct UserSettings {
         /// Whether other players' swords can hurt this player. Decided by each player for himself:
         /// it arms the hitbox on the puppets HE sees, so nobody can switch it on for someone else.
         ConfigVar<bool> friendlyFire;
+        /// The host's wallet setting for the sessions it hosts: one shared wallet (true) or one
+        /// per player. Read when hosting starts and sent to every guest (policy_sync.hpp); a
+        /// guest's own value is never used in a session.
+        ConfigVar<bool> sharedWallet;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports

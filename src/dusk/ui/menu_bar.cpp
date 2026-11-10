@@ -17,7 +17,9 @@
 #include "dusk/livesplit.h"
 #include "dusk/main.h"
 #include "dusk/mods/svc/ui.hpp"
+#include "dusk/multiplayer/policy/mp_policy.hpp"
 #include "dusk/multiplayer/session/network_manager.hpp"
+#include "dusk/multiplayer/session/policy_sync.hpp"
 #include "dusk/multiplayer/session/presence.hpp"
 #include "dusk/settings.h"
 #include "dusk/speedrun.h"
@@ -86,6 +88,11 @@ private:
         for (const auto& p : s.players) {
             key +=
                 fmt::format("|{}:{}:{}:{}", p.playerId, p.handshakeComplete, p.color, p.nickname);
+        }
+        // A guest's read-only wallet line shows the host's choice, which can change under it. The
+        // host's own toggle rewrites its label in place instead, so pressing it keeps focus.
+        if (s.role == mp::Role::Client) {
+            key += fmt::format("|wallet:{}", static_cast<int>(mp::g_mpPolicy.rupees));
         }
         return key;
     }
@@ -156,6 +163,53 @@ private:
         pane.add_text("When on, other players' sword attacks can hurt you.");
     }
 
+    /* --- batch 7: policy --- */
+    /// Outside a session: the setting the next hosted session starts with. In one: the session's.
+    static bool wallet_shared(mp::Role role) {
+        if (role == mp::Role::Inactive) {
+            return getSettings().multiplayer.sharedWallet.getValue();
+        }
+        return mp::g_mpPolicy.rupees == mp::Ownership::Shared;
+    }
+
+    static Rml::String wallet_label(mp::Role role) {
+        return wallet_shared(role) ? "Wallet: Shared" : "Wallet: Per player";
+    }
+
+    /// Session-wide, so the host's alone: a guest sees the host's choice and cannot change it.
+    static void add_wallet_toggle(Pane& pane, mp::Role role) {
+        constexpr const char* kSaveNote =
+            "Per player: everyone keeps their own rupees. Only the host's save file is ever "
+            "written, so a guest's own wallet can't be saved anywhere.";
+        if (role == mp::Role::Client) {
+            pane.add_text(fmt::format("{} (the host's setting)", wallet_label(role)));
+            pane.add_text(kSaveNote);
+            return;
+        }
+        auto& button = pane.add_button(wallet_label(role));
+        auto* buttonPtr = &button;
+        button.on_pressed([buttonPtr] {
+            const mp::Role now = mp::network_manager().role();
+            if (now == mp::Role::Client) {
+                return;
+            }
+            mDoAud_seStartMenu(kSoundClick);
+            const bool shared = !wallet_shared(now);
+            auto& var = getSettings().multiplayer.sharedWallet;
+            var.setValue(shared);
+            config::save();
+            if (now == mp::Role::Host) {
+                mp::policy_sync::host_set_rupees(
+                    shared ? mp::Ownership::Shared : mp::Ownership::Individual, "menu");
+            }
+            buttonPtr->set_text(wallet_label(now));
+        });
+        pane.add_text(role == mp::Role::Host ?
+                          "Shared: one wallet for everyone. Applies to every player at once." :
+                          "For the sessions you host: one wallet for everyone, or one each.");
+        pane.add_text(kSaveNote);
+    }
+
     void build(Rml::Element* content) {
         mLive.clear();
         mPresence.clear();
@@ -170,6 +224,7 @@ private:
             }
             pane.add_section("Options");
             add_friendly_fire_toggle(pane);
+            add_wallet_toggle(pane, s.role);
             return;
         }
 
@@ -228,6 +283,7 @@ private:
 
         pane.add_section("Options");
         add_friendly_fire_toggle(pane);
+        add_wallet_toggle(pane, s.role);
 
         pane.add_section("Actions");
         const bool isHost = s.role == mp::Role::Host;

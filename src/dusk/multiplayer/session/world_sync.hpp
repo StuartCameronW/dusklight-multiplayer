@@ -31,6 +31,10 @@
  * tick() from NetworkManager::post_actor_tick.
  */
 
+namespace dusk::mp {
+struct MultiplayerPolicy;
+}
+
 namespace dusk::mp::world_sync {
 
 /// Once per sim tick, after the actor pass, while a session exists. Diffs, commits or proposes,
@@ -78,5 +82,30 @@ void log_temp(const char* tag);
 
 /// Session over: back to Unsynced with nothing remembered.
 void reset();
+
+/* --- batch 7: policy ---
+ * A policy switch (g_mpPolicy.questFlags / inventory / rupees) changes WHICH fields are in the
+ * view, not the world itself: capture() leaves an Individual group at zero on both ends. Diffing
+ * across the switch would therefore read it as a world change (Shared -> Individual: "every rupee
+ * spent"; Individual -> Shared: "this end just found its whole wallet") and send it. So both ends
+ * rebase their shadow at the switch instead, and the switch emits no ops:
+ *   - a group that went Individual: zero in the shadow, on both ends; each engine keeps its own.
+ *   - a group that went Shared: the host takes its own engine's values into its shadow. A guest
+ *     installs the host's: the wallet straight from PolicySync (hostWallet), anything bigger with
+ *     a WorldSync it asks for.
+ * Ops that cross the switch in flight for a group now Individual are dropped on both ends.
+ */
+
+/// Host: g_mpPolicy has just changed from @p before. Call BEFORE broadcasting the PolicySync, so
+/// host_wallet() already reads the rebased shadow.
+void host_on_policy_changed(const MultiplayerPolicy& before);
+
+/// Host: the wallet a guest installs when rupees become Shared: the shadow's while rupees are
+/// Shared and there is a shadow, else -1.
+std::int32_t host_wallet();
+
+/// Guest: g_mpPolicy has just taken the host's values (PolicySync). @p hostWallet is the host's
+/// host_wallet() at the time it sent it.
+void guest_on_policy_changed(const MultiplayerPolicy& before, std::int32_t hostWallet);
 
 }  // namespace dusk::mp::world_sync

@@ -230,6 +230,30 @@ MultiplayerWindow::MultiplayerWindow(LaunchCallback launch) : mLaunch(std::move(
                     "themselves: turning it on only makes YOU hittable.");
             });
 
+        /* --- batch 7: policy --- */
+        leftPane.register_control(
+            leftPane.add_child<BoolButton>(BoolButton::Props{
+                .key = "Wallet",
+                .getValue = [&settings] { return settings.sharedWallet.getValue(); },
+                .setValue =
+                    [&settings](bool value) {
+                        settings.sharedWallet.setValue(value);
+                        config::save();
+                    },
+                .valueOverride =
+                    [&settings] {
+                        return Rml::String{
+                            settings.sharedWallet.getValue() ? "Shared" : "Per player"};
+                    },
+            }),
+            rightPane, [](Pane& pane) {
+                add_help(pane,
+                    "When you host: Shared gives everyone one wallet, Per player lets each player "
+                    "keep their own rupees. The host's choice applies to the whole session; when "
+                    "you join, the host's setting is used. Only the host's save file is ever "
+                    "written, so a guest's own wallet can't be saved anywhere.");
+            });
+
         leftPane.register_control(
             leftPane.add_button("Back").on_pressed([this] { request_close(); }), rightPane,
             [](Pane& pane) { add_help(pane, "Return to the main menu."); });
