@@ -294,6 +294,10 @@ enum class DisconnectReason : std::uint32_t {
     /// HelloAck before the hang-up carries the host's list, so the client can say which ones.
     /// Since v18 also sent mid-session, after a ModsUpdate, when the two ends stop matching.
     ModMismatch = 5,
+    /// v24 (batch 7, death rule H2): a deliberate leave because this end's save memory was reset
+    /// or replaced mid-session (back to the title, a soft reset, a save reloaded). From the host,
+    /// the session ended. A peer that predates it reads it as ConnectionLost.
+    SaveReset = 6,
 };
 
 /// The host occupies a fixed player id so both ends can name it without a lookup.

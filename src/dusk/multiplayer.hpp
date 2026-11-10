@@ -152,4 +152,18 @@ void claims_note_item_removed(int itemBitNo, bool takenByPartner);
 /// because the partner picked it up.
 void claims_note_key_taken(int tboxNo);
 
+/*
+ * Batch 7: death (.claude/future-plans/mp-death-rule.md, hook H1), called from d_menu_save.cpp
+ * dMenu_save_c::retryQuestion1 inside #if TARGET_PC. Implemented in
+ * multiplayer/session/network_manager.cpp.
+ */
+
+/// True in a live session whose MultiplayerPolicy::onDeath is RespawnSelf: the death menu's
+/// "Retry?" must not lead on to "Return to the title screen?". False outside a session (vanilla).
+bool death_menu_hides_title();
+
+/// The player answered No to "Retry?" while death_menu_hides_title(): toast (and log) where
+/// leaving the session lives.
+void death_menu_title_refused();
+
 }  // namespace dusk::mp
