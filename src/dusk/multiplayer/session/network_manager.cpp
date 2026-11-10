@@ -1352,6 +1352,90 @@ void NetworkManager::broadcast_peer_left(std::uint32_t playerId) {
     mTransport->broadcast(w.data().data(), w.size(), kChannelControl, true);
 }
 
+namespace {
+
+/**
+ * Rewrite a held pose as Link standing in his ordinary idle at the same spot and facing
+ * (puppet-events.md §3(a)). The rewrite sends the sender's answer, "standing", rather than a
+ * made-up proc. Every field goes to the value the capture itself sends for a standing Link with
+ * nothing in his hands:
+ *
+ *   - no action override, slot-1 anime, UPPER_2 overlay or root offsets (clear_action_anim's set);
+ *   - no held item, bow BCK, iron ball or clawshot. A TOOL demo really does delete his items
+ *     (d_a_alink_demo.inc:651-653), and the sword and shield go back on his back with them;
+ *   - zero gait rate, standing (ZeroSpeed + ModeIdle), no skid, guard or foot-IK opt-out;
+ *   - the plain WAIT idle, no attention set, head and torso straight, no lean;
+ *   - no lantern flame: it is a held item.
+ *
+ * Position, facing, outfit, gear, location and the time vote are kept.
+ */
+void make_stand_in_idle(PlayerState& pose) {
+    pose.moveRate = 0.0f;
+    pose.flags |= kPlayerStateZeroSpeed | kPlayerStateModeIdle;
+    pose.flags &= static_cast<std::uint8_t>(
+        ~(kPlayerStateSharpTurn | kPlayerStateUpperGuard | kPlayerStateNoFootIk));
+    pose.equip &= static_cast<std::uint8_t>(~(kPlayerEquipSwordInHand | kPlayerEquipShieldInHand));
+    pose.idleKind = kPlayerIdleWait;
+    pose.atnKind = kPlayerAtnNone;
+
+    pose.neckX = 0;
+    pose.neckY = 0;
+    pose.bodyX = 0;
+    pose.bodyTwist = 0;
+    pose.bodyZ = 0;
+    pose.bankZ = 0;
+
+    // block (2)
+    pose.actUnder = kPlayerActNone;
+    pose.actUpper = kPlayerActNone;
+    pose.actFrame = 0;
+    pose.actUpperFrame = 0;
+    pose.actRate = 0;
+    pose.actMorf = 0;
+    pose.actHandL = kPlayerActBodyHand;
+    pose.actHandR = kPlayerActBodyHand;
+    pose.actRootX = 0;
+    pose.actRootY = 0;
+    pose.actRootZ = 0;
+    pose.locPhase = 0;
+    // block (4)
+    pose.act1Under = kPlayerActNone;
+    pose.act1Upper = kPlayerActNone;
+    pose.act1Phase = 0;
+    pose.act1Ratio = 0;
+    pose.actRootRotX = 0;
+    pose.actRootRotZ = 0;
+    pose.actYawOff = 0;
+    pose.actPitch = 0;
+    // block (3) and the v19/v20 item blocks
+    pose.heldItem = kPlayerHeldNone;
+    pose.heldFlags = 0;
+    pose.heldMat = 0;
+    pose.upper2Idx = kPlayerActNone;
+    pose.upper2Frame = 0;
+    pose.upper2Ratio = 0;
+    pose.upper2Morf = 0;
+    pose.heldBck = 0;
+    pose.heldBckFrame = 0;
+    pose.ironBallX = 0;
+    pose.ironBallY = 0;
+    pose.ironBallZ = 0;
+    pose.ironBallAngX = 0;
+    pose.ironBallAngY = 0;
+    pose.ironBallLinks = 0;
+    pose.ironBallState = 0;
+    pose.clawFlags = 0;
+    std::fill(std::begin(pose.clawTipFrame), std::end(pose.clawTipFrame), std::uint8_t{0});
+    std::fill(std::begin(pose.clawTipPos), std::end(pose.clawTipPos), std::int16_t{0});
+    std::fill(std::begin(pose.clawTipAng), std::end(pose.clawTipAng), std::int16_t{0});
+    // v19 attack and v20 effects: no hitbox, no flame, no flash.
+    pose.atMask = 0;
+    pose.fxFlags = 0;
+    pose.dmgFlash = 0;
+}
+
+}  // namespace
+
 /**
  * ★ Always produce something to send. Going quiet is what used to cost the session its latency.
  *
@@ -1366,18 +1450,36 @@ void NetworkManager::broadcast_peer_left(std::uint32_t playerId) {
  * So we send every tick regardless. Holding the LAST GOOD pose, rather than sending a cleared
  * one, is deliberate: it reproduces exactly what the far end already displayed during these gaps
  * (its buffer held the last sample), so this change moves no puppet by a single unit. It only
- * stops the timeline stalling. Whether a puppet should instead HIDE during the other player's
- * cutscenes is a real question, but it is a visual-design decision and not this one's to make —
- * kPlayerStateInWorld is already allocated for it.
+ * stops the timeline stalling.
+ *
+ * Two exceptions to "hold it as it was" (puppet-events.md). During an STB cutscene the held pose is
+ * rewritten as a standing idle at the same spot, which is Stuart's rule that the partner "sees the
+ * other player standing still" (make_stand_in_idle). And a held pose from an earlier Link actor is
+ * sent as not in the world: see below. The smaller events (talk, chest, item get, door, the
+ * stage-entry walk-in) do not come here any more. capture_local() reads them live.
  *
  * Before the first readable pose there is genuinely nothing to show, so the flags stay clear and
  * drive_puppets() declines to spawn a puppet at the origin.
  */
 PlayerState NetworkManager::wire_local_state() {
+    // Edge state for the P2 stand-in log, shared by both paths so its "off" line is written when
+    // live capture resumes, not only when the held pose stops being a cutscene.
+    static bool s_standInOn = false;
+    static int s_standInLogs = 0;
+    static bool s_staleOn = false;
+    static int s_staleLogs = 0;
+
     PlayerState state;
     if (replication_manager().capture_local(state)) {
         mLastLocalState = state;
         mHaveLastLocal = true;
+        if (s_standInOn && s_standInLogs < 100) {
+            s_standInLogs++;
+            Log.info("Local stand-in idle off: live capture resumed at ({:.0f}, {:.0f}, {:.0f})",
+                state.posX, state.posY, state.posZ);
+        }
+        s_standInOn = false;
+        s_staleOn = false;
         return state;
     }
     if (!mHaveLastLocal) {
@@ -1393,11 +1495,44 @@ PlayerState NetworkManager::wire_local_state() {
         ~(kPlayerFxSwordTrail | kPlayerFxSpin | kPlayerFxSwordCharge | kPlayerFxVariantMask |
             kPlayerFxDmgTintMask));
     held.dmgFlash = 0;
+
+    /* The held pose belongs to one Link actor. Once a different one exists (the new scene's Link
+     * after a load, still being created or in an entry cutscene), it is the old stage's pose: it
+     * has the old position, room and location epoch. Saying "in world" with it put the puppet back
+     * at the exit it had just left, because the scene-change latch below clears as soon as the new
+     * Link appears (puppet-events.md §2, REASONED from player_bridge.cpp, not measured). No Link at
+     * all, mid-load, is the same answer. */
+    const bool sameLink = local_player_is_last_captured();
+
+    /* P2: an STB cutscene. Link is on the cast's marks playing demo-archive BCKs the far end does
+     * not have, so his real pose cannot go out. Instead of a still frame of whatever he was doing
+     * on the last free tick (often mid-stride or mid-swing), send what Stuart's rule asks for: him
+     * standing at his last live position. The receiver plays its own WAIT through the ordinary path
+     * and needs no change, and older receivers see the same thing. */
+    const LocalEventKind kind = local_event_kind();
+    const bool standIn = sameLink && kind == LocalEventKind::Cutscene;
+    if (standIn) {
+        make_stand_in_idle(held);
+    }
+    if (standIn != s_standInOn && s_standInLogs < 100) {
+        s_standInLogs++;
+        Log.info("Local stand-in idle {} at ({:.0f}, {:.0f}, {:.0f})", standIn ? "on" : "off",
+            held.posX, held.posY, held.posZ);
+    }
+    s_standInOn = standIn;
+
     /* Leaving the scene is the one gap where holding the pose is wrong: the load that follows can
      * stall this process for seconds, and the far end would show us frozen at the exit the whole
      * time (~2 s mid-roll, measured). Cleared in-world flag = the far end despawns the puppet,
-     * the same path it takes for a load it can see. Cutscenes still hold, as above. */
-    if (local_scene_change_queued()) {
+     * the same path it takes for a load it can see. Cutscenes still hold, as the stand-in above. */
+    const bool leaving = local_scene_change_queued();
+    const bool stale = !sameLink && !leaving;
+    if (stale && !s_staleOn && s_staleLogs < 100) {
+        s_staleLogs++;
+        Log.info("Local held pose is from an earlier Link (or none); sent as not in world");
+    }
+    s_staleOn = stale;
+    if (leaving || !sameLink) {
         held.flags &= ~kPlayerStateInWorld;
     }
     return held;

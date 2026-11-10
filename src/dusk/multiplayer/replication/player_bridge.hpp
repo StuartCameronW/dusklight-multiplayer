@@ -28,6 +28,28 @@ bool world_is_playable();
 /// scene's Link exists. The sender stops claiming to be in the world for that whole stretch.
 bool local_scene_change_queued();
 
+/// Which event the local Link is in, read off HIS proc and demo type (the answers his own
+/// setDemoData / checkDemoAction chose). The numbering matches the planned v21 wire byte
+/// (.claude/future-plans/puppet-events.md §6), but nothing puts it on the wire yet.
+enum class LocalEventKind : std::uint8_t {
+    None = 0,      ///< no event, no Link, a Link still being created, or the title's attract demo
+    Talk = 1,      ///< PROC_TALK: an NPC, a sign, Midna
+    Chest = 2,     ///< PROC_OPEN_TREASURE
+    GetItem = 3,   ///< PROC_GET_ITEM
+    Door = 4,      ///< PROC_DOOR_OPEN
+    InPlace = 5,   ///< DEMO_TYPE_SPECIAL_e: bottle, oil, whistle, boomerang catch, death
+    Scripted = 6,  ///< any other event proc that draws ALANM (the stage-entry walk-in, warps)
+    Cutscene = 7,  ///< a TOOL demo / PROC_TOOL_DEMO, or a demo-archive BCK during an event
+};
+
+LocalEventKind local_event_kind();
+const char* local_event_kind_name(LocalEventKind kind);
+
+/// True when the player actor that exists now is the one the last successful capture read. False
+/// when there is no Link, or when a different one exists, such as a new scene's Link that is not
+/// capturable yet. A held pose from the old Link must not then claim to be in the world.
+bool local_player_is_last_captured();
+
 /// Read the local player's pose. False when Link doesn't currently exist (loading, title screen),
 /// in which case nothing should be sent this tick.
 bool capture_local_player(PlayerState& out);

@@ -16,8 +16,10 @@
 #include "d/d_com_inf_game.h"
 #include "d/d_meter2_info.h"
 #include "dusk/logging.h"
+#include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 #include "dusk/settings.h"
+#include "f_op/f_op_actor_mng.h"
 #include "f_op/f_op_camera_mng.h"
 
 /**
@@ -62,6 +64,9 @@ enum class Op {
     Arrows,
     Oil,
     Quit,
+    Nearest,
+    TalkNear,
+    GetItem,
 };
 
 struct Command {
@@ -85,6 +90,8 @@ struct Command {
     /// Repeat -> index of its End, and vice versa.
     std::size_t pair = 0;
     int line = 0;
+    /// Nearest / TalkNear only: how far from Link to look, world units.
+    double radius = 0.0;
 };
 
 struct LoopFrame {
@@ -308,6 +315,169 @@ void run_setup_command(const Command& command) {
     }
 }
 
+/* --- nearest / talknear / getitem: drive the sender's events for the puppet-event tests ------ */
+
+/// TalkNear: the NPC picked on the command's first tick.
+fpc_ProcID sTalkTarget = fpcM_ERROR_PROCESS_ID_e;
+
+struct ActorHit {
+    fopAc_ac_c* actor = nullptr;
+    double distance = 0.0;
+};
+
+struct ActorSearch {
+    const fopAc_ac_c* from = nullptr;
+    /// Upper-cased stage name ("BOU", "KANBAN"...), "*" for any actor, or "TALK" for any actor that
+    /// can be talked to right now.
+    std::string name;
+    /// A profile name typed as a number ("0x0FB"), or -1.
+    int profName = -1;
+    double radius = 0.0;
+    std::vector<ActorHit> hits;
+};
+
+/**
+ * "Can be talked to right now", as the game asks it: the NPC base's own test for its talk target
+ * (d_a_npc.cpp:2053) is SPEAK or TALK in attention_info.flags. NPCs clear the flags whenever they
+ * cannot talk (d_a_npc_moi.cpp:624, d_a_npc_bou.cpp:661).
+ */
+bool actor_is_talkable(const fopAc_ac_c* actor) {
+    return (actor->attention_info.flags & (fopAc_AttnFlag_SPEAK_e | fopAc_AttnFlag_TALK_e)) != 0;
+}
+
+void* collect_actor(void* actorPtr, void* data) {
+    auto* search = static_cast<ActorSearch*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(actorPtr);
+    if (actor == search->from || !fopAcM_IsExecuting(fopAcM_GetID(actor))) {
+        return nullptr;
+    }
+    const s16 prof = fopAcM_GetProfName(actor);
+    // Never ourselves or a partner's puppet: neither is something to walk up to and talk to.
+    if (prof == fpcNm_ALINK_e || prof == fpcNm_REMOTE_PLAYER_e) {
+        return nullptr;
+    }
+    bool match;
+    if (search->name == "TALK") {
+        match = actor_is_talkable(actor);
+    } else if (search->name == "*") {
+        match = true;
+    } else if (search->profName >= 0) {
+        match = prof == search->profName;
+    } else {
+        match = to_upper(fopAcM_getProcNameString(actor)) == search->name;
+    }
+    if (!match) {
+        return nullptr;
+    }
+    const double dx = actor->current.pos.x - search->from->current.pos.x;
+    const double dy = actor->current.pos.y - search->from->current.pos.y;
+    const double dz = actor->current.pos.z - search->from->current.pos.z;
+    const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance <= search->radius) {
+        search->hits.push_back(ActorHit{actor, distance});
+    }
+    return nullptr;  // keep iterating: the whole list is wanted, sorted afterwards
+}
+
+/// Every matching actor within the radius, nearest first.
+std::vector<ActorHit> find_actors(const std::string& name, double radius) {
+    ActorSearch search;
+    search.from = dComIfGp_getPlayer(0);
+    if (search.from == nullptr) {
+        return {};
+    }
+    search.name = to_upper(name);
+    int number = 0;
+    if (parse_int(name, number)) {
+        search.profName = number;
+    }
+    search.radius = radius;
+    fopAcM_Search(collect_actor, &search);
+    std::sort(search.hits.begin(), search.hits.end(),
+        [](const ActorHit& a, const ActorHit& b) { return a.distance < b.distance; });
+    return search.hits;
+}
+
+void log_actor_hit(const char* what, const ActorHit& hit) {
+    const fopAc_ac_c* actor = hit.actor;
+    Log.info("[{}] {} '{}' prof 0x{:03X} id {} at ({:.0f}, {:.0f}, {:.0f}) room {}, {:.0f} units "
+             "away, attention flags 0x{:08X}{}",
+        sTicks, what, fopAcM_getProcNameString(actor),
+        static_cast<unsigned>(static_cast<u16>(fopAcM_GetProfName(actor))), fopAcM_GetID(actor),
+        actor->current.pos.x, actor->current.pos.y, actor->current.pos.z,
+        static_cast<int>(fopAcM_GetRoomNo(actor)), hit.distance, actor->attention_info.flags,
+        actor_is_talkable(actor) ? " (talkable)" : "");
+}
+
+/**
+ * `nearest <name|*|talk|0xPROF> [radius]`: log up to eight matching actors, nearest first, and the
+ * `stickto` line that walks to the nearest. Read-only: nothing in the game changes.
+ */
+void run_nearest(const Command& command) {
+    if (!in_world()) {
+        Log.error("[{}] line {}: nearest needs the world; skipped", sTicks, command.line);
+        return;
+    }
+    const std::vector<ActorHit> hits = find_actors(command.text, command.radius);
+    if (hits.empty()) {
+        Log.warn(
+            "[{}] nearest '{}': nothing within {:.0f} units", sTicks, command.text, command.radius);
+        return;
+    }
+    for (std::size_t i = 0; i < hits.size() && i < 8; i++) {
+        log_actor_hit(i == 0 ? "nearest" : "  also", hits[i]);
+    }
+    Log.info("[{}] nearest '{}': {} found; walk there with: stickto {:.0f} {:.0f} 120", sTicks,
+        command.text, hits.size(), hits[0].actor->current.pos.x, hits[0].actor->current.pos.z);
+}
+
+/**
+ * `getitem <itemNo>`: the real item-get event, fanfare and all, through Dusk's own give queue:
+ * the same path a randomizer's forced give takes (mods/item_gives.cpp dispatch_demo_give: the
+ * DEFAULT_GETITEM event with setGtItm). The queue waits until Link is in a plain wait or move
+ * proc with no event running (safe_to_dispatch), so this line returns at once and the event
+ * starts a few ticks later. Follow it with a `wait` and `tap A` to page out the text box.
+ *
+ * Like `give`, it grants the item into THIS instance's save in memory. It runs only on the
+ * instance whose script has it. The partner's puppet spawns nothing (puppet-events.md §5.4).
+ * A unique check name per command keeps two queued gives from sharing one commit.
+ */
+void run_getitem(const Command& command) {
+    if (!in_world()) {
+        Log.error("[{}] line {}: getitem needs the world; skipped", sTicks, command.line);
+        return;
+    }
+    static int s_getItemCount = 0;
+    const std::string name = "autopilot:getitem:" + std::to_string(++s_getItemCount);
+    dusk::mods::item_check_enqueue_deferred(name.c_str(), static_cast<u8>(command.room));
+    Log.info("[{}] queued item get 0x{:02X} ('{}'); the event starts once Link is free", sTicks,
+        command.room, name);
+}
+
+/// Steer toward a world XZ point: the same mapping as the StickTo case in tick().
+void steer_toward(PADStatus& status, double targetX, double targetZ, double maxMagnitude) {
+    fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    auto* camera = dComIfGp_getCamera(dComIfGp_getPlayerCameraID(0));
+    if (link == nullptr || camera == nullptr) {
+        return;
+    }
+    const double dx = targetX - link->current.pos.x;
+    const double dz = targetZ - link->current.pos.z;
+    const double distance = std::sqrt(dx * dx + dz * dz);
+    const double kToRad = 3.14159265358979 / 32768.0;
+    double stickAngle = std::atan2(dx, dz) - dCam_getControledAngleY(camera) * kToRad;
+    if (dusk::getSettings().game.enableMirrorMode) {
+        stickAngle = -stickAngle;
+    }
+    const double magnitude = std::min(maxMagnitude, std::max(0.45, distance / 100.0));
+    status.stickX = stick_value(-std::sin(stickAngle) * magnitude);
+    status.stickY = stick_value(std::cos(stickAngle) * magnitude);
+}
+
+/// TalkNear: close enough to press A. NPC talk ranges are well past this; under it Link would
+/// mostly be pushing against the NPC's collider.
+constexpr double kTalkReach = 120.0;
+
 /// Runs every command that takes no time (say/repeat/end/quit), leaving sPc on a timed one.
 /// Returns false once the program is over.
 bool settle_program_counter() {
@@ -380,6 +550,16 @@ bool settle_program_counter() {
             Log.info("Script asked to quit after {} ticks", sTicks);
             request_quit();
             return false;
+
+        case Op::Nearest:
+            run_nearest(command);
+            sPc++;
+            continue;
+
+        case Op::GetItem:
+            run_getitem(command);
+            sPc++;
+            continue;
 
         default:
             return true;
@@ -532,6 +712,27 @@ void load_script(const std::filesystem::path& path) {
             ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
         } else if (verb == "QUIT") {
             command.op = Op::Quit;
+        } else if (verb == "NEAREST") {
+            // "nearest Bou 2000": log the nearest actors with that stage name ("*" = any, "talk" =
+            // any NPC that can be talked to now, or a profile number like 0x0FB). Radius optional.
+            command.op = Op::Nearest;
+            command.text = a;
+            command.radius = 3000.0;
+            ok = !a.empty() && (b.empty() || parse_double(b, command.radius)) &&
+                 command.radius > 0.0;
+        } else if (verb == "TALKNEAR") {
+            // "talknear 1500 300": walk to the nearest talkable NPC within the radius and press A
+            // until an event starts, giving up after the timeout in ticks.
+            command.op = Op::TalkNear;
+            command.radius = 1500.0;
+            command.frames = 300;
+            ok = (a.empty() || parse_double(a, command.radius)) &&
+                 (b.empty() || parse_int(b, command.frames)) && command.radius > 0.0 &&
+                 command.frames > 0;
+        } else if (verb == "GETITEM") {
+            // "getitem 0x01": the real item-get event for that item (dItemNo_*). See run_getitem.
+            command.op = Op::GetItem;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -691,6 +892,55 @@ void tick() {
         const double magnitude = std::min(command.magnitude, std::max(0.45, distance / 100.0));
         status.stickX = stick_value(-std::sin(stickAngle) * magnitude);
         status.stickY = stick_value(std::cos(stickAngle) * magnitude);
+        break;
+    }
+
+    case Op::TalkNear: {
+        /* Ends the tick an event starts, whatever started it: the point is to put Link into
+         * PROC_TALK for the partner to watch, and the script's next lines page the text out. */
+        if (dComIfGp_event_runCheck()) {
+            if (sElapsed > 0) {
+                Log.info("[{}] talknear: an event started after {} ticks", sTicks, sElapsed);
+            }
+            duration = sElapsed + 1;
+            break;
+        }
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        if (link == nullptr) {
+            break;
+        }
+        if (sElapsed == 0) {
+            sTalkTarget = fpcM_ERROR_PROCESS_ID_e;
+            const std::vector<ActorHit> hits = find_actors("talk", command.radius);
+            if (hits.empty()) {
+                Log.warn("[{}] line {}: talknear: no talkable NPC within {:.0f} units", sTicks,
+                    command.line, command.radius);
+                duration = 1;
+                break;
+            }
+            log_actor_hit("talknear: heading for", hits[0]);
+            sTalkTarget = fopAcM_GetID(hits[0].actor);
+        }
+        fopAc_ac_c* target = fopAcM_SearchByID(sTalkTarget);
+        if (target == nullptr) {
+            Log.warn("[{}] talknear: the NPC is gone", sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        const double dx = target->current.pos.x - link->current.pos.x;
+        const double dz = target->current.pos.z - link->current.pos.z;
+        if (std::sqrt(dx * dx + dz * dz) > kTalkReach) {
+            steer_toward(status, target->current.pos.x, target->current.pos.z, 1.0);
+        } else if (std::fabs(link->speedF) < 0.5f) {
+            // Standing, so A cannot become a roll. 4 ticks on, 8 off: one clean edge per press.
+            if (sElapsed % 12 < 4) {
+                status.button = PAD_BUTTON_A;
+            }
+        }
+        if (sElapsed + 1 >= command.frames) {
+            Log.warn("[{}] line {}: talknear: no event after {} ticks", sTicks, command.line,
+                command.frames);
+        }
         break;
     }
 
