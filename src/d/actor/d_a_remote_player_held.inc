@@ -387,7 +387,7 @@ void daRemotePlayer_c::setupHeldItems() {
         }
         bckWanted++;
         mpHeldItemBckAnm[i] = static_cast<J3DAnmTransform*>(held_load_aram_anm(
-            l_heldItemBck[i].mResIdx, 0, "item bck", l_heldItemBckBufSize));
+            l_heldItemBck[i].mResIdx, 8, "item bck", l_heldItemBckBufSize));  // J3DAnmTransformKey
         if (mpHeldItemBckAnm[i] == NULL) {
             continue;
         }
