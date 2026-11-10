@@ -184,8 +184,8 @@ inline constexpr ObjKindInfo kObjKinds[] = {
     {ObjKind::Explosion, "explosion", 0, 0, 0, false},
     // d_a_boomerang.cpp:1476.
     {ObjKind::Boomerang, "boomerang", 1, 15, 0xC0D0, false},
-    // d_a_crod.cpp:81.
-    {ObjKind::RodBall, "rodball", 1, 15, 0x10C0, false},
+    // d_a_crod.cpp:81: the ball model + its BCK's J3DMtxCalc, which is all the ghost allocates too.
+    {ObjKind::RodBall, "rodball", 1, 15, 0x10C0, true},
     {ObjKind::Carry, "carry", 1, 15, 0, false},
     {ObjKind::Statue, "statue", 1, 15, 0, false},
     {ObjKind::Horse, "horse", 1, 15, 0, false},

@@ -106,10 +106,57 @@ private:
     /* ==== end boom ==== */
 
     /* ==== Dominion Rod ball (0x08): d_a_mp_ghost_crod.inc ==== */
+public:
+    /**
+     * The rod ball's wire blobs, ONE definition for both ends: the owner side
+     * (src/dusk/multiplayer/replication/object_capture_crod.cpp) writes them, the ghost reads them.
+     *
+     * Spawn init blob and state blob: [u8 phase][u8 bck], CROD_STATE_LEN bytes.
+     *   phase: the owner's daCrod_c param, CROD_PHASE_FLY or CROD_PHASE_RETURN (d_a_crod.cpp:187-356).
+     *   bck:   "Alink" resource index of the BCK the owner's ball is playing, CROD_BCK_FIRST..LAST.
+     * Event blobs (event ids are ObjEventId values, used per this kind):
+     *   Stuck  (1) = possessed a statue: [u16 BE procname of the statue][u8 boss type], 3 bytes.
+     *   Hit    (6) = hit something and turned back: [u16 BE procname of what it hit, 0 = none].
+     *   Caught (5) = back in Link's hand: empty.
+     */
+    enum {
+        CROD_PHASE_FLY = 3,
+        CROD_PHASE_RETURN = 5,
+        CROD_STATE_PHASE = 0,
+        CROD_STATE_BCK = 1,
+        CROD_STATE_LEN = 2,
+        CROD_EVENT_PROC_HI = 0,
+        CROD_EVENT_PROC_LO = 1,
+        CROD_EVENT_BOSS = 2,
+        CROD_EVENT_HIT_LEN = 2,
+        CROD_EVENT_POSSESS_LEN = 3,
+    };
+    /// "Alink" resource indices of the ball (d_a_crod.cpp:14-25).
+    enum {
+        CROD_RES_BMD = 0x22,
+        CROD_RES_BRK = 0x40,
+        CROD_RES_BTK = 0x46,
+        CROD_BCK_FIRST = 13,     ///< ANM_REVIVE_DEMO
+        CROD_BCK_WAIT_A = 14,    ///< ANM_WAIT_A: daCrod_c::createHeap's first animation
+        CROD_BCK_WAIT_A_T = 15,  ///< ANM_WAIT_A_T: what a ball in flight normally plays
+        CROD_BCK_LAST = 18,      ///< ANM_WAIT_C
+    };
+
+private:
     int createHeapCrod();
     void executeCrod();
     int drawCrod();
     void eventCrod(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    void crodEnterMaterialAnm();
+
+    /// The ball's own joint animation, in this actor's solid heap.
+    mDoExt_bckAnm mCrodBck;
+    /// The ball's BRK / BTK: shared "Alink" resources (the local Link's ball plays the same ones).
+    J3DAnmTevRegKey* mpCrodBrk;
+    J3DAnmTextureSRTKey* mpCrodBtk;
+    u8 mCrodBckId;
+    bool mCrodAnmEntered;
+    bool mCrodDrawnLogged;
     /* ==== end crod ==== */
 };
 
