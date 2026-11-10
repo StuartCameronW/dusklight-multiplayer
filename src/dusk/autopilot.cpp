@@ -58,6 +58,8 @@ enum class Op {
     Give,
     Equip,
     Clothes,
+    Time,
+    Arrows,
     Quit,
 };
 
@@ -278,6 +280,20 @@ void run_setup_command(const Command& command) {
         daPy_getPlayerActorClass()->setClothesChange(0);
         Log.info("[{}] wearing outfit item 0x{:02X}", sTicks, command.room);
         break;
+    case Op::Time:
+        // 15 degrees an hour, as the save editor writes it. On a host the world clock sees this
+        // as a set and sends it on; on a guest it is a TimeOverride.
+        dComIfGs_setTime(static_cast<f32>(command.room) * 15.0f);
+        Log.info("[{}] set the time to {:02}:00", sTicks, command.room);
+        break;
+    case Op::Arrows:
+        // What item_func_BOW does on top of the slot: a bow with no arrows cannot nock one.
+        if (dComIfGs_getArrowMax() < command.room) {
+            dComIfGs_setArrowMax(static_cast<u8>(command.room));
+        }
+        dComIfGs_setArrowNum(static_cast<u8>(command.room));
+        Log.info("[{}] arrows set to {}", sTicks, command.room);
+        break;
     default:
         break;
     }
@@ -344,6 +360,8 @@ bool settle_program_counter() {
         case Op::Give:
         case Op::Equip:
         case Op::Clothes:
+        case Op::Time:
+        case Op::Arrows:
             run_setup_command(command);
             sPc++;
             continue;
@@ -488,6 +506,15 @@ void load_script(const std::filesystem::path& path) {
         } else if (verb == "CLOTHES") {
             // "clothes 0x31": wear that outfit item (dItemNo_WEAR_*, dItemNo_ARMOR_e).
             command.op = Op::Clothes;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
+        } else if (verb == "TIME") {
+            // "time 12": set the clock to that hour (0-23). Hyrule Field at night spawns
+            // Stalchildren, which knock a scripted player about.
+            command.op = Op::Time;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 23;
+        } else if (verb == "ARROWS") {
+            // "arrows 30": the quiver count (and its max, if lower). "give 4 0x43" alone leaves 0.
+            command.op = Op::Arrows;
             ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
         } else if (verb == "QUIT") {
             command.op = Op::Quit;
