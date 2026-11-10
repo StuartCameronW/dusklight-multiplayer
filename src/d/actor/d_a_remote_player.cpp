@@ -8250,6 +8250,7 @@ int daRemotePlayer_c::execute() {
     updateLanternFx(); // lantern flame + glow: after setMatrix's lantern calc (agent D)
     updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
     updateGearFx(); // armour BRK, Zora mask, shield burn (agent G): after setMatrix's shield pose
+    updateFootFx(); // footstep dust, ripples, splashes (agent J): needs this tick's foot joints
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8650,3 +8651,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_hookshot.inc"
 // Magic armour glow, Zora mask, burning wooden shield (agent G): gear bits 3-6.
 #include "d/actor/d_a_remote_player_gear.inc"
+// Footstep dust, ripples, splashes and wet footprints (agent J). Uses the fx file's emitter slots.
+#include "d/actor/d_a_remote_player_footfx.inc"

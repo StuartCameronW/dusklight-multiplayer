@@ -5,8 +5,10 @@
 #include "Z2AudioLib/Z2SoundStarter.h"
 #include "d/actor/d_a_player.h"
 #include "d/d_cc_d.h"
+#include "d/d_bg_s_acch.h"  // foot fx (agent J): mFootAcch
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
+#include "d/d_particle_copoly.h"  // foot fx (agent J): mFootPoly
 #include "d/d_resorce.h"
 #include "dusk/interp/samples.h"
 #include "f_op/f_op_actor.h"
@@ -1513,6 +1515,13 @@ public:
         PUPPET_FX_SWORD_FIRST = 1,
         /// ZI_J_LK_SH_BURN_A, the burning wooden shield (agent G).
         PUPPET_FX_SHIELD_FIRE = 8,
+        /// Ground-contact effects (agent J): PUPPET_FX_FOOT_FIRST .. PUPPET_FX_FOOT_LAST. 9-11
+        /// are setRunSplash's ZI_J_DASHWTRA_A/B/C; 12 is reserved for the foot fx, unused.
+        PUPPET_FX_FOOT_FIRST = 9,
+        PUPPET_FX_FOOT_SPLASH_A = 9,
+        PUPPET_FX_FOOT_SPLASH_B = 10,
+        PUPPET_FX_FOOT_SPLASH_C = 11,
+        PUPPET_FX_FOOT_LAST = 12,
         PUPPET_FX_NUM = 13,
     };
     JPABaseEmitter* setPuppetEmitter(int i_slot, u16 i_name, const cXyz* i_pos,
@@ -1777,6 +1786,45 @@ private:
     /// The shield model the fire was last placed on, for the burn-out particles.
     J3DModel* mpShieldBurnModel;
     u16 mGearFxLogCount;
+
+    // --- foot fx (agent J) ---
+    /* Footstep dust / grass / water kick-up, landing, roll and slide dust, water ripples, the
+     * water-entry splash, the run splash and wet footprints: daAlink_c::setEffect's field_0x2e54
+     * half and setRunSplash, rebuilt on the puppet's own floor, water and BCK frames. No wire
+     * bytes. See d_a_remote_player_footfx.inc. All zeroed by fopAcM_ct; the rest is set up lazily
+     * on the first tick (setupFootFx). */
+private:
+    enum { FOOT_FX_LOG_NUM = 9 };
+    /// execute(), after setMatrix: once a tick.
+    void updateFootFx();
+    void setupFootFx();
+    /// CrrPos's ground and water queries into mFootAcch, without its writes.
+    void footFxBgCheck();
+    /// setFootEffectProcType.
+    void setFootFxProcType(u8 i_type);
+    /// m_fEffParamProc[mEffProc], human branches.
+    void setFootFxParam();
+    /// setFootMark on one of the puppet's foot joints.
+    void setFootFxMark(cXyz* i_pos, u16 i_jointNo, int i_kind);
+    bool mFootFxReady;
+    /// Link's own acch type, used only as the holder his dPaPoF_c reads (m_gnd, m_wtr, ground
+    /// height, water hit). Never CrrPos'd: that would write the position and ride the floor.
+    dBgS_LinkAcch mFootAcch;
+    /// His field_0x2e54: the per-point level emitters and their types.
+    dPaPoF_c mFootPoly;
+    /// His mEffProc and field_0x2f9f (the kind last set, for setFootEffectProcType's clear).
+    u8 mFootFxProc;
+    u8 mFootFxProcSet;
+    /// His field_0x2fc4: ticks left in which a footprint is wet.
+    u8 mFootFxWetTimer;
+    /// Last tick's override BCK (l_actNone if none) and skid state, for "this proc just began".
+    u16 mFootFxPrevActUnder;
+    bool mFootFxPrevSlip;
+    /// His field_0x3798 (old.pos), for the ripple rate.
+    cXyz mFootFxPrevPos;
+    bool mFootFxPrevPosValid;
+    bool mFootFxRippling;
+    u8 mFootFxLogCount[FOOT_FX_LOG_NUM];
 };
 
 /**
