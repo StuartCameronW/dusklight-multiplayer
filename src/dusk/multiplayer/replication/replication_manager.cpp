@@ -216,7 +216,8 @@ void ReplicationManager::drive_puppets() {
         // puppet. It does so by rebuilding the actor — see reconcile_puppet_outfit() for why an
         // in-place re-mount is not on offer. Driven off `pose` rather than off the newest sample
         // received so the change lands on the same delayed timeline as the movement it accompanies.
-        if (reconcile_puppet_outfit(player.playerId, pose.outfit)) {
+        // v21: the human/wolf form rides the same rebuild (puppet-wolf.md §3).
+        if (reconcile_puppet_outfit(player.playerId, pose.outfit, pose.wolf())) {
             // The puppet is gone for this tick; ensure_puppet() rebuilds it in the new clothes on
             // the next one. Deliberately not the same tick: it keeps the old actor's archive and
             // solid heap from having to coexist with the new one's.
@@ -227,7 +228,7 @@ void ReplicationManager::drive_puppets() {
         // Asked every tick rather than cached in puppetAlive: the actor can be destroyed under us
         // by a room unload, and a cached "alive" would leave us applying poses to nothing forever.
         // ensure_puppet() owns the whole question, including respawning after a scene change.
-        if (!ensure_puppet(player.playerId, player.color, pose.outfit)) {
+        if (!ensure_puppet(player.playerId, player.color, pose.outfit, pose.wolf())) {
             player.puppetAlive = false;
             continue;
         }

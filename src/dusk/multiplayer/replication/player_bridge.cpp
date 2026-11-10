@@ -83,6 +83,12 @@ constexpr int kCreateStuckTicks = 300;
 /// must not be able to destroy and rebuild an actor (archive mount included) every tick.
 constexpr int kOutfitRespawnCooldownTicks = 30;
 
+/// v21: the create parameter's top byte for a WOLF puppet (puppet-wolf.md §6), in the slot the
+/// outfit uses for a human. Pre-assigned so piece B's isWolf() reads the same value; any byte
+/// >= l_outfitNum already resolves to the default clothes on an older build
+/// (daRemotePlayer_outfitFromWire), so it cannot be mistaken for an outfit.
+constexpr std::uint8_t kPuppetParamWolf = 0xFE;
+
 /*
  * ★ Do NOT add a "wait N settled ticks before creating the puppet" gate here.
  *
@@ -776,7 +782,14 @@ std::int16_t clamp_joint_aim(int v, const char* name) {
  * Joint 16 (field_0x3088/308a) is skipped: every writer of it is a horse, boar, glide or demo
  * state, none of which the puppet can show yet.
  *
- * Wolf: zeros. His jointControll arms are a different set (:2150-2191) on a different skeleton.
+ * Wolf: the same six fields carry his jointControll arms (:2150-2191) on the 40-joint skeleton,
+ * each the value that arm consumes (puppet-wolf.md §2 table). neckX/neckY are joint 4, as for the
+ * human. bodyX is joint 3's X, `field_0x30d6 + field_0x30b2` (the standing slope pitch,
+ * wolf.inc:2201, plus the howl demo's lean, :4259), summed as jointControll sums them into an s16.
+ * bodyTwist is the turn bend `field_0x2fec` that joints 2 and 26 apply NEGATED (:2179-2187); the
+ * sign travels as he stores it and the receiver negates. bodyZ is joint 3's Z, `field_0x30b0`.
+ * bankZ is shape_angle.z, as for the human. The tail (37-39) is not sent: the receiver runs the
+ * spring itself.
  */
 void fill_joint_aim(daAlink_c* alink, PlayerState& out) {
     out.neckX = 0;
@@ -785,7 +798,17 @@ void fill_joint_aim(daAlink_c* alink, PlayerState& out) {
     out.bodyTwist = 0;
     out.bodyZ = 0;
     out.bankZ = 0;
-    if (alink == nullptr || alink->checkWolf()) {
+    if (alink == nullptr) {
+        return;
+    }
+    if (alink->checkWolf()) {
+        out.neckX = clamp_joint_aim(alink->field_0x3124.x, "wolf neckX");
+        out.neckY = clamp_joint_aim(alink->field_0x3124.y, "wolf neckY");
+        out.bodyX = clamp_joint_aim(
+            static_cast<s16>(alink->field_0x30d6 + alink->field_0x30b2), "wolf bodyX");
+        out.bodyTwist = clamp_joint_aim(alink->field_0x2fec, "wolf bodyTwist");
+        out.bodyZ = clamp_joint_aim(alink->field_0x30b0, "wolf bodyZ");
+        out.bankZ = clamp_joint_aim(alink->shape_angle.z, "wolf bankZ");
         return;
     }
 
@@ -967,9 +990,17 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
     static std::uint16_t s_demoLogCount = 0;
     static std::uint16_t s_changeLogCount = 0;
     static std::uint16_t s_lastSentUnder = kPlayerActNone;
+    static std::uint16_t s_latchedUnder1 = kPlayerActNone;
 
-    if (alink == nullptr || alink->checkWolf() || puppet_reproduces_proc(alink->mProcID)) {
+    /* ★ A wolf sender keeps the override ON in every proc, the gait and the idles included
+     * (puppet-wolf.md §2): the puppet has no wolf locomotion of its own, and rebuilding
+     * setBlendWolfMoveAnime's bands on the receiver is the re-derivation the rules forbid. Every
+     * wolf row is a dRes_ID_ALANM_BCK_WL_* in the same archive, so actUnder needs no new id space.
+     */
+    const bool wolf = alink != nullptr && alink->checkWolf();
+    if (alink == nullptr || (!wolf && puppet_reproduces_proc(alink->mProcID))) {
         s_latchedUnder = kPlayerActNone;
+        s_latchedUnder1 = kPlayerActNone;
     } else {
         const daPy_anmHeap_c& under = alink->mUnderAnmHeap[0];
         const daPy_anmHeap_c& upper = alink->mUpperAnmHeap[0];
@@ -989,6 +1020,7 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
                     upper.getArcNo());
             }
             s_latchedUnder = kPlayerActNone;
+            s_latchedUnder1 = kPlayerActNone;
         } else if (!under.checkNoSetIdx()) {
             out.actUnder = under.getIdx();
             out.actUpper = upper.getIdx();  // 0xFFFF already means "follows under"
@@ -1007,9 +1039,18 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
              * capture after the actor pass reads m-2. The receiver's setAnm + calc repeat exactly
              * that sequence, which is why m — not the counter — is what travels. REASONED, not
              * measured: a proc that sets its animation after modelCalc would read m-1 and send
-             * one frame long. */
-            if (out.actUnder != s_latchedUnder) {
+             * one frame long.
+             *
+             * Slot 1 is filled FIRST so a wolf can key the latch on it too: setDoubleAnimeWolf
+             * re-morfs when EITHER slot loads a new BCK (wolf.inc:1271-1294, var_r30 |= 1 on the
+             * slot-1 load), so a gait band change that only swaps slot 1 (WALK_A -> WALK_B over
+             * an unchanged slot 0) starts a morf the slot-0 key would never see. The human key is
+             * left as it was: his gait never reaches this block (puppet_reproduces_proc). */
+            fill_action_slot1(alink, out);
+            const std::uint16_t key1 = wolf ? out.act1Under : kPlayerActNone;
+            if (out.actUnder != s_latchedUnder || key1 != s_latchedUnder1) {
                 s_latchedUnder = out.actUnder;
+                s_latchedUnder1 = key1;
                 const f32 counter = alink->field_0x2060 != nullptr ?
                                         alink->field_0x2060->getOldFrameMorfCounter() :
                                         0.0f;
@@ -1017,8 +1058,6 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
                 s_latchedMorf = static_cast<std::uint8_t>(morf > 255.0f ? 255.0f : morf + 0.5f);
             }
             out.actMorf = s_latchedMorf;
-
-            fill_action_slot1(alink, out);
 
             /* Joint 0's FINAL translation, after jointControll has applied whatever root clear
              * this proc asked for (d_a_alink.cpp:2213-2235, including the 0x60 case). Read off the
@@ -1053,6 +1092,7 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
             }
         } else {
             s_latchedUnder = kPlayerActNone;
+            s_latchedUnder1 = kPlayerActNone;
         }
     }
 
@@ -1070,7 +1110,7 @@ void fill_action_anim(daAlink_c* alink, PlayerState& out) {
      * hands in the world, so "unknown" is sent and the puppet uses its own derivation. The
      * held-item block makes the same test (fill_held_item). A wolf has no hands model, so he keeps
      * clear_action_anim's kPlayerActBodyHand. */
-    if (alink != nullptr && !alink->checkWolf()) {
+    if (alink != nullptr && !wolf) {
         if (alink->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW)) {
             out.actHandL = kPlayerHandUnknown;
             out.actHandR = kPlayerHandUnknown;
@@ -1366,15 +1406,20 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
     static std::uint16_t s_upper2LogCount = 0;
     static bool s_loggedDemoUpper2 = false;
 
-    if (alink == nullptr || alink->checkWolf()) {
+    if (alink == nullptr) {
         s_latchedUpper2 = kPlayerActNone;
         return;
     }
 
+    /* A wolf sends the UPPER_2 overlay only (puppet-wolf.md §2): WL_DASHWIND, the WL_PICKUP carry.
+     * His held models (0x109 Midna's lock-on dome, 0x10A the poe soul) are deferred, and the arrow,
+     * boomerang and lantern are human-only, so every held-item test below is gated off for him and
+     * the kind stays none. */
+    const bool wolf = alink->checkWolf();
     const u16 item = alink->mEquipItem;
     J3DModel* held = alink->mHeldItemModel;
 
-    if (held != nullptr && !alink->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW) &&
+    if (!wolf && held != nullptr && !alink->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW) &&
         alink->checkItemDraw())
     {
         if (daPy_py_c::checkBottleItem(item)) {
@@ -1537,7 +1582,7 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
         // Anything else (grass whistle, wolf change, fishing) is not reproduced.
     }
 
-    if (item == dItemNo_BOOMERANG_e) {
+    if (!wolf && item == dItemNo_BOOMERANG_e) {
         fopAc_ac_c* boom = alink->mItemAcKeep.getActor();
         if (boom != nullptr && fopAcM_GetName(boom) == fpcNm_BOOMERANG_e &&
             fopAcM_GetParam(boom) == 0)
@@ -1554,7 +1599,7 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
      * (procWait, d_a_arrow.cpp:538-542), a property of the viewer, and the partner looking at the
      * puppet is never inside this Link's head. Types 0/1 only — 4 is the slingshot pellet, which
      * flies the tick it is made, and 2 is Zelda's (d_a_hozelda.cpp). */
-    {
+    if (!wolf) {
         fopAc_ac_c* keep = alink->mItemAcKeep.getActor();
         if (keep != nullptr && fopAcM_GetName(keep) == fpcNm_ARROW_e) {
             daArrow_c* arrow = static_cast<daArrow_c*>(keep);
@@ -1570,7 +1615,7 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
     }
 
     // The lantern: his draw gate (d_a_alink.cpp:19822) and his placement test (:6098).
-    if (alink->checkNoResetFlg2(daPy_py_c::FLG2_UNK_1)) {
+    if (!wolf && alink->checkNoResetFlg2(daPy_py_c::FLG2_UNK_1)) {
         out.heldFlags |= kPlayerHeldLanternShown;
         if (item == dItemNo_KANTERA_e || alink->checkOilBottleItemNotGet(item)) {
             out.heldFlags |= kPlayerHeldLanternInHand;
@@ -1649,6 +1694,139 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
         }
         s_lastSentUpper2 = out.upper2Idx;
     }
+}
+
+/* ── v21 form block (wolf piece A) ─────────────────────────────────────────────────────────────
+ * .claude/future-plans/puppet-wolf.md §3 and §6. */
+
+/// AL_WF, the fur overlay setMetamorphoseModel makes his held model (d_a_alink.cpp:14145). There is
+/// no named item number for it.
+constexpr u16 kMetamorphoseFurItem = 0x106;
+
+/**
+ * The form byte and the tint, from SCALARS on daAlink_c only: mProcID, mClothesChangeWaitTimer,
+ * mProcVar1/3/5 (field_0x300a / 300e / 3012), mEquipItem, the mHeldItemModel POINTER (compared,
+ * never dereferenced) and one save flag. No model, no animation object.
+ *
+ * ★ That restriction is the point. During the model swap (mClothesChangeWaitTimer != 0)
+ * loadModelDVD frees mpArcHeap at timer 2 (d_a_alink_swindow.inc:67-115), so capture does not run
+ * (local_pose_is_live) and the far end gets the HELD pose. Those are exactly the ticks
+ * kPlayerFormChanging exists for, so refresh_held_form() runs this on the held copy then, and it
+ * must be safe while his models are gone. AL_WF itself lives in the item heap (setItemHeap,
+ * :14136), not mpArcHeap, but nothing here relies on that.
+ *
+ * The proc vars are a union shared by every proc, so they are read only while mProcID is
+ * PROC_METAMORPHOSE. Their meaning there, checked against the writers (procCoMetamorphoseInit /
+ * procCoMetamorphose, d_a_alink.cpp:17421-17696):
+ *   - field_0x300a != 0: the no-effect demo branch (init :17447) or the second half has ended and
+ *     he waits for the event to finish (:17572, :17622) — metaPhase 0, no tint, per the spec.
+ *     procCoMetamorphose returns at once then (:17545), so field_0x300e keeps its last value and
+ *     his draw keeps using it (:19531-19536). That residue is ~0 when the anim ran out, but NOT
+ *     when the player cancelled the second half early (:17603); the puppet then drops a faint
+ *     tint a few frames before he does. Accepted, not measured.
+ *   - field_0x3012 == 0: before the swap (zeroed :17531), != 0 after it (set :17560);
+ *   - field_0x300e: the TevColor he draws with, written every tick (:17643-17666), range -64..64.
+ *
+ * PROC_METAMORPHOSE_ONLY shares loadModelDVD but draws nothing during the swap (the blob is
+ * PROC_METAMORPHOSE only, :19505-19522), so it sends metaPhase 0 and no changing bit; the far end
+ * holds his last pose for those few ticks, as for an outfit change.
+ */
+std::uint8_t local_form_scalars(daAlink_c* alink, std::int8_t& o_tint) {
+    o_tint = 0;
+    std::uint8_t form = 0;
+    if (alink == nullptr) {
+        return form;
+    }
+    // His own draw gate for the shackle chain (d_a_alink.cpp:19616); the receiver applies it to a
+    // wolf only, as his draw does.
+    if (dComIfGs_isEventBit(dSv_event_flag_c::M_011)) {
+        form |= kPlayerFormChain;
+    }
+    if (alink->mProcID == daAlink_c::PROC_METAMORPHOSE) {
+        if (alink->mClothesChangeWaitTimer != 0) {
+            form |= kPlayerFormChanging;
+        }
+        if (alink->mProcVar1.field_0x300a == 0) {
+            form |= static_cast<std::uint8_t>(alink->mProcVar5.field_0x3012 == 0 ? 1 : 2);
+            const int tint = alink->mProcVar3.field_0x300e;
+            o_tint = static_cast<std::int8_t>(tint > 127 ? 127 : (tint < -128 ? -128 : tint));
+        }
+    }
+    if (alink->mEquipItem == kMetamorphoseFurItem && alink->mHeldItemModel != nullptr) {
+        form |= kPlayerFormFur;
+    }
+    return form;
+}
+
+/// Latched edge logs for the form, shared by the live and held paths. Keyed on CHANGE, so the
+/// second capture of a tick (--mp-trace) and the held refresh both see "no change" and stay quiet.
+void note_local_form(daAlink_c* alink, std::uint8_t form, std::int8_t tint, const char* path) {
+    static int s_lastWolf = -1;
+    static int s_lastForm = -1;
+    static std::uint16_t s_logCount = 0;
+    if (alink == nullptr) {
+        return;
+    }
+    const int wolf = alink->checkWolf() ? 1 : 0;
+    if (wolf != s_lastWolf) {
+        if (s_logCount < 200) {
+            s_logCount++;
+            if (s_lastWolf < 0) {
+                Log.info("Local form is {} at first capture (proc 0x{:X})", wolf ? "wolf" : "human",
+                    static_cast<unsigned>(alink->mProcID));
+            } else {
+                Log.info("Local form {} (proc 0x{:X}, {} path)",
+                    wolf ? "human->wolf" : "wolf->human", static_cast<unsigned>(alink->mProcID),
+                    path);
+            }
+        }
+        s_lastWolf = wolf;
+    }
+    if (static_cast<int>(form) != s_lastForm) {
+        if (s_logCount < 200) {
+            s_logCount++;
+            const unsigned from = s_lastForm < 0 ? 0u : static_cast<unsigned>(s_lastForm);
+            Log.info("Local form metaPhase {}->{} (form 0x{:02x}->0x{:02x}: changing {}, fur {}, "
+                     "chain {}; tint {}, clothes timer {}, proc 0x{:X}, {} path)",
+                from & kPlayerFormMetaPhaseMask, form & kPlayerFormMetaPhaseMask, from,
+                static_cast<unsigned>(form), (form & kPlayerFormChanging) != 0 ? 1 : 0,
+                (form & kPlayerFormFur) != 0 ? 1 : 0, (form & kPlayerFormChain) != 0 ? 1 : 0,
+                static_cast<int>(tint), static_cast<unsigned>(alink->mClothesChangeWaitTimer),
+                static_cast<unsigned>(alink->mProcID), path);
+        }
+        s_lastForm = form;
+    }
+}
+
+/**
+ * Fill the v21 form block on the LIVE path. The scalars above, plus the fur overlay's frame off
+ * the animation object his setItemMatrix entered it into (mItemBck, init'd by setMetamorphoseModel,
+ * :14140), as frame / frameMax x255 — the same encoding as heldBckFrame. Only while metaPhase != 0,
+ * which is when the wire carries it.
+ *
+ * Never runs while mClothesChangeWaitTimer != 0: capture_local_player is gated off then
+ * (local_pose_is_live), so reading mItemBck here is safe. refresh_held_form covers those ticks
+ * without it.
+ */
+void fill_form(daAlink_c* alink, PlayerState& out) {
+    std::int8_t tint = 0;
+    out.form = local_form_scalars(alink, tint);
+    out.metaTint = 0;
+    out.furFrame = 0;
+    if (alink == nullptr || out.meta_phase() == 0) {
+        note_local_form(alink, out.form, 0, "live");
+        return;
+    }
+    out.metaTint = tint;
+    if ((out.form & kPlayerFormFur) != 0) {
+        J3DAnmTransform* furBck = alink->mItemBck.getBckAnm();
+        if (furBck != nullptr && furBck->getFrameMax() > 0) {
+            const f32 f = furBck->getFrame() / furBck->getFrameMax();
+            out.furFrame = static_cast<std::uint8_t>(
+                f <= 0.0f ? 0.0f : (f >= 1.0f ? 255.0f : f * 255.0f + 0.5f));
+        }
+    }
+    note_local_form(alink, out.form, tint, "live");
 }
 
 }  // namespace
@@ -2324,6 +2502,15 @@ bool capture_local_player(PlayerState& out) {
     out.outfit = daRemotePlayer_localOutfitToWire();
     out.flags = kPlayerStateInWorld;
 
+    /* v21: the wolf bit is checkWolf(), i.e. FLG1_IS_WOLF. Checked against its writers rather than
+     * its name: set by changeWolf (d_a_alink_wolf.inc:231) and at create for a wolf start
+     * (d_a_alink.cpp:4969), cleared by changeLink (wolf.inc:521). Both run from loadModelDVD at the
+     * end of the swap, so the bit flips on the first LIVE tick after the blob, with the new body
+     * already built. `outfit` stays his human clothes throughout: it is what he turns back into. */
+    if (alink != nullptr && alink->checkWolf()) {
+        out.flags |= kPlayerStateWolf;
+    }
+
     /* The sharp turn. Read straight off the proc the state machine is IN rather than inferred from
      * anything: commonProcInit writes mProcID = the proc it is entering (d_a_alink.cpp:15144) and
      * procSlipInit enters PROC_SLIP and plays ANM_SLIP in the same two lines
@@ -2376,6 +2563,13 @@ bool capture_local_player(PlayerState& out) {
     {
         out.flags |= kPlayerStateNoFootIk;
     }
+    /* A wolf's foot IK is the four-legged wolfFootBgCheck (d_a_alink_wolf.inc:1968), which the
+     * puppet does not port (puppet-wolf.md §7 Q3, deferred), so a wolf always says "no IK": his
+     * feet follow the BCK and the slope pitch arrives via bodyX. Kept apart from the footBgCheck
+     * transcription above so that line still diffs clean against the original. */
+    if (alink != nullptr && alink->checkWolf()) {
+        out.flags |= kPlayerStateNoFootIk;
+    }
 
     /* Whether the world's clock is allowed to run where this player is standing — the vote that
      * decides the shared time of day under TimeAdvanceRule::AllPlayers (world_clock.hpp).
@@ -2418,8 +2612,32 @@ bool capture_local_player(PlayerState& out) {
     fill_lantern_fx(alink, out);    // fxFlags bit 0, after fill_held_item (agent D)
     fill_sword_fx(alink, out); // sword trail + spin/charge fx (agent F): bits 1-3, 6-7
     fill_clawshot(alink, out); // v20 clawshot block, gated on the held item's kind
+    fill_form(alink, out);     // v21 form block (wolf piece A)
 
     return true;
+}
+
+void refresh_held_form(PlayerState& held) {
+    /* Only for the Link the held pose came from: a new scene's Link (or none) is not his, and
+     * wire_local_state sends that pose as not in the world anyway. */
+    if (!local_player_is_last_captured()) {
+        return;
+    }
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr) {
+        return;
+    }
+    std::int8_t tint = 0;
+    const std::uint8_t form = local_form_scalars(alink, tint);
+    const bool phase = (form & kPlayerFormMetaPhaseMask) != 0;
+    /* The fur frame needs mItemBck, which is off limits here. While the fur is still his held model
+     * the last live frame is carried; it is near the end of the first half's BCK, and during the
+     * swap itself he draws only the blob, so nothing shows it. */
+    const bool keepFur = phase && (form & kPlayerFormFur) != 0 && (held.form & kPlayerFormFur) != 0;
+    held.furFrame = keepFur ? held.furFrame : 0;
+    held.form = form;
+    held.metaTint = phase ? tint : 0;
+    note_local_form(alink, form, held.metaTint, "held");
 }
 
 RemoteLocation remote_location(const PlayerState& pose) {
@@ -2444,7 +2662,7 @@ RemoteLocation remote_location(const PlayerState& pose) {
                                                       RemoteLocation::RoomNotShown;
 }
 
-bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit) {
+bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit, bool wolf) {
     // Inserted on first sight rather than on first successful spawn: the failure history has to
     // outlive the process id it belongs to, or backing off would be impossible.
     PuppetRef& ref = s_puppets[playerId];
@@ -2569,8 +2787,13 @@ bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t 
     // The outfit rides in the top byte of the create parameter. The actor needs it at its first
     // create() entry, before the multi-phase archive mount starts, and this is the only channel
     // that exists that early — see the packing note in d_a_remote_player.h.
+    //
+    // v21: a wolf sender gets kPuppetParamWolf (0xFE) in that byte instead, which mounts Wmdl in
+    // place of the outfit archive (puppet-wolf.md §6). His `outfit` is not lost: the next pose
+    // still carries it, and the rebuild when he turns back reads it from there.
+    const std::uint8_t topByte = wolf ? kPuppetParamWolf : outfit;
     const std::uint32_t param =
-        (static_cast<std::uint32_t>(outfit) << daRemotePlayer_outfitParamShift) |
+        (static_cast<std::uint32_t>(topByte) << daRemotePlayer_outfitParamShift) |
         (playerId & daRemotePlayer_playerIdMask);
 
     const fpc_ProcID id = fopAcM_create(
@@ -2589,7 +2812,8 @@ bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t 
     ref.everResolved = false;
     ref.ticksSinceRequest = 0;
     ref.loggedStuck = false;
-    Log.info("Spawned puppet for player {} (#{:06X}) as process {}", playerId, colorRgb, id);
+    Log.info("Spawned puppet for player {} (#{:06X}) as process {}{}", playerId, colorRgb, id,
+        wolf ? " (wolf, param top byte 0xFE)" : "");
     return true;
 }
 
@@ -2645,6 +2869,10 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkAttack(state.atMask, static_cast<f32>(state.atRadius), state.atSpl, atPoints);
     // v19 block A: bow
     puppet->setNetworkHeldItemBck(state.heldBck, state.heldBckFrame);
+    // v21 form block, whole: the wolf body (piece B) and the transform visuals (piece C) decode it.
+    // Whether the puppet IS a wolf is not pushed here: that is the build, see
+    // reconcile_puppet_outfit.
+    puppet->setNetworkForm(state.form, state.metaTint, state.furFrame);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -2892,7 +3120,7 @@ void destroy_puppet(std::uint32_t playerId) {
  *    worst. It defers a change, never drops one: the sender keeps reporting the new outfit, so the
  *    mismatch is still there when the cooldown expires.
  */
-bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit) {
+bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit, bool wolf) {
     const auto it = s_puppets.find(playerId);
     if (it == s_puppets.end()) {
         return false;
@@ -2906,16 +3134,26 @@ bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit) {
         return false;
     }
 
+    /* v21: the pair (form, outfit). A wolf puppet's outfit is whatever 0xFE resolved to and means
+     * nothing, so only the form is compared for a wolf; a human compares the clothes as before.
+     * The same cooldown applies: it is shorter than a transformation (puppet-wolf.md §3), so it
+     * never delays one, and it still bounds a flapping bit to one rebuild per second. */
+    const bool builtWolf = puppet->isWolf();
     const int wanted = daRemotePlayer_outfitFromWire(outfit);
-    if (puppet->getOutfit() == wanted) {
+    if (builtWolf == wolf && (wolf || puppet->getOutfit() == wanted)) {
         return false;
     }
     if (it->second.ticksSinceRequest < kOutfitRespawnCooldownTicks) {
         return false;
     }
 
-    Log.info("Player {} changed outfit ({} -> {}); rebuilding their puppet", playerId,
-        puppet->getOutfit(), wanted);
+    if (builtWolf != wolf) {
+        Log.info("Player {} changed form ({} -> {}); rebuilding their puppet", playerId,
+            builtWolf ? "wolf" : "human", wolf ? "wolf" : "human");
+    } else {
+        Log.info("Player {} changed outfit ({} -> {}); rebuilding their puppet", playerId,
+            puppet->getOutfit(), wanted);
+    }
     destroy_puppet(playerId);
     return true;
 }

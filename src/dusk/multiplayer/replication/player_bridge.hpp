@@ -54,6 +54,13 @@ bool local_player_is_last_captured();
 /// in which case nothing should be sent this tick.
 bool capture_local_player(PlayerState& out);
 
+/// v21: rewrite a HELD pose's form block (form, metaTint, furFrame) from the local Link as he is
+/// now. For wire_local_state while capture is gated off — above all the model swap of a
+/// transformation (mClothesChangeWaitTimer != 0), which is exactly when kPlayerFormChanging must
+/// reach the far end. Reads scalars on daAlink_c only, never a model: his model heap is freed for
+/// part of that window. No-op unless the Link that exists is the one the pose was captured from.
+void refresh_held_form(PlayerState& held);
+
 /// Where a remote sender is, relative to what this instance is drawing (v16 location fields).
 enum class RemoteLocation : std::uint8_t {
     /// Same stage, and in a room this end displays (or the sender has not said where he is).
@@ -77,13 +84,17 @@ RemoteLocation remote_location(const PlayerState& pose);
 /// off after a failed creation and eventually disabling a puppet that will not come up. A false
 /// return therefore does NOT mean "try harder"; it means there is no puppet this tick, for a reason
 /// the log already carries. See the failure-policy block at the top of player_bridge.cpp.
-bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit);
+///
+/// v21: `wolf` (the pose's kPlayerStateWolf) builds a wolf puppet instead: the create parameter's
+/// top byte is then 0xFE, and `outfit` (still his human clothes) is not used for this build.
+bool ensure_puppet(std::uint32_t playerId, std::uint32_t colorRgb, std::uint8_t outfit, bool wolf);
 
-/// Destroy `playerId`'s puppet if it is wearing an outfit the sender is no longer in, so the next
-/// ensure_puppet() rebuilds it in the right clothes. Returns true when it did — the caller should
-/// skip the rest of this tick for that player. No-op when the puppet is absent, still being
-/// created, or already dressed correctly.
-bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit);
+/// Destroy `playerId`'s puppet if it is wearing an outfit — or, since v21, a FORM (human/wolf) —
+/// the sender is no longer in, so the next ensure_puppet() rebuilds it right. Returns true when it
+/// did — the caller should skip the rest of this tick for that player. No-op when the puppet is
+/// absent, still being created, or already correct. A wolf puppet's outfit is not compared: it has
+/// no clothes.
+bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit, bool wolf);
 
 /// Push an interpolated pose onto an existing puppet. No-op if the puppet isn't alive.
 void apply_puppet_state(std::uint32_t playerId, const PlayerState& state);

@@ -1504,6 +1504,15 @@ PlayerState NetworkManager::wire_local_state() {
      * all, mid-load, is the same answer. */
     const bool sameLink = local_player_is_last_captured();
 
+    /* v21 (wolf piece A): the form block is the one part of the held pose kept CURRENT. The model
+     * swap of a transformation is a held stretch (local_pose_is_live is off while his
+     * mClothesChangeWaitTimer runs), and it is exactly when the far end needs kPlayerFormChanging
+     * to draw the blob. refresh_held_form reads only scalars, never his models, which are freed for
+     * part of that window. It does nothing unless this is the Link the pose came from. */
+    if (sameLink) {
+        refresh_held_form(held);
+    }
+
     /* P2: an STB cutscene. Link is on the cast's marks playing demo-archive BCKs the far end does
      * not have, so his real pose cannot go out. Instead of a still frame of whatever he was doing
      * on the last free tick (often mid-stride or mid-swing), send what Stuart's rule asks for: him

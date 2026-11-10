@@ -71,6 +71,7 @@ enum class Op {
     Nearest,
     TalkNear,
     GetItem,
+    Transform,
 };
 
 struct Command {
@@ -109,6 +110,9 @@ std::size_t sPc = 0;
 int sElapsed = 0;
 /// StickTo: reached the target during the current command; stays let go until the next one.
 bool sStickToArrived = false;
+/// Transform: which way the current command is going (true = human -> wolf), fixed at its first
+/// tick.
+bool sTransformToWolf = false;
 bool sActive = false;
 bool sFinished = false;
 bool sSawWorld = false;
@@ -782,6 +786,12 @@ void load_script(const std::filesystem::path& path) {
             // "getitem 0x01": the real item-get event for that item (dItemNo_*). See run_getitem.
             command.op = Op::GetItem;
             ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
+        } else if (verb == "TRANSFORM") {
+            // "transform [timeout]": human <-> wolf through the game's own request flag, falling
+            // back to procCoMetamorphoseInit after the timeout (default 60). See the tick() case.
+            command.op = Op::Transform;
+            command.frames = 60;
+            ok = (a.empty() || parse_int(a, command.frames)) && command.frames > 0;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -989,6 +999,65 @@ void tick() {
         if (sElapsed + 1 >= command.frames) {
             Log.warn("[{}] line {}: talknear: no event after {} ticks", sTicks, command.line,
                 command.frames);
+        }
+        break;
+    }
+
+    case Op::Transform: {
+        /* Human <-> wolf, by the game's own request flags rather than a mid-frame proc call
+         * (puppet-wolf.md "Autopilot test"). Human: onForceWolfChange (d_a_player.h:1091), which
+         * checkGroundSpecialMode consumes on the ground (d_a_alink.cpp:12275-12279) - the path the
+         * twilight tag uses (d_a_kytag12.cpp:398). Wolf: ERFLG0_UNK_1, consumed by
+         * checkWolfGroundSpecialMode (d_a_alink_wolf.inc:1418-1423); it has no named setter. Both
+         * are END-reset flags, cleared at the end of his execute (d_a_alink.cpp:18897), so the
+         * request is re-raised every tick until the proc starts, as kytag12 does.
+         *
+         * Not Dusk's quick transform (d_a_alink_dusk.cpp:67-147): that needs M_077 and Midna
+         * riding, and the test save may have neither. These flags need neither.
+         *
+         * If the proc has not started by the timeout (a proc that never asks, such as a swim), it
+         * falls back to procCoMetamorphoseInit(), which is what the console `transform` does
+         * (dusk/commands.cpp:809-814). The log says which path ran. */
+        daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+        if (sElapsed == 0) {
+            if (alink == nullptr || !in_world()) {
+                Log.error("[{}] line {}: transform needs the world; skipped", sTicks, command.line);
+                duration = 1;
+                break;
+            }
+            sTransformToWolf = !alink->checkWolf();
+            Log.info("[{}] transform: requesting {} via the game's own flag ({}), proc 0x{:X}",
+                sTicks, sTransformToWolf ? "human->wolf" : "wolf->human",
+                sTransformToWolf ? "ERFLG0_FORCE_WOLF_CHANGE" : "ERFLG0_UNK_1",
+                static_cast<unsigned>(alink->mProcID));
+        }
+        if (alink == nullptr) {
+            Log.warn("[{}] transform: Link is gone; giving up", sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        if (alink->mProcID == daAlink_c::PROC_METAMORPHOSE) {
+            Log.info("[{}] transform: PROC_METAMORPHOSE started after {} tick(s) via the request "
+                     "flag",
+                sTicks, sElapsed);
+            duration = sElapsed + 1;
+            break;
+        }
+        if (sElapsed + 1 >= command.frames) {
+            const unsigned procBefore = static_cast<unsigned>(alink->mProcID);
+            const int started = alink->procCoMetamorphoseInit();
+            Log.warn("[{}] transform: the request flag was not consumed in {} ticks (proc 0x{:X}); "
+                     "fell back to procCoMetamorphoseInit() as the console 'transform' does: "
+                     "returned {}, proc now 0x{:X}{}",
+                sTicks, command.frames, procBefore, started, static_cast<unsigned>(alink->mProcID),
+                alink->mProcID == daAlink_c::PROC_METAMORPHOSE ? " (fallback path ran)" :
+                                                                 " (DID NOT START)");
+            break;
+        }
+        if (sTransformToWolf) {
+            alink->onForceWolfChange();
+        } else {
+            alink->onEndResetFlg0(daPy_py_c::ERFLG0_UNK_1);
         }
         break;
     }

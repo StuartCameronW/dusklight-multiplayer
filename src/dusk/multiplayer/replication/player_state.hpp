@@ -33,7 +33,8 @@ enum PlayerStateFlags : std::uint8_t {
     /// Link exists and is in the world this tick. Clear during loads/cutscenes, when the puppet
     /// must hide rather than freeze at a stale position.
     kPlayerStateInWorld = 1 << 0,
-    /// Reserved for M3 transform sync; sent as 0 for now so the bit is already allocated.
+    /// v21: the sender is Wolf Link, daPy_py_c::checkWolf() (FLG1_IS_WOLF). Flips on the first live
+    /// tick after the transformation's model swap. The receiver rebuilds the puppet on the edge.
     kPlayerStateWolf = 1 << 1,
     /**
      * The sender is skidding — daAlink_c::PROC_SLIP, the sharp turn you get by flicking the stick
