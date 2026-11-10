@@ -1712,6 +1712,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/world_clock.hpp
         src/dusk/multiplayer/replication/world_state.cpp
         src/dusk/multiplayer/replication/world_state.hpp
+        src/dusk/multiplayer/replication/item_claims.cpp
+        src/dusk/multiplayer/replication/item_claims.hpp
         src/dusk/multiplayer/replication/world_bridge.cpp
         src/dusk/multiplayer/replication/world_bridge.hpp
         src/dusk/multiplayer/replication/object_channel.cpp

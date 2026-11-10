@@ -11,6 +11,9 @@
 #include "Z2AudioLib/Z2Instances.h"
 #include <cmath>
 #include <cstring>
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"
+#endif
 
 static const f32 l_cull_size_box[6] = { -150.0f, -10.0f, -150.0f, 150.0f, 300.0f, 100.0f };
 
@@ -1422,6 +1425,34 @@ int daTbox_c::actionOpenWait() {
     daMidna_c* midna = daPy_py_c::getMidnaActor();
     daPy_py_c* player = daPy_getPlayerActorClass();
 
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H3): checkOpen() is only read at create (initAnm), so a chest the
+     * partner opened while this one was already loaded stayed closed and could be opened again,
+     * granting its item twice. The partner's dComIfGs_onTbox arrives through the world sync; when
+     * it does, switch to the state initAnm's checkOpen() branch builds: lid at the end frame,
+     * opened collision, treasure-map marker off, actionWait. No event, no item.
+     * If my own open event has already been given to this chest, it is left to run: abandoning a
+     * started event would leave Link stuck in it, and the claim below should make this path
+     * unreachable anyway. */
+    if (dusk::mp::claims_active() && checkOpen()) {
+        if (eventInfo.checkCommandDoor()) {
+            dusk::mp::claims_note_tbox_opened(getTboxNo(), true);
+        } else {
+            dusk::mp::claims_note_tbox_opened(getTboxNo(), false);
+            mpAnm->setPlaySpeed(0.0f);
+            mpAnm->setFrame(mpAnm->getEndFrame());
+            setDzb();
+            if (mpBgCollision != NULL) {
+                mpBgCollision->Move();
+            }
+            int tbox_no = getTboxNo();
+            dTres_c::offStatus(0, tbox_no, 1);
+            setAction(&daTbox_c::actionWait);
+            return true;
+        }
+    }
+#endif
+
     if (eventInfo.checkCommandDoor()) {
         dComIfGp_event_onEventFlag(4);
 
@@ -1440,6 +1471,23 @@ int daTbox_c::actionOpenWait() {
             field_0x9f4 = 0;
         }
     } else if (boxCheck()) {
+#if TARGET_PC
+        /* Dusk (multiplayer W-B, H4): two players at one chest. The chest is only OFFERED (the
+         * condition that lets Link's A press order the open event) once the host has granted this
+         * player a claim on it. Claiming here, before the event exists, rather than at
+         * checkCommandDoor(), is deliberate: once the door command is given the event has started
+         * and Link is in it, and holding or abandoning it from this side would leave him stuck.
+         * Pending: no prompt yet (about one round trip). Denied: someone else holds it; it shows
+         * open through H3 above as soon as their open reaches us. The wolf's "can't open" demo
+         * claims nothing, so a wolf standing at a big chest never locks it from the partner. */
+        if (dusk::mp::claims_active() &&
+            !(getShapeType() != SHAPE_SMALL && player->checkNowWolf() &&
+              !midna->checkMetamorphoseEnable()) &&
+            dusk::mp::claim_tbox(getTboxNo()) != dusk::mp::kClaimGranted)
+        {
+            return true;
+        }
+#endif
         eventInfo.onCondition(4);
         if (getShapeType() == SHAPE_SMALL) {
             eventInfo.setEventName("DEFAULT_TREASURE_SIMPLE");

@@ -18,6 +18,7 @@
 #include "../net/enet_transport.hpp"
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
+#include "../replication/item_claims.hpp"
 #include "../replication/object_channel.hpp"
 #include "../replication/player_bridge.hpp"
 #include "../replication/player_state.hpp"
@@ -567,6 +568,8 @@ void NetworkManager::shutdown() {
     world_sync::reset();
     presence::reset();
     objects::reset();
+    // v23: every chest / floor-item lease and pending claim belonged to this session.
+    item_claims::reset();
     mLastPresence.clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
@@ -695,6 +698,8 @@ void NetworkManager::post_actor_tick() {
     if (session_live()) {
         world_sync::tick();
         objects::tick();
+        // v23: guest claim timeouts and host lease expiry (replication/item_claims.hpp).
+        item_claims::tick();
         send_presence();
     }
 
@@ -828,6 +833,8 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
     presence::on_peer_left(session.playerId);
     mLastPresence.erase(session.playerId);
     objects::on_peer_left(session.playerId);
+    // v23: a chest or item they held a claim on is free again at once, not after the lease lapses.
+    item_claims::on_peer_left(session.playerId);
     broadcast_peer_left(session.playerId);
 
     if (session.refused) {
@@ -1078,14 +1085,16 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
     // and digests. A host taking a WorldSync would put someone else's world into the one save the
     // session writes. Presence and the owner-originated object packets go either way (the host
     // relays them), and are policed per packet below.
+    // v23: a chest / floor-item claim is asked of the host and answered by it, never relayed.
     const bool hostBound = id == PacketId::Hello || id == PacketId::PlayerStateUpdate ||
                            id == PacketId::TimeOverride || id == PacketId::WorldPropose ||
-                           id == PacketId::WorldSyncRequest || id == PacketId::ObjClaim;
+                           id == PacketId::WorldSyncRequest || id == PacketId::ObjClaim ||
+                           id == PacketId::ClaimRequest;
     const bool clientBound = id == PacketId::HelloAck || id == PacketId::WorldSnapshot ||
                              id == PacketId::PeerList || id == PacketId::PeerJoined ||
                              id == PacketId::PeerLeft || id == PacketId::WorldSync ||
                              id == PacketId::WorldCommit || id == PacketId::WorldDigest ||
-                             id == PacketId::ObjClaimResult;
+                             id == PacketId::ObjClaimResult || id == PacketId::ClaimReply;
     if ((hostBound && mRole != Role::Host) || (clientBound && mRole != Role::Client)) {
         if (warn_budget()) {
             Log.warn("Ignoring packet {} from peer {}: wrong direction for this role", rawId, peer);
@@ -1571,6 +1580,10 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
     case PacketId::WorldSyncRequest:
     case PacketId::WorldDigest:
         world_sync::on_packet(id, r, sender->second.playerId);
+        break;
+    case PacketId::ClaimRequest:  // v23, host-bound: judged by the host, answered to the asker
+    case PacketId::ClaimReply:    // v23, client-bound: the host's verdict
+        item_claims::on_packet(id, r, sender->second.playerId);
         break;
     case PacketId::ObjSpawn:
     case PacketId::ObjState:

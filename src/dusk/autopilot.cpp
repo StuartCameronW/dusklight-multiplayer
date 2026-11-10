@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -14,11 +15,13 @@
 
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_player.h"
+#include "d/actor/d_a_tbox.h"
 #include "d/d_camera.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_meter2_info.h"
 #include "dusk/logging.h"
 #include "dusk/mods/item.hpp"
+#include "dusk/multiplayer/replication/item_claims.hpp"
 #include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 #include "dusk/multiplayer/replication/world_bridge.hpp"
@@ -93,6 +96,17 @@ enum class Op {
     ExpectKeys,
     ExpectRupees,
     WaitEvent,
+    /* --- batch 6: item claims --- */
+    // Chest / floor-item claims (mp-m4-m5-world.md II.6, H3-H5): see run_claims_command and the
+    // TboxOpen / ClaimTest cases in tick().
+    TboxNear,
+    TboxSet,
+    TboxClear,
+    TboxOpen,
+    ExpectTbox,
+    ExpectTboxOpen,
+    ClaimTest,
+    ExpectClaim,
 };
 
 struct Command {
@@ -789,6 +803,194 @@ void steer_toward(PADStatus& status, double targetX, double targetZ, double maxM
 /// mostly be pushing against the NPC's collider.
 constexpr double kTalkReach = 120.0;
 
+/* --- batch 6: item claims --- */
+/* Chest and floor-item claim verbs (future-plans/mp-m4-m5-world.md II.6, hooks H3-H5; the claim
+ * protocol is replication/item_claims.hpp). Every grep-able result line starts "[autopilot]"; the
+ * claim module's own lines start "[mp-claim]" on both ends.
+ *   tboxnear [radius]              log the nearest chests (number, table, open, action, frame)
+ *   tboxset [radius]               mark the nearest chest's bit open (dComIfGs_onTbox), no event
+ *   tboxclear [radius]             clear it again (dComIfGs_offTbox); the actor stays as it is,
+ *                                  so re-warp to get a closed chest back
+ *   tboxopen [radius] [timeout]    walk to the nearest chest's front, face it, press A until an
+ *                                  event starts; logs "tboxopen result=event|none"
+ *   expecttbox open|closed [r]     PASS/FAIL on the nearest chest's state
+ *   expecttboxopen event|none      PASS/FAIL on what the last tboxopen ended with
+ *   claimtest tbox|item <tbl|live> <no> [timeout]
+ *                                  item_claims::claim() every tick until it resolves; item `no` is
+ *                                  the save bit 0x80-0x9F, as expectbit takes it
+ *   expectclaim granted|denied|pending   PASS/FAIL on the last claimtest */
+
+/// TboxOpen: the chest picked on the command's first tick, and whether Link reached its front.
+fpc_ProcID sTboxTarget = fpcM_ERROR_PROCESS_ID_e;
+bool sTboxArrived = false;
+/// ExpectTboxOpen: what the last `tboxopen` ended with: -1 none ran, 0 no event, 1 an event.
+int sLastTboxOpenEvent = -1;
+/// ClaimTest: the target resolved on the command's first tick, and the last result.
+mp::item_claims::ClaimTarget sClaimTarget;
+bool sHaveClaimResult = false;
+mp::item_claims::ClaimState sLastClaimState = mp::item_claims::ClaimState::Pending;
+mp::item_claims::DenyReason sLastClaimReason = mp::item_claims::DenyReason::None;
+std::string sLastClaimDesc;
+
+/// Where Link stands to open a chest: this far out along its facing, inside boxCheck's 150-unit
+/// reach (d_a_tbox.cpp) and clear of the large chest's collider.
+constexpr double kTboxFront = 100.0;
+/// Link counts as facing the chest within this many s16 units (boxCheck allows 0x2000).
+constexpr int kTboxFaceTolerance = 0x0C00;
+
+const char* tbox_action_name(daTbox_c* tbox) {
+    const daTbox_actionFn fn = tbox->mpActionFn;
+    if (fn == &daTbox_c::actionWait) {
+        return "Wait";
+    }
+    if (fn == &daTbox_c::actionOpenWait) {
+        return "OpenWait";
+    }
+    if (fn == &daTbox_c::actionDemo) {
+        return "Demo";
+    }
+    if (fn == &daTbox_c::actionDemo2) {
+        return "Demo2";
+    }
+    if (fn == &daTbox_c::actionNotOpenDemo) {
+        return "NotOpenDemo";
+    }
+    if (fn == &daTbox_c::actionSwOnWait) {
+        return "SwOnWait";
+    }
+    if (fn == &daTbox_c::actionSwOnWait2) {
+        return "SwOnWait2";
+    }
+    if (fn == &daTbox_c::actionDropWait) {
+        return "DropWait";
+    }
+    if (fn == &daTbox_c::actionDropDemo) {
+        return "DropDemo";
+    }
+    if (fn == &daTbox_c::actionGenocide) {
+        return "Genocide";
+    }
+    if (fn == &daTbox_c::actionDropWaitForWeb) {
+        return "DropWaitForWeb";
+    }
+    if (fn == &daTbox_c::actionDropForWeb) {
+        return "DropForWeb";
+    }
+    return "?";
+}
+
+/// Every daTbox_c within the radius of Link, nearest first (the `nearest` search by profile).
+std::vector<ActorHit> find_tboxes(double radius) {
+    return find_actors(std::to_string(static_cast<int>(fpcNm_TBOX_e)), radius);
+}
+
+daTbox_c* nearest_tbox(double radius) {
+    const std::vector<ActorHit> hits = find_tboxes(radius);
+    return hits.empty() ? nullptr : static_cast<daTbox_c*>(hits[0].actor);
+}
+
+std::string describe_tbox(daTbox_c* tbox) {
+    return fmt::format("tbox {} tbl {} open={} action={} frame {:.1f}/{:.1f} shape {} func {} item "
+                       "0x{:02X} at ({:.0f}, {:.0f}, {:.0f}) angle 0x{:04X} room {} claims={}",
+        tbox->getTboxNo(), live_stage_table(), tbox->checkOpen() ? 1 : 0, tbox_action_name(tbox),
+        tbox->mpAnm != nullptr ? tbox->mpAnm->getFrame() : -1.0f,
+        tbox->mpAnm != nullptr ? tbox->mpAnm->getEndFrame() : -1.0f, tbox->getShapeType(),
+        tbox->getFuncType(), tbox->getItemNo(), tbox->current.pos.x, tbox->current.pos.y,
+        tbox->current.pos.z, static_cast<unsigned>(static_cast<u16>(tbox->shape_angle.y)),
+        static_cast<int>(fopAcM_GetRoomNo(tbox)), mp::item_claims::active() ? "on" : "off");
+}
+
+/// "Shows open" the way initAnm builds an opened chest: bit set, actionWait, lid at the end frame.
+bool tbox_shows_open(daTbox_c* tbox) {
+    return tbox->checkOpen() && tbox->mpActionFn == &daTbox_c::actionWait &&
+           tbox->mpAnm != nullptr && tbox->mpAnm->getFrame() >= tbox->mpAnm->getEndFrame() - 0.5f;
+}
+
+void run_claims_command(const Command& command) {
+    namespace ic = mp::item_claims;
+    switch (command.op) {
+    case Op::TboxNear: {
+        if (!in_world()) {
+            Log.error("[{}] line {}: tboxnear needs the world; skipped", sTicks, command.line);
+            break;
+        }
+        const std::vector<ActorHit> hits = find_tboxes(command.radius);
+        if (hits.empty()) {
+            Log.warn("[autopilot] tboxnear: no chest within {:.0f} units (stage '{}' room {}) "
+                     "tick={}",
+                command.radius, dComIfGp_getStartStageName(), current_room(), sTicks);
+            break;
+        }
+        for (std::size_t i = 0; i < hits.size() && i < 6; i++) {
+            Log.info("[autopilot] tboxnear {} {}, {:.0f} units away tick={}",
+                i == 0 ? "nearest" : "  also", describe_tbox(static_cast<daTbox_c*>(hits[i].actor)),
+                hits[i].distance, sTicks);
+        }
+        Log.info("[autopilot] tboxnear: {} chest(s) in stage '{}'; walk to the nearest with: "
+                 "stickto {:.0f} {:.0f} 120",
+            hits.size(), dComIfGp_getStartStageName(), hits[0].actor->current.pos.x,
+            hits[0].actor->current.pos.z);
+        break;
+    }
+
+    case Op::TboxSet:
+    case Op::TboxClear: {
+        const bool set = command.op == Op::TboxSet;
+        daTbox_c* tbox = in_world() ? nearest_tbox(command.radius) : nullptr;
+        if (tbox == nullptr || live_stage_table() < 0) {
+            Log.error("[autopilot] {}: no chest within {:.0f} units (or no world); nothing changed "
+                      "tick={}",
+                set ? "tboxset" : "tboxclear", command.radius, sTicks);
+            break;
+        }
+        const std::string before = describe_tbox(tbox);
+        if (set) {
+            dComIfGs_onTbox(tbox->getTboxNo());
+        } else {
+            dComIfGs_offTbox(tbox->getTboxNo());
+        }
+        Log.info("[autopilot] {}: chest {} of stage table {} bit {} (was {}) tick={}",
+            set ? "tboxset" : "tboxclear", tbox->getTboxNo(), live_stage_table(),
+            set ? "set" : "cleared", before, sTicks);
+        break;
+    }
+
+    case Op::ExpectTbox: {
+        daTbox_c* tbox = in_world() ? nearest_tbox(command.radius) : nullptr;
+        const char* want = command.layer != 0 ? "open" : "closed";
+        if (tbox == nullptr) {
+            log_expect(false, "expecttbox",
+                fmt::format("want={} got=? (no chest within {:.0f} units)", want, command.radius));
+            break;
+        }
+        const bool pass = command.layer != 0 ?
+                              tbox_shows_open(tbox) :
+                              (!tbox->checkOpen() && tbox->mpActionFn == &daTbox_c::actionOpenWait);
+        log_expect(pass, "expecttbox", fmt::format("want={} {}", want, describe_tbox(tbox)));
+        break;
+    }
+
+    case Op::ExpectTboxOpen: {
+        const char* want = command.layer != 0 ? "event" : "none";
+        const char* got = sLastTboxOpenEvent < 0 ? "?" : (sLastTboxOpenEvent != 0 ? "event" : "none");
+        log_expect(sLastTboxOpenEvent == command.layer, "expecttboxopen",
+            fmt::format("want={} got={}", want, got));
+        break;
+    }
+
+    case Op::ExpectClaim: {
+        const char* got = sHaveClaimResult ? ic::state_name(sLastClaimState) : "?";
+        log_expect(sHaveClaimResult && to_upper(got) == command.text, "expectclaim",
+            fmt::format("{} want={} got={} reason={}", sLastClaimDesc, command.text, got,
+                ic::reason_name(sLastClaimReason)));
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
 /// Runs every command that takes no time (say/repeat/end/quit), leaving sPc on a timed one.
 /// Returns false once the program is over.
 /// Ticks a `warp` has been held so far, waiting for a guest's world install (see Op::Warp).
@@ -933,6 +1135,18 @@ bool settle_program_counter() {
         case Op::ExpectKeys:
         case Op::ExpectRupees:
             run_world_command(command);
+            sPc++;
+            continue;
+
+        /* --- batch 6: item claims --- */
+        // tboxopen and claimtest take ticks; they are run by tick().
+        case Op::TboxNear:
+        case Op::TboxSet:
+        case Op::TboxClear:
+        case Op::ExpectTbox:
+        case Op::ExpectTboxOpen:
+        case Op::ExpectClaim:
+            run_claims_command(command);
             sPc++;
             continue;
 
@@ -1213,6 +1427,56 @@ void load_script(const std::filesystem::path& path) {
             command.frames = 1800;
             ok = parse_event_flag(a, command.point) &&
                  (b.empty() || parse_int(b, command.frames)) && command.frames > 0;
+        /* --- batch 6: item claims --- */
+        } else if (verb == "TBOXNEAR" || verb == "TBOXSET" || verb == "TBOXCLEAR") {
+            // "tboxnear [radius]": log the nearest chests. "tboxset [radius]": mark the nearest
+            // chest's bit open, as `tbox <no>` does without needing its number. "tboxclear": off.
+            command.op = verb == "TBOXNEAR" ? Op::TboxNear :
+                                              (verb == "TBOXSET" ? Op::TboxSet : Op::TboxClear);
+            command.radius = 5000.0;
+            ok = (a.empty() || parse_double(a, command.radius)) && command.radius > 0.0;
+        } else if (verb == "TBOXOPEN") {
+            // "tboxopen [radius] [timeout]": open the nearest chest as a player would.
+            command.op = Op::TboxOpen;
+            command.radius = 3000.0;
+            command.frames = 300;
+            ok = (a.empty() || parse_double(a, command.radius)) &&
+                 (b.empty() || parse_int(b, command.frames)) && command.radius > 0.0 &&
+                 command.frames > 0;
+        } else if (verb == "EXPECTTBOX") {
+            // "expecttbox open|closed [radius]": the nearest chest's state.
+            command.op = Op::ExpectTbox;
+            command.radius = 5000.0;
+            const std::string want = to_upper(a);
+            command.layer = want == "OPEN" ? 1 : (want == "CLOSED" ? 0 : -1);
+            ok = command.layer >= 0 && (b.empty() || parse_double(b, command.radius)) &&
+                 command.radius > 0.0;
+        } else if (verb == "EXPECTTBOXOPEN") {
+            // "expecttboxopen event|none": what the last tboxopen ended with.
+            command.op = Op::ExpectTboxOpen;
+            const std::string want = to_upper(a);
+            command.layer = want == "EVENT" ? 1 : (want == "NONE" ? 0 : -1);
+            ok = command.layer >= 0;
+        } else if (verb == "CLAIMTEST") {
+            // "claimtest tbox|item <tbl|live> <no> [timeout]": ask item_claims every tick until
+            // it resolves (default timeout 150 ticks; the claim itself gives up at 90).
+            command.op = Op::ClaimTest;
+            command.text = to_upper(a);
+            command.frames = 150;
+            ok = (command.text == "TBOX" || command.text == "ITEM") &&
+                 parse_stage_table(b, command.room) && parse_int(c, command.point) &&
+                 (d.empty() || parse_int(d, command.frames)) && command.frames > 0;
+            if (ok && command.text == "TBOX") {
+                ok = command.point >= 0 && command.point < kTboxLimit;
+            } else if (ok) {
+                ok = command.point >= dSv_info_c::MEMORY_ITEM &&
+                     command.point < dSv_info_c::MEMORY_ITEM + dSv_info_c::DAN_ITEM;
+            }
+        } else if (verb == "EXPECTCLAIM") {
+            // "expectclaim granted|denied|pending": the last claimtest's result.
+            command.op = Op::ExpectClaim;
+            command.text = to_upper(a);
+            ok = command.text == "GRANTED" || command.text == "DENIED" || command.text == "PENDING";
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -1501,6 +1765,127 @@ void tick() {
         // settle_program_counter() performs the warp once the guest is synced.
         duration = sElapsed + 2;
         break;
+
+    /* --- batch 6: item claims --- */
+    case Op::TboxOpen: {
+        /* Opens the nearest chest the way a player does: walk to a point in front of it, turn to
+         * face it (a stick under ~0.4 only turns Link on the spot), stand still and press A. The
+         * chest only takes the press once its "Open" prompt is offered, which in a session waits
+         * for the claim (d_a_tbox.cpp H4), so pressing on a cadence covers the round trip. Ends
+         * the tick any event starts; a chest that shows open (H3) offers nothing, so that case
+         * runs to the timeout and reports result=none. */
+        if (dComIfGp_event_runCheck()) {
+            fopAc_ac_c* found =
+                sTboxTarget != fpcM_ERROR_PROCESS_ID_e ? fopAcM_SearchByID(sTboxTarget) : nullptr;
+            sLastTboxOpenEvent = 1;
+            Log.info("[autopilot] tboxopen result=event after {} tick(s){}{} tick={}", sElapsed,
+                sElapsed == 0 ? " (an event was already running when tboxopen began)" : "",
+                found != nullptr ? ": " + describe_tbox(static_cast<daTbox_c*>(found)) :
+                                   std::string(),
+                sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        if (link == nullptr) {
+            break;
+        }
+        if (sElapsed == 0) {
+            sTboxTarget = fpcM_ERROR_PROCESS_ID_e;
+            sTboxArrived = false;
+            sLastTboxOpenEvent = -1;
+            daTbox_c* nearest = nearest_tbox(command.radius);
+            if (nearest == nullptr) {
+                Log.warn("[autopilot] tboxopen: no chest within {:.0f} units; skipped tick={}",
+                    command.radius, sTicks);
+                duration = 1;
+                break;
+            }
+            Log.info("[autopilot] tboxopen: heading for {} tick={}", describe_tbox(nearest), sTicks);
+            sTboxTarget = fopAcM_GetID(nearest);
+        }
+        fopAc_ac_c* found = fopAcM_SearchByID(sTboxTarget);
+        if (found == nullptr) {
+            Log.warn("[autopilot] tboxopen: the chest is gone tick={}", sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        daTbox_c* tbox = static_cast<daTbox_c*>(found);
+        const double kToRad = 3.14159265358979 / 32768.0;
+        const double facing = tbox->shape_angle.y * kToRad;
+        const double frontX = tbox->current.pos.x + std::sin(facing) * kTboxFront;
+        const double frontZ = tbox->current.pos.z + std::cos(facing) * kTboxFront;
+        const double dfx = frontX - link->current.pos.x;
+        const double dfz = frontZ - link->current.pos.z;
+        if (!sTboxArrived && std::sqrt(dfx * dfx + dfz * dfz) > 15.0) {
+            steer_toward(status, frontX, frontZ, 1.0);
+        } else {
+            if (!sTboxArrived) {
+                sTboxArrived = true;
+                Log.info("[autopilot] tboxopen: at the chest's front after {} tick(s) tick={}",
+                    sElapsed, sTicks);
+            }
+            const double toX = tbox->current.pos.x - link->current.pos.x;
+            const double toZ = tbox->current.pos.z - link->current.pos.z;
+            const int wantYaw = static_cast<int>(std::lround(std::atan2(toX, toZ) / kToRad));
+            const s16 diff = static_cast<s16>(wantYaw - link->shape_angle.y);
+            if (std::abs(static_cast<int>(diff)) > kTboxFaceTolerance) {
+                steer_toward(status, tbox->current.pos.x, tbox->current.pos.z, 0.3);
+            } else if (std::fabs(link->speedF) < 0.5f && sElapsed % 12 < 4) {
+                // Standing, so A cannot become a roll. 4 ticks on, 8 off: one clean edge per press.
+                status.button = PAD_BUTTON_A;
+            }
+        }
+        if (sElapsed + 1 >= command.frames) {
+            sLastTboxOpenEvent = 0;
+            Log.info("[autopilot] tboxopen result=none: no event after {} ticks ({}) tick={}",
+                command.frames, describe_tbox(tbox), sTicks);
+        }
+        break;
+    }
+
+    case Op::ClaimTest: {
+        namespace ic = mp::item_claims;
+        if (sElapsed == 0) {
+            sHaveClaimResult = false;
+            sLastClaimReason = ic::DenyReason::None;
+            const int tbl = command.room == kLiveTbl ? live_stage_table() : command.room;
+            const bool item = command.text == "ITEM";
+            sLastClaimDesc = fmt::format("{} {}/{}", item ? "item" : "tbox", tbl,
+                item ? fmt::format("0x{:02X}", command.point) : std::to_string(command.point));
+            if (tbl < 0) {
+                Log.error("[autopilot] claimtest {}: no live stage table; skipped tick={}",
+                    sLastClaimDesc, sTicks);
+                duration = 1;
+                break;
+            }
+            sClaimTarget.kind = item ? ic::ClaimKind::Item : ic::ClaimKind::Tbox;
+            sClaimTarget.tbl = static_cast<std::uint8_t>(tbl);
+            sClaimTarget.no = static_cast<std::uint16_t>(
+                item ? command.point - dSv_info_c::MEMORY_ITEM : command.point);
+            Log.info("[autopilot] claimtest {}: asking (claims {}, role {}) tick={}",
+                sLastClaimDesc, ic::active() ? "on" : "OFF (vanilla: always granted)",
+                mp::network_manager().role() == mp::Role::Host ? "host" : "guest", sTicks);
+        }
+        const ic::ClaimState result = ic::claim(sClaimTarget);
+        if (result != ic::ClaimState::Pending) {
+            sHaveClaimResult = true;
+            sLastClaimState = result;
+            sLastClaimReason =
+                result == ic::ClaimState::Denied ? ic::last_reason(sClaimTarget) : ic::DenyReason::None;
+            Log.info("[autopilot] claimtest {} result={} reason={} after {} tick(s) tick={}",
+                sLastClaimDesc, ic::state_name(result), ic::reason_name(sLastClaimReason),
+                sElapsed, sTicks);
+            duration = sElapsed + 1;
+        } else if (sElapsed + 1 >= command.frames) {
+            sHaveClaimResult = true;
+            sLastClaimState = ic::ClaimState::Pending;
+            sLastClaimReason = ic::DenyReason::None;
+            Log.error("[autopilot] claimtest {} result=pending: unresolved after {} ticks tick={}",
+                sLastClaimDesc, command.frames, sTicks);
+        }
+        break;
+    }
 
     default:
         break;
