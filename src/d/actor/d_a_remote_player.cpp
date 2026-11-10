@@ -2820,7 +2820,8 @@ void daRemotePlayer_c::setNetworkJointAim(
  * pin the rate into band 1 outright (d_a_alink.cpp:7620-7653). The SWORD half of that is done — see
  * anm_bck_data() and runAnm(), which follow his own `mEquipItem == 0x103` test off the wire. So is
  * the shield (guardOr) and the iron boots (kPlayerGearHeavyGait, below), which is the one of these
- * that DOES change the band arithmetic. The iron ball is still not replicated.
+ * that DOES change the band arithmetic. So is the iron ball's carry gait (kPlayerGearIronBallGait,
+ * below), which changes it the same way.
  */
 void daRemotePlayer_c::selectAnimation() {
     const daAlinkHIO_move_c1& hio = daAlinkHIO_move_c0::m;
@@ -2993,9 +2994,37 @@ void daRemotePlayer_c::selectAnimation() {
             fraction = hio.mWalkChangeRate - 0.001f;
         }
     }
-    const daAlink_c::daAlink_ANM walkID = heavyGait ? daAlink_c::ANM_WALK_HEAVY : l_walkAnm;
+    /* The iron-ball carry gait: the other half of the same `sp20` branch, `!checkBootsMoveAnime(0)`
+     * (d_a_alink.cpp:7641-7654), taken when the sender says his slot 1 is ANM_IRONBALL_WALK
+     * (kPlayerGearIronBallGait). The same arithmetic as the boots with the ball's own table:
+     *
+     *   - the pair is IBWAIT / IBWALK (idleAnm() supplies the wait) instead of WAITS / WALKS;
+     *   - the walk rate is mIronBall's mWalkAnmSpeedMin..Max on the rate after dividing out
+     *     mHeavySpeedMultiplier squared — which is mIronBoots.mInputFactor here too, setStickData's
+     *     first case (:9538-9545), since the ball's IBWAIT overlay is what checkHeavyStateOn saw;
+     *   - the rate is scaled into band 1 and clamped below mWalkChangeRate (:7651-7654): he cannot
+     *     run while carrying the ball, for the same reason he cannot run in the boots.
+     *
+     * The wait's own rate (mIronBall.mWaitAnmSpeed, :7778-7779) is applied with speedA below. */
+    const bool ballGait = !heavyGait && mNetIronBallGait && mIronBallGaitAnm[0].mpUnder != NULL &&
+                          mIronBallGaitAnm[1].mpUnder != NULL;
+    if (ballGait) {
+        const daAlinkHIO_ironBall_c1& ball = daAlinkHIO_ironBall_c0::m;
+        const daAlinkHIO_magneBoots_c1& boots = daAlinkHIO_magneBoots_c0::m;
+        fraction *= 1.0f / (boots.mInputFactor * boots.mInputFactor);
+        walkSpeed =
+            ball.mWalkAnmSpeedMin + (fraction * (ball.mWalkAnmSpeedMax - ball.mWalkAnmSpeedMin));
+        fraction *= hio.mWalkChangeRate;
+        if (fraction >= hio.mWalkChangeRate) {
+            fraction = hio.mWalkChangeRate - 0.001f;
+        }
+    }
+    const daAlink_c::daAlink_ANM walkID =
+        heavyGait ? daAlink_c::ANM_WALK_HEAVY :
+                    (ballGait ? daAlink_c::ANM_IRONBALL_WALK : l_walkAnm);
     const daRemotePlayer_anm_c& walkAnm =
-        heavyGait ? guardOr(walkID, mAtnAnm[walkID]) : guardOr(l_walkAnm, mWalkAnm);
+        heavyGait ? guardOr(walkID, mAtnAnm[walkID]) :
+                    (ballGait ? mIronBallGaitAnm[1] : guardOr(l_walkAnm, mWalkAnm));
 
     /* Standing, decided by the SENDER and carried on the wire, because the branch it picks has a
      * step in it rather than a taper — see the remap in band 1 below, and kPlayerStateZeroSpeed.
@@ -3071,6 +3100,10 @@ void daRemotePlayer_c::selectAnimation() {
          * the BCK and the blend are all still correct. It only shows as a low-health idle that does
          * not read as tired. */
         speedA = tiredIdle ? 1.0f : hio.mWaitAnmSpeed;
+        // ...and the carried ball's wait at mIronBall.mWaitAnmSpeed, his same override (:7778).
+        if (idleID == daAlink_c::ANM_IRONBALL_WAIT) {
+            speedA = daAlinkHIO_ironBall_c0::m.mWaitAnmSpeed;
+        }
         speedB = walkSpeed;
 
         /* The standing pivot: setBlendMoveAnime's step-turn branch (d_a_alink.cpp:7706-7745).
@@ -3091,6 +3124,12 @@ void daRemotePlayer_c::selectAnimation() {
         if (zeroSpeed && !mNetUpperGuard && turnAbs > 100) {
             const int stepIdx = (yawStep > 0 ? 0 : 1) + (tiredIdle ? 2 : 0);
             if (mStepTurnAnm[stepIdx].mpUnder != NULL) {
+                // He pivots off the plain wait while carrying the ball (:7717-7719).
+                if (idleID == daAlink_c::ANM_IRONBALL_WAIT) {
+                    anmA = &mIdleAnm;
+                    idA = l_idleAnm;
+                    speedA = hio.mWaitAnmSpeed;
+                }
                 stepTurn = static_cast<u8>(stepIdx + 1);
                 anmB = &mStepTurnAnm[stepIdx];
                 idB = static_cast<daAlink_c::daAlink_ANM>(daAlink_c::ANM_STEP_TURN + stepIdx);
@@ -3208,6 +3247,22 @@ void daRemotePlayer_c::selectAnimation() {
             Log.debug("Puppet {} iron-boots gait: walk anm {} (bck {}) at rate {:.3f}, blend "
                       "fraction {:.3f} from wire rate {:.3f}",
                 mPlayerId, static_cast<int>(walkID), anm_bck_idx(walkID, mNetEquip), walkSpeed,
+                fraction, mNetMoveRate);
+        }
+    }
+
+    // The ball picked up or put down mid-walk: both slots swap at the same weight, as above.
+    if (ballGait != mGaitPrevIronBall) {
+        mGaitPrevIronBall = ballGait;
+        if (morf < 0.0f) {
+            morf = daAlinkHIO_basic_c0::m.mBasicInterpolation;
+        }
+        if (ballGait && !mLoggedIronBallGait) {
+            mLoggedIronBallGait = true;
+            Log.debug("Puppet {} iron-ball gait: anm {}/{} (bck {}/{}) at rates {:.3f}/{:.3f}, "
+                      "blend fraction {:.3f} from wire rate {:.3f}",
+                mPlayerId, static_cast<int>(idleID), static_cast<int>(walkID),
+                anm_bck_idx(idleID, mNetEquip), anm_bck_idx(walkID, mNetEquip), speedA, walkSpeed,
                 fraction, mNetMoveRate);
         }
     }
@@ -3433,6 +3488,17 @@ const daRemotePlayer_anm_c& daRemotePlayer_c::runAnm() const {
  * attention byte said "none".
  */
 const daRemotePlayer_anm_c& daRemotePlayer_c::idleAnm(u16* o_anmID) const {
+    /* The carried ball replaces whatever wait he would otherwise be in: setBlendMoveAnime's carry
+     * branch sets IBWAIT unconditionally, over the WAIT_B the heavy state picked first
+     * (d_a_alink.cpp:7601-7604, :7642). Keyed on the same gait bit as the walk, so the pair is
+     * always the pair (see ballGait in selectAnimation). */
+    if (mNetIronBallGait && !mNetHeavyGait && mIronBallGaitAnm[0].mpUnder != NULL &&
+        mIronBallGaitAnm[1].mpUnder != NULL)
+    {
+        *o_anmID = static_cast<u16>(daAlink_c::ANM_IRONBALL_WAIT);
+        return mIronBallGaitAnm[0];
+    }
+
     const daRemotePlayer_anm_c* anm = &mIdleAnm;
     daAlink_c::daAlink_ANM id = l_idleAnm;
 
@@ -8461,6 +8527,7 @@ int daRemotePlayer_c::draw() {
     shadowDraw();
     addHeldItemShadow();
     addHeavyBootsShadow();
+    drawIronBall();
     traceCalc("draw done");
     return 1;
 }
@@ -8497,3 +8564,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 // block (3): held item. Last in the file: it uses the helpers above (init_model, own_archive_*,
 // loadActionBck) and keeps this feature out of the functions other work is editing.
 #include "d/actor/d_a_remote_player_held.inc"
+// The iron ball and chain, after the held-item file whose loaders it uses.
+#include "d/actor/d_a_remote_player_ironball.inc"

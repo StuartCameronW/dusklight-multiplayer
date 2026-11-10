@@ -23,10 +23,10 @@ namespace dusk::mp {
  * (setItemModel, d_a_alink.cpp:14161-14212). The lantern is the exception — it is a separate model
  * that can be out alongside another item — so it rides in PlayerHeldFlags instead.
  *
- * Not reproduced, and sent as kPlayerHeldNone: the iron ball (its model is the BALL, swung in world
- * space by setIronBallPos, d_a_alink_ironball.inc:465-770), the fishing rod and bombs (separate
- * actors), the grass whistle (a stage-archive model), the wolf-change model (0x106) and the spinner
- * (ridden, not held).
+ * Not reproduced, and sent as kPlayerHeldNone: the fishing rod and bombs (separate actors), the
+ * grass whistle (a stage-archive model), the wolf-change model (0x106) and the spinner (ridden, not
+ * held). The iron ball IS reproduced (kPlayerHeldIronBall), with its world-space placement in a
+ * block of its own (PlayerState's v19 block B).
  */
 enum PlayerHeldItem : std::uint8_t {
     kPlayerHeldNone = 0,
@@ -47,7 +47,12 @@ enum PlayerHeldItem : std::uint8_t {
     /// The boomerang while it sits in his hand — daBoomerang_c's procWait/setKeepMatrix
     /// (d_a_boomerang.cpp:686-699, :932-935). In flight it is a world actor and is not sent.
     kPlayerHeldBoomerang = 8,
-    kPlayerHeldKindNum = 9,
+    /// dItemNo_IRONBALL_e: al_ib, the BALL, which is not in his hand — setIronBallPos places it in
+    /// world space (d_a_alink_ironball.inc:465-770) and hsChainShape_c draws the chain between it
+    /// and his right hand (d_a_alink_hook.inc:58-147). Where it is rides in PlayerState's iron-ball
+    /// block, not here.
+    kPlayerHeldIronBall = 9,
+    kPlayerHeldKindNum = 10,
 };
 
 /// Bit flags in PlayerState::heldFlags.
@@ -84,5 +89,14 @@ constexpr std::uint8_t kPlayerHeldMatBottleBrkMask = 0x0F;
 constexpr std::uint8_t kPlayerHeldMatBottleBtpShift = 4;
 constexpr std::uint8_t kPlayerHeldMatBottleBtpMask = 0x30;
 constexpr std::uint8_t kPlayerHeldMatBottleMat0Hidden = 0x40;
+
+/* PlayerState::ironBallState (v19 block B), while kPlayerHeldIronBall is out. */
+/// mItemVar0.field_0x3018 in the low nibble: the throw state (0 carried .. 8 caught again), which
+/// setIronBallPos and setIronBallChainPos branch on (d_a_alink_ironball.inc:198-449, :465-810)...
+constexpr std::uint8_t kPlayerIronBallStateMask = 0x0F;
+/// ...and bit 7 set while he is in PROC_IRON_BALL_SUBJECT / PROC_IRON_BALL_MOVE, the two procs in
+/// which the carried ball takes its rotation from his left item joint instead of his facing
+/// (setIronBallPos, d_a_alink_ironball.inc:511-516).
+constexpr std::uint8_t kPlayerIronBallJointRot = 0x80;
 
 }  // namespace dusk::mp

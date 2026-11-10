@@ -8,10 +8,12 @@
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
 #include "d/d_resorce.h"
+#include "dusk/interp/samples.h"
 #include "f_op/f_op_actor.h"
 #include "m_Do/m_Do_ext.h"
 
 class daNpcF_MatAnm_c;
+class J3DPacket;
 class J3DShape;
 
 /**
@@ -1290,7 +1292,7 @@ private:
     void addHeldItemShadow();
     void applyUpper2Overlay();
     void clearUpper2Overlay(f32 i_morf);
-    J3DModel* mpHeldModel[9];
+    J3DModel* mpHeldModel[10];
     /// The second clawshot and the two claw tips (daAlink_c's field_0x0710 / mpHookTipModel /
     /// field_0x0714).
     J3DModel* mpHeldClaw2Model;
@@ -1322,8 +1324,8 @@ private:
     u16 mUpper2Failed;
     u8 mUpper2AppliedMorf;
     u16 mHeldLogCount;
-    bool mLoggedHeldMissing[9];
-    bool mLoggedHeldDraw[9];
+    bool mLoggedHeldMissing[10];
+    bool mLoggedHeldDraw[10];
     bool mLoggedLantern;
 
     // --- v19: friendly fire (coordinator) ---
@@ -1355,6 +1357,75 @@ private:
     bool mHeavyBootsBodyHidden;
     bool mLoggedHeavyBootsDraw;
     u16 mHeavyBootsLogCount;
+    // --- iron ball (agent B) ---
+    /* The ball and chain, and the carry gait. See d_a_remote_player_ironball.inc.
+     *
+     * The ball model rides in mpHeldModel[kPlayerHeldIronBall] so the held-item code poses, draws
+     * and shadows it like any other held model; everything here is what daAlink_c keeps for it
+     * beyond the model (setIronBallModel, d_a_alink_ironball.inc:90-170). */
+public:
+    /// v19 block B and gear bit 2, decoded by the bridge. i_ballRel is mIronBallChainPos[0]
+    /// relative to the sender's position; i_state is the wire's ironBallState byte.
+    void setNetworkIronBall(bool i_gait, const cXyz& i_ballRel, s16 i_angX, s16 i_angY, u8 i_links,
+        u8 i_state);
+    /// kPlayerGearIronBallGait as received.
+    bool getNetIronBallGait() const { return mNetIronBallGait; }
+    /// daAlink_c::hsChainShape_c::draw's iron-ball half, from the chain packet at paint time.
+    void drawIronBallChain();
+
+private:
+    J3DModel* setupIronBall();
+    void setIronBallMatrix(J3DModel* i_ball);
+    void setIronBallChainPos();
+    void drawIronBall();
+    /// The ball is in his hands (states 0 and 8): it casts into the body's real shadow then, and
+    /// into a shadow of its own otherwise (d_a_alink.cpp:19310-19321).
+    bool ironBallInHands() const;
+    /// ANM_IRONBALL_WAIT / ANM_IRONBALL_WALK: setBlendMoveAnime's carry-gait pair
+    /// (d_a_alink.cpp:7642-7643).
+    daRemotePlayer_anm_c mIronBallGaitAnm[2];
+    /// al_hs_kusari, the chain link: model DATA only, as his mpItemModelData
+    /// (d_a_alink_ironball.inc:94).
+    J3DModelData* mpIronBallChainData;
+    /// The chain's immediate packet (his mpHookChain), on the solid heap.
+    J3DPacket* mpIronBallChainPacket;
+    /* His mIronBallChainPos / mIronBallChainAngle / field_0x3848 (pos, rotation, velocity), all 102
+     * of them (d_a_alink_ironball.inc:97-99). [0] is the ball's chain end, [1..mIronBallLinks] the
+     * paid-out links, [mIronBallLinks + 1] his hand, and the rest are parked on the hand. */
+    cXyz mIronBallChainPos[102];
+    csXyz mIronBallChainAngle[102];
+    cXyz mIronBallChainVel[102];
+    /// His mHookshotTopPos (the chain's hand end), mHeldItemRootPos and field_0x316c.
+    cXyz mIronBallHandTop;
+    cXyz mIronBallHandRoot;
+    csXyz mIronBallHandRootAngle;
+    /// His mIronBallCenterPos and mIronBallBgChkPos.
+    cXyz mIronBallCenter;
+    cXyz mIronBallBgChkPos;
+    /// His mItemMode while the ball is out, and the state the chain was last solved for.
+    s16 mIronBallLinks;
+    u8 mIronBallState;
+    /// The chain has been initialised and solved on the previous sim tick (g_Counter.mCounter0).
+    bool mIronBallChainLive;
+    u32 mIronBallSolvedTick;
+    /// His field_0x32d4: the ball's own real-shadow slot while it is out of his hands.
+    u32 mIronBallShadowKey;
+    /// Frame interpolation of the chain, as AlinkInterp's ib_pos/ib_angle/ib_hand
+    /// (d_a_alink.cpp:67-72).
+    dusk::interp::Samples<cXyz> mIronBallPosSamples;
+    dusk::interp::Samples<csXyz> mIronBallAngleSamples;
+    dusk::interp::Samples<cXyz> mIronBallHandSamples;
+    // The wire's values, as pushed by setNetworkIronBall().
+    bool mNetIronBallGait;
+    cXyz mNetIronBallRel;
+    s16 mNetIronBallAngX;
+    s16 mNetIronBallAngY;
+    u8 mNetIronBallLinks;
+    u8 mNetIronBallState;
+    bool mGaitPrevIronBall;
+    bool mLoggedIronBallGait;
+    bool mLoggedIronBallDraw;
+    u16 mIronBallLogCount;
 };
 
 /**

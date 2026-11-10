@@ -179,7 +179,30 @@ enum PlayerGearFlags : std::uint8_t {
      * the ordinary gait, which is what it did before.
      */
     kPlayerGearHeavyGait = 1 << 1,
+    /**
+     * The sender's legs are on the iron-ball carry gait:
+     * `checkUnderMove1BckNoArc(ANM_IRONBALL_WALK)`, read off his animation heap exactly as
+     * kPlayerGearHeavyGait is.
+     *
+     * setBlendMoveAnime takes ANM_IRONBALL_WAIT / ANM_IRONBALL_WALK under `checkBootsMoveAnime(1)
+     * && !checkBootsMoveAnime(0)` and not enableFastIronBoots (d_a_alink.cpp:7579, :7641-7649):
+     * the ball's IBWAIT upper overlay makes him heavy for the gait but not for the boots branch.
+     * Both iron-ball rows sit in slot 1 for the whole of band 1, which is the only band the branch
+     * can reach, and the standing pivot replaces slot 1, so the bit is clear exactly when his legs
+     * are not on the carry gait. Deriving it from heldItem would get the fast-iron-boots setting
+     * and the pivot wrong, as deriving the boots gait from the boots bit would.
+     */
+    kPlayerGearIronBallGait = 1 << 2,
 };
+
+/**
+ * v19 block B, the iron ball: where the ball is, in units of 1/kPlayerIronBallPosScale relative
+ * to the sender's own position (posX/Y/Z). 4 steps a unit is +-8191 units, and the ball never gets
+ * further from him than its chain allows: setIronBallPos clamps it to 1000 units from his hand
+ * (d_a_alink_ironball.inc:579-580), and at most 100 links of 10 units can be paid out (:563-564).
+ */
+constexpr float kPlayerIronBallPosScale = 4.0f;
+// The ironBallState byte's layout is in dusk/player_held.hpp, which the puppet can include.
 
 /**
  * The joint-aim fields' wire scale: one s8 step is 128 binary-angle units, 0.70 degrees.
@@ -608,6 +631,34 @@ struct PlayerState {
     std::uint8_t atRadius = 0;
     std::uint8_t atSpl = 0;
     std::int16_t atPt[9] = {};
+
+    // v19 block B: iron ball (after the attack block)
+    /**
+     * Where the sender's ball is, while heldItem is kPlayerHeldIronBall. 12 bytes:
+     *
+     *   ironBallX/Y/Z     mIronBallChainPos[0] (the chain end of the ball, where its model's
+     *                     origin is), relative to posX/Y/Z, x kPlayerIronBallPosScale.
+     *   ironBallAngX/Y    mIronBallChainAngle[0].x / .y, the ball model's rotation. Its z is a roll
+     *                     about the chain and is not sent.
+     *   ironBallLinks     mItemMode: how many chain links are paid out (6 carried, up to 100).
+     *   ironBallState     mItemVar0.field_0x3018 | kPlayerIronBallJointRot.
+     *
+     * All zero when the ball is not out. The chain itself is NOT sent (102 links): the receiver
+     * re-runs setIronBallChainPos between its own hand and this ball, which is a deterministic
+     * relaxation, not a physics state worth the bytes.
+     */
+    std::int16_t ironBallX = 0;
+    std::int16_t ironBallY = 0;
+    std::int16_t ironBallZ = 0;
+    std::int16_t ironBallAngX = 0;
+    std::int16_t ironBallAngY = 0;
+    std::uint8_t ironBallLinks = 0;
+    std::uint8_t ironBallState = 0;
+
+    bool iron_ball_out() const { return heldItem == kPlayerHeldIronBall; }
+    float iron_ball_x() const { return static_cast<float>(ironBallX) / kPlayerIronBallPosScale; }
+    float iron_ball_y() const { return static_cast<float>(ironBallY) / kPlayerIronBallPosScale; }
+    float iron_ball_z() const { return static_cast<float>(ironBallZ) / kPlayerIronBallPosScale; }
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
 
@@ -634,6 +685,7 @@ struct PlayerState {
     }
     bool heavy_boots() const { return (gear & kPlayerGearHeavyBoots) != 0; }
     bool heavy_gait() const { return (gear & kPlayerGearHeavyGait) != 0; }
+    bool iron_ball_gait() const { return (gear & kPlayerGearIronBallGait) != 0; }
 
     void write(Writer& w) const {
         w.write_f32(posX);
@@ -698,6 +750,16 @@ struct PlayerState {
                 w.write_s16(v);
             }
         }
+        // v19 iron ball block: only while the ball is out
+        if (iron_ball_out()) {
+            w.write_s16(ironBallX);
+            w.write_s16(ironBallY);
+            w.write_s16(ironBallZ);
+            w.write_s16(ironBallAngX);
+            w.write_s16(ironBallAngY);
+            w.write_u8(ironBallLinks);
+            w.write_u8(ironBallState);
+        }
     }
 
     bool read(Reader& r) {
@@ -750,6 +812,19 @@ struct PlayerState {
             atRadius = 0;
             atSpl = 0;
             std::fill(std::begin(atPt), std::end(atPt), std::int16_t{0});
+        }
+        // v19 iron ball block: only while the ball is out
+        if (iron_ball_out()) {
+            if (!(r.read_s16(ironBallX) && r.read_s16(ironBallY) && r.read_s16(ironBallZ) &&
+                    r.read_s16(ironBallAngX) && r.read_s16(ironBallAngY) &&
+                    r.read_u8(ironBallLinks) && r.read_u8(ironBallState)))
+            {
+                return false;
+            }
+        } else {
+            ironBallX = ironBallY = ironBallZ = 0;
+            ironBallAngX = ironBallAngY = 0;
+            ironBallLinks = ironBallState = 0;
         }
         roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
@@ -975,6 +1050,29 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
         }
     } else {
         std::copy(std::begin(b.atPt), std::end(b.atPt), std::begin(out.atPt));
+    }
+
+    // v19 block B: iron ball (after the attack block)
+    /* The link count and the state are discrete. The ball's position and rotation blend only while
+     * BOTH samples have it out: the other side's zeroes mean "no ball", and blending out of them
+     * would fly it in from his feet. t is clamped to 1, as for the joint aim: a swung ball circles
+     * him (state 2) and extrapolating a circle overshoots it outward. */
+    out.ironBallLinks = b.ironBallLinks;
+    out.ironBallState = b.ironBallState;
+    out.ironBallX = b.ironBallX;
+    out.ironBallY = b.ironBallY;
+    out.ironBallZ = b.ironBallZ;
+    out.ironBallAngX = b.ironBallAngX;
+    out.ironBallAngY = b.ironBallAngY;
+    if (a.iron_ball_out() && b.iron_ball_out()) {
+        out.ironBallX = act_encode_s16(
+            a.iron_ball_x() + (b.iron_ball_x() - a.iron_ball_x()) * aimT, kPlayerIronBallPosScale);
+        out.ironBallY = act_encode_s16(
+            a.iron_ball_y() + (b.iron_ball_y() - a.iron_ball_y()) * aimT, kPlayerIronBallPosScale);
+        out.ironBallZ = act_encode_s16(
+            a.iron_ball_z() + (b.iron_ball_z() - a.iron_ball_z()) * aimT, kPlayerIronBallPosScale);
+        out.ironBallAngX = lerp_angle(a.ironBallAngX, b.ironBallAngX, aimT);
+        out.ironBallAngY = lerp_angle(a.ironBallAngY, b.ironBallAngY, aimT);
     }
     return out;
 }

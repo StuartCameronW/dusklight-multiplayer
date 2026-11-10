@@ -128,6 +128,10 @@ namespace dusk::mp {
  * position), so 77 bytes idle and 97 mid-swing. The receiver turns it into a hitbox on the puppet
  * that only the local player's hurtbox can touch: friendly fire. A v18 peer's read() would stop a
  * byte short and drop every pose.
+ *   After the attack block, while heldItem is kPlayerHeldIronBall (9, new in v19), 12 more bytes:
+ * the ball's chain end relative to the sender (3 x s16 at 1/4 unit), its model rotation (2 x s16),
+ * the paid-out link count and the throw state (u8 each). gear bit 2 is kPlayerGearIronBallGait,
+ * the carry gait read off his slot 1.
  */
 inline constexpr std::uint32_t kProtocolVersion = 19;
 
