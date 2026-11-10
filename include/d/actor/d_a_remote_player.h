@@ -1321,7 +1321,61 @@ private:
     bool mLoggedHeldMissing[9];
     bool mLoggedHeldDraw[9];
     bool mLoggedLantern;
+
+    // --- held items: bottle/bow (agent A) ---
+    /* The bow / slingshot model's own animation and the nocked arrow (protocol v19 block A). See
+     * d_a_remote_player_held.inc.
+     *
+     * mpHeldItemBckAnm: every BCK daAlink_c can put in his mItemBck for a bow or slingshot,
+     * PRELOADED (indexed by PlayerHeldItemBck; [0] NULL), each read with his mAnmHeap9 buffer size.
+     * mHeldItemBck: his mDoExt_bckAnm, built once on the first BCK that loaded and switched with
+     * changeBckOnly — the ONLY driver of those animation objects' frames.
+     * mpHeldArrowModel: AL_ARROW / AL_ARROWB from the private Alink mount, built as
+     * daArrow_c::createHeap builds them. mHeldArrowTevStr: the arrow's own type-0 light, as the
+     * arrow actor keeps its own. */
+public:
+    /// Pushed every tick right after setNetworkHeldItem(): PlayerState::heldBck / heldBckFrame.
+    void setNetworkHeldItemBck(u8 i_bck, u8 i_frame);
+    /// What was drawn (trace / logs): the item BCK id installed last tick (0 none), and the arrow
+    /// model entered last pass (0 normal, 1 bomb, 0xFF none).
+    u8 getHeldItemBckShown() const { return mHeldItemBckShown; }
+    /// That BCK's own frame / frameMax, x255 (0 with none installed).
+    u8 getHeldItemBckDrawnFrame() const;
+    u8 getHeldArrowDrawn() const { return mHeldArrowDrawn; }
+
+private:
+    void setHeldItemBck(J3DModel* i_held, u8 i_kind);
+    void setHeldArrowMatrix();
+    void drawHeldArrow();
+    J3DAnmTransform* mpHeldItemBckAnm[10];
+    mDoExt_bckAnm mHeldItemBck;
+    bool mHeldItemBckReady;
+    u8 mHeldItemBckShown;
+    J3DModel* mpHeldArrowModel[2];
+    dKy_tevstr_c mHeldArrowTevStr;
+    /// The bomb arrow's fuse, daArrow_c::field_0x950: starts at getBombExplodeTime() when it is
+    /// nocked and counts down one per tick (d_a_arrow.cpp:1038-1041); drives its material-1 pulse.
+    s16 mHeldArrowFuse;
+    /// A BOMB arrow was nocked last tick (the fuse only runs on one).
+    bool mHeldArrowWasNocked;
+    // The wire's v19 block A bytes, as pushed by setNetworkHeldItemBck().
+    u8 mNetHeldBck;
+    u8 mNetHeldBckFrame;
+    // What was drawn (log / trace): the arrow model entered last pass, 0xFF none.
+    u8 mHeldArrowDrawn;
+    /// The validated wire BCK id last tick, so a change is logged once even if it cannot be shown.
+    u8 mHeldItemBckWanted;
+    bool mLoggedArrowMissing;
+    u16 mHeldBckLogCount;
 };
+
+/**
+ * protocol v19 block A: the wire id (PlayerHeldItemBck, dusk/player_held.hpp) of the item BCK
+ * resource daAlink_c has in mAnmHeap9, for held kind i_kind (PlayerHeldItem). 0 when it is not one
+ * the puppet reproduces for that kind. The table lives in d_a_remote_player_held.inc, once, and
+ * the puppet maps the id back through it — so the two ends cannot disagree.
+ */
+u8 daRemotePlayer_heldItemBckToWire(u16 i_resIdx, u8 i_kind);
 
 /**
  * How the puppet's fopAcM_create parameter is packed: the player id in the low 24 bits, the wire

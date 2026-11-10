@@ -10,6 +10,7 @@
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_arrow.h"
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_com_inf_game.h"
 #include "dusk/logging.h"
@@ -1119,6 +1120,8 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
     out.upper2Frame = 0;
     out.upper2Ratio = 0;
     out.upper2Morf = 0;
+    out.heldBck = 0;
+    out.heldBckFrame = 0;
 
     static std::uint16_t s_latchedUpper2 = kPlayerActNone;
     static std::uint8_t s_latchedUpper2Morf = 0;
@@ -1175,6 +1178,24 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
             if (alink->checkBowGrabLeftHand()) {
                 out.heldFlags |= kPlayerHeldBowLeftHand;
             }
+            /* v19 block A: the model's own BCK. mItemBck holds what changeItemBck() last loaded
+             * into mAnmHeap9 (d_a_alink.cpp:14386-14397); its frame is the one setItemMatrix
+             * ENTERED this tick, after his clamp below frameMax (:6083-6089) — read off the
+             * animation object, not re-derived from field_0x33dc's many writers. */
+            J3DAnmTransform* itemBck = alink->mItemBck.getBckAnm();
+            if (itemBck != nullptr && !alink->mAnmHeap9.checkNoSetIdx() &&
+                alink->mAnmHeap9.checkNoSetArcNo())
+            {
+                const std::uint8_t id =
+                    daRemotePlayer_heldItemBckToWire(alink->mAnmHeap9.getIdx(), out.heldItem);
+                const f32 frameMax = itemBck->getFrameMax();
+                if (id != kPlayerHeldBckNone && frameMax > 0.0f) {
+                    const f32 f = itemBck->getFrame() / frameMax;
+                    out.heldBck = id;
+                    out.heldBckFrame = static_cast<std::uint8_t>(
+                        f <= 0.0f ? 0.0f : (f >= 1.0f ? 255.0f : f * 255.0f + 0.5f));
+                }
+            }
         } else if (daPy_py_c::checkHookshotItem(item)) {
             if (item == dItemNo_W_HOOKSHOT_e) {
                 out.heldItem = kPlayerHeldDoubleClawshot;
@@ -1209,6 +1230,29 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
             fopAcM_GetParam(boom) == 0)
         {
             out.heldItem = kPlayerHeldBoomerang;
+        }
+    }
+
+    /* v19 block A: the nocked arrow. A daArrow_c of its own, kept in mItemAcKeep by makeArrow
+     * (d_a_alink_bow.inc:110-126), that draws itself on his left item joint while it waits
+     * (setKeepMatrix, d_a_arrow.cpp:402-423) — so it is read off that actor, independent of the
+     * bow model above. Its draw gates are checkWait() (procWait; 1/2 = shot ordered) and
+     * deleteArrow()'s field_0x93f. NOT field_0x942: that is "OUR camera is in first person"
+     * (procWait, d_a_arrow.cpp:538-542), a property of the viewer, and the partner looking at the
+     * puppet is never inside this Link's head. Types 0/1 only — 4 is the slingshot pellet, which
+     * flies the tick it is made, and 2 is Zelda's (d_a_hozelda.cpp). */
+    {
+        fopAc_ac_c* keep = alink->mItemAcKeep.getActor();
+        if (keep != nullptr && fopAcM_GetName(keep) == fpcNm_ARROW_e) {
+            daArrow_c* arrow = static_cast<daArrow_c*>(keep);
+            if (arrow->checkWait() && arrow->field_0x93f == 0 &&
+                (arrow->mArrowType == 0 || arrow->mArrowType == 1))
+            {
+                out.heldFlags |= kPlayerHeldArrowNocked;
+                if (arrow->checkBombArrow()) {
+                    out.heldBck |= kPlayerHeldBckBombArrow;
+                }
+            }
         }
     }
 
@@ -1250,6 +1294,27 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
     }
     out.upper2Morf = s_latchedUpper2Morf;
 
+    {
+        static std::uint8_t s_lastSentBck = 0;
+        static bool s_lastSentArrow = false;
+        static std::uint16_t s_bckLogCount = 0;
+        const bool arrow = (out.heldFlags & kPlayerHeldArrowNocked) != 0;
+        if ((out.held_bck_id() != (s_lastSentBck & kPlayerHeldBckIdMask) ||
+                arrow != s_lastSentArrow) &&
+            s_bckLogCount < 200)
+        {
+            s_bckLogCount++;
+            Log.debug("Local held item BCK {} -> {} (res {}, frame {}/255), arrow {} -> {}{}",
+                static_cast<unsigned>(s_lastSentBck & kPlayerHeldBckIdMask),
+                static_cast<unsigned>(out.held_bck_id()),
+                alink->mAnmHeap9.checkNoSetIdx() ? -1 : static_cast<int>(alink->mAnmHeap9.getIdx()),
+                static_cast<unsigned>(out.heldBckFrame), s_lastSentArrow ? "nocked" : "none",
+                arrow ? "nocked" : "none",
+                (out.heldBck & kPlayerHeldBckBombArrow) != 0 ? " (bomb)" : "");
+        }
+        s_lastSentBck = out.heldBck;
+        s_lastSentArrow = arrow;
+    }
     if (out.heldItem != s_lastSentKind) {
         if (s_kindLogCount < 100) {
             s_kindLogCount++;
@@ -1755,6 +1820,8 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     // block (3): held item
     puppet->setNetworkHeldItem(state.heldItem, state.heldFlags, state.heldMat, state.upper2Idx,
         state.upper2_frame(), state.upper2_ratio(), static_cast<f32>(state.upper2Morf));
+    // v19 block A: bow
+    puppet->setNetworkHeldItemBck(state.heldBck, state.heldBckFrame);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
@@ -1850,6 +1917,11 @@ bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {
             ratio <= 0.0f ? 0.0f : (ratio >= 1.0f ? 255.0f : ratio * 255.0f + 0.5f));
     }
     out.upper2Morf = puppet->getUpper2DrawnMorf();
+    // v19 block A: bow — the item BCK the puppet installed and its frame, and the arrow it drew.
+    out.heldBck =
+        static_cast<std::uint8_t>((puppet->getHeldItemBckShown() & kPlayerHeldBckIdMask) |
+                                  (puppet->getHeldArrowDrawn() == 1 ? kPlayerHeldBckBombArrow : 0));
+    out.heldBckFrame = puppet->getHeldItemBckDrawnFrame();
     return true;
 }
 

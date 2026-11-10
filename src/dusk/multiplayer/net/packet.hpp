@@ -122,6 +122,13 @@ namespace dusk::mp {
  * re-sends the fingerprint when it changes mid-session (a save loaded, a mod toggled) so the host
  * can re-check an admitted guest; a v17 peer would log it as an unknown id and never re-check.
  */
+/*
+ * 19, block A (bow): PlayerState grew 2 bytes after locEpoch (after the attack block): u8 heldBck
+ * (bits 0-3 which BCK animates the bow / slingshot model itself — daAlink_c's mItemBck — and bit 4
+ * "the nocked arrow is a bomb arrow") and u8 heldBckFrame (that BCK's entered frame / frameMax,
+ * x255). heldFlags bit 7 (kPlayerHeldArrowNocked, previously always 0) now means an arrow is
+ * nocked and drawn on the left item joint. A v18 peer's read() would under-run.
+ */
 inline constexpr std::uint32_t kProtocolVersion = 18;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.

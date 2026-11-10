@@ -95,10 +95,13 @@ J3DModelData* held_load_aram_bmd(u16 i_resIdx, u32 i_bufSize, const char* i_what
 
 /**
  * daAlink_c::loadAram (d_a_alink.cpp:14343-14351) with his 0x400 literal, refusing an absent index
- * or a loaded object of the wrong kind (5 = J3DAnmTevRegKey, 2 = J3DAnmTexPattern).
+ * or a loaded object of the wrong kind (5 = J3DAnmTevRegKey, 2 = J3DAnmTexPattern, 0 =
+ * J3DAnmTransform). The item BCKs pass mAnmHeap9's 0x800 instead (d_a_alink_link.inc:447): that is
+ * the buffer his changeItemBck reads them into.
  */
-J3DAnmBase* held_load_aram_anm(u16 i_resIdx, s32 i_kind, const char* i_what) {
-    const u32 bufSize = 0x400;
+J3DAnmBase* held_load_aram_anm(
+    u16 i_resIdx, s32 i_kind, const char* i_what, u32 i_bufSize = 0x400) {
+    const u32 bufSize = i_bufSize;
     JKRArchive* archive = dComIfGp_getAnmArchive();
     if (archive == NULL || archive->findIdxResource(i_resIdx) == NULL) {
         Log.warn("Puppet held item '{}': anm {} is not in the ARAM archive", i_what, i_resIdx);
@@ -154,12 +157,56 @@ bool held_is_clawshot(u8 i_kind) {
     return i_kind == dusk::mp::kPlayerHeldClawshot || i_kind == dusk::mp::kPlayerHeldDoubleClawshot;
 }
 
+// --- held items: bottle/bow (agent A) ---
+
+/// mAnmHeap9's buffer (d_a_alink_link.inc:447): the size changeItemBck reads an item BCK into.
+const u32 l_heldItemBckBufSize = 0x800;
+
+/**
+ * The wire's PlayerHeldItemBck ids, and the resource and held kind each one is. Every BCK
+ * setBowModel / setSlingModel / changeItemBck can leave in his mItemBck for a bow or slingshot
+ * (d_a_alink_bow.inc:55-68, :204-252, :282-300, :367, :511-543). The ONE table both ends use: the
+ * sender maps through daRemotePlayer_heldItemBckToWire, the puppet indexes it. The indices are the
+ * same in every region's AlAnm.h.
+ */
+struct HeldItemBckEntry {
+    u16 mResIdx;
+    u8 mKind;
+};
+const HeldItemBckEntry l_heldItemBck[dusk::mp::kPlayerHeldBckNum] = {
+    {0xFFFF, dusk::mp::kPlayerHeldNone},
+    {dRes_ID_ALANM_BCK_BVJMPCL_e, dusk::mp::kPlayerHeldBow},
+    {dRes_ID_ALANM_BCK_BVJMPCH_e, dusk::mp::kPlayerHeldBow},
+    {dRes_ID_ALANM_BCK_BASHOOT_e, dusk::mp::kPlayerHeldBow},
+    {dRes_ID_ALANM_BCK_BASHOOTTAME_e, dusk::mp::kPlayerHeldBow},
+    {dRes_ID_ALANM_BCK_BARELORD_e, dusk::mp::kPlayerHeldBow},
+    {dRes_ID_ALANM_BCK_BARELORDTAME_e, dusk::mp::kPlayerHeldBow},
+    {dRes_ID_ALANM_BCK_PWAIT_e, dusk::mp::kPlayerHeldSlingshot},
+    {dRes_ID_ALANM_BCK_PSHOOT_e, dusk::mp::kPlayerHeldSlingshot},
+    {dRes_ID_ALANM_BCK_PRELORD_e, dusk::mp::kPlayerHeldSlingshot},
+};
+
+/// daArrow_c::createHeap's models for types 0 and 1 (d_a_arrow.cpp:31-39), in the private mount.
+const u16 l_heldArrowResIdx[2] = {
+    dRes_INDEX_ALINK_BMD_AL_ARROW_e, dRes_INDEX_ALINK_BMD_AL_ARROWB_e};
+
 }  // namespace
+
+u8 daRemotePlayer_heldItemBckToWire(u16 i_resIdx, u8 i_kind) {
+    for (int i = 1; i < dusk::mp::kPlayerHeldBckNum; i++) {
+        if (l_heldItemBck[i].mResIdx == i_resIdx && l_heldItemBck[i].mKind == i_kind) {
+            return static_cast<u8>(i);
+        }
+    }
+    return dusk::mp::kPlayerHeldBckNone;
+}
 
 /* The wire's PlayerHeldItem values index mpHeldModel, which the header sizes as a bare 9 for the
  * same reason mpSwordModel is a bare 3. STATIC_ASSERT is a no-op off the GC target (see the shield
  * one); held_kind() is the real guard. */
 STATIC_ASSERT(dusk::mp::kPlayerHeldKindNum == 9);
+// Likewise mpHeldItemBckAnm's bare 10; setHeldItemBck bounds the id against the enum at runtime.
+STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 10);
 
 /**
  * Build every handheld item model the puppet might need, once, at createHeap time. Called LAST in
@@ -179,9 +226,13 @@ STATIC_ASSERT(dusk::mp::kPlayerHeldKindNum == 9);
  *   - boomerang: Alink al_boom (0x1F), 0x80000 / 0x11000084 (d_a_boomerang.cpp:1406)
  *   - lantern: al_kantera.bmd from the OUTFIT archive, initModelEnv 0 (d_a_alink_wolf.inc:405)
  *
- * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the item BCKs (bow
- * string, clawshot spin, tip open), the lantern glow, the clawshot chain. The model is in the hand;
- * those are its motion. Every load is individually non-fatal.
+ * Also built (protocol v19 block A): the bow's and slingshot's item BCKs — every one his mItemBck
+ * can hold for them, read with mAnmHeap9's 0x800 — on one mDoExt_bckAnm as his is; and the two
+ * arrow models daArrow_c draws while nocked (AL_ARROW / AL_ARROWB, from the private Alink mount).
+ *
+ * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the clawshot's
+ * item BCKs (spin, tip open), the lantern glow, the clawshot chain, the bomb arrow's fuse smoke
+ * particles. Every load is individually non-fatal.
  */
 void daRemotePlayer_c::setupHeldItems() {
     for (int i = 0; i < dusk::mp::kPlayerHeldKindNum; i++) {
@@ -212,6 +263,23 @@ void daRemotePlayer_c::setupHeldItems() {
     mUpper2AppliedMorf = 0;
     mHeldLogCount = 0;
     mLoggedLantern = false;
+    // --- held items: bottle/bow (agent A) ---
+    for (int i = 0; i < dusk::mp::kPlayerHeldBckNum; i++) {
+        mpHeldItemBckAnm[i] = NULL;
+    }
+    mHeldItemBckReady = false;
+    mHeldItemBckShown = dusk::mp::kPlayerHeldBckNone;
+    mpHeldArrowModel[0] = NULL;
+    mpHeldArrowModel[1] = NULL;
+    dKy_tevstr_init(&mHeldArrowTevStr, static_cast<s8>(fopAcM_GetRoomNo(this)), 0xFF);
+    mHeldArrowFuse = 0;
+    mHeldArrowWasNocked = false;
+    mNetHeldBck = 0;
+    mNetHeldBckFrame = 0;
+    mHeldArrowDrawn = 0xFF;
+    mHeldItemBckWanted = dusk::mp::kPlayerHeldBckNone;
+    mLoggedArrowMissing = false;
+    mHeldBckLogCount = 0;
 
     JKRHeap* heap = JKRGetCurrentHeap();
     const s32 freeBefore = heap != NULL ? heap->getFreeSize() : 0;
@@ -304,6 +372,46 @@ void daRemotePlayer_c::setupHeldItems() {
                 0, "held lantern");
     }
 
+    // --- held items: bottle/bow (agent A) ---
+    /* The bow's and slingshot's own BCKs. Only for a model that loaded: a BCK with no model to
+     * pose is heap spent on nothing. mHeldItemBck is built on the first one, exactly as setBowModel
+     * builds his (init, play FALSE, attr 2 — d_a_alink_bow.inc:517), and every later switch is
+     * changeBckOnly: one J3DMtxCalcAnimation, made here in the solid heap, never at runtime. */
+    int bckBuilt = 0;
+    int bckWanted = 0;
+    for (int i = 1; i < dusk::mp::kPlayerHeldBckNum; i++) {
+        if (mpHeldModel[l_heldItemBck[i].mKind] == NULL) {
+            continue;
+        }
+        bckWanted++;
+        mpHeldItemBckAnm[i] = static_cast<J3DAnmTransform*>(held_load_aram_anm(
+            l_heldItemBck[i].mResIdx, 0, "item bck", l_heldItemBckBufSize));
+        if (mpHeldItemBckAnm[i] == NULL) {
+            continue;
+        }
+        bckBuilt++;
+        if (!mHeldItemBckReady) {
+            mHeldItemBckReady =
+                mHeldItemBck.init(mpHeldItemBckAnm[i], FALSE, 2, 1.0f, 0, -1, false) != 0;
+        }
+    }
+    /* The arrow: daArrow_c::createHeap's raw create, 0x80000 / 0x11000084 (d_a_arrow.cpp:42) —
+     * init_model's flags exactly. Resident data in the private mount, so only the instance is new.
+     * Only with a bow to nock it on. */
+    if (mpHeldModel[dusk::mp::kPlayerHeldBow] != NULL) {
+        for (int i = 0; i < 2; i++) {
+            if (held_heap_fits(0, "arrow")) {
+                mpHeldArrowModel[i] = init_model(
+                    static_cast<J3DModelData*>(own_archive_idx(mAlinkRes, l_heldArrowResIdx[i])), 0,
+                    i == 0 ? "held arrow" : "held bomb arrow");
+            }
+        }
+    }
+    Log.info("Puppet {} held bow/sling BCKs {}/{} (calc {}), arrows {}/{}", mPlayerId, bckBuilt,
+        bckWanted, mHeldItemBckReady ? "ok" : "MISSING",
+        mpHeldArrowModel[0] != NULL ? "ok" : "MISSING",
+        mpHeldArrowModel[1] != NULL ? "ok" : "MISSING");
+
     int built = 0;
     for (int i = 1; i < dusk::mp::kPlayerHeldKindNum; i++) {
         if (mpHeldModel[i] != NULL) {
@@ -337,6 +445,12 @@ void daRemotePlayer_c::setNetworkHeldItem(u8 i_kind, u8 i_flags, u8 i_mat, u16 i
     mNetUpper2Morf = i_upper2Morf;
 }
 
+// --- held items: bottle/bow (agent A) ---
+void daRemotePlayer_c::setNetworkHeldItemBck(u8 i_bck, u8 i_frame) {
+    mNetHeldBck = i_bck;
+    mNetHeldBckFrame = i_frame;
+}
+
 /// daAlink_c::bottleModelCallBack (d_a_alink_bottle.inc:13-21): the cork, joint 1, rides the right
 /// item joint. Runs inside the bottle's calc, after the body's, so the joint matrix is final.
 int daRemotePlayer_c::heldBottleCallBack() {
@@ -361,6 +475,12 @@ int daRemotePlayer_c::heldBottleCallBack() {
 void daRemotePlayer_c::setHeldItemMatrix() {
     const u8 kind = mNetHeldKind;
     J3DModel* held = mpHeldModel[kind];
+
+    if (held == NULL ||
+        (kind != dusk::mp::kPlayerHeldBow && kind != dusk::mp::kPlayerHeldSlingshot))
+    {
+        mHeldItemBckShown = dusk::mp::kPlayerHeldBckNone;
+    }
 
     if (held != NULL) {
         switch (kind) {
@@ -410,6 +530,8 @@ void daRemotePlayer_c::setHeldItemMatrix() {
             } else {
                 held->setBaseTRMtx(model->getAnmMtx(l_rightItemJointNo));
             }
+            // v19 block A: his mItemBck, entered before the calc below as his is (:6083-6091).
+            setHeldItemBck(held, kind);
             break;
         case dusk::mp::kPlayerHeldClawshot:
         case dusk::mp::kPlayerHeldDoubleClawshot: {
@@ -488,6 +610,9 @@ void daRemotePlayer_c::setHeldItemMatrix() {
         }
     }
 
+    // v19 block A: the nocked arrow, its own actor's placement.
+    setHeldArrowMatrix();
+
     // The lantern (:6093-6111): in the left hand, or on the hip joint 0x10.
     if ((mNetHeldFlags & dusk::mp::kPlayerHeldLanternShown) != 0 && mpHeldLanternModel != NULL) {
         if ((mNetHeldFlags & dusk::mp::kPlayerHeldLanternInHand) != 0) {
@@ -532,7 +657,8 @@ void daRemotePlayer_c::drawHeldItems() {
         }
         mHeldDrawnKind = kind;
         mHeldDrawnFlags = static_cast<u8>(mNetHeldFlags & ~(dusk::mp::kPlayerHeldLanternShown |
-                                                              dusk::mp::kPlayerHeldLanternInHand));
+                                                              dusk::mp::kPlayerHeldLanternInHand |
+                                                              dusk::mp::kPlayerHeldArrowNocked));
         mHeldDrawnMat = mNetHeldMat;
 
         if (!mLoggedHeldDraw[kind]) {
@@ -557,6 +683,12 @@ void daRemotePlayer_c::drawHeldItems() {
                 (mNetHeldFlags & dusk::mp::kPlayerHeldLanternInHand) != 0 ? "in hand" : "on hip");
         }
     }
+
+    // v19 block A: the nocked arrow, whose own actor daAlink_c's draw does not enter.
+    drawHeldArrow();
+    if (mHeldArrowDrawn != 0xFF) {
+        mHeldDrawnFlags |= dusk::mp::kPlayerHeldArrowNocked;
+    }
 }
 
 /// The held models cast into the puppet's real shadow, as his do (d_a_alink.cpp:19312-19345).
@@ -580,6 +712,169 @@ void daRemotePlayer_c::addHeldItemShadow() {
     }
     if ((mHeldDrawnFlags & dusk::mp::kPlayerHeldLanternShown) != 0) {
         dComIfGd_addRealShadow(mShadowKey, mpHeldLanternModel);
+    }
+}
+
+/* --- held items: bottle/bow (agent A) --------------------------------------------------------- */
+
+/**
+ * The bow / slingshot model's own animation: daAlink_c::setItemMatrix's
+ * `mItemBck.entry(mHeldItemModel->getModelData(), field_0x33dc)` (d_a_alink.cpp:6083-6089), with
+ * the sender's BCK and frame. From setHeldItemMatrix, after the base matrix and before the calc.
+ *
+ * The id must name a BCK for THIS kind (a bow BCK on the slingshot's joints would pose garbage);
+ * anything else — none, an older peer, a BCK that did not load — takes the hook off joint 0 and the
+ * model draws in its bind pose, which is what it did before this existed. The animation objects
+ * are the puppet's own and this is their only frame driver (memory: J3D anms hold their own frame).
+ */
+void daRemotePlayer_c::setHeldItemBck(J3DModel* i_held, u8 i_kind) {
+    u8 id = static_cast<u8>(mNetHeldBck & dusk::mp::kPlayerHeldBckIdMask);
+    if (id >= dusk::mp::kPlayerHeldBckNum || l_heldItemBck[id].mKind != i_kind) {
+        id = dusk::mp::kPlayerHeldBckNone;
+    }
+    J3DAnmTransform* bck = mHeldItemBckReady ? mpHeldItemBckAnm[id] : NULL;
+
+    if (id != mHeldItemBckWanted && mHeldBckLogCount < l_heldLogMax) {
+        mHeldBckLogCount++;
+        Log.debug("Puppet {} held item BCK {} -> {} (res {}, kind {}, frame {}/255){}", mPlayerId,
+            static_cast<unsigned>(mHeldItemBckWanted), static_cast<unsigned>(id),
+            id != dusk::mp::kPlayerHeldBckNone ? static_cast<int>(l_heldItemBck[id].mResIdx) : -1,
+            static_cast<unsigned>(i_kind), static_cast<unsigned>(mNetHeldBckFrame),
+            id != dusk::mp::kPlayerHeldBckNone && bck == NULL ? " NOT LOADED, bind pose" : "");
+    }
+    mHeldItemBckWanted = id;
+
+    if (bck == NULL) {
+        if (mHeldItemBckReady) {
+            mHeldItemBck.remove(i_held->getModelData());
+        }
+        mHeldItemBckShown = dusk::mp::kPlayerHeldBckNone;
+        return;
+    }
+
+    if (mHeldItemBck.getBckAnm() != bck) {
+        mHeldItemBck.changeBckOnly(bck);
+    }
+    const f32 frameMax = bck->getFrameMax();
+    f32 frame = frameMax * static_cast<f32>(mNetHeldBckFrame) / 255.0f;
+    // setItemMatrix's own clamp (:6084-6086): never frameMax itself.
+    if (frame >= frameMax) {
+        frame = frameMax - 0.001f;
+    }
+    if (frame < 0.0f) {
+        frame = 0.0f;
+    }
+    mHeldItemBck.entry(i_held->getModelData(), frame);
+    mHeldItemBckShown = id;
+}
+
+u8 daRemotePlayer_c::getHeldItemBckDrawnFrame() const {
+    if (mHeldItemBckShown == dusk::mp::kPlayerHeldBckNone || !mHeldItemBckReady) {
+        return 0;
+    }
+    J3DAnmTransform* bck = mpHeldItemBckAnm[mHeldItemBckShown];
+    if (bck == NULL || !(bck->getFrameMax() > 0)) {
+        return 0;
+    }
+    const f32 f = bck->getFrame() / bck->getFrameMax();
+    return static_cast<u8>(f <= 0.0f ? 0.0f : (f >= 1.0f ? 255.0f : f * 255.0f + 0.5f));
+}
+
+/**
+ * The nocked arrow's placement: daArrow_c::setKeepMatrix for types 0/1 (d_a_arrow.cpp:414-417) —
+ * `YrotS(-0x8000)` then `revConcat(getLeftItemMatrix())`, his left item joint turned half a turn
+ * about Y. From setHeldItemMatrix, once per tick, after the body's calc. Also ticks the bomb
+ * arrow's fuse, which daArrow_c::execute burns down every tick it is alive, nocked or not
+ * (d_a_arrow.cpp:1038-1041), from the full getBombExplodeTime() it was made with (:1198).
+ */
+void daRemotePlayer_c::setHeldArrowMatrix() {
+    const bool nocked = (mNetHeldFlags & dusk::mp::kPlayerHeldArrowNocked) != 0;
+    const bool bomb = (mNetHeldBck & dusk::mp::kPlayerHeldBckBombArrow) != 0;
+    // A fresh fuse whenever there was no bomb arrow last tick — including changeArrowType's
+    // same-tick swap, which deletes the arrow and makes a new one (d_a_alink_bow.inc:180-183).
+    if (!(nocked && bomb) || !mHeldArrowWasNocked) {
+        daAlink_c* link = daAlink_getAlinkActorClass();
+        mHeldArrowFuse = link != NULL ? link->getBombExplodeTime() : 0;
+    } else if (mHeldArrowFuse > 0) {
+        mHeldArrowFuse--;
+    }
+    mHeldArrowWasNocked = nocked && bomb;
+
+    J3DModel* arrow = mpHeldArrowModel[bomb ? 1 : 0];
+    if (!nocked || arrow == NULL || model == NULL) {
+        return;
+    }
+    mDoMtx_stack_c::YrotS(-0x8000);
+    mDoMtx_stack_c::revConcat(model->getAnmMtx(l_leftItemJointNo));
+    arrow->setBaseTRMtx(mDoMtx_stack_c::get());
+    arrow->calc();
+}
+
+/**
+ * Enter the nocked arrow, as daArrow_c::draw does (d_a_arrow.cpp:1073-1129): its own tevStr, type
+ * 0 at its own position (not Link's type 10), MAJI, and no mirror entry — the arrow actor makes
+ * none. The bomb arrow's material-1 C1 is its fuse pulse, set for this draw and zeroed after, as
+ * his is; the freeze tint (field_0x943) is not replicated. ★ Hang 4: one entry per pass — draw()
+ * carries the per-sim-tick guard and this is called once from drawHeldItems.
+ */
+void daRemotePlayer_c::drawHeldArrow() {
+    const u8 previous = mHeldArrowDrawn;
+    mHeldArrowDrawn = 0xFF;
+    const bool nocked = (mNetHeldFlags & dusk::mp::kPlayerHeldArrowNocked) != 0;
+    const u8 type = (mNetHeldBck & dusk::mp::kPlayerHeldBckBombArrow) != 0 ? 1 : 0;
+    J3DModel* arrow = mpHeldArrowModel[type];
+    if (nocked && arrow != NULL) {
+        cXyz pos;
+        mDoMtx_multVecZero(arrow->getBaseTRMtx(), &pos);
+        // The arrow actor is made in his room (makeArrow, d_a_arrow.h:76-85), and the puppet keeps
+        // its own tevStr.room_no on the floor it stands on.
+        mHeldArrowTevStr.room_no = tevStr.room_no;
+        g_env_light.settingTevStruct(0, &pos, &mHeldArrowTevStr);
+
+        J3DGXColorS10 color;
+        color.r = 0;
+        color.g = 0;
+        color.b = 0;
+        color.a = 0;
+        const bool pulse = type == 1 && arrow->getModelData()->getMaterialNum() > 1;
+        if (pulse) {
+            // d_a_arrow.cpp:1095-1109, with this end's fuse.
+            daAlink_c* link = daAlink_getAlinkActorClass();
+            const s16 explodeTime = link != NULL ? link->getBombExplodeTime() : 0;
+            const s16 fuse = mHeldArrowFuse;
+            f32 r = 0.0f;
+            if ((explodeTime >> 4) != 0) {
+                if (fuse > explodeTime >> 1) {
+                    r = fabsf(cM_fsin((fuse - (explodeTime >> 1)) * M_PI / (explodeTime >> 2)));
+                } else if (fuse > explodeTime >> 2) {
+                    r = fabsf(cM_fsin((fuse - (explodeTime >> 2)) * M_PI / (explodeTime >> 3)));
+                } else {
+                    r = fabsf(cM_fsin((fuse - (explodeTime >> 3)) * M_PI / (explodeTime >> 4)));
+                }
+            }
+            color.r = (u8)(r * 50.0f);
+            arrow->getModelData()->getMaterialNodePointer(1)->setTevColor(1, &color);
+        }
+
+        g_env_light.setLightTevColorType_MAJI(arrow, &mHeldArrowTevStr);
+        mDoExt_modelEntryDL(arrow);
+
+        if (pulse) {
+            color.r = 0;
+            arrow->getModelData()->getMaterialNodePointer(1)->setTevColor(1, &color);
+        }
+        mHeldArrowDrawn = type;
+    } else if (nocked && !mLoggedArrowMissing) {
+        mLoggedArrowMissing = true;
+        Log.warn("Puppet {} told an arrow (type {}) is nocked but has no model for it", mPlayerId,
+            static_cast<unsigned>(type));
+    }
+
+    if (mHeldArrowDrawn != previous && mHeldBckLogCount < l_heldLogMax) {
+        mHeldBckLogCount++;
+        Log.debug("Puppet {} nocked arrow {} -> {}", mPlayerId, previous == 0xFF ? "none" :
+            (previous == 1 ? "bomb" : "normal"), mHeldArrowDrawn == 0xFF ? "none" :
+            (mHeldArrowDrawn == 1 ? "bomb" : "normal"));
     }
 }
 

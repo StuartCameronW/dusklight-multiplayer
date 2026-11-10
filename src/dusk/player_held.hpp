@@ -72,7 +72,43 @@ enum PlayerHeldFlags : std::uint8_t {
     kPlayerHeldClawRight = 1 << 5,
     /// Double clawshot: the second one is drawn too — not guarding (d_a_alink.cpp:19779-19789).
     kPlayerHeldClawBoth = 1 << 6,
+    /// An arrow is nocked: the actor in mItemAcKeep is a daArrow_c still in procWait (checkWait(),
+    /// not deleteArrow()ed), so it draws itself on his left item joint every frame
+    /// (daArrow_c::setKeepMatrix / draw, d_a_arrow.cpp:402-423, :1073-1129). Independent of
+    /// heldItem: the arrow is its own actor. Its kind is kPlayerHeldBckBombArrow in heldBck.
+    kPlayerHeldArrowNocked = 1 << 7,
 };
+
+/**
+ * PlayerState::heldBck (protocol v19 block A), bits 0-3: WHICH BCK is animating the bow or
+ * slingshot model itself — daAlink_c's mItemBck, the string pull and limb bend. It is whatever
+ * changeItemBck() last loaded into mAnmHeap9 (d_a_alink.cpp:14386-14397), entered on the item model
+ * with field_0x33dc every tick by setItemMatrix (:6083-6089). These are every resource
+ * setBowModel / setSlingModel / changeItemBck can put there (d_a_alink_bow.inc); the puppet maps
+ * the id back to the resource. Ids are the wire's, not resource numbers, so they fit in 4 bits.
+ */
+enum PlayerHeldItemBck : std::uint8_t {
+    kPlayerHeldBckNone = 0,
+    kPlayerHeldBckBowJumpClose = 1,     ///< BVJMPCL: setBowModel's and setBowNormalAnime's
+    kPlayerHeldBckBowJumpHang = 2,      ///< BVJMPCH: setBowHangAnime
+    kPlayerHeldBckBowShoot = 3,         ///< BASHOOT: setBowReadyAnime, and an uncharged release
+    kPlayerHeldBckBowShootCharged = 4,  ///< BASHOOTTAME: a charged release (field_0x301c == 0)
+    kPlayerHeldBckBowReload = 5,        ///< BARELORD: setBowReloadAnime, drawing the string
+    kPlayerHeldBckBowReloadCharge = 6,  ///< BARELORDTAME: held at full draw
+    kPlayerHeldBckSlingWait = 7,        ///< PWAIT: setSlingModel's, and setBowNormalAnime's
+    kPlayerHeldBckSlingShoot = 8,       ///< PSHOOT
+    kPlayerHeldBckSlingReload = 9,      ///< PRELORD
+    kPlayerHeldBckNum = 10,
+};
+constexpr std::uint8_t kPlayerHeldBckIdMask = 0x0F;
+/// heldBck bit 4: the nocked arrow (kPlayerHeldArrowNocked) is a bomb arrow — daArrow_c type 1,
+/// AL_ARROWB, rather than type 0, AL_ARROW (daArrow_c::createHeap, d_a_arrow.cpp:24-46).
+constexpr std::uint8_t kPlayerHeldBckBombArrow = 0x10;
+
+/* PlayerState::heldBckFrame (v19 block A): the frame that BCK was entered with — mItemBck's
+ * animation frame after setItemMatrix clamped field_0x33dc below getFrameMax() — as a fraction of
+ * getFrameMax(), x255. 255 is "the end", which the receiver clamps to frameMax - 0.001 as he does.
+ * Meaningless while the id is kPlayerHeldBckNone. */
 
 /* PlayerState::heldMat, per kind. The material animation frames Link's held model is showing.
  *

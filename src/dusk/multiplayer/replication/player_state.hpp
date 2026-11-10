@@ -301,7 +301,8 @@ inline std::uint32_t location_stage_hash(const char* name) {
 /// 1-byte `gear` (offset 47), then the protocol-15 fields, in order: `locPhase` (offset 48),
 /// 12 bytes of action slot 1 / swim (block 4, offset 49), 9 bytes of held item (block 3,
 /// offset 61), then the protocol-16 location (offset 70: u32 stageHash, s8 roomNo at 74,
-/// u8 locEpoch at 75). Sent unreliably at the sim rate, so it has to stay small.
+/// u8 locEpoch at 75). Protocol 19 appends after locEpoch; its block A (bow) is 2 bytes: u8
+/// heldBck, u8 heldBckFrame. Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -541,7 +542,8 @@ struct PlayerState {
      * (player_bridge.cpp fill_held_item):
      *
      *   heldItem      PlayerHeldItem: the mHeldItemModel he placed AND checkItemDraw() let through.
-     *   heldFlags     PlayerHeldFlags: lantern, which hand, the bottle cork, the second clawshot.
+     *   heldFlags     PlayerHeldFlags: lantern, which hand, the bottle cork, the second clawshot,
+     *                 and (v19) a nocked arrow.
      *   heldMat       the held model's material animation frames (see player_held.hpp).
      *   upper2Idx     mUpperAnmHeap[UPPER_2].getIdx(), the item hold/aim overlay BCK (ALANM only);
      *                 kPlayerActNone = no overlay.
@@ -582,6 +584,26 @@ struct PlayerState {
     std::uint32_t stageHash = 0;
     std::int8_t roomNo = -1;
     std::uint8_t locEpoch = 0;
+
+    // v19 block A: bow (after the attack block)
+    /**
+     * The bow / slingshot model's own animation (daAlink_c's mItemBck), and the nocked arrow's
+     * kind. 2 bytes, read after his setItemMatrix entered them (player_bridge.cpp fill_held_item):
+     *
+     *   heldBck       bits 0-3 PlayerHeldItemBck: which BCK is in mItemBck (0 = none / not a bow or
+     *                 slingshot); bit 4 kPlayerHeldBckBombArrow: the arrow flagged by
+     *                 kPlayerHeldArrowNocked is a bomb arrow.
+     *   heldBckFrame  that BCK's entered frame / getFrameMax(), x255.
+     *
+     * The id and the arrow bit are discrete; the frame blends within one BCK — see lerp_state.
+     */
+    std::uint8_t heldBck = 0;
+    std::uint8_t heldBckFrame = 0;
+
+    std::uint8_t held_bck_id() const {
+        return static_cast<std::uint8_t>(heldBck & kPlayerHeldBckIdMask);
+    }
+    float held_bck_frame_unit() const { return static_cast<float>(heldBckFrame) / 255.0f; }
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
 
@@ -662,6 +684,9 @@ struct PlayerState {
         w.write_u32(stageHash);
         w.write_u8(static_cast<std::uint8_t>(roomNo));
         w.write_u8(locEpoch);
+        // v19 block A: bow (after the attack block)
+        w.write_u8(heldBck);
+        w.write_u8(heldBckFrame);
     }
 
     bool read(Reader& r) {
@@ -694,7 +719,9 @@ struct PlayerState {
                 r.read_u16(upper2Idx) && r.read_u16(upper2Frame) && r.read_u8(upper2Ratio) &&
                 r.read_u8(upper2Morf) &&
                 // v16: location
-                r.read_u32(stageHash) && r.read_u8(room) && r.read_u8(locEpoch)))
+                r.read_u32(stageHash) && r.read_u8(room) && r.read_u8(locEpoch) &&
+                // v19 block A: bow (after the attack block)
+                r.read_u8(heldBck) && r.read_u8(heldBckFrame)))
         {
             return false;
         }
@@ -906,6 +933,22 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.stageHash = b.stageHash;
     out.roomNo = b.roomNo;
     out.locEpoch = b.locEpoch;
+
+    // v19 block A: bow (after the attack block). The id and the arrow bit are discrete. The frame
+    // blends only within one BCK and only forward — block 3's overlay rule: a release or reload
+    // swaps the BCK (changeItemBck), and the wait free-runs into the end clamp, so anything else
+    // takes b whole.
+    out.heldBck = b.heldBck;
+    out.heldBckFrame = b.heldBckFrame;
+    if (a.held_bck_id() != kPlayerHeldBckNone && a.held_bck_id() == b.held_bck_id() &&
+        b.heldBckFrame >= a.heldBckFrame)
+    {
+        const float frameT = t > 1.0f ? 1.0f : t;
+        const float frame =
+            a.held_bck_frame_unit() + (b.held_bck_frame_unit() - a.held_bck_frame_unit()) * frameT;
+        out.heldBckFrame = static_cast<std::uint8_t>(
+            frame <= 0.0f ? 0.0f : (frame >= 1.0f ? 255.0f : frame * 255.0f + 0.5f));
+    }
     return out;
 }
 
