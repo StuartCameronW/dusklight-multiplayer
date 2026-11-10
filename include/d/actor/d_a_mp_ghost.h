@@ -182,6 +182,42 @@ private:
     void executeBoom();
     int drawBoom();
     void eventBoom(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    /// The blade's matrix (daBoomerang_c::setMoveMatrix's second half) from the pose and the spin.
+    void setBoomBladeMatrix();
+    /// Calc the tornado model with this ghost's own bck frame and joint-4 callback, putting the
+    /// SHARED model data's root mtxCalc, joint-4 callback and bck frame back afterwards.
+    void calcBoomShippu();
+    /// The trace and wind particles (daBoomerang_c::setEffect's thrown branch, minus the BG ones).
+    void setBoomEffect();
+
+    /* mpModel is the tornado ("shippu") model: updateMatrix() gives it exactly the matrix
+     * setMoveMatrix does (trans * ZXYrot(shape_angle)). The blade has its own model. */
+    J3DModel* mpBoomBlade;
+    /// "Alink" btk 0x48, the tornado's scrolling texture. An archive resource SHARED with the local
+    /// player's own daBoomerang_c: this ghost sets its own frame around its own draw only.
+    J3DAnmTextureSRTKey* mpBoomWindBtk;
+    /// "Alink" bck 0x13 on the tornado. Owns its J3DMtxCalc (this ghost's heap); the transform
+    /// itself is the shared archive resource.
+    mDoExt_bckAnm mBoomShippuBck;
+    /// The tornado's level sound and the blade's whoosh. Its destructor (deleteObject) is the
+    /// teardown, run by ~daMpGhost_c with every other member.
+    Z2SoundObjSimple mBoomSound;
+    f32 mBoomShippuFrame;
+    f32 mBoomWindBtkFrame;
+    f32 mBoomShippuSize;
+    /// m_modelRotY: -0x1F00 a tick from 0 at the throw, run here rather than sent.
+    s16 mBoomSpin;
+    u16 mBoomAge;
+    u8 mBoomBits;
+    u8 mBoomLocks;
+    bool mBoomCaught;
+    bool mBoomLogged;
+    /// Level-emitter ids (0x1FE, 0x1FF, 0x24C). A level emitter that is not refreshed for one
+    /// frame is cut by dPa_control_c::level_c::execute, so hiding or deleting the ghost ends them
+    /// the way the real boomerang's do; these are zeroed whenever they stop being refreshed.
+    u32 mBoomFx[3];
+    /// mExecuteCount at the last tornado calc: once per sim tick, not once per draw call.
+    u32 mBoomCalcTick;
     /* ==== end boom ==== */
 
     /* ==== Dominion Rod ball (0x08): d_a_mp_ghost_crod.inc ==== */

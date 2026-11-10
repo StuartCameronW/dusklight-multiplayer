@@ -188,8 +188,9 @@ inline constexpr ObjKindInfo kObjKinds[] = {
     // Event-only: an Explode event on a bomb (or a bomb arrow) replays as a real, masked
     // explosion-only daNbomb_c (daMpGhost_spawnRemoteExplosion), never a ghost of its own.
     {ObjKind::Explosion, "explosion", 0, 0, 0, false},
-    // d_a_boomerang.cpp:1476.
-    {ObjKind::Boomerang, "boomerang", 1, 15, 0xC0D0, false},
+    // d_a_boomerang.cpp:1476. Most of that is the lock-on sight's 2D screens, which the ghost
+    // never loads; the solid heap is trimmed to what was used after create.
+    {ObjKind::Boomerang, "boomerang", 1, 15, 0xC0D0, true},
     // d_a_crod.cpp:81.
     {ObjKind::RodBall, "rodball", 1, 15, 0x10C0, false},
     {ObjKind::Carry, "carry", 1, 15, 0, false},
