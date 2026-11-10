@@ -704,8 +704,10 @@ struct PlayerState {
     // v20 effects block (after the iron ball block): 2 bytes, always on the wire.
     /**
      *   fxFlags   PlayerFx bits, see above.
-     *   dmgFlash  the sender's damage-flash timer as daAlink_c drives his body tint from it
-     *             (0 = no flash). Its exact meaning is set by the damage-flash feature.
+     *   dmgFlash  the timer behind fxFlags' tint kind (PlayerDmgTint, dusk/player_fx.hpp):
+     *             Damage = his mDamageTimer + mDamageColorTime, Ice = his mIceDamageWaitTimer,
+     *             each clamped to 0..255; 0 for Freeze and None. Not interpolated: the |sin| pulse
+     *             it drives is 16 ticks long, so the receiver uses each tick's value as sent.
      */
     std::uint8_t fxFlags = 0;
     std::uint8_t dmgFlash = 0;

@@ -16,6 +16,7 @@
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_com_inf_game.h"
 #include "dusk/logging.h"
+#include "dusk/player_fx.hpp"
 #include "f_op/f_op_actor_mng.h"
 #include "m_Do/m_Do_mtx.h"
 
@@ -1596,6 +1597,130 @@ void fill_attack(daAlink_c* alink, PlayerState& out) {
     out.atSpl = static_cast<std::uint8_t>(cps[0].GetAtSpl());
 }
 
+// --- damage flash + lantern fx (agent D) ---
+namespace {
+
+const char* dmg_tint_name(std::uint8_t i_kind) {
+    switch (i_kind) {
+    case kPlayerDmgTintDamage:
+        return "damage";
+    case kPlayerDmgTintFreeze:
+        return "freeze";
+    case kPlayerDmgTintIce:
+        return "ice";
+    default:
+        return "none";
+    }
+}
+
+/**
+ * The damage tint: WHICH branch of daAlink_c::draw's tint ladder he took this tick
+ * (d_a_alink.cpp:19530-19583) and the timer that branch reads. The ladder is an else-if chain, so
+ * it is walked in his order and the first branch that holds wins, including the three above the
+ * damage tints that this feature does not reproduce: while one of those owns his colour, None is
+ * sent rather than a tint he is not showing.
+ *
+ * The damage branch is entered on mDamageTimer alone; with the Magic Armor absorbing the hit
+ * (checkMagicArmorNoDamage) it then tints nothing AND skips the ice test below it, so that case
+ * sends None, as the chain does.
+ *
+ * Idempotent within a tick (capture runs twice, see fill_action_anim): the statics only gate logs.
+ */
+void fill_damage_flash(daAlink_c* alink, PlayerState& out) {
+    static std::uint8_t s_lastKind = 0;
+    static std::uint16_t s_logCount = 0;
+
+    if (alink == nullptr) {
+        s_lastKind = kPlayerDmgTintNone;
+        return;
+    }
+
+    std::uint8_t kind = kPlayerDmgTintNone;
+    int timer = 0;
+    if (alink->field_0x06f4 != nullptr || alink->mProcID == daAlink_c::PROC_METAMORPHOSE ||
+        alink->mProcID == daAlink_c::PROC_DUNGEON_WARP ||
+        alink->mProcID == daAlink_c::PROC_DUNGEON_WARP_SCN_START || alink->field_0x346c != 0.0f)
+    {
+        // A higher branch of his ladder owns the colour; none of them is a damage tint.
+    } else if (alink->checkFreezeDamage()) {
+        kind = kPlayerDmgTintFreeze;
+    } else if (alink->mDamageTimer != 0) {
+        if (!alink->checkMagicArmorNoDamage()) {
+            kind = kPlayerDmgTintDamage;
+            timer = alink->mDamageTimer + alink->mDamageColorTime;
+        }
+    } else if (alink->mIceDamageWaitTimer != 0) {
+        kind = kPlayerDmgTintIce;
+        timer = alink->mIceDamageWaitTimer;
+    }
+
+    out.fxFlags |=
+        static_cast<std::uint8_t>((kind << kPlayerFxDmgTintShift) & kPlayerFxDmgTintMask);
+    out.dmgFlash = static_cast<std::uint8_t>(std::clamp(timer, 0, 255));
+
+    if (kind != s_lastKind) {
+        if (s_logCount < 64) {
+            s_logCount++;
+            Log.debug("Local damage tint {} -> {}: dmgFlash {} (mDamageTimer {}, colorTime {}, "
+                      "iceTimer {}, proc 0x{:X})",
+                dmg_tint_name(s_lastKind), dmg_tint_name(kind), static_cast<unsigned>(out.dmgFlash),
+                static_cast<int>(alink->mDamageTimer),
+                static_cast<unsigned>(alink->mDamageColorTime),
+                static_cast<int>(alink->mIceDamageWaitTimer),
+                static_cast<unsigned>(alink->mProcID));
+        }
+        s_lastKind = kind;
+    }
+}
+
+/**
+ * kPlayerFxLanternLit: his flame is burning. This is the condition daAlink_c::setLight refreshes
+ * the ZI_J_KANTERA_FIRE emitter and the glow under (d_a_alink.cpp:14862-14888), transcribed for the
+ * case the wire can show at all — the lantern out (FLG2_UNK_1, which is kPlayerHeldLanternShown):
+ * oil left, not snuffed (FLG2_KANDELAAR_LIGHT_OFF: set while pouring or scooping oil into it,
+ * d_a_alink_kandelaar.inc:276, d_a_alink_bottle.inc:578, and by d_a_npc_bans.cpp:1342), and not
+ * frozen. The ERFLG1_UNK_4 / _10 half is setKandelaarMtx's cutscene lantern, which clears
+ * FLG2_UNK_1 as it takes over (d_a_alink_kandelaar.inc:37-52), so it never reaches here.
+ *
+ * Not his FLG1_UNK_80, though that is the flag his setLight sets for the same thing: the Light
+ * Sword sets it too (:14911-14914), so it would light a cold lantern on the hip of a player holding
+ * the Light Sword. It is compared, and a disagreement in the other direction (predicate lit, flag
+ * off) is logged once, because that one would mean this transcription has missed a branch.
+ */
+void fill_lantern_fx(daAlink_c* alink, PlayerState& out) {
+    static bool s_lastLit = false;
+    static std::uint16_t s_logCount = 0;
+    static bool s_loggedDisagree = false;
+
+    const bool lit = alink != nullptr && !alink->checkWolf() &&
+                     (out.heldFlags & kPlayerHeldLanternShown) != 0 &&
+                     alink->checkNoResetFlg2(daPy_py_c::FLG2_UNK_1) && dComIfGs_getOil() != 0 &&
+                     !alink->checkNoResetFlg2(daPy_py_c::FLG2_KANDELAAR_LIGHT_OFF) &&
+                     !alink->checkFreezeDamage();
+    if (lit) {
+        out.fxFlags |= kPlayerFxLanternLit;
+        if (!s_loggedDisagree && !alink->checkNoResetFlg1(daPy_py_c::FLG1_UNK_80)) {
+            s_loggedDisagree = true;
+            Log.warn("Local lantern reads lit but his FLG1_UNK_80 is off (proc 0x{:X}, oil {}); "
+                     "fill_lantern_fx's predicate may be missing a branch of setLight (logged "
+                     "once)",
+                static_cast<unsigned>(alink->mProcID), static_cast<unsigned>(dComIfGs_getOil()));
+        }
+    }
+
+    if (lit != s_lastLit) {
+        if (s_logCount < 64) {
+            s_logCount++;
+            Log.debug("Local lantern {} (oil {}, held 0x{:02x})", lit ? "LIT" : "out",
+                alink != nullptr ? static_cast<unsigned>(dComIfGs_getOil()) : 0u,
+                static_cast<unsigned>(out.heldFlags));
+        }
+        s_lastLit = lit;
+    }
+}
+
+}  // namespace
+
 bool capture_local_player(PlayerState& out) {
     if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
@@ -1758,6 +1883,8 @@ bool capture_local_player(PlayerState& out) {
     // v20: effects. Each feature ORs in only its own PlayerFx bits.
     out.fxFlags = 0;
     out.dmgFlash = 0;
+    fill_damage_flash(alink, out);  // fxFlags bits 4-5 + dmgFlash (agent D)
+    fill_lantern_fx(alink, out);    // fxFlags bit 0, after fill_held_item (agent D)
 
     return true;
 }
@@ -1953,6 +2080,8 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkIronBall(state.iron_ball_gait(),
         cXyz(state.iron_ball_x(), state.iron_ball_y(), state.iron_ball_z()), state.ironBallAngX,
         state.ironBallAngY, state.ironBallLinks, state.ironBallState);
+    puppet->setNetworkDamageLantern((state.fxFlags & kPlayerFxDmgTintMask) >> kPlayerFxDmgTintShift,
+        state.dmgFlash, (state.fxFlags & kPlayerFxLanternLit) != 0);  // v20 (agent D)
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.

@@ -2662,6 +2662,7 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     // actor's solid heap (Z2SoundObject.cpp:529-532); stopping every handle now, rather than in
     // ~Z2Creature after this body, means no sound can outlive the memory it points at.
     deleteSound();
+    deletePuppetEmitters(); // no particle emitter outlives its puppet (agent D)
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
@@ -8236,6 +8237,7 @@ int daRemotePlayer_c::execute() {
     traceCalc("setMatrix");
     setMatrix();
     setHeavyBootsMatrix(); // iron boots: ride the body's leg joints, so after its calc
+    updateLanternFx(); // lantern flame + glow: after setMatrix's lantern calc (agent D)
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8561,6 +8563,7 @@ int daRemotePlayer_c::draw() {
     g_env_light.PrevCol = savedPrevCol;
     g_env_light.pat_ratio = savedPatRatio;
     g_env_light.plight_near_pos = savedPlightNearPos;
+    applyDamageTint(); // his damage/freeze/ice tint onto tevStr, before any model (agent D)
     traceCalc("draw: body");
     drawModel(model);
     // Same order daAlink_c draws them in, which matters for the face: it is drawn after the head so
@@ -8571,6 +8574,7 @@ int daRemotePlayer_c::draw() {
     // After the body, exactly where daAlink_c draws them (d_a_alink.cpp:19610-19617): they are
     // separate models rather than geometry on the body, and they read their own visibility.
     traceCalc("draw: equipment");
+    clearDamageKColor(); // the damage pulse is the body's alone (agent D)
     drawEquip();
     // block (3): the held item and the lantern, after the equipment as daAlink_c draws them.
     traceCalc("draw: held item");
@@ -8622,3 +8626,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_held.inc"
 // The iron ball and chain, after the held-item file whose loaders it uses.
 #include "d/actor/d_a_remote_player_ironball.inc"
+// The damage tint, the lantern glow and flame, and the puppet's particle emitters (agent D).
+#include "d/actor/d_a_remote_player_fx.inc"

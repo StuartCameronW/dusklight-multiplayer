@@ -1471,6 +1471,102 @@ private:
     u8 mHeldItemBckWanted;
     bool mLoggedArrowMissing;
     u16 mHeldBckLogCount;
+    // --- damage flash + lantern fx (agent D) ---
+    /* The damage / freeze / ice body tint, the lantern's glow model and flame, and the puppet's
+     * particle emitters. See d_a_remote_player_fx.inc. All zeroed by fopAcM_ct, and 0 is "nothing
+     * live" for every member below (a level-emitter handle of 0 names no emitter). */
+public:
+    /// v20 effects block, decoded by the bridge: i_tint is PlayerDmgTint (dusk/player_fx.hpp),
+    /// i_flash the wire's dmgFlash, i_lanternLit kPlayerFxLanternLit.
+    void setNetworkDamageLantern(u8 i_tint, u8 i_flash, bool i_lanternLit);
+    u8 getNetDmgTint() const { return mNetDmgTint; }
+    bool getNetLanternLit() const { return mNetLanternLit; }
+    /// The lantern's joint-1 callback body (daAlink_c::kandelaarModelCallBack). Public for the
+    /// static trampoline only.
+    int lanternModelCallBack();
+
+    /* ★ PUPPET PARTICLE EMITTERS — the reusable part. Use these rather than dComIfGp_particle_set
+     * directly, so every emitter a puppet owns is torn down with it.
+     *
+     * They are dPa_control_c "level" emitters, the kind daAlink_c keeps in field_0x31c4 and
+     * friends: one handle per slot, and an emitter lives exactly as long as it is refreshed.
+     *
+     *   - setPuppetEmitter(slot, name, &pos, &rot, &scale): call it EVERY sim tick, from execute(),
+     *     for as long as the effect should exist. The first call creates the emitter, every later
+     *     one moves it (dPa_control_c::set, d_particle.cpp:1733-1765) and un-hides it. rot and
+     *     scale may be NULL. Returns the emitter, or NULL if none could be made. Lit by the
+     *     puppet's own tevStr, as his are by his.
+     *   - setPuppetEmitterMtx(slot, name, mtx): the same, placed and rotated by a joint matrix
+     *     (setGlobalRTMatrix) — for effects that ride a joint, like a sword's.
+     *   - stopPuppetEmitter(slot): hides it now and forgets the handle. A level emitter that is not
+     *     refreshed is cut by the particle manager on its next pass (level_c::execute,
+     *     d_particle.cpp:971-984), so stopping IS deleting; no other call is needed.
+     *   - deletePuppetEmitters(): every slot, from the destructor. Nothing else has to call it.
+     *
+     * Slots are owned per feature, below. Name a new one rather than sharing: two features on one
+     * slot would each re-create the other's emitter every tick. */
+    enum {
+        /// ZI_J_KANTERA_FIRE, the lantern flame (agent D).
+        PUPPET_FX_LANTERN_FIRE = 0,
+        /// First of the slots reserved for the sword trail / spin / charge effects (agent F):
+        /// PUPPET_FX_SWORD_FIRST .. PUPPET_FX_NUM - 1.
+        PUPPET_FX_SWORD_FIRST = 1,
+        PUPPET_FX_NUM = 8,
+    };
+    JPABaseEmitter* setPuppetEmitter(int i_slot, u16 i_name, const cXyz* i_pos,
+        const csXyz* i_rot = NULL, const cXyz* i_scale = NULL);
+    JPABaseEmitter* setPuppetEmitterMtx(int i_slot, u16 i_name, CMtxP i_mtx);
+    void stopPuppetEmitter(int i_slot);
+    JPABaseEmitter* getPuppetEmitter(int i_slot) const;
+    void deletePuppetEmitters();
+
+private:
+    /// draw(): his tint ladder onto tevStr (and the outfit's reg-1 materials), right after
+    /// settingTevStruct; and his TevKColor reset, right before the equipment.
+    void applyDamageTint();
+    void clearDamageKColor();
+    /// setWaterDropColor's material list for this outfit, reg 1, for the freeze and ice tints;
+    /// restores the materials' own values when the tint ends.
+    void setDamageReg1(bool i_on);
+    /// The glow model, its BTK and the swing callback. From setupHeldItems, after the lantern.
+    void setupLanternFx();
+    /// execute(), after setMatrix: the glow's matrix and scale, and the flame emitter.
+    void updateLanternFx();
+    /// drawHeldItems(), right after the lantern: preKandelaarDraw, then the glow.
+    void drawLanternGlow();
+    // The wire's values, as pushed by setNetworkDamageLantern().
+    u8 mNetDmgTint;
+    u8 mNetDmgFlash;
+    bool mNetLanternLit;
+    /// Reg-1 tint state: written now, and the materials' own values saved before the first write.
+    bool mDmgReg1On;
+    bool mDmgReg1Saved;
+    GXColorS10 mDmgReg1Orig[9];
+    bool mLoggedDmgTint[4];
+    u16 mDmgTintLogCount;
+    /// ef_ktGlow.bmd / .btk from this puppet's outfit archive (his mpKanteraGlowModel /
+    /// mpKanteraGlowBtk, d_a_alink_wolf.inc:407-413).
+    J3DModel* mpLanternGlowModel;
+    J3DAnmTextureSRTKey* mpLanternGlowBtk;
+    /// His mKandelaarFlamePos, field_0x3624 (last tick's) and field_0x3618 (the swing velocity).
+    cXyz mLanternFlamePos;
+    cXyz mLanternFlamePrev;
+    cXyz mLanternFlameVel;
+    /// The swing has been seeded since the lantern came out (setKandelaarModel's reset).
+    bool mLanternSwingLive;
+    bool mLanternSwingHooked;
+    /// His field_0x3448 (glow scale), field_0x32c8 (peeked depth) and field_0x344c (the flame's
+    /// own depth). The peek is written by dDlst_peekZ_c at the start of the next frame.
+    f32 mLanternGlowScale;
+    u32 mLanternGlowPeek;
+    f32 mLanternGlowZ;
+    /// The glow was posed this tick, so draw may enter it.
+    bool mLanternGlowPosed;
+    bool mLoggedLanternGlow;
+    u16 mLanternFxLogCount;
+    u32 mFxEmitter[PUPPET_FX_NUM];
+    bool mLoggedFxFail[PUPPET_FX_NUM];
+    u16 mFxLogCount;
 };
 
 /**
