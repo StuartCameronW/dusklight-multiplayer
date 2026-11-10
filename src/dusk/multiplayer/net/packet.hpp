@@ -146,7 +146,15 @@ namespace dusk::mp {
  * bytes. heldBck id 10 is the gun's HS_SPIN, and heldFlags' kPlayerHeldClawRight is now also sent
  * for the single clawshot.
  */
-inline constexpr std::uint32_t kProtocolVersion = 20;
+/*
+ * 21: PlayerState grew two blocks after the clawshot block, both always on the wire. The event
+ * block: u8 evt (the sender's event kind, a stand-in bit, a hidden bit), plus u8 evtItem and u8
+ * evtItemScale while the kind is an item get. The form block: u8 form (wolf transform phase, the
+ * reload blob, the fur overlay, the shackle chain, Midna reserved), plus s8 metaTint and u8
+ * furFrame while a transformation runs. flags' kPlayerStateWolf is now set for a wolf sender.
+ * 2 bytes idle; a v20 peer's read() would stop two bytes short and drop every pose.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 21;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

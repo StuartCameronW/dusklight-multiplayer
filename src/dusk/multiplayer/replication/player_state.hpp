@@ -437,6 +437,49 @@ inline std::uint32_t location_stage_hash(const char* name) {
 /// offset 61), then the protocol-16 location (offset 70: u32 stageHash, s8 roomNo at 74,
 /// u8 locEpoch at 75). Protocol 19 appends after locEpoch; its block A (bow) is 2 bytes: u8
 /// heldBck, u8 heldBckFrame. Sent unreliably at the sim rate, so it has to stay small.
+/**
+ * v21 event byte (PlayerState::evt). Spec: .claude/future-plans/puppet-events.md section 6.
+ *   bits 0-3  PlayerEventKind: which event the SENDER is in, from his own proc and demo type
+ *             (player_bridge.cpp local_event_kind; the values match LocalEventKind there).
+ *   bit 4     kPlayerEvtStandIn: the pose on the wire is the stand-in idle, not his real one.
+ *   bit 5     kPlayerEvtHidden: FLG0_PLAYER_NO_DRAW alone (NOT checkPlayerNoDraw, which is also
+ *             true in his first-person view).
+ * While the kind is GetItem, two more bytes follow: evtItem and evtItemScale.
+ */
+enum PlayerEventKind : std::uint8_t {
+    kPlayerEvtNone = 0,
+    kPlayerEvtTalk = 1,
+    kPlayerEvtChest = 2,
+    kPlayerEvtGetItem = 3,
+    kPlayerEvtDoor = 4,
+    kPlayerEvtInPlace = 5,
+    kPlayerEvtScripted = 6,
+    kPlayerEvtCutscene = 7,
+};
+constexpr std::uint8_t kPlayerEvtKindMask = 0x0F;
+constexpr std::uint8_t kPlayerEvtStandIn = 1 << 4;
+constexpr std::uint8_t kPlayerEvtHidden = 1 << 5;
+constexpr std::uint8_t kPlayerEvtKnownMask = 0x3F;
+
+/**
+ * v21 form byte (PlayerState::form). Spec: .claude/future-plans/puppet-wolf.md section 6. Wolf
+ * itself is flags' kPlayerStateWolf (checkWolf(), FLG1_IS_WOLF); this byte is the transformation
+ * around it.
+ *   bits 0-1  metaPhase: 0 none, 1 PROC_METAMORPHOSE before the model swap, 2 after it.
+ *   bit 2     kPlayerFormChanging: PROC_METAMORPHOSE while his model archive reloads
+ *             (mClothesChangeWaitTimer != 0): he draws only the black transform blob then.
+ *   bit 3     kPlayerFormFur: the AL_WF fur overlay is his held model (mEquipItem 0x106).
+ *   bit 4     kPlayerFormChain: the shackle chain is drawn (M_011).
+ *   bit 5     kPlayerFormMidna: reserved for Midna on his back (piece D).
+ * While metaPhase != 0, two more bytes follow: metaTint and furFrame.
+ */
+constexpr std::uint8_t kPlayerFormMetaPhaseMask = 0x03;
+constexpr std::uint8_t kPlayerFormChanging = 1 << 2;
+constexpr std::uint8_t kPlayerFormFur = 1 << 3;
+constexpr std::uint8_t kPlayerFormChain = 1 << 4;
+constexpr std::uint8_t kPlayerFormMidna = 1 << 5;
+constexpr std::uint8_t kPlayerFormKnownMask = 0x3F;
+
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -824,6 +867,20 @@ struct PlayerState {
     std::int16_t clawTipPos[6] = {};
     std::int16_t clawTipAng[4] = {};
 
+    // v21 event block (after the clawshot block). See PlayerEventKind.
+    std::uint8_t evt = 0;
+    /// Only while the kind is GetItem: the partner daDitem_c's display item no, and its scale.x
+    /// x255 (0 = not shown yet). Zero otherwise.
+    std::uint8_t evtItem = 0;
+    std::uint8_t evtItemScale = 0;
+
+    // v21 form block (after the event block). See kPlayerFormMetaPhaseMask.
+    std::uint8_t form = 0;
+    /// Only while metaPhase != 0: his transform tint (field_0x300e, clamped to s8) and the fur
+    /// overlay's BCK frame / frameMax x255. Zero otherwise.
+    std::int8_t metaTint = 0;
+    std::uint8_t furFrame = 0;
+
     bool clawshot_out() const {
         return heldItem == kPlayerHeldClawshot || heldItem == kPlayerHeldDoubleClawshot;
     }
@@ -835,6 +892,14 @@ struct PlayerState {
     }
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
+
+    std::uint8_t evt_kind() const { return static_cast<std::uint8_t>(evt & kPlayerEvtKindMask); }
+    bool evt_stand_in() const { return (evt & kPlayerEvtStandIn) != 0; }
+    bool evt_hidden() const { return (evt & kPlayerEvtHidden) != 0; }
+    std::uint8_t meta_phase() const {
+        return static_cast<std::uint8_t>(form & kPlayerFormMetaPhaseMask);
+    }
+    bool wolf() const { return (flags & kPlayerStateWolf) != 0; }
 
     bool attacking() const { return (atMask & kPlayerAtCapsuleMask) != 0; }
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
@@ -955,6 +1020,18 @@ struct PlayerState {
                 }
             }
         }
+        // v21 event block: always; the item only during an item get
+        w.write_u8(evt);
+        if (evt_kind() == kPlayerEvtGetItem) {
+            w.write_u8(evtItem);
+            w.write_u8(evtItemScale);
+        }
+        // v21 form block: always; the tint and fur frame only mid-transform
+        w.write_u8(form);
+        if (meta_phase() != 0) {
+            w.write_u8(static_cast<std::uint8_t>(metaTint));
+            w.write_u8(furFrame);
+        }
     }
 
     bool read(Reader& r) {
@@ -1055,6 +1132,34 @@ struct PlayerState {
             clawTipFrame[0] = clawTipFrame[1] = 0;
             std::fill(std::begin(clawTipPos), std::end(clawTipPos), std::int16_t{0});
             std::fill(std::begin(clawTipAng), std::end(clawTipAng), std::int16_t{0});
+        }
+        // v21 event block
+        if (!r.read_u8(evt)) {
+            return false;
+        }
+        evt &= kPlayerEvtKnownMask;
+        if (evt_kind() == kPlayerEvtGetItem) {
+            if (!(r.read_u8(evtItem) && r.read_u8(evtItemScale))) {
+                return false;
+            }
+        } else {
+            evtItem = 0;
+            evtItemScale = 0;
+        }
+        // v21 form block
+        if (!r.read_u8(form)) {
+            return false;
+        }
+        form &= kPlayerFormKnownMask;
+        if (meta_phase() != 0) {
+            std::uint8_t tint = 0;
+            if (!(r.read_u8(tint) && r.read_u8(furFrame))) {
+                return false;
+            }
+            metaTint = static_cast<std::int8_t>(tint);
+        } else {
+            metaTint = 0;
+            furFrame = 0;
         }
         roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
@@ -1351,6 +1456,21 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
             }
         }
     }
+
+    /* v21 event + form blocks: discrete, take b, except the item's scale, which blends while both
+     * samples show the same item (it grows in over the fanfare). */
+    out.evt = b.evt;
+    out.evtItem = b.evtItem;
+    out.evtItemScale = b.evtItemScale;
+    if (a.evt_kind() == kPlayerEvtGetItem && b.evt_kind() == kPlayerEvtGetItem &&
+        a.evtItem == b.evtItem)
+    {
+        const float scale = a.evtItemScale + (b.evtItemScale - a.evtItemScale) * aimT;
+        out.evtItemScale = static_cast<std::uint8_t>(scale + 0.5f);
+    }
+    out.form = b.form;
+    out.metaTint = b.metaTint;
+    out.furFrame = b.furFrame;
     return out;
 }
 
