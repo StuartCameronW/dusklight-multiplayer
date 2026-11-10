@@ -35,6 +35,21 @@
  * `no` is the tbox number (0-63) for a chest and the dSv_memBit_c item index (0-31, the save bit
  * dSv_info_c::onItem numbers 0x80 + no) for a floor item. `reason` is a DenyReason.
  *
+ * Where the hooks are (all TARGET_PC):
+ *   - chests, daTbox_c (d_a_tbox.cpp): H3 re-check in actionOpenWait, H4 claim before the chest is
+ *     offered (boxCheck branch).
+ *   - floor items with a saved item bit, daItem_c (d_a_obj_item.cpp): H5 re-check in execute,
+ *     claim in itemGetNextExecute.
+ *   - heart pieces, daObjLife_c (d_a_obj_life_container.cpp): H5 re-check in execute, claim in
+ *     initActionOrderGetDemo, renewed through the get demo (its bit is only set when the demo
+ *     ENDS, so the lease must outlive a slow read of the text box).
+ *   - floor small keys, daKey_c (d_a_obj_smallkey.cpp): H5 re-check only (their "taken" state is
+ *     a TBOX bit). OPEN: no claim at the grab yet. The pickup starts inside Link's grab
+ *     (fopAcM_cancelCarryNow + getGrabUpStart), and holding it for a round trip there needs a
+ *     runtime test of what Link's grab proc does with a cancelled carry. Proposed: claim (kind
+ *     Tbox) while Link is within reach and only raise fopAc_AttnFlag_CARRY_e once granted, the way
+ *     the chest gates its prompt.
+ *
  * Outside a live session with shared quest flags, nothing here runs and the hooks change nothing.
  * Game thread only.
  */

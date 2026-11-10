@@ -649,4 +649,9 @@ void claims_note_item_removed(int itemBitNo, bool takenByPartner) {
     }
 }
 
+void claims_note_key_taken(int tboxNo) {
+    HookLog.info("[mp-claim] key tbox {}/{} taken by partner: removing tick={}",
+        world_bridge::live_tbl(), tboxNo, network_manager().sim_tick());
+}
+
 }  // namespace dusk::mp

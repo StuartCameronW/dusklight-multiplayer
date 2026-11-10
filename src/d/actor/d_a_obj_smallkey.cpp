@@ -12,6 +12,9 @@
 #include "d/d_tresure.h"
 #include "f_op/f_op_camera_mng.h"
 #include <cstring>
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"
+#endif
 
 const static dCcD_SrcCyl l_cyl_src = {
     {
@@ -539,6 +542,26 @@ int daKey_c::execute() {
         &daKey_c::actionE_GB,
     };
 
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H5): a floor small key keeps its "taken" state in a TBOX bit
+     * (create refuses when dComIfGs_isTbox(saveBitNo)), and an existing key never looks again, so
+     * once the partner's pickup arrives through the world sync, remove this copy quietly, as the
+     * pickup itself would (bit set, treasure-map marker off). Not while this player is carrying or
+     * collecting it, and only while it lies free (WAIT) or hidden (SW_ON_WAIT): a key an enemy
+     * holds (PARENT_WAIT, E_GB) or the boomerang is pulling may be referenced by that actor.
+     * No claim at the grab yet (H4 for keys is open): see item_claims.hpp. */
+    if (dusk::mp::claims_active() &&
+        (chkStatus(STATUS_WAIT_e) || chkStatus(STATUS_SW_ON_WAIT_e)) &&
+        !fopAcM_checkCarryNow(this) && dComIfGs_isTbox(getSaveBitNo()))
+    {
+        dusk::mp::claims_note_key_taken(getSaveBitNo());
+        dTres_c::offStatus(getSaveBitNo(), 1);
+        effectStop();
+        hide();
+        fopAcM_delete(this);
+        return 1;
+    }
+#endif
     mPrevSpeed = speed;
     field_0x930++;
 

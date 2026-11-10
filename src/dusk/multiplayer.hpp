@@ -126,4 +126,8 @@ void claims_note_tbox_opened(int tboxNo, bool eventAlreadyStarted);
 /// because its claim was denied.
 void claims_note_item_removed(int itemBitNo, bool takenByPartner);
 
+/// Logging for the hooks: a floor small key (its "taken" state is tbox bit `tboxNo`) removed
+/// because the partner picked it up.
+void claims_note_key_taken(int tboxNo);
+
 }  // namespace dusk::mp
