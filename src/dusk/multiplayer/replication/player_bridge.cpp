@@ -1880,6 +1880,17 @@ bool local_pose_is_live() {
     if (local_scene_change_queued()) {
         return false;
     }
+    /* His model archive is being reloaded: an outfit change (the collection menu, the save editor,
+     * the autopilot) or the human/wolf change, which share loadModelDVD. It frees mpArcHeap at
+     * timer 2 and changeLink rebuilds the models at timer 1 (d_a_alink_swindow.inc:67-115), and his
+     * own draw skips those ticks. Every fill_* that reads his models would read freed memory then
+     * (measured: an access violation in shown_hand_index on `clothes 0x30`), so the far end holds
+     * the last pose for those few ticks instead. */
+    if (fopAc_ac_c* link = dComIfGp_getPlayer(0); link != nullptr &&
+        static_cast<daPy_py_c*>(link)->getClothesChangeWaitTimer() != 0)
+    {
+        return false;
+    }
     if (world_is_playable()) {
         log_local_event_edge(LocalEventKind::None, true);
         return true;
