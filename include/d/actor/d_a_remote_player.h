@@ -1522,7 +1522,14 @@ public:
         PUPPET_FX_FOOT_SPLASH_B = 10,
         PUPPET_FX_FOOT_SPLASH_C = 11,
         PUPPET_FX_FOOT_LAST = 12,
-        PUPPET_FX_NUM = 13,
+        /// The transformation's particles (wolf piece C): PUPPET_FX_TRANSFORM_FIRST ..
+        /// PUPPET_FX_TRANSFORM_LAST. 13 is his field_0x31f8 (ZI_J_ATOW_A / ZI_J_WTOA_B), 14 his
+        /// field_0x31fc (ZI_J_ATOW_B / ZI_J_WTOA_A); d_a_alink_effect.inc:1557-1595.
+        PUPPET_FX_TRANSFORM_FIRST = 13,
+        PUPPET_FX_TRANSFORM_A = 13,
+        PUPPET_FX_TRANSFORM_B = 14,
+        PUPPET_FX_TRANSFORM_LAST = 14,
+        PUPPET_FX_NUM = 15,
     };
     JPABaseEmitter* setPuppetEmitter(int i_slot, u16 i_name, const cXyz* i_pos,
         const csXyz* i_rot = NULL, const cXyz* i_scale = NULL);
@@ -1843,6 +1850,56 @@ private:
     u8 mNetForm;
     s8 mNetMetaTint;
     u8 mNetFurFrame;
+
+    // --- transform fx (piece C) ---
+    /* procCoMetamorphose's visuals on both puppet kinds, driven by mNetForm / mNetMetaTint /
+     * mNetFurFrame: the WL_CHANGE blob drawn INSTEAD of the body while kPlayerFormChanging, the
+     * TevColor tint, the AL_WF fur overlay on the human puppet's head and the ZI_J_ATOW / WTOA
+     * particles. See d_a_remote_player_transform.inc. All zeroed by fopAcM_ct, and 0 is "nothing
+     * shown" for every member below. */
+private:
+    /// createHeap(), last: WL_CHANGE (both kinds), AL_WF and its two BCKs (human only).
+    void setupTransformFx();
+    /// execute(), after setMatrix(): blob and fur poses, the stale-body hold, the emitters, logs.
+    void updateTransformFx();
+    /// draw(), right after settingTevStruct: true = his draw would show only the blob now, so the
+    /// caller returns without drawing the body (d_a_alink.cpp:19505-19522).
+    bool drawTransformBlob();
+    /// draw(), right after applyDamageTint(): his PROC_METAMORPHOSE rung of the tint ladder.
+    void applyTransformTint();
+    /// draw(), right after drawHeldItems(): the fur overlay, where he draws mHeldItemModel.
+    void drawTransformFur();
+    /// The destructor, BEFORE deletePuppetEmitters(): forget the transform emitters so they fade
+    /// out naturally across the rebuild instead of being hidden mid-effect.
+    void releaseTransformFx();
+    /// His mpWlChangeModel, out of this puppet's private "Alink" mount.
+    J3DModel* mpWlChangeModel;
+    /// His mHeldItemModel while mEquipItem == 0x106: AL_WF, loaded into this puppet's heap.
+    J3DModel* mpTransformFurModel;
+    /// [0] WFCHANGEATOW (human -> wolf), [1] WFCHANGEWTOA (wolf -> human); his mItemBck.
+    J3DAnmTransform* mpTransformFurBck[2];
+    mDoExt_bckAnm mTransformFurBck;
+    bool mTransformFurBckReady;
+    /// What execute posed this tick: the blob is to replace the body (and was calc'd, if loaded),
+    /// and the fur BCK shown (0 none, 1 ATOW, 2 WTOA).
+    bool mTransformBlobOn;
+    bool mTransformBlobPosed;
+    u8 mTransformFurShown;
+    /// The blob's MAJI colour, +1 / -1 (his field_0x300e > 0), latched while changing so the
+    /// stale-body hold keeps the colour it had. 0 = never latched (treated as -1).
+    s8 mTransformBlobSign;
+    /// This puppet showed the pre-swap half (phase 1, not changing). Phase 2 on such a puppet
+    /// means it is the OLD body awaiting its rebuild: it keeps the blob up instead of its body.
+    bool mTransformSawPreSwap;
+    bool mTransformStale;
+    u16 mTransformStaleTicks;
+    /// His field_0x37c8: joint 2's world position, refreshed in phase 1 and frozen in phase 2.
+    cXyz mTransformFxPos;
+    bool mTransformFxPosValid;
+    /// Edge log state: the last form byte and stale flag logged (+1 so 0 means "none yet").
+    u16 mTransformLoggedState;
+    bool mTransformLoggedTint;
+    u16 mTransformLogCount;
 };
 
 /**

@@ -1508,6 +1508,7 @@ int daRemotePlayer_c::createHeap() {
     // footsteps.
     loadStepTurnAnimations();
     setupSwordFx(); // sword trail (agent F): last, so a short heap costs only the trail
+    setupTransformFx(); // transform blob + fur (wolf piece C): last, a short heap costs only those
 
     JKRHeap* heap = JKRGetCurrentHeap();
     if (heap != NULL) {
@@ -2669,6 +2670,7 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     // actor's solid heap (Z2SoundObject.cpp:529-532); stopping every handle now, rather than in
     // ~Z2Creature after this body, means no sound can outlive the memory it points at.
     deleteSound();
+    releaseTransformFx(); // wolf piece C: let the transform particles fade across the rebuild
     deletePuppetEmitters(); // no particle emitter outlives its puppet (agent D)
     deleteSwordFx(); // sword fx (agent F): hide its emitters, free the trail's texture object
     deleteGearFx(); // the shield fire's second emitter (agent G)
@@ -8251,6 +8253,7 @@ int daRemotePlayer_c::execute() {
     updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
     updateGearFx(); // armour BRK, Zora mask, shield burn (agent G): after setMatrix's shield pose
     updateFootFx(); // footstep dust, ripples, splashes (agent J): needs this tick's foot joints
+    updateTransformFx(); // transform blob/fur/particles (wolf piece C): needs this tick's joints
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8576,7 +8579,11 @@ int daRemotePlayer_c::draw() {
     g_env_light.PrevCol = savedPrevCol;
     g_env_light.pat_ratio = savedPatRatio;
     g_env_light.plight_near_pos = savedPlightNearPos;
+    if (drawTransformBlob()) {
+        return 1; // wolf piece C: only the transform blob, as his draw (d_a_alink.cpp:19505-19522)
+    }
     applyDamageTint(); // his damage/freeze/ice tint onto tevStr, before any model (agent D)
+    applyTransformTint(); // his PROC_METAMORPHOSE tint, above damage in his ladder (piece C)
     applyMagicArmorBrk(); // the armour glow, entered or removed as his draw() does (agent G)
     traceCalc("draw: body");
     drawModel(model);
@@ -8593,6 +8600,7 @@ int daRemotePlayer_c::draw() {
     // block (3): the held item and the lantern, after the equipment as daAlink_c draws them.
     traceCalc("draw: held item");
     drawHeldItems();
+    drawTransformFur(); // the AL_WF fur overlay, his mHeldItemModel 0x106 (wolf piece C)
     drawHeavyBoots(); // after the lantern, daAlink_c's order (d_a_alink.cpp:19822-19847)
     // Last, exactly where daAlink_c puts it (d_a_alink.cpp:19849-19853): the shadow projects the
     // models, so it wants them posed and their tevStr settled, and it renders in its own later pass
@@ -8653,3 +8661,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_gear.inc"
 // Footstep dust, ripples, splashes and wet footprints (agent J). Uses the fx file's emitter slots.
 #include "d/actor/d_a_remote_player_footfx.inc"
+// The transformation's visuals (wolf piece C): the blob, tint, fur and particles.
+#include "d/actor/d_a_remote_player_transform.inc"
