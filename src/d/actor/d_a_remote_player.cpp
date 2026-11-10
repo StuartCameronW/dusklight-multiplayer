@@ -1346,6 +1346,7 @@ int daRemotePlayer_c::createHeap() {
     setupFootIk();
     setupJointControl();
     setupEquipModels();
+    setupHeavyBootsModel();
 
     /* Hands, and the one body shape this outfit is built with hidden. Both are the tail of
      * daAlink_c::setLinkModel (d_a_alink_wolf.inc:471-498) and both were missing; see setDrawHand()
@@ -7612,6 +7613,207 @@ void daRemotePlayer_c::drawEquip() {
     }
 }
 
+/* --- iron boots (agent C) ---
+ *
+ * The Iron Boots are not a different body and not a texture swap. daAlink_c does two things, and
+ * the puppet has to do both or it gets one of two visible bugs:
+ *
+ *   1. He builds TWO extra models from his outfit archive's al_bootsH.bmd, one per foot
+ *      (mpLinkBootModels, d_a_alink_wolf.inc:399-403), poses them off the body's leg joints after
+ *      the body's calc (d_a_alink.cpp:5995-6023), and draws them after everything else
+ *      (:19832-19847) and into the real shadow (:19348-19352) — all gated on checkEquipHeavyBoots().
+ *   2. He HIDES one body-model shape while they are on — field_0x06e0, the outfit's own boots — in
+ *      setHeavyBoots (d_a_alink_hvyboots.inc:47-84) and again whenever the model is rebuilt
+ *      (d_a_alink_wolf.inc:480-490). Without it the outfit's boots poke through the iron ones;
+ *      without (1) and with it, Link has no feet.
+ *
+ * The puppet already receives the right predicate: kPlayerGearHeavyBoots is the sender's
+ * checkEquipHeavyBoots() (player_bridge.cpp), so no wire change. */
+
+/* daAlink_c's field_0x06e0 per outfit, in l_outfits order, from setLinkModel's four wear branches:
+ * casual clothes leave it NULL (d_a_alink_wolf.inc:437), the hero's clothes take material 6 (:473),
+ * Zora armour 8 (:445), magic armour 10 (:455). A separate table rather than a column of l_outfits
+ * so that table stays as it is.
+ *
+ * The Zora armour's mask (material 9, field_0x06e4) is ALSO hidden by setHeavyBoots, but the puppet
+ * hides it permanently already (l_outfits' hide column), so there is nothing more to do for it. */
+const u16 l_bootsBodyMatNo[] = {l_noBodyMat, 6, 8, 10};
+const int l_bootsBodyMatNum = sizeof(l_bootsBodyMatNo) / sizeof(l_bootsBodyMatNo[0]);
+
+/* The boots mesh, by name for the same reason the body is (the outfit headers cannot be included
+ * here). Present in all four outfit archives, every region: dRes_*_BMD_AL_BOOTSH_e in
+ * assets/<region>/res/Object/{B,K,Z,M}mdl.h, four joints (WORLD_ROOT + AL_BOOTSHA/B/C). */
+const char l_heavyBootsResName[] = "al_bootsH.bmd";
+const u16 l_heavyBootsJointNum = 4;
+
+/* The body joints each boot's joints 1..3 are overwritten with (d_a_alink.cpp:6001-6019): the left
+ * leg's LEGL2 / FOOTL / TOEL for boot 0 verbatim, the right leg's LEGR2 / FOOTR / TOER for boot 1
+ * with a half turn about X folded in, because one mesh serves both feet. */
+const u16 l_heavyBootsBodyJointNo[2][3] = {{0x13, 0x14, 0x15}, {0x18, 0x19, 0x1A}};
+
+/* How many boots-on/off changes to log per puppet. Putting them on and off is rare, so a handful
+ * covers a whole session without letting a flapping bit flood the log. */
+const u16 l_heavyBootsLogMax = 8;
+
+/**
+ * Build the two boot models and find the body shape they replace. Called from createHeap.
+ *
+ * Non-fatal on every path. ★ And all-or-nothing on the shape: the body's own boots are only hidden
+ * when BOTH iron boots exist, so a missing resource costs the iron boots and never Link's feet.
+ */
+void daRemotePlayer_c::setupHeavyBootsModel() {
+    mpHeavyBootsModel[0] = NULL;
+    mpHeavyBootsModel[1] = NULL;
+    mpHeavyBootsBodyShape = NULL;
+    mHeavyBootsOn = false;
+    mHeavyBootsBodyHidden = false;
+
+    JKRHeap* heap = JKRGetCurrentHeap();
+    const s32 freeBefore = heap != NULL ? heap->getFreeSize() : 0;
+
+    J3DModelData* bootsData =
+        static_cast<J3DModelData*>(own_archive_res(mOwnRes, l_heavyBootsResName));
+    if (bootsData == NULL) {
+        Log.warn("Puppet {} has no '{}'; its iron boots will not be drawn", mPlayerId,
+            l_heavyBootsResName);
+        return;
+    }
+    // setHeavyBootsMatrix writes joints 1..3, so a mesh with fewer would be written out of bounds.
+    if (bootsData->getJointNum() < l_heavyBootsJointNum) {
+        Log.warn("Puppet {} '{}' has {} joints, expected {}; its iron boots will not be drawn",
+            mPlayerId, l_heavyBootsResName, bootsData->getJointNum(), l_heavyBootsJointNum);
+        return;
+    }
+
+    // daAlink_c's initModel(modelData, 0) for both (d_a_alink_wolf.inc:402): one data, two models.
+    J3DModel* boots0 = init_model(bootsData, 0, "boots L");
+    J3DModel* boots1 = init_model(bootsData, 0, "boots R");
+    if (boots0 == NULL || boots1 == NULL) {
+        // Solid heap: a lone survivor cannot be given back, and is simply never drawn.
+        Log.warn("Puppet {} could not build its iron boots (heap); they will not be drawn",
+            mPlayerId);
+        return;
+    }
+    mpHeavyBootsModel[0] = boots0;
+    mpHeavyBootsModel[1] = boots1;
+
+    J3DModelData* bodyData = model != NULL ? model->getModelData() : NULL;
+    u16 matNo = l_noBodyMat;
+    if (bodyData != NULL && mOutfit >= 0 && mOutfit < l_bootsBodyMatNum) {
+        matNo = l_bootsBodyMatNo[mOutfit];
+        if (matNo != l_noBodyMat && matNo < bodyData->getMaterialNum()) {
+            mpHeavyBootsBodyShape = bodyData->getMaterialNodePointer(matNo)->getShape();
+        }
+    }
+
+    /* The material's NAME, not just its number: an index that is right for one outfit and wrong for
+     * another hides a visible piece of the body and says nothing. Reading "boots"/"foot" here is
+     * the check; reading anything else means the table above is wrong for that outfit. */
+    JUTNameTab* matNames = bodyData != NULL ? bodyData->getMaterialName() : NULL;
+    const char* matName =
+        mpHeavyBootsBodyShape != NULL && matNames != NULL ? matNames->getName(matNo) : NULL;
+    Log.info("Puppet {} iron boots: 2 models from '{}', {} bytes | body mat {} ('{}') {} while "
+             "worn",
+        mPlayerId, l_heavyBootsResName, heap != NULL ? freeBefore - heap->getFreeSize() : 0,
+        matNo == l_noBodyMat ? -1 : static_cast<int>(matNo), matName != NULL ? matName : "-",
+        mpHeavyBootsBodyShape != NULL ? "hidden" :
+                                        (matNo == l_noBodyMat ? "none to hide (outfit)" :
+                                                                "OUT OF RANGE, not hidden"));
+}
+
+/**
+ * Latch this tick's boots state, swap the body shape to match, and pose the boots. Called from
+ * execute() right after setMatrix(), because the boots ride body joints that are only final once
+ * the body's calc has run (and, with them, the foot IK that lands during it).
+ *
+ * The state is LATCHED here and draw reads the latch, never mNetHeavyBoots: the network can flip
+ * the bit between execute and draw, and a boot drawn on a tick it was not posed would draw at
+ * whatever its matrices last held.
+ */
+void daRemotePlayer_c::setHeavyBootsMatrix() {
+    const bool on =
+        mNetHeavyBoots && mpHeavyBootsModel[0] != NULL && mpHeavyBootsModel[1] != NULL;
+
+    if (on != mHeavyBootsOn) {
+        mHeavyBootsOn = on;
+        if (mHeavyBootsLogCount < l_heavyBootsLogMax) {
+            mHeavyBootsLogCount++;
+            Log.debug("Puppet {} iron boots {} (body shape {})", mPlayerId, on ? "ON" : "OFF",
+                mpHeavyBootsBodyShape == NULL ? "none" : (on ? "hidden" : "shown"));
+        }
+    }
+
+    /* Shape visibility lives on the puppet's OWN body model data (private mount), so nothing else
+     * reads this flag. Only written on a change, and it is consumed at entry. */
+    if (mpHeavyBootsBodyShape != NULL && mHeavyBootsBodyHidden != on) {
+        if (on) {
+            mpHeavyBootsBodyShape->hide();
+        } else {
+            mpHeavyBootsBodyShape->show();
+        }
+        mHeavyBootsBodyHidden = on;
+    }
+
+    if (!on) {
+        return;
+    }
+
+    // d_a_alink.cpp:5995-6023: calc first, then overwrite joints 1..3 — calc would undo it otherwise.
+    for (int i = 0; i < 2; i++) {
+        mpHeavyBootsModel[i]->setBaseTRMtx(model->getBaseTRMtx());
+        mpHeavyBootsModel[i]->calc();
+    }
+
+    for (int j = 0; j < 3; j++) {
+        mpHeavyBootsModel[0]->setAnmMtx(j + 1, model->getAnmMtx(l_heavyBootsBodyJointNo[0][j]));
+    }
+
+    /* Always through a temporary and setAnmMtx — his TARGET_PC interp branch — rather than his
+     * original concat straight into getAnmMtx(): on PC setAnmMtx is out of line and frame
+     * interpolation needs to see the write. */
+    mDoMtx_stack_c::XrotS(-0x8000);
+    Mtx bootMtx;
+    for (int j = 0; j < 3; j++) {
+        mDoMtx_concat(model->getAnmMtx(l_heavyBootsBodyJointNo[1][j]), mDoMtx_stack_c::get(),
+            bootMtx);
+        mpHeavyBootsModel[1]->setAnmMtx(j + 1, bootMtx);
+    }
+}
+
+/**
+ * Draw both boots, where daAlink_c draws his: last of the human models (d_a_alink.cpp:19832-19847).
+ *
+ * Not reproduced: his tevStr.TevColor darkening while a magnet-boots emitter is live on that foot
+ * (:19835-19841). The puppet emits no magnet effect (setMagneBootsEffect) and magnet state is not on
+ * the wire, so there is nothing for it to follow.
+ *
+ * Hang 4's rule holds: draw()'s per-sim-tick guard is above this call, each boot is entered once,
+ * and the two are distinct J3DModels sharing data — exactly what daAlink_c does.
+ */
+void daRemotePlayer_c::drawHeavyBoots() {
+    if (!mHeavyBootsOn) {
+        return;
+    }
+    drawModel(mpHeavyBootsModel[0]);
+    drawModel(mpHeavyBootsModel[1]);
+
+    // Absence is the signal: no line means this puppet never drew its iron boots all session.
+    if (!mLoggedHeavyBootsDraw) {
+        mLoggedHeavyBootsDraw = true;
+        Log.debug("Puppet {} drawing iron boots", mPlayerId);
+    }
+}
+
+/// Both boots into the puppet's real shadow, daAlink_c's d_a_alink.cpp:19348-19352. After
+/// shadowDraw(), which is what registers mShadowKey.
+void daRemotePlayer_c::addHeavyBootsShadow() {
+    if (!mHeavyBootsOn || mShadowKey == 0) {
+        return;
+    }
+    dComIfGd_addRealShadow(mShadowKey, mpHeavyBootsModel[0]);
+    dComIfGd_addRealShadow(mShadowKey, mpHeavyBootsModel[1]);
+}
+
 void daRemotePlayer_c::setMatrix() {
     mDoMtx_stack_c::transS(current.pos);
     /* daAlink_c's own rotation order (d_a_alink.cpp:5776). shape_angle.z is the sender's run bank
@@ -7801,6 +8003,7 @@ int daRemotePlayer_c::execute() {
     soundFramework();
     traceCalc("setMatrix");
     setMatrix();
+    setHeavyBootsMatrix(); // iron boots: ride the body's leg joints, so after its calc
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8140,12 +8343,14 @@ int daRemotePlayer_c::draw() {
     // block (3): the held item and the lantern, after the equipment as daAlink_c draws them.
     traceCalc("draw: held item");
     drawHeldItems();
+    drawHeavyBoots(); // after the lantern, daAlink_c's order (d_a_alink.cpp:19822-19847)
     // Last, exactly where daAlink_c puts it (d_a_alink.cpp:19849-19853): the shadow projects the
     // models, so it wants them posed and their tevStr settled, and it renders in its own later pass
     // rather than into the draw list we have just filled.
     traceCalc("draw: shadow");
     shadowDraw();
     addHeldItemShadow();
+    addHeavyBootsShadow();
     traceCalc("draw done");
     return 1;
 }

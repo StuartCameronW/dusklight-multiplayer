@@ -174,8 +174,8 @@ public:
     /// like the guard bit. It drives the footstep swap WALK/JUMP_DUMMY -> _HEAVY, which is
     /// Z2LinkSoundStarter's test on the same flag's boots type (Z2LinkMgr.cpp:578-601); see
     /// daRemotePlayer_soundStarter_c. It does NOT pick the gait. The gait is mNetHeavyGait, a
-    /// separate fact (kPlayerGearHeavyGait). The puppet still draws no boot models (daAlink_c's
-    /// mpLinkBootModels, d_a_alink.cpp:5995/:19832).
+    /// separate fact (kPlayerGearHeavyGait). It also draws the boot models (daAlink_c's
+    /// mpLinkBootModels, d_a_alink.cpp:5995/:19832); see setupHeavyBootsModel().
     void setNetworkHeavyBoots(bool i_heavyBoots) {
         mNetHeavyBoots = i_heavyBoots;
         mSoundStarter.mHeavyBoots = i_heavyBoots;
@@ -1321,6 +1321,24 @@ private:
     bool mLoggedHeldMissing[9];
     bool mLoggedHeldDraw[9];
     bool mLoggedLantern;
+
+    // --- iron boots (agent C) ---
+    /* daAlink_c's mpLinkBootModels and field_0x06e0, driven by mNetHeavyBoots. See the block
+     * comment above setupHeavyBootsModel() in d_a_remote_player.cpp. All zeroed by fopAcM_ct. */
+    void setupHeavyBootsModel();
+    void setHeavyBootsMatrix();
+    void drawHeavyBoots();
+    void addHeavyBootsShadow();
+    /// One per foot, both from this puppet's outfit archive's al_bootsH.bmd. Both or neither.
+    J3DModel* mpHeavyBootsModel[2];
+    /// The body shape the outfit's own boots are (field_0x06e0), or NULL when the outfit has none.
+    J3DShape* mpHeavyBootsBodyShape;
+    /// This tick's boots state as latched by setHeavyBootsMatrix(); draw reads this, not the wire.
+    bool mHeavyBootsOn;
+    /// What mpHeavyBootsBodyShape's hide flag currently says, so it is only written on a change.
+    bool mHeavyBootsBodyHidden;
+    bool mLoggedHeavyBootsDraw;
+    u16 mHeavyBootsLogCount;
 };
 
 /**
