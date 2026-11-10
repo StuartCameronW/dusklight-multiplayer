@@ -58,7 +58,23 @@ constexpr float kFadeEnd = 4200.0f;
 /// Tag text height as a fraction of the game image's height, so it scales with window size and
 /// DPI alike (ImGui works in logical units; the font atlas is already rasterised at the display
 /// scale by ImGuiEngine_Initialize).
-constexpr float kTextHeightFraction = 0.034f;
+constexpr float kTextHeightFraction = 0.024f;
+
+/// The tag shrinks with distance so a far partner's name does not cover the scenery: full size up
+/// to kShrinkStart, then down linearly to kFarScale of it at kFadeStart, where the fade takes over.
+constexpr float kShrinkStart = 300.0f;
+constexpr float kFarScale = 0.55f;
+
+/// Smallest text drawn, in ImGui logical units. Below this the font is unreadable anyway.
+constexpr float kMinTextSize = 8.0f;
+
+float distance_scale(float distance) {
+    if (distance <= kShrinkStart) {
+        return 1.0f;
+    }
+    const float t = std::min(1.0f, (distance - kShrinkStart) / (kFadeStart - kShrinkStart));
+    return 1.0f - (1.0f - kFarScale) * t;
+}
 
 /// Why tags are not being drawn this frame, for the transition log.
 enum class Gate {
@@ -279,8 +295,7 @@ void ShowNameTags() {
     const ScreenRect rect = game_rect();
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
     ImFont* font = ImGuiEngine::fontLarge != nullptr ? ImGuiEngine::fontLarge : ImGui::GetFont();
-    const float textSize = std::clamp(rect.h * kTextHeightFraction, 12.0f, 64.0f);
-    const float outline = std::max(1.0f, textSize / 18.0f);
+    const float baseTextSize = std::clamp(rect.h * kTextHeightFraction, 10.0f, 48.0f);
     const auto now = std::chrono::steady_clock::now();
 
     for (const PuppetEntry& entry : puppets) {
@@ -311,6 +326,8 @@ void ShowNameTags() {
                                1.0f :
                                1.0f - (at.distance - kFadeStart) / (kFadeEnd - kFadeStart);
 
+        const float textSize = std::max(kMinTextSize, baseTextSize * distance_scale(at.distance));
+        const float outline = std::max(1.0f, textSize / 18.0f);
         const char* name = player.nickname.empty() ? "Player" : player.nickname.c_str();
         const ImVec2 size = font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, name);
         const ImVec2 pos(std::floor(at.x - size.x * 0.5f), std::floor(at.y - size.y));
