@@ -112,6 +112,8 @@ bool sStickToArrived = false;
 bool sActive = false;
 bool sFinished = false;
 bool sSawWorld = false;
+/// `shield` swapped the model outside the collection menu: pump his reload until it lands.
+bool sShieldLoadPending = false;
 std::uint64_t sTicks = 0;
 
 struct ButtonName {
@@ -324,6 +326,11 @@ void run_setup_command(const Command& command) {
         dComIfGs_onItemFirstBit(static_cast<u8>(command.room));
         dMeter2Info_setShield(static_cast<u8>(command.room), false);
         daAlink_getAlinkActorClass()->setShieldChange();
+        /* His shield reload (loadShieldModelDVD) only runs from statusWindowExecute, i.e. while
+         * the collection menu is open (d_a_alink_swindow.inc:300-306). Outside it the timer never
+         * runs down and checkShieldDraw() stays false: no shield is drawn at all. tick() pumps
+         * it in the menu's place. */
+        sShieldLoadPending = true;
         Log.info("[{}] wearing shield item 0x{:02X}", sTicks, command.room);
         break;
     case Op::ShieldBurn: {
@@ -830,6 +837,16 @@ void tick() {
     }
 
     sTicks++;
+
+    if (sShieldLoadPending) {
+        daAlink_c* alink = daAlink_getAlinkActorClass();
+        if (alink == nullptr || alink->getShieldChangeWaitTimer() == 0) {
+            sShieldLoadPending = false;
+            Log.info("[{}] shield model {}", sTicks, alink != nullptr ? "loaded" : "load dropped (no Link)");
+        } else {
+            alink->loadShieldModelDVD();
+        }
+    }
 
     if (!settle_program_counter()) {
         sFinished = true;
