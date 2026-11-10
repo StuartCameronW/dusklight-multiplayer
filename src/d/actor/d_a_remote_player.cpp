@@ -8243,6 +8243,7 @@ int daRemotePlayer_c::execute() {
     setHeavyBootsMatrix(); // iron boots: ride the body's leg joints, so after its calc
     updateLanternFx(); // lantern flame + glow: after setMatrix's lantern calc (agent D)
     updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
+    updateFootFx(); // footstep dust, ripples, splashes (agent J): needs this tick's foot joints
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8638,3 +8639,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_swordfx.inc"
 // The clawshot's fired tips and chains, after both: it uses the held loaders and the ball's chain.
 #include "d/actor/d_a_remote_player_hookshot.inc"
+// Footstep dust, ripples, splashes and wet footprints (agent J). Uses the fx file's emitter slots.
+#include "d/actor/d_a_remote_player_footfx.inc"
