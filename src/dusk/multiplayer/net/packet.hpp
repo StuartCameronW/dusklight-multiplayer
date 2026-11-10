@@ -140,6 +140,11 @@ namespace dusk::mp {
  * 20: PlayerState grew a 2-byte effects block after the iron ball block, always on the wire: u8
  * fxFlags (lantern lit, sword trail, spin, charge ready, damage tint kind) and u8 dmgFlash (the
  * damage-flash timer). A v19 peer's read() would stop two bytes short and drop every pose.
+ *   Then, while heldItem is a clawshot (4 or 5), the clawshot block: u8 clawFlags (which tips are
+ * off their guns, wait, roof hang, chain-wobble stop time), u8 x 2 tip-open frames, and per tip
+ * that is out 3 x s16 position relative to the sender (1/4 unit) + 2 x s16 rotation: 3, 13 or 23
+ * bytes. heldBck id 10 is the gun's HS_SPIN, and heldFlags' kPlayerHeldClawRight is now also sent
+ * for the single clawshot.
  */
 inline constexpr std::uint32_t kProtocolVersion = 20;
 

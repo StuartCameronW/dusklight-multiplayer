@@ -1451,7 +1451,7 @@ private:
     void setHeldItemBck(J3DModel* i_held, u8 i_kind);
     void setHeldArrowMatrix();
     void drawHeldArrow();
-    J3DAnmTransform* mpHeldItemBckAnm[10];
+    J3DAnmTransform* mpHeldItemBckAnm[11];
     mDoExt_bckAnm mHeldItemBck;
     bool mHeldItemBckReady;
     u8 mHeldItemBckShown;
@@ -1471,6 +1471,52 @@ private:
     u8 mHeldItemBckWanted;
     bool mLoggedArrowMissing;
     u16 mHeldBckLogCount;
+    // --- clawshot chain + tip (agent E) ---
+    /* The clawshot's fired tips, their chains and the tip-open BCK (protocol v20 clawshot block).
+     * See d_a_remote_player_hookshot.inc. The guns and tips themselves are the held-item models
+     * (mpHeldModel[kPlayerHeldClawshot], mpHeldClaw2Model, mpHeldClawTip), and the guns' HS_SPIN is
+     * wire block A's kPlayerHeldBckClawSpin on mHeldItemBck. "Slot" 0/1 is daAlink_c's
+     * mHeldItemModel set / field_0x0710 set, not a hand. */
+public:
+    /// The v20 clawshot block, decoded by the bridge: clawFlags, the two tip-open frames, each
+    /// tip's position relative to the sender (zero while on its gun) and its rotation x/y pairs.
+    void setNetworkClawshot(u8 i_flags, const u8* i_tipFrame, const cXyz* i_tipRel,
+        const s16* i_tipAng);
+    /// daAlink_c::hsChainShape_c::draw's clawshot half, from the chain packet at paint time.
+    void drawClawshotChain();
+
+private:
+    void setupClawshot();
+    void setClawshotMatrix(J3DModel* i_held, u8 i_kind);
+    void drawClawshot();
+    void addClawshotShadow(u8 i_kind);
+    /// HS_TIP_OPEN on his mHookTipBck's terms (d_a_alink_hook.inc:448-451); both tips share data.
+    J3DAnmTransform* mpClawTipBckAnm;
+    mDoExt_bckAnm mClawTipBck;
+    bool mClawTipBckReady;
+    /// al_hs_kusari model data (the iron ball's when it loaded) and the chain's immediate packet.
+    J3DModelData* mpClawChainData;
+    J3DPacket* mpClawChainPacket;
+    /// Each slot's muzzle (his mHeldItemRootPos / field_0x3810) and tip anchor (mHookshotTopPos /
+    /// mIronBallBgChkPos), as posed this tick: the chains' ends.
+    cXyz mClawRoot[2];
+    cXyz mClawTop[2];
+    /// getHookshotStopTime() as received: the slot-0 chain's wobble.
+    u8 mClawStopTime;
+    /// The kind the four anchors were last posed for, so the chain never draws stale ones.
+    u8 mClawPosedKind;
+    /// The flags the last pass drew with (shadow gates), and the last logged flags.
+    u8 mClawDrawnFlags;
+    u8 mClawLoggedFlags;
+    /// Frame interpolation of the four anchors, as AlinkInterp's hs_chain (d_a_alink.cpp:64-71).
+    dusk::interp::Samples<cXyz> mClawChainSamples;
+    // The wire's values, as pushed by setNetworkClawshot().
+    u8 mNetClawFlags;
+    u8 mNetClawTipFrame[2];
+    cXyz mNetClawTipRel[2];
+    s16 mNetClawTipAng[4];
+    u16 mClawLogCount;
+    bool mLoggedClawChain;
 };
 
 /**

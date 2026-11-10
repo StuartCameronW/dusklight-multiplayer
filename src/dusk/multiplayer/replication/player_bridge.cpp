@@ -1183,6 +1183,117 @@ void fill_iron_ball(daAlink_c* alink, PlayerState& out) {
     }
 }
 
+// v20 clawshot block
+/**
+ * Fill the v20 clawshot block: where his two clawshot sets' tips are and what they show, read
+ * after setHookshotPos placed them (setItemMatrix, d_a_alink.cpp:6067-6068, inside his execute).
+ *
+ * Read, not re-derived (memory: measure the output, not the input):
+ *   - "out" is his draw's own chain test, `root.abs(top) > 1` per set (d_a_alink.cpp:19793-19796),
+ *     on the very anchors hsChainShape_c::draw reads (getHsChainTopPos etc.,
+ *     d_a_alink.h:3828-3830);
+ *   - an out tip's rotation is read back off the tip MODEL's base matrix, whichever of his three
+ *     placements (fired, hanging, flying back; d_a_alink_hook.inc:1195-1229) produced it;
+ *   - slot 1's tip-open frame is mHookTipBck's own frame, which setHookshotPos entered last
+ *     (:1240); slot 0's is field_0x33e0, which it entered just before (:1208).
+ *
+ * Gated on the held block's kind, filled first: a clawshot his draw is not drawing is not sent.
+ * Idempotent within a tick (capture runs twice per tick): the statics only gate logging.
+ */
+void fill_clawshot(daAlink_c* alink, PlayerState& out) {
+    out.clawFlags = 0;
+    out.clawTipFrame[0] = 0;
+    out.clawTipFrame[1] = 0;
+    std::fill(std::begin(out.clawTipPos), std::end(out.clawTipPos), std::int16_t{0});
+    std::fill(std::begin(out.clawTipAng), std::end(out.clawTipAng), std::int16_t{0});
+
+    static std::uint8_t s_lastFlags = 0xFF;
+    static std::uint16_t s_logCount = 0;
+    static bool s_loggedClamp = false;
+
+    if (alink == nullptr || !out.clawshot_out() || alink->mpHookTipModel == nullptr ||
+        alink->field_0x0714 == nullptr || alink->mHookTipBck.getBckAnm() == nullptr)
+    {
+        s_lastFlags = 0xFF;
+        return;
+    }
+
+    const cXyz* const root[2] = {&alink->mHeldItemRootPos, &alink->field_0x3810};
+    const cXyz* const top[2] = {&alink->mHookshotTopPos, &alink->mIronBallBgChkPos};
+    J3DModel* const tip[2] = {alink->mpHookTipModel, alink->field_0x0714};
+    const float reach = 32767.0f / kPlayerClawPosScale;
+    float rel[6] = {};
+
+    std::uint8_t flags = 0;
+    for (int s = 0; s < 2; s++) {
+        if (!(root[s]->abs(*top[s]) > 1.0f)) {
+            continue;
+        }
+        flags |= static_cast<std::uint8_t>(kPlayerClawTipOut0 << s);
+        rel[s * 3 + 0] = top[s]->x - out.posX;
+        rel[s * 3 + 1] = top[s]->y - out.posY;
+        rel[s * 3 + 2] = top[s]->z - out.posZ;
+        for (int i = s * 3; i < s * 3 + 3; i++) {
+            out.clawTipPos[i] = act_encode_s16(rel[i], kPlayerClawPosScale);
+            if (!s_loggedClamp && std::fabs(rel[i]) > reach) {
+                s_loggedClamp = true;
+                Log.warn("Local clawshot tip {} is ({:.0f}, {:.0f}, {:.0f}) from Link, past the "
+                         "wire's +-{:.0f}; sent clamped (logged once)",
+                    s, rel[s * 3 + 0], rel[s * 3 + 1], rel[s * 3 + 2], reach);
+            }
+        }
+        csXyz rot;
+        mDoMtx_MtxToRot(tip[s]->getBaseTRMtx(), &rot);
+        out.clawTipAng[s * 2 + 0] = rot.x;
+        out.clawTipAng[s * 2 + 1] = rot.y;
+    }
+    if (alink->checkHookshotWait()) {
+        flags |= kPlayerClawWait;
+    }
+    if (dComIfGp_checkPlayerStatus1(0, 0x10000)) {
+        flags |= kPlayerClawRoofHang;
+    }
+    const s16 stop = alink->field_0x3026;
+    flags |= static_cast<std::uint8_t>(
+        ((stop < 0 ? 0 : (stop > 15 ? 15 : stop)) << kPlayerClawStopShift) & kPlayerClawStopMask);
+    out.clawFlags = flags;
+
+    const f32 frames[2] = {alink->field_0x33e0, alink->mHookTipBck.getBckAnm()->getFrame()};
+    for (int s = 0; s < 2; s++) {
+        out.clawTipFrame[s] = static_cast<std::uint8_t>(
+            frames[s] <= 0.0f ? 0.0f : (frames[s] >= 255.0f ? 255.0f : frames[s] + 0.5f));
+    }
+
+    // Logged on a change of which tips are out, wait or hang - not of the stop time, which counts.
+    const std::uint8_t logKey = static_cast<std::uint8_t>(flags & ~kPlayerClawStopMask);
+    if (logKey != s_lastFlags) {
+        if (s_logCount < 100) {
+            s_logCount++;
+            Log.debug("Local clawshot 0x{:02x} -> 0x{:02x}: kind {}, mode {}, right {}, tip0 "
+                      "({:.1f}, {:.1f}, {:.1f}) rot ({}, {}) frame {}, tip1 ({:.1f}, {:.1f}, "
+                      "{:.1f}) frame {}, stop {}",
+                static_cast<unsigned>(s_lastFlags), static_cast<unsigned>(logKey),
+                static_cast<unsigned>(out.heldItem), static_cast<int>(alink->mItemMode),
+                static_cast<int>(alink->field_0x3020), rel[0], rel[1], rel[2],
+                static_cast<int>(out.clawTipAng[0]), static_cast<int>(out.clawTipAng[1]),
+                static_cast<unsigned>(out.clawTipFrame[0]), rel[3], rel[4], rel[5],
+                static_cast<unsigned>(out.clawTipFrame[1]), static_cast<int>(stop));
+        }
+        s_lastFlags = logKey;
+    }
+}
+
+/// The v20 clawshot block, decoded from the wire's fixed point here so the actor never sees the
+/// wire layout. A tip on its gun decodes to a zero offset, which the puppet never reads.
+void apply_clawshot(daRemotePlayer_c* puppet, const PlayerState& state) {
+    cXyz rel[2];
+    for (int s = 0; s < 2; s++) {
+        rel[s].set(state.claw_tip_pos(s * 3 + 0), state.claw_tip_pos(s * 3 + 1),
+            state.claw_tip_pos(s * 3 + 2));
+    }
+    puppet->setNetworkClawshot(state.clawFlags, state.clawTipFrame, rel, state.clawTipAng);
+}
+
 // block (3): held item
 /**
  * Fill block (3): the item model Link is DRAWING in his hands, and the UPPER_2 overlay posing his
@@ -1289,9 +1400,6 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
         } else if (daPy_py_c::checkHookshotItem(item)) {
             if (item == dItemNo_W_HOOKSHOT_e) {
                 out.heldItem = kPlayerHeldDoubleClawshot;
-                if (alink->field_0x3020 != 0) {
-                    out.heldFlags |= kPlayerHeldClawRight;
-                }
                 // The draw's own test for the second pair (d_a_alink.cpp:19779-19780).
                 if (!alink->checkPlayerGuardAndAttack() &&
                     !alink->checkNoResetFlg0(daPy_py_c::FLG0_UNK_2))
@@ -1300,6 +1408,34 @@ void fill_held_item(daAlink_c* alink, PlayerState& out) {
                 }
             } else {
                 out.heldItem = kPlayerHeldClawshot;
+            }
+            /* For the single clawshot too since the v20 clawshot block: a hang flips field_0x3020
+             * and changeHookshotDrawModel then draws his second pair
+             * (d_a_alink_hook.inc:346-356). */
+            if (alink->field_0x3020 != 0) {
+                out.heldFlags |= kPlayerHeldClawRight;
+            }
+            /* The gun's own BCK, HS_SPIN: setHookshotModel's mAnmHeap9 load into mItemBck
+             * (d_a_alink_hook.inc:428-433), entered on mHeldItemModel with field_0x33dc by
+             * setItemMatrix (d_a_alink.cpp:6083-6089) - read off the animation object, as the bow
+             * case above reads his. The table row's kind is kPlayerHeldClawshot for both kinds:
+             * they share one model. A single clawshot drawn swapped shows field_0x0710 instead,
+             * which setHookshotPos enters at frame 0 (d_a_alink_hook.inc:911), so 0 is sent. */
+            J3DAnmTransform* itemBck = alink->mItemBck.getBckAnm();
+            if (itemBck != nullptr && !alink->mAnmHeap9.checkNoSetIdx() &&
+                alink->mAnmHeap9.checkNoSetArcNo())
+            {
+                const std::uint8_t id = daRemotePlayer_heldItemBckToWire(
+                    alink->mAnmHeap9.getIdx(), kPlayerHeldClawshot);
+                const f32 frameMax = itemBck->getFrameMax();
+                if (id != kPlayerHeldBckNone && frameMax > 0.0f) {
+                    out.heldBck = id;
+                    if (out.heldItem == kPlayerHeldDoubleClawshot || alink->field_0x3020 == 0) {
+                        const f32 f = itemBck->getFrame() / frameMax;
+                        out.heldBckFrame = static_cast<std::uint8_t>(
+                            f <= 0.0f ? 0.0f : (f >= 1.0f ? 255.0f : f * 255.0f + 0.5f));
+                    }
+                }
             }
         } else if (item == dItemNo_COPY_ROD_e) {
             out.heldItem = kPlayerHeldCopyRod;
@@ -1758,6 +1894,7 @@ bool capture_local_player(PlayerState& out) {
     // v20: effects. Each feature ORs in only its own PlayerFx bits.
     out.fxFlags = 0;
     out.dmgFlash = 0;
+    fill_clawshot(alink, out); // v20 clawshot block, gated on the held item's kind
 
     return true;
 }
@@ -1953,6 +2090,7 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     puppet->setNetworkIronBall(state.iron_ball_gait(),
         cXyz(state.iron_ball_x(), state.iron_ball_y(), state.iron_ball_z()), state.ironBallAngX,
         state.ironBallAngY, state.ironBallLinks, state.ironBallState);
+    apply_clawshot(puppet, state); // v20 clawshot block
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.
