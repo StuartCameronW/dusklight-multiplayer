@@ -69,8 +69,8 @@ struct OutfitArc {
     /* One BODY-model material daAlink_c hides as it builds the model and never shows again for a
      * player in this state, or l_noBodyMat for none. Two outfits have one: the hero's clothes hide
      * material 16 outright (d_a_alink_wolf.inc:471), and the Zora armour hides material 9 — its
-     * mask — which only comes back for checkZoraWearMaskDraw(), a Zora-swimming state a puppet has
-     * no way to be in yet (:447-449, :488-490). */
+     * mask — which only comes back for checkZoraWearMaskDraw() (:447-449, :488-490). The sender
+     * sends that as kPlayerGearZoraMask, and d_a_remote_player_gear.inc shows it from there. */
     u16 hiddenBodyMatNo;
 };
 
@@ -1404,6 +1404,7 @@ int daRemotePlayer_c::createHeap() {
     setupJointControl();
     setupEquipModels();
     setupHeavyBootsModel();
+    setupGearFx(); // gear fx (agent G): armour BRKs, Zora shapes; no heap
 
     /* Hands, and the one body shape this outfit is built with hidden. Both are the tail of
      * daAlink_c::setLinkModel (d_a_alink_wolf.inc:471-498) and both were missing; see setDrawHand()
@@ -2670,6 +2671,7 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     deleteSound();
     deletePuppetEmitters(); // no particle emitter outlives its puppet (agent D)
     deleteSwordFx(); // sword fx (agent F): hide its emitters, free the trail's texture object
+    deleteGearFx(); // the shield fire's second emitter (agent G)
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
@@ -7721,13 +7723,13 @@ void daRemotePlayer_c::drawEquip() {
      * (:4385-4395); he does no show/hide on the shield at all, and this data is private in any
      * case, so there is no one flag serving two actors here for them to fight over.
      *
-     * What is NOT reproduced is the burnt-wood tint (:19732-19739). It is driven by field_0x2fcb,
-     * the wooden-shield burn timer, which is not on the wire — so a puppet whose shield is on fire
-     * reads as un-tinted. One byte when someone wants it; called out rather than left to be
-     * discovered. */
+     * The burnt-wood tint (:19747-19759) brackets it: his field_0x2fcb burn timer, re-run on this
+     * end from kPlayerGearShieldBurning. See d_a_remote_player_gear.inc. */
     J3DModel* shield = currentShield();
     if (shield != NULL) {
+        const bool burnTint = beginShieldBurnTint(); // agent G
         drawModel(shield);
+        endShieldBurnTint(burnTint);
 
         /* Its OWN latch, not mLoggedEquip's. The two halves of the byte draw independently now, so
          * a session in which the sword line appears and this one does not is a real and diagnosable
@@ -7768,8 +7770,8 @@ void daRemotePlayer_c::drawEquip() {
  * Zora armour 8 (:445), magic armour 10 (:455). A separate table rather than a column of l_outfits
  * so that table stays as it is.
  *
- * The Zora armour's mask (material 9, field_0x06e4) is ALSO hidden by setHeavyBoots, but the puppet
- * hides it permanently already (l_outfits' hide column), so there is nothing more to do for it. */
+ * The Zora armour's mask (material 9, field_0x06e4) is ALSO hidden by setHeavyBoots. The puppet's
+ * mask code reads the same boots bit for it (updateZoraMask, d_a_remote_player_gear.inc). */
 const u16 l_bootsBodyMatNo[] = {l_noBodyMat, 6, 8, 10};
 const int l_bootsBodyMatNum = sizeof(l_bootsBodyMatNo) / sizeof(l_bootsBodyMatNo[0]);
 
@@ -8247,6 +8249,7 @@ int daRemotePlayer_c::execute() {
     setHeavyBootsMatrix(); // iron boots: ride the body's leg joints, so after its calc
     updateLanternFx(); // lantern flame + glow: after setMatrix's lantern calc (agent D)
     updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
+    updateGearFx(); // armour BRK, Zora mask, shield burn (agent G): after setMatrix's shield pose
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8573,6 +8576,7 @@ int daRemotePlayer_c::draw() {
     g_env_light.pat_ratio = savedPatRatio;
     g_env_light.plight_near_pos = savedPlightNearPos;
     applyDamageTint(); // his damage/freeze/ice tint onto tevStr, before any model (agent D)
+    applyMagicArmorBrk(); // the armour glow, entered or removed as his draw() does (agent G)
     traceCalc("draw: body");
     drawModel(model);
     // Same order daAlink_c draws them in, which matters for the face: it is drawn after the head so
@@ -8644,3 +8648,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_swordfx.inc"
 // The clawshot's fired tips and chains, after both: it uses the held loaders and the ball's chain.
 #include "d/actor/d_a_remote_player_hookshot.inc"
+// Magic armour glow, Zora mask, burning wooden shield (agent G): gear bits 3-6.
+#include "d/actor/d_a_remote_player_gear.inc"

@@ -11,6 +11,7 @@
 #include <SDL3/SDL_events.h>
 #include <dolphin/pad.h>
 
+#include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_player.h"
 #include "d/d_camera.h"
 #include "d/d_com_inf_game.h"
@@ -61,6 +62,9 @@ enum class Op {
     Time,
     Arrows,
     Oil,
+    Rupees,
+    Shield,
+    ShieldBurn,
     Quit,
 };
 
@@ -303,6 +307,31 @@ void run_setup_command(const Command& command) {
         dComIfGs_setOil(static_cast<u16>(command.room));
         Log.info("[{}] lantern oil set to {}", sTicks, command.room);
         break;
+    case Op::Rupees:
+        // The wallet, for the magic armour's drain: 0 is its power-down, any other its power-up.
+        dComIfGs_setRupee(static_cast<u16>(command.room));
+        Log.info("[{}] rupees set to {}", sTicks, command.room);
+        break;
+    case Op::Shield:
+        // The collection menu's own three calls (d_menu_collect.cpp:1376-1406).
+        dComIfGs_onItemFirstBit(static_cast<u8>(command.room));
+        dMeter2Info_setShield(static_cast<u8>(command.room), false);
+        daAlink_getAlinkActorClass()->setShieldChange();
+        Log.info("[{}] wearing shield item 0x{:02X}", sTicks, command.room);
+        break;
+    case Op::ShieldBurn: {
+        // A fire hit on the wooden shield: his own guard-side write (d_a_alink_guard.inc:107-108),
+        // so the timer, the tint, the fire and the burn-out all run as they do in play.
+        daAlink_c* alink = daAlink_getAlinkActorClass();
+        if (alink != nullptr && daPy_py_c::checkWoodShieldEquip() && alink->field_0x2fcb == 0) {
+            alink->field_0x2fcb = 120;
+            Log.info("[{}] wooden shield set alight", sTicks);
+        } else {
+            Log.error("[{}] line {}: shieldburn needs a wooden shield that is not already burning",
+                sTicks, command.line);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -372,6 +401,9 @@ bool settle_program_counter() {
         case Op::Time:
         case Op::Arrows:
         case Op::Oil:
+        case Op::Rupees:
+        case Op::Shield:
+        case Op::ShieldBurn:
             run_setup_command(command);
             sPc++;
             continue;
@@ -530,6 +562,17 @@ void load_script(const std::filesystem::path& path) {
             // "oil 21600": lantern oil (and its max, if lower); 21600 is a full lantern.
             command.op = Op::Oil;
             ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+        } else if (verb == "RUPEES") {
+            // "rupees 5": the wallet, for the magic armour (a low count drains to 0 in seconds).
+            command.op = Op::Rupees;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+        } else if (verb == "SHIELD") {
+            // "shield 0x2A": wear that shield (dItemNo_WOOD_SHIELD_e 0x2A, _SHIELD_e 0x2B, ...).
+            command.op = Op::Shield;
+            ok = parse_int(a, command.room) && command.room >= 0x2A && command.room <= 0x2C;
+        } else if (verb == "SHIELDBURN") {
+            // "shieldburn": set the worn wooden shield alight, as a fire hit does.
+            command.op = Op::ShieldBurn;
         } else if (verb == "QUIT") {
             command.op = Op::Quit;
         } else {
