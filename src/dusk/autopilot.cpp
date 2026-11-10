@@ -60,6 +60,7 @@ enum class Op {
     Clothes,
     Time,
     Arrows,
+    Oil,
     Quit,
 };
 
@@ -294,6 +295,14 @@ void run_setup_command(const Command& command) {
         dComIfGs_setArrowNum(static_cast<u8>(command.room));
         Log.info("[{}] arrows set to {}", sTicks, command.room);
         break;
+    case Op::Oil:
+        // What item_func_KANTERA does on top of the slot: an empty lantern will not light.
+        if (dComIfGs_getMaxOil() < command.room) {
+            dComIfGs_setMaxOil(static_cast<u16>(command.room));
+        }
+        dComIfGs_setOil(static_cast<u16>(command.room));
+        Log.info("[{}] lantern oil set to {}", sTicks, command.room);
+        break;
     default:
         break;
     }
@@ -362,6 +371,7 @@ bool settle_program_counter() {
         case Op::Clothes:
         case Op::Time:
         case Op::Arrows:
+        case Op::Oil:
             run_setup_command(command);
             sPc++;
             continue;
@@ -516,6 +526,10 @@ void load_script(const std::filesystem::path& path) {
             // "arrows 30": the quiver count (and its max, if lower). "give 4 0x43" alone leaves 0.
             command.op = Op::Arrows;
             ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFF;
+        } else if (verb == "OIL") {
+            // "oil 21600": lantern oil (and its max, if lower); 21600 is a full lantern.
+            command.op = Op::Oil;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
         } else if (verb == "QUIT") {
             command.op = Op::Quit;
         } else {
