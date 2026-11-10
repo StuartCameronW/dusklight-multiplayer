@@ -237,8 +237,8 @@ STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 11);
  * The clawshot's gun spin (HS_SPIN) is in the same BCK table; its tip-open BCK and its chain are
  * built right after this, by setupClawshot (d_a_remote_player_hookshot.inc).
  *
- * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the lantern glow,
- * the bomb arrow's fuse smoke particles. Every load is individually non-fatal.
+ * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the bomb arrow's
+ * fuse smoke particles. (The lantern glow is setupLanternFx, d_a_remote_player_fx.inc.) Every load is individually non-fatal.
  */
 void daRemotePlayer_c::setupHeldItems() {
     for (int i = 0; i < dusk::mp::kPlayerHeldKindNum; i++) {
