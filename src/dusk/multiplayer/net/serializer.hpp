@@ -148,6 +148,9 @@ public:
 
     /// True if every read so far succeeded. Check this once after parsing a whole packet.
     bool ok() const { return mOk; }
+    /// Where the bytes not read yet start (with remaining()), for code that keeps a packet to
+    /// handle later.
+    const std::uint8_t* cursor() const { return mData + mPos; }
     std::size_t remaining() const { return mSize - mPos; }
 
 private:

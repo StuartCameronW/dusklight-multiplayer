@@ -21,6 +21,7 @@
 #include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
+#include "dusk/multiplayer/session/network_manager.hpp"
 #include "dusk/multiplayer/session/presence.hpp"
 #include "dusk/multiplayer/session/world_sync.hpp"
 #include "dusk/settings.h"
@@ -789,6 +790,38 @@ constexpr double kTalkReach = 120.0;
 
 /// Runs every command that takes no time (say/repeat/end/quit), leaving sPc on a timed one.
 /// Returns false once the program is over.
+/// Ticks a `warp` has been held so far, waiting for a guest's world install (see Op::Warp).
+int sWarpHeld = 0;
+constexpr int kWarpHoldLimit = 1800;
+
+/// A guest's scripted warp waits until the host's world is installed. The install reloads the
+/// current stage in place (world_bridge reload_in_place), and the game starts that stage change on
+/// the next tick; a warp issued meanwhile lands mid-fade and is dropped, so the guest silently
+/// stays where it booted and every check after it runs in the wrong stage. Measured 2026-11-10:
+/// both batch-5 pair tests lost the guest's Ordon warp this way. A player can't hit this (no one
+/// warps within a second of joining), so it is held here, in the harness, not in the game.
+bool warp_must_wait_for_world_sync() {
+    const mp::NetworkManager& net = mp::network_manager();
+    if (net.role() != mp::Role::Client || mp::world_sync::synced()) {
+        if (sWarpHeld > 0) {
+            Log.info("[{}] warp released after {} tick(s): the host's world is installed", sTicks,
+                sWarpHeld);
+        }
+        sWarpHeld = 0;
+        return false;
+    }
+    if (sWarpHeld == 0) {
+        Log.info("[{}] warp held: waiting for the host's world to be installed first", sTicks);
+    }
+    if (++sWarpHeld > kWarpHoldLimit) {
+        Log.warn("[{}] warp: still no world sync after {} ticks; warping anyway", sTicks,
+            kWarpHoldLimit);
+        sWarpHeld = 0;
+        return false;
+    }
+    return true;
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -838,6 +871,9 @@ bool settle_program_counter() {
              *
              * Not gated on in_world(): a warp issued before the world exists is the game's own
              * problem to reject, and pretending otherwise would hide a real ordering bug. */
+            if (warp_must_wait_for_world_sync()) {
+                return true;  // the timed switch holds it (case Op::Warp) and settle retries
+            }
             Log.info("[{}] warping to stage '{}' point {} room {} layer {}", sTicks, command.text,
                 command.point, command.room, command.layer);
             dComIfGp_setNextStage(command.text.c_str(), static_cast<s16>(command.point),
@@ -1455,6 +1491,12 @@ void tick() {
                       "continuing anyway",
                 command.point, command.frames);
         }
+        break;
+
+    case Op::Warp:
+        // Only reached while warp_must_wait_for_world_sync() holds it: never advance from here;
+        // settle_program_counter() performs the warp once the guest is synced.
+        duration = sElapsed + 2;
         break;
 
     default:

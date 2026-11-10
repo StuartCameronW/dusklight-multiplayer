@@ -102,6 +102,17 @@ struct State {
     world::WorldView cur;
     std::vector<world::WorldOp> ops;
 
+    /// Packets that arrived while this end's world was away (a stage change), kept in order and
+    /// handled once it is back: guest proposals on the host, host commits on a guest. Dropping
+    /// them and resyncing instead lost the change for good: a chest the guest opened while the
+    /// host walked through a door came back closed (and openable again), and the resync also
+    /// overwrote anything this end's own game set during its load (stage-entry scenes set flags).
+    struct Deferred {
+        std::uint32_t from = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+    std::deque<Deferred> deferred;
+
     bool haveEpoch = false;
     std::uint32_t epoch = 0;
 
@@ -212,6 +223,30 @@ bool is_host() {
     return network_manager().role() == Role::Host;
 }
 
+/// Beyond this many held packets something is stuck; fall back to a resync.
+constexpr std::size_t kMaxDeferred = 512;
+
+/// Keeps the rest of `r` to be handled once this end's world is back. False when the queue is full.
+bool defer_packet(Reader& r, std::uint32_t from) {
+    State& s = st();
+    if (s.deferred.size() >= kMaxDeferred) {
+        Log.error("[mp-world] {}: {} packets held while the world is away; giving up on holding",
+            is_host() ? "host" : "guest", s.deferred.size());
+        return false;
+    }
+    State::Deferred d;
+    d.from = from;
+    d.bytes.assign(r.cursor(), r.cursor() + r.remaining());
+    s.deferred.push_back(std::move(d));
+    if (s.deferred.size() == 1) {
+        Log.info("[mp-world] {}: world away (stage change); holding packets until it is back",
+            is_host() ? "host" : "guest");
+    }
+    return true;
+}
+
+void drain_deferred();
+
 void go_unsynced(const char* why) {
     State& s = st();
     if (s.synced) {
@@ -316,6 +351,7 @@ void host_tick(bool ready) {
         s.hostEverSynced = true;
     }
 
+    drain_deferred();
     host_send_owed_syncs();
 
     world_bridge::capture(s.cur);
@@ -481,7 +517,8 @@ void guest_send_flood() {
 void guest_tick(bool ready) {
     State& s = st();
     if (!ready) {
-        go_unsynced("no world");
+        // A stage change, not a new world (that bumps the reset epoch, handled in tick()): stay
+        // synced, stop diffing, and hold the host's commits until the world is back (deferred).
         return;
     }
 
@@ -494,6 +531,8 @@ void guest_tick(bool ready) {
         }
         return;
     }
+
+    drain_deferred();
 
     if (test_world_flood() && !s.floodSent && now_tick() - s.syncedAtTick >= 90) {
         guest_send_flood();
@@ -737,6 +776,25 @@ bool any_bits(const std::uint8_t* bytes, std::size_t count, std::size_t skipByte
     return false;
 }
 
+void drain_deferred() {
+    State& s = st();
+    if (s.deferred.empty()) {
+        return;
+    }
+    std::deque<State::Deferred> queue;
+    queue.swap(s.deferred);
+    Log.info("[mp-world] {}: world back; handling {} held packet(s)", is_host() ? "host" : "guest",
+        queue.size());
+    for (const State::Deferred& d : queue) {
+        Reader rr(d.bytes.data(), d.bytes.size());
+        if (is_host()) {
+            host_on_propose(rr, d.from);
+        } else {
+            guest_on_commit(rr);
+        }
+    }
+}
+
 }  // namespace
 
 void tick() {
@@ -753,6 +811,9 @@ void tick() {
             is_host() ? "host" : "guest", s.epoch, epoch);
         go_unsynced("reset epoch changed");
         s.installedThisEpoch = false;
+        // Held packets belong to the old world. The host resends its new world to everyone; a
+        // guest asks for it.
+        s.deferred.clear();
         if (is_host()) {
             // A different world: recapture and resend it rather than diff old against new.
             s.haveShadow = false;
@@ -783,9 +844,18 @@ void on_packet(PacketId id, Reader& r, std::uint32_t fromPlayerId) {
     }
 
     switch (id) {
-    case PacketId::WorldPropose:
+    case PacketId::WorldPropose: {
+        // The host's world is away (a stage change) but it is the same world: hold the proposal
+        // rather than drop it. With no shadow at all (never had a world, or a new one) the old
+        // path stands: dropped, and the guest gets a WorldSync.
+        State& s = st();
+        const bool away = !s.synced || !world_bridge::world_ready() || !s.deferred.empty();
+        if (away && s.haveShadow && defer_packet(r, fromPlayerId)) {
+            break;
+        }
         host_on_propose(r, fromPlayerId);
         break;
+    }
     case PacketId::WorldSyncRequest: {
         std::uint32_t lastApplied = 0;
         std::uint8_t reason = 0;
@@ -805,9 +875,18 @@ void on_packet(PacketId id, Reader& r, std::uint32_t fromPlayerId) {
     case PacketId::WorldSync:
         guest_on_sync(r);
         break;
-    case PacketId::WorldCommit:
+    case PacketId::WorldCommit: {
+        State& s = st();
+        if (s.synced && (!world_bridge::world_ready() || !s.deferred.empty())) {
+            if (!defer_packet(r, fromPlayerId)) {
+                s.deferred.clear();
+                go_unsynced("too many held commits");
+            }
+            break;
+        }
         guest_on_commit(r);
         break;
+    }
     case PacketId::WorldDigest:
         guest_on_digest(r);
         break;
