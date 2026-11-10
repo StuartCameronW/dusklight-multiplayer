@@ -427,7 +427,9 @@ void host_on_propose(Reader& r, std::uint32_t fromPlayerId) {
         }
         // Counters as deltas onto the host's own value: absolutes would lose one of two pickups
         // that cross in flight (world_state.hpp).
-        if (!world::apply_op(s.scratch, s.shadow, op, false)) {
+        // The shadow first: apply_op adds a counter delta onto its FIRST view, and the scratch
+        // view is stale (it held 0 rupees, so a guest's +30 set the shared wallet to 30).
+        if (!world::apply_op(s.shadow, s.scratch, op, false)) {
             Log.warn("[mp-world] host: op{} from player {} did not apply; dropped",
                 describe_ops({op}), fromPlayerId);
             continue;

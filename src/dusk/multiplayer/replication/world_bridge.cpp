@@ -67,6 +67,7 @@ static_assert(kPbWallet + 1 == world::kPlayerBytes, "Items byte map vs kPlayerBy
 /// Which mSave table mMemory currently holds; -1 between putSave and the next getSave.
 int s_liveTbl = -1;
 std::uint32_t s_resetEpoch = 0;
+bool s_reloadPending = false;
 /// A stage has loaded its table since the last bulk reset/load (a game is actually in progress).
 bool s_loadedSinceReset = false;
 
@@ -294,6 +295,7 @@ void reload_in_place() {
 
     dComIfGs_setRestartRoom(pos, angle, room);
     dComIfGp_setNextStage(stage, -1, room, -1);
+    s_reloadPending = true;
     // Start mode 0 = arrive standing. Without this the param left by the last void-out would be
     // reused (d_stage.cpp:1714 copies it into Link's parameters for point -1).
     dComIfGs_setRestartRoomParam(daPy_py_c::setParamData(room, 0, 0, 0));
@@ -503,6 +505,10 @@ std::uint32_t reset_epoch() {
     return s_resetEpoch;
 }
 
+bool reload_pending() {
+    return s_reloadPending;
+}
+
 }  // namespace world_bridge
 
 // --- decomp hooks (declared in dusk/multiplayer.hpp) ---------------------------------------------
@@ -516,6 +522,7 @@ void world_on_memory_loaded(int stageNo) {
         return;
     }
     world_bridge::s_liveTbl = stageNo;
+    world_bridge::s_reloadPending = false;
     world_bridge::s_loadedSinceReset = true;
 }
 

@@ -21,6 +21,7 @@
 #include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
+#include "dusk/multiplayer/replication/world_bridge.hpp"
 #include "dusk/multiplayer/session/network_manager.hpp"
 #include "dusk/multiplayer/session/presence.hpp"
 #include "dusk/multiplayer/session/world_sync.hpp"
@@ -802,7 +803,9 @@ constexpr int kWarpHoldLimit = 1800;
 /// warps within a second of joining), so it is held here, in the harness, not in the game.
 bool warp_must_wait_for_world_sync() {
     const mp::NetworkManager& net = mp::network_manager();
-    if (net.role() != mp::Role::Client || mp::world_sync::synced()) {
+    const bool settled =
+        mp::world_sync::synced() && !mp::world_bridge::reload_pending() && in_world();
+    if (net.role() != mp::Role::Client || settled) {
         if (sWarpHeld > 0) {
             Log.info("[{}] warp released after {} tick(s): the host's world is installed", sTicks,
                 sWarpHeld);

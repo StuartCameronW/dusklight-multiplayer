@@ -75,5 +75,8 @@ int live_tbl();
 /// Bumped every time the save info was bulk-reset or bulk-loaded (dSv_info_c::init, card_to_memory,
 /// title/file select). The world_sync layer drops to Unsynced when it changes.
 std::uint32_t reset_epoch();
+/// True from install_host_world's reload in place until the reloaded stage has loaded its flags
+/// (hook H1). A warp issued in that window is dropped by the scene change already under way.
+bool reload_pending();
 
 }  // namespace dusk::mp::world_bridge
