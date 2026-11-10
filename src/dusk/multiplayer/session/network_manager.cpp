@@ -1,23 +1,46 @@
 #include "network_manager.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <iterator>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <thread>
+
+#include <aurora/card.h>
+#include <borealis/io.hpp>
 
 #include "../net/enet_transport.hpp"
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
+#include "../replication/object_channel.hpp"
 #include "../replication/player_bridge.hpp"
 #include "../replication/player_state.hpp"
 #include "../replication/replication_manager.hpp"
 #include "../replication/world_clock.hpp"
+#include "../replication/world_state.hpp"
 #include "dusk/logging.h"
+#include "dusk/save_manager.hpp"
 #include "dusk/ui/ui.hpp"
+#include "dusk/version.hpp"
 #include "fmt/format.h"
+#include "m_Do/m_Do_MemCard.h"
 #include "mod_check.hpp"
+#include "presence.hpp"
 #include "save_guard.hpp"
 #include "trace.hpp"
+#include "world_sync.hpp"
+
+namespace dusk::mp::world {
+/// Agent S's engine-free self-test of world_state (world_state.cpp). Declared here as well as
+/// wherever S declares it, so this file does not depend on which header that is.
+bool selftest(std::string& failure);
+}  // namespace dusk::mp::world
 
 namespace dusk::mp {
 namespace {
@@ -114,6 +137,160 @@ std::uint64_t test_leave_tick() {
         return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
     }();
     return value;
+}
+
+/**
+ * ★ Test knob (mp-m4-m5-world.md I.6): DUSK_MP_TEST_STALL_MS=<ms>@<tick> sleeps the game thread
+ * once, for <ms>, on session tick <tick>, to measure what a real stall (shader compile, the Windows
+ * modal drag loop, a DVD error box) does to the far end: does it drop us, and after how long. Read
+ * once; never set in normal play.
+ */
+struct StallKnob {
+    std::uint64_t ms = 0;
+    std::uint64_t tick = 0;
+};
+
+const StallKnob& test_stall() {
+    static const StallKnob value = [] {
+        StallKnob knob;
+        const char* env = std::getenv("DUSK_MP_TEST_STALL_MS");
+        if (env == nullptr || env[0] == '\0') {
+            return knob;
+        }
+        char* end = nullptr;
+        const unsigned long long ms = std::strtoull(env, &end, 10);
+        if (end == nullptr || *end != '@') {
+            Log.warn("DUSK_MP_TEST_STALL_MS='{}' is not <ms>@<tick>; ignored", env);
+            return knob;
+        }
+        knob.ms = ms;
+        knob.tick = std::strtoull(end + 1, nullptr, 10);
+        return knob;
+    }();
+    return value;
+}
+
+/// Rate limit for per-packet warnings that a misbehaving peer could produce at the sim rate.
+bool warn_budget() {
+    static int remaining = 50;
+    return remaining > 0 && remaining-- > 0;
+}
+
+/**
+ * ★ Pre-session backup of the host's card (mp-m4-m5-world.md II.8 c). From M5 on, a GUEST's changes
+ * are written into the HOST's real save, and the host autosaves at every stage entry and shutter
+ * door. A guest bug that slips past the proposal limits would be saved one door later. With this,
+ * a bad session costs that session, not the file.
+ *
+ * Not save_manager::create_backup, although it exists: that one prunes the Save Manager's backups
+ * down to ten, and this copy must never delete or overwrite any backup. Not data.cpp's startup
+ * backup either (internal to data.cpp, and it prunes too). So: one plain copy per session into
+ * <card folder>/mp-backups/, named mp-backup-<yyyymmdd-hhmmss>.<gci|raw>, plus the save's mod
+ * sidecar when there is one.
+ *
+ * Into a subfolder rather than next to the card file on purpose: a second .gci in the GCI folder
+ * would be mounted as another save file by the card layer. The Save Manager's own backups/ already
+ * lives in the same place.
+ *
+ * Best-effort, like every backup here: a failure warns and hosting goes on.
+ */
+void backup_host_card_for_session() {
+    if (saving_disabled()) {
+        // This instance writes no save at all (P0: another Dusklight holds the data directory),
+        // so there is nothing a session could damage, and the card belongs to the other instance.
+        Log.info("[mp-world] pre-session backup skipped: saving is disabled on this instance");
+        return;
+    }
+
+    const auto& diskId = dusk::version::getDiskID();
+    const std::string game{diskId.gameName, sizeof(diskId.gameName)};
+    const std::string maker{diskId.company, sizeof(diskId.company)};
+    const char* fileName = mDoMemCd_GetFileName();
+    const std::string saveName = fileName != nullptr ? fileName : "";
+    const auto cardType = aurora_card_get_type(0);
+    const auto storage = save_manager::resolve_storage(game,
+        cardType == AURORA_CARD_RAW_IMAGE ? save_manager::StorageKind::RawImage :
+                                            save_manager::StorageKind::GciDirectory,
+        0);
+    if (!storage) {
+        Log.warn(
+            "[mp-world] pre-session backup skipped: no card storage ({})", storage.result.message);
+        return;
+    }
+
+    const bool gciFolder = storage.value.kind == save_manager::StorageKind::GciDirectory;
+    const std::filesystem::path source =
+        gciFolder ?
+            storage.value.path / borealis::io::fs_path_from_utf8(
+                                     save_manager::card_file_stem(maker, game, saveName) + ".gci") :
+            storage.value.path;
+    const std::string extension = gciFolder ? ".gci" : ".raw";
+
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(source, ec)) {
+        Log.info("[mp-world] pre-session backup: no card file at '{}' yet; nothing to back up",
+            borealis::io::fs_path_to_string(source));
+        return;
+    }
+
+    const std::filesystem::path dir =
+        (gciFolder ? storage.value.path : storage.value.path.parent_path()) / "mp-backups";
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        Log.warn("[mp-world] pre-session backup failed: cannot create '{}': {}",
+            borealis::io::fs_path_to_string(dir), ec.message());
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    std::array<char, 32> stamp{};
+    if (std::strftime(stamp.data(), stamp.size(), "%Y%m%d-%H%M%S", &local) == 0) {
+        Log.warn("[mp-world] pre-session backup failed: could not format a timestamp");
+        return;
+    }
+
+    // Never overwrite: two sessions in one second get -1, -2, ...
+    const std::string stem = std::string("mp-backup-") + stamp.data();
+    std::filesystem::path target = dir / (stem + extension);
+    for (int n = 1; std::filesystem::exists(target, ec) && n < 1000; ++n) {
+        target = dir / fmt::format("{}-{}{}", stem, n, extension);
+    }
+    // copy_options::none fails rather than overwrite if the name was taken in between.
+    std::filesystem::copy_file(source, target, std::filesystem::copy_options::none, ec);
+    if (ec) {
+        Log.warn("[mp-world] pre-session backup of '{}' to '{}' failed: {}",
+            borealis::io::fs_path_to_string(source), borealis::io::fs_path_to_string(target),
+            ec.message());
+        return;
+    }
+    Log.info("[mp-world] pre-session backup: '{}' -> '{}'", borealis::io::fs_path_to_string(source),
+        borealis::io::fs_path_to_string(target));
+
+    // A randomizer's seed lives in the mod sidecar; a backup without it is not the whole save.
+    const auto sidecar = save_manager::save_sidecar_directory(
+        storage.value.path, storage.value.kind, maker, game, saveName);
+    if (!std::filesystem::is_directory(sidecar, ec)) {
+        return;
+    }
+    std::filesystem::path sidecarTarget = target;
+    sidecarTarget += ".mods";
+    if (std::filesystem::exists(sidecarTarget, ec)) {
+        return;
+    }
+    std::filesystem::copy(sidecar, sidecarTarget, std::filesystem::copy_options::recursive, ec);
+    if (ec) {
+        Log.warn("[mp-world] pre-session backup of the mod data '{}' failed: {}",
+            borealis::io::fs_path_to_string(sidecar), ec.message());
+        return;
+    }
+    Log.info("[mp-world] pre-session backup: mod data '{}' -> '{}'",
+        borealis::io::fs_path_to_string(sidecar), borealis::io::fs_path_to_string(sidecarTarget));
 }
 
 /// Both the toast and the log, always together, so a run's log shows exactly what the player saw.
@@ -226,6 +403,19 @@ void NetworkManager::ensure_initialized() {
     }
     mInitialized = true;
 
+    // Test hook: DUSK_MP_SELFTEST=world runs world_state's engine-free self-test once, session or
+    // not, and says so in a line the harness greps for.
+    if (const char* selftest = env_or_null("DUSK_MP_SELFTEST");
+        selftest != nullptr && std::string_view(selftest) == "world")
+    {
+        std::string failure;
+        if (world::selftest(failure)) {
+            Log.info("[mp-world] selftest PASS");
+        } else {
+            Log.error("[mp-world] selftest FAIL: {}", failure);
+        }
+    }
+
     // Command line first, environment second. The real Host/Join lobby replaces both at M2
     // (see 05-ui-integration.md); until then these are how a session gets opened.
     const std::uint16_t port =
@@ -309,6 +499,8 @@ bool NetworkManager::host(std::uint16_t port) {
     mSentMods = local_mod_fingerprint();
     Log.info("Session started as HOST (protocol v{})", kProtocolVersion);
     Log.info("Mods: hosting with {}", describe_mod_fingerprint(mSentMods));
+    // Once per session, before any guest can have changed anything (II.8 c).
+    backup_host_card_for_session();
     notify("Hosting a co-op session", fmt::format("Waiting for players on UDP port {}.", port));
     return true;
 }
@@ -370,6 +562,12 @@ void NetworkManager::shutdown() {
     // flag is deliberately NOT touched — see save_guard.hpp for why leaving does not undo joining.
     replication_manager().clear();
     world_clock().clear();
+    // v22: the shared world, presence and replicated objects all belong to the session. The world
+    // in memory stays as it is (a guest's save stays latched; see save_guard.hpp).
+    world_sync::reset();
+    presence::reset();
+    objects::reset();
+    mLastPresence.clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
     mAttentiveTime = {};
@@ -419,6 +617,23 @@ void NetworkManager::pre_actor_tick() {
     }
 
     ++mSimTick;
+
+    // Test knob, once per process. Before the drain, so everything the far end sent during the
+    // stall arrives together afterwards, as it would after a real one.
+    static bool s_stalled = false;
+    if (!s_stalled && test_stall().ms != 0 && mSimTick == test_stall().tick) {
+        s_stalled = true;
+        Log.warn("DUSK_MP_TEST_STALL_MS: stalling the game thread for {} ms at tick {}",
+            test_stall().ms, mSimTick);
+        const auto stallStart = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(test_stall().ms));
+        Log.warn("DUSK_MP_TEST_STALL_MS: resumed after {} ms (tick {}, {} peer(s) still connected "
+                 "before the drain)",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - stallStart)
+                .count(),
+            mSimTick, mPeers.size());
+    }
 
     // Advance the watchdog's clock before draining, so packets that queued up while we were away
     // are stamped with the time we came back.
@@ -473,6 +688,14 @@ void NetworkManager::post_actor_tick() {
         send_time_override();
     } else if (mRole == Role::Host) {
         broadcast_snapshot();
+    }
+
+    // v22, after the actor pass for the same reason as the pose: the world diff, object states and
+    // presence describe where this tick ended.
+    if (session_live()) {
+        world_sync::tick();
+        objects::tick();
+        send_presence();
     }
 
     send_heartbeats();
@@ -600,6 +823,11 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
     // standing in a dungeon would otherwise stop the sun for everyone left, permanently, with no
     // way to see why.
     world_clock().forget_peer(session.playerId);
+    // v22: their proposal sequence and owed sync, their presence, and the objects they owned.
+    world_sync::on_peer_left(session.playerId);
+    presence::on_peer_left(session.playerId);
+    mLastPresence.erase(session.playerId);
+    objects::on_peer_left(session.playerId);
     broadcast_peer_left(session.playerId);
 
     if (session.refused) {
@@ -845,18 +1073,34 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
     // host, poses and Hellos only ever up to it. Without this a client could send the host a
     // PeerLeft and make it despawn a third player. And a host acts on nothing from a peer it has
     // not admitted (or has refused) beyond the Hello itself — a heartbeat is harmless either way.
-    const bool hostBound =
-        id == PacketId::Hello || id == PacketId::PlayerStateUpdate || id == PacketId::TimeOverride;
+    //
+    // v22: a guest only PROPOSES world changes and asks for syncs; only the host syncs, commits
+    // and digests. A host taking a WorldSync would put someone else's world into the one save the
+    // session writes. Presence and the owner-originated object packets go either way (the host
+    // relays them), and are policed per packet below.
+    const bool hostBound = id == PacketId::Hello || id == PacketId::PlayerStateUpdate ||
+                           id == PacketId::TimeOverride || id == PacketId::WorldPropose ||
+                           id == PacketId::WorldSyncRequest || id == PacketId::ObjClaim;
     const bool clientBound = id == PacketId::HelloAck || id == PacketId::WorldSnapshot ||
                              id == PacketId::PeerList || id == PacketId::PeerJoined ||
-                             id == PacketId::PeerLeft;
+                             id == PacketId::PeerLeft || id == PacketId::WorldSync ||
+                             id == PacketId::WorldCommit || id == PacketId::WorldDigest ||
+                             id == PacketId::ObjClaimResult;
     if ((hostBound && mRole != Role::Host) || (clientBound && mRole != Role::Client)) {
-        Log.warn("Ignoring packet {} from peer {}: wrong direction for this role", rawId, peer);
+        if (warn_budget()) {
+            Log.warn("Ignoring packet {} from peer {}: wrong direction for this role", rawId, peer);
+        }
         return;
     }
     if (mRole == Role::Host && id != PacketId::Hello && id != PacketId::Heartbeat &&
         id != PacketId::HeartbeatAck &&
         (!sender->second.handshakeComplete || sender->second.refused))
+    {
+        return;
+    }
+    // v22: nothing of the host's world, presence or objects before it has accepted us. A join that
+    // fails may only give saving back if nothing of the host's was applied (save_guard.hpp).
+    if (mRole == Role::Client && !mJoined && rawId >= static_cast<std::uint8_t>(PacketId::Presence))
     {
         return;
     }
@@ -972,6 +1216,9 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // view of.
         send_peer_list(peer);
         broadcast_peer_joined(peerIt->second);
+        // Presence is sent only on change, so a newcomer would otherwise never learn where anyone
+        // already is until they moved (mp-m4-m5-world.md I.3: "sent on change and once on join").
+        send_cached_presence(peer, playerId);
 
         replication_manager().add_player(playerId, nickname, assignedColor);
         Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
@@ -1290,12 +1537,70 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         const std::string name = player_name(playerId);
         const bool known = replication_manager().players().count(playerId) != 0;
         replication_manager().remove_player(playerId);
+        presence::on_peer_left(playerId);
+        objects::on_peer_left(playerId);
         Log.info("Player {} left", playerId);
         if (known) {
             notify(fmt::format("{} left", name), "They are no longer in the session.", 4);
         }
         break;
     }
+    case PacketId::Presence: {
+        const std::uint32_t from = sender->second.playerId;
+        if (mRole == Role::Host) {
+            // The payload names its player ([u32 playerId] first, mp-m4-m5-world.md I.3), and is
+            // relayed verbatim, so the far ends believe that name. A guest speaks only for itself.
+            Reader peek = r;
+            std::uint32_t claimed = 0;
+            if (!peek.read_u32(claimed) || claimed != from) {
+                if (warn_budget()) {
+                    Log.warn("Dropping Presence from player {}: it claims to be player {}", from,
+                        claimed);
+                }
+                return;
+            }
+            relay_to_others(peer, data, size, kChannelControl, true);
+            mLastPresence[from].assign(data, data + size);
+        }
+        presence::on_packet(r, from);
+        break;
+    }
+    case PacketId::WorldSync:
+    case PacketId::WorldPropose:
+    case PacketId::WorldCommit:
+    case PacketId::WorldSyncRequest:
+    case PacketId::WorldDigest:
+        world_sync::on_packet(id, r, sender->second.playerId);
+        break;
+    case PacketId::ObjSpawn:
+    case PacketId::ObjState:
+    case PacketId::ObjEvent:
+    case PacketId::ObjDespawn: {
+        const std::uint32_t from = sender->second.playerId;
+        if (mRole == Role::Host) {
+            // Owner-originated: the host checks the sender may speak for that object before anyone
+            // else hears it (mp-object-channel.md 1.2 "Direction policing").
+            if (!objects::relay_allowed(id, r, from)) {
+                if (warn_budget()) {
+                    Log.warn("Dropping object packet {} from player {}: not theirs to send", rawId,
+                        from);
+                }
+                return;
+            }
+            // Relayed on the channel it travels on: the state stream unreliable on channel 1, the
+            // rest reliable and ordered on channel 2 so a despawn never overtakes its spawn. The
+            // transport does not report the arrival channel; this is the same mapping by packet id.
+            const bool stateStream = id == PacketId::ObjState;
+            relay_to_others(
+                peer, data, size, stateStream ? kChannelState : kChannelObjects, !stateStream);
+        }
+        objects::on_packet(id, r, from);
+        break;
+    }
+    case PacketId::ObjClaim:        // host-bound: judged by the host, never relayed
+    case PacketId::ObjClaimResult:  // client-bound: the host's verdict
+        objects::on_packet(id, r, sender->second.playerId);
+        break;
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);
         break;
@@ -1637,6 +1942,69 @@ void NetworkManager::send_time_override() {
     // Reliable: these are rare, discrete, and a dropped one loses the whole point of the event that
     // produced it — the player would watch the sky snap back to whatever the host still thinks.
     mTransport->broadcast(w.data().data(), w.size(), kChannelControl, true);
+}
+
+void NetworkManager::send_to_player(
+    std::uint32_t playerId, const Writer& w, std::uint8_t channel, bool reliable) {
+    if (!mTransport || w.size() == 0) {
+        return;
+    }
+    for (const auto& [id, session] : mPeers) {
+        if (session.handshakeComplete && !session.refused && session.playerId == playerId) {
+            mTransport->send(id, w.data().data(), w.size(), channel, reliable);
+            return;
+        }
+    }
+}
+
+void NetworkManager::send_to_session(
+    const Writer& w, std::uint8_t channel, bool reliable, std::uint32_t exceptPlayerId) {
+    if (!mTransport || w.size() == 0) {
+        return;
+    }
+    // Admitted peers only, not the transport's broadcast: a peer still in its handshake, or one
+    // being refused, has no business receiving the host's world.
+    for (const auto& [id, session] : mPeers) {
+        if (!session.handshakeComplete || session.refused || session.playerId == exceptPlayerId) {
+            continue;
+        }
+        mTransport->send(id, w.data().data(), w.size(), channel, reliable);
+    }
+}
+
+void NetworkManager::relay_to_others(
+    PeerId from, const std::uint8_t* data, std::size_t size, std::uint8_t channel, bool reliable) {
+    if (!mTransport || mRole != Role::Host) {
+        return;
+    }
+    for (const auto& [id, session] : mPeers) {
+        if (id == from || !session.handshakeComplete || session.refused) {
+            continue;
+        }
+        mTransport->send(id, data, size, channel, reliable);
+    }
+}
+
+void NetworkManager::send_presence() {
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::Presence));
+    if (!presence::build_if_changed(w)) {
+        return;
+    }
+    // Reliable: sent only on change, so a lost one would leave the far end wrong until the next.
+    send_to_session(w, kChannelControl, true);
+    if (mRole == Role::Host) {
+        mLastPresence[kHostPlayerId] = w.data();
+    }
+}
+
+void NetworkManager::send_cached_presence(PeerId peer, std::uint32_t newcomer) {
+    for (const auto& [playerId, bytes] : mLastPresence) {
+        if (playerId == newcomer || bytes.empty()) {
+            continue;
+        }
+        mTransport->send(peer, bytes.data(), bytes.size(), kChannelControl, true);
+    }
 }
 
 void NetworkManager::report_interpolation() {

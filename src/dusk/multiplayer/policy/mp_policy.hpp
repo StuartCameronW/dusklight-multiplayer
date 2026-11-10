@@ -50,22 +50,34 @@ enum class TimeAdvanceRule {
     HostRoom,
 };
 
-/// What happens when a player's hearts reach zero. Product decision, pending (see 00-status.md).
+/// What happens when a player's hearts reach zero.
 enum class DeathRule {
     ReloadRoom,
     RespawnAtCheckpoint,
     DownedUntilRevived,
+    /// Only the player who died respawns; nobody else's game is touched. Stuart's call
+    /// (mp-m4-m5-world.md II.8 #3). Whatever implements it must never reach the memory card: a
+    /// vanilla continue that reloads from the card would put a guest's own file over the host's
+    /// world.
+    RespawnSelf,
 };
 
 struct MultiplayerPolicy {
     Ownership rupees = Ownership::Shared;
-    Ownership inventory = Ownership::Shared;  ///< item slots / owned items
-    Ownership equipment = Ownership::Shared;  ///< visible sword / shield / clothes
-    Ownership ammo = Ownership::Shared;       ///< arrows, bombs
+    Ownership inventory = Ownership::Shared;    ///< item slots / owned items
+    Ownership equipment = Ownership::Shared;    ///< visible sword / shield / clothes
+    Ownership ammo = Ownership::Individual;     ///< arrows, bombs, seeds (counts, not capacity)
+    Ownership bottles = Ownership::Individual;  ///< bottle contents. Pending Q2 (mp-m4-m5-world IV)
+    Ownership oil = Ownership::Individual;      ///< lantern oil. Pending Q2 (mp-m4-m5-world IV)
     Ownership magic = Ownership::Shared;
     Ownership questFlags = Ownership::Shared;  ///< story flags, chests, switches, dungeon items
-    Ownership sceneRoom = Ownership::Shared;   ///< everyone in the same stage/room (lockstep)
+    /// Individual = free roam (Stuart, 2026-11-10): each player goes where they like and loads
+    /// their own stage. Shared would be the old lockstep "everyone in one room".
+    Ownership sceneRoom = Ownership::Individual;
     Ownership timeOfDay = Ownership::Shared;
+
+    /// Free roam's optional "warp to where my partner is" (mp-m4-m5-world.md I.4).
+    bool allowJoinPartner = true;
 
     /// Only read when timeOfDay is Shared. See TimeAdvanceRule for what each one costs.
     TimeAdvanceRule timeAdvance = TimeAdvanceRule::AllPlayers;
@@ -80,7 +92,9 @@ struct MultiplayerPolicy {
     /// rather than assume a single world state. tpmp reached the same answer.
     Ownership transform = Ownership::Individual;
 
-    DeathRule onDeath = DeathRule::ReloadRoom;
+    /// RespawnSelf: "death respawns only that player" (Stuart). Read nowhere yet (2026-11-10), so
+    /// this is the decision recorded rather than behaviour; see DeathRule::RespawnSelf.
+    DeathRule onDeath = DeathRule::RespawnSelf;
 
     // --- Presentation. Not ownership decisions, but they belong in the same settings object so
     // --- the UI binds to one place. tpmp bolted its settings menu on afterwards (08).

@@ -8,12 +8,16 @@
 #include <vector>
 
 #include "../net/packet.hpp"
+#include "../net/serializer.hpp"
 #include "../net/transport.hpp"
 #include "../replication/player_state.hpp"
 #include "dusk/multiplayer.hpp"
 #include "mod_check.hpp"
 
 namespace dusk::mp {
+
+/// "No player": the default for send_to_session's exception.
+inline constexpr std::uint32_t kNoPlayerId = 0xFFFFFFFFu;
 
 enum class Role {
     Inactive,
@@ -124,7 +128,24 @@ public:
     void post_actor_tick();
 
     bool is_active() const { return mRole != Role::Inactive; }
+    /// Host: always while hosting. Client: only once the host has accepted us (HelloAck). Nothing
+    /// of the host's world may be applied, or anything of ours sent for it, before that.
+    bool session_live() const { return mRole == Role::Host || (mRole == Role::Client && mJoined); }
     Role role() const { return mRole; }
+
+    /**
+     * Send a ready-made packet (its first byte is the PacketId) to one player by world identity.
+     * Only admitted, unrefused peers are reachable; a client can reach only the host
+     * (kHostPlayerId). Does nothing if that player is not connected. For the session modules
+     * (world_sync, presence, object_channel), which own their payloads but not the transport.
+     */
+    void send_to_player(
+        std::uint32_t playerId, const Writer& w, std::uint8_t channel, bool reliable);
+
+    /// Send a ready-made packet to every admitted peer except @p exceptPlayerId. On a client that
+    /// is just the host; on the host, every guest.
+    void send_to_session(const Writer& w, std::uint8_t channel, bool reliable,
+        std::uint32_t exceptPlayerId = kNoPlayerId);
     std::uint64_t sim_tick() const { return mSimTick; }
     const std::unordered_map<PeerId, PeerSession>& peers() const { return mPeers; }
     const std::string& local_nickname() const { return mLocalNickname; }
@@ -179,6 +200,18 @@ private:
     /// replication/world_clock.hpp for why a shared clock cannot be a one-way broadcast.
     void send_time_override();
 
+    /// v22: this end's Presence, when it changed (session/presence.hpp). Client: up to the host.
+    /// Host: down to every guest. A guest's presence reaches the others by relay (handle_packet).
+    void send_presence();
+
+    /// Host: everyone's last Presence (the newcomer's own excepted) to a newly admitted peer, so it
+    /// knows where everyone is before they next move.
+    void send_cached_presence(PeerId peer, std::uint32_t newcomer);
+
+    /// Host: forward a packet exactly as it arrived to every admitted peer but @p from.
+    void relay_to_others(PeerId from, const std::uint8_t* data, std::size_t size,
+        std::uint8_t channel, bool reliable);
+
     /// The pose to put on the wire this tick, which is a different question from "is there a Link
     /// to read". Never fails: see the definition for why silence is not an option.
     PlayerState wire_local_state();
@@ -226,6 +259,10 @@ private:
 
     std::unordered_map<PeerId, PeerSession> mPeers;
     std::vector<TransportEvent> mEventScratch;
+
+    /// Host: the last Presence packet (PacketId byte included) from each player, its own under
+    /// kHostPlayerId. Replayed to each newcomer; see send_cached_presence().
+    std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> mLastPresence;
 
     /// Last pose we could actually read off Link, resent while there is none. See
     /// wire_local_state().
