@@ -1755,6 +1755,9 @@ bool capture_local_player(PlayerState& out) {
     fill_location(link, out);
     // v19: attack
     fill_attack(alink, out);
+    // v20: effects. Each feature ORs in only its own PlayerFx bits.
+    out.fxFlags = 0;
+    out.dmgFlash = 0;
 
     return true;
 }

@@ -202,6 +202,25 @@ enum PlayerGearFlags : std::uint8_t {
  * (d_a_alink_ironball.inc:579-580), and at most 100 links of 10 units can be paid out (:563-564).
  */
 constexpr float kPlayerIronBallPosScale = 4.0f;
+
+/**
+ * v20 effects byte (PlayerState::fxFlags). Each bit is owned by one feature; a bit nobody sets is 0.
+ *   bit 0       the lantern is lit (its glow, flame and light).
+ *   bit 1       a sword trail is live (m_swordBlur).
+ *   bit 2       a spin attack's effect is live.
+ *   bit 3       the sword charge is ready (charge glow).
+ *   bits 4-5    PlayerState::dmgFlash's tint kind (kPlayerDmgTint*).
+ *   bits 6-7    reserved, 0.
+ */
+enum PlayerFx : std::uint8_t {
+    kPlayerFxLanternLit = 1 << 0,
+    kPlayerFxSwordTrail = 1 << 1,
+    kPlayerFxSpin = 1 << 2,
+    kPlayerFxChargeReady = 1 << 3,
+};
+constexpr std::uint8_t kPlayerFxDmgTintShift = 4;
+constexpr std::uint8_t kPlayerFxDmgTintMask = 0x30;
+constexpr std::uint8_t kPlayerFxKnownMask = 0x3F;
 // The ironBallState byte's layout is in dusk/player_held.hpp, which the puppet can include.
 
 /**
@@ -681,6 +700,15 @@ struct PlayerState {
     float iron_ball_x() const { return static_cast<float>(ironBallX) / kPlayerIronBallPosScale; }
     float iron_ball_y() const { return static_cast<float>(ironBallY) / kPlayerIronBallPosScale; }
     float iron_ball_z() const { return static_cast<float>(ironBallZ) / kPlayerIronBallPosScale; }
+
+    // v20 effects block (after the iron ball block): 2 bytes, always on the wire.
+    /**
+     *   fxFlags   PlayerFx bits, see above.
+     *   dmgFlash  the sender's damage-flash timer as daAlink_c drives his body tint from it
+     *             (0 = no flash). Its exact meaning is set by the damage-flash feature.
+     */
+    std::uint8_t fxFlags = 0;
+    std::uint8_t dmgFlash = 0;
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
 
@@ -785,6 +813,9 @@ struct PlayerState {
             w.write_u8(ironBallLinks);
             w.write_u8(ironBallState);
         }
+        // v20 effects block
+        w.write_u8(fxFlags);
+        w.write_u8(dmgFlash);
     }
 
     bool read(Reader& r) {
@@ -855,6 +886,11 @@ struct PlayerState {
             ironBallAngX = ironBallAngY = 0;
             ironBallLinks = ironBallState = 0;
         }
+        // v20 effects block
+        if (!(r.read_u8(fxFlags) && r.read_u8(dmgFlash))) {
+            return false;
+        }
+        fxFlags &= kPlayerFxKnownMask;
         roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
         actPitch = act_decode_turn(pitch);
@@ -1119,6 +1155,10 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
         out.ironBallAngX = lerp_angle(a.ironBallAngX, b.ironBallAngX, aimT);
         out.ironBallAngY = lerp_angle(a.ironBallAngY, b.ironBallAngY, aimT);
     }
+
+    // v20 effects block: discrete, take b.
+    out.fxFlags = b.fxFlags;
+    out.dmgFlash = b.dmgFlash;
     return out;
 }
 

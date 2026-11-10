@@ -136,7 +136,12 @@ namespace dusk::mp {
  * the paid-out link count and the throw state (u8 each). gear bit 2 is kPlayerGearIronBallGait,
  * the carry gait read off his slot 1.
  */
-inline constexpr std::uint32_t kProtocolVersion = 19;
+/*
+ * 20: PlayerState grew a 2-byte effects block after the iron ball block, always on the wire: u8
+ * fxFlags (lantern lit, sword trail, spin, charge ready, damage tint kind) and u8 dmgFlash (the
+ * damage-flash timer). A v19 peer's read() would stop two bytes short and drop every pose.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 20;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
