@@ -13,12 +13,16 @@
 #include <dolphin/pad.h>
 #include <fmt/format.h>
 
+#include "JSystem/JUtility/JUTGamePad.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_player.h"
 #include "d/actor/d_a_tbox.h"
 #include "d/d_camera.h"
 #include "d/d_com_inf_game.h"
+#include "d/d_gameover.h"
+#include "d/d_menu_save.h"
 #include "d/d_meter2_info.h"
+#include "d/d_msg_scrn_explain.h"
 #include "dusk/logging.h"
 #include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/item_claims.hpp"
@@ -122,6 +126,12 @@ enum class Op {
     BombArrows,
     Ammo,
     FacePartner,
+    /* --- batch 7: death --- */
+    Life,
+    ExpectLife,
+    DeathMenu,
+    MenuAnswer,
+    Reset,
 };
 
 struct Command {
@@ -1285,6 +1295,113 @@ void run_arrow_command(const Command& command) {
     }
 }
 
+/* --- batch 7: death --- */
+
+/**
+ * The death-rule test's verbs (.claude/future-plans/mp-death-rule.md §5):
+ *  - `life <n>`: Link's current life in quarter hearts, capped at the heart containers. `life 0`
+ *    kills him exactly as the console `kill` does: checkDeadHP sees 0 on his next frame (a fairy
+ *    in a bottle still saves him, as in vanilla).
+ *  - `expectlife <n> [tag]`: PASS/FAIL on the current life. Retry respawns at 12 (3 hearts).
+ *  - `deathmenu [tag]`: log the game-over menu's state ("[autopilot] deathmenu <tag> ...").
+ *  - `menuanswer yes|no [timeout]` (run by tick()): wait for the death menu's "Retry?" prompt and
+ *    answer it through the virtual pad, the stick and A as a player would, then report which state
+ *    the menu went to.
+ *  - `reset`: a soft reset to the title, the same flag the console `reset` and the menu bar set.
+ */
+constexpr int kMenuAnswerYes = 0;
+constexpr int kMenuAnswerNo = 1;
+
+/// menuanswer: A has been pressed on the wanted answer, and the prompt has since closed.
+bool sMenuAnswerPressed = false;
+bool sMenuAnswerClosed = false;
+
+/// The game-over process, or null. msg_class holds its base process as its first member rather
+/// than deriving from it, so this is the decomp's own pointer cast (d_gameover.h does the same).
+dGameover_c* find_gameover() {
+    return reinterpret_cast<dGameover_c*>(fpcM_SearchByName(fpcNm_GAMEOVER_e));
+}
+
+/// The game-over screen's menu (d_gameover.cpp creates it for death, useType 2), or null.
+dMenu_save_c* death_menu() {
+    dGameover_c* gameover = find_gameover();
+    return gameover != nullptr ? gameover->dMs_c : nullptr;
+}
+
+const char* menu_proc_name(u8 proc) {
+    switch (proc) {
+    case dMenu_save_c::PROC_RETRY_QUESTION0:
+        return "retry0";
+    case dMenu_save_c::PROC_RETRY_QUESTION1:
+        return "retry";
+    case dMenu_save_c::PROC_RETRY_QUESTION2:
+        return "title-question";
+    case dMenu_save_c::PROC_GAME_CONTINUE3:
+        return "to-title";
+    case dMenu_save_c::PROC_SAVE_WAIT:
+        return "closing";
+    case dMenu_save_c::PROC_MESSAGE_CHANGE:
+        return "message-change";
+    default:
+        return "other";
+    }
+}
+
+std::string describe_death_menu() {
+    dGameover_c* gameover = find_gameover();
+    if (gameover == nullptr) {
+        return fmt::format("gameover=0 life={}", dComIfGs_getLife());
+    }
+    dMenu_save_c* menu = gameover->dMs_c;
+    if (menu == nullptr) {
+        return fmt::format(
+            "gameover=1 goProc={} menu=0 life={}", gameover->mProc, dComIfGs_getLife());
+    }
+    dMsgScrnExplain_c* explain = menu->mpScrnExplain;
+    return fmt::format("gameover=1 goProc={} menuProc=0x{:02X} ({}) explain={} cursor={} "
+                       "endStatus={} saveStatus={} life={}",
+        gameover->mProc, menu->mMenuProc, menu_proc_name(menu->mMenuProc),
+        explain != nullptr ? static_cast<int>(explain->getStatus()) : -1,
+        explain != nullptr ? static_cast<int>(explain->getSelectCursor()) : -1,
+        menu->getEndStatus(), menu->getSaveStatus(), dComIfGs_getLife());
+}
+
+void run_death_command(const Command& command) {
+    switch (command.op) {
+    case Op::Life: {
+        if (!in_world()) {
+            Log.error("[{}] line {}: life needs the world; skipped", sTicks, command.line);
+            break;
+        }
+        const int maxGauge = dComIfGs_getMaxLifeGauge();
+        const int life = std::min(command.room, maxGauge);
+        dComIfGs_setLife(static_cast<u16>(life));
+        Log.info("[autopilot] life set to {} (max {}){} tick={}", life, maxGauge,
+            life == 0 ? ": Link dies on his next frame" : "", sTicks);
+        break;
+    }
+    case Op::ExpectLife: {
+        const int life = dComIfGs_getLife();
+        Log.info("[autopilot] expectlife {} {} life={} want={} tick={}",
+            command.text.empty() ? std::string("-") : command.text,
+            life == command.room ? "PASS" : "FAIL", life, command.room, sTicks);
+        break;
+    }
+    case Op::DeathMenu:
+        Log.info("[autopilot] deathmenu {} {} session={} tick={}",
+            command.text.empty() ? std::string("-") : command.text, describe_death_menu(),
+            mp::network_manager().session_live() ? "live" : "none", sTicks);
+        break;
+    case Op::Reset:
+        Log.info("[autopilot] reset: soft reset to the title (session {}) tick={}",
+            mp::network_manager().session_live() ? "live" : "none", sTicks);
+        JUTGamePad::C3ButtonReset::sResetSwitchPushing = true;
+        break;
+    default:
+        break;
+    }
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -1433,6 +1550,15 @@ bool settle_program_counter() {
             } else {
                 run_arrow_command(command);
             }
+            sPc++;
+            continue;
+        /* --- batch 7: death --- */
+        // menuanswer takes ticks; it is run by tick().
+        case Op::Life:
+        case Op::ExpectLife:
+        case Op::DeathMenu:
+        case Op::Reset:
+            run_death_command(command);
             sPc++;
             continue;
 
@@ -1820,6 +1946,32 @@ void load_script(const std::filesystem::path& path) {
         } else if (verb == "FACEPARTNER") {
             // "facepartner": turn on the spot toward the nearest remote player's puppet.
             command.op = Op::FacePartner;
+            /* --- batch 7: death --- */
+        } else if (verb == "LIFE") {
+            // "life 0": Link's life in quarter hearts (capped at his containers); 0 kills him.
+            command.op = Op::Life;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+        } else if (verb == "EXPECTLIFE") {
+            // "expectlife 12 retried": PASS/FAIL on the current life (Retry respawns at 12).
+            command.op = Op::ExpectLife;
+            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+            command.text = b;
+        } else if (verb == "DEATHMENU") {
+            // "deathmenu after-no": log the game-over menu's state.
+            command.op = Op::DeathMenu;
+            command.text = a;
+        } else if (verb == "MENUANSWER") {
+            // "menuanswer no [timeout]": answer the death menu's "Retry?" when it is asked.
+            command.op = Op::MenuAnswer;
+            const std::string answer = to_upper(a);
+            command.point =
+                answer == "YES" ? kMenuAnswerYes : (answer == "NO" ? kMenuAnswerNo : -1);
+            command.frames = 1800;
+            ok = command.point >= 0 && (b.empty() || parse_int(b, command.frames)) &&
+                 command.frames > 0;
+        } else if (verb == "RESET") {
+            // "reset": soft reset to the title, as the console `reset` does.
+            command.op = Op::Reset;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -2226,6 +2378,59 @@ void tick() {
             sLastClaimReason = ic::DenyReason::None;
             Log.error("[autopilot] claimtest {} result=pending: unresolved after {} ticks tick={}",
                 sLastClaimDesc, command.frames, sTicks);
+        }
+        break;
+    }
+
+    /* --- batch 7: death --- */
+    case Op::MenuAnswer: {
+        /* Answers "Retry?" through the virtual pad: the explain box moves its cursor on a stick
+         * edge (up = Yes, down = No, d_msg_scrn_explain.cpp move_select_proc) and takes A. 4 ticks
+         * on, 8 off, so every press is a clean edge and its 30-tick key wait is simply waited out.
+         * Done once the prompt has closed and the menu has gone somewhere: "retry" again (the
+         * co-op re-ask, or vanilla after title-question's No), "closing" (Retry chosen), or
+         * "title-question" (vanilla No). */
+        const bool wantNo = command.point == kMenuAnswerNo;
+        if (sElapsed == 0) {
+            sMenuAnswerPressed = false;
+            sMenuAnswerClosed = false;
+        }
+        dMenu_save_c* menu = death_menu();
+        dMsgScrnExplain_c* explain = menu != nullptr ? menu->mpScrnExplain : nullptr;
+        const u8 menuProc = menu != nullptr ? menu->mMenuProc : 0xFF;
+        const bool atRetry = menuProc == dMenu_save_c::PROC_RETRY_QUESTION1;
+        const u8 explainStatus = explain != nullptr ? explain->getStatus() : 0xFF;
+        const bool asking = atRetry && explainStatus == dMsgScrnExplain_c::STATUS_MOVE_SELECT_e;
+
+        if (sMenuAnswerPressed && !asking) {
+            sMenuAnswerClosed = true;
+        }
+        if (sMenuAnswerClosed) {
+            // Back at "Retry?" with a new prompt opening, or anywhere else but a message swap.
+            const bool reopened = atRetry && explainStatus != dMsgScrnExplain_c::STATUS_CLOSE_e &&
+                                  explainStatus != dMsgScrnExplain_c::STATUS_WAIT_e;
+            const bool moved = menu == nullptr ||
+                               (!atRetry && menuProc != dMenu_save_c::PROC_MESSAGE_CHANGE);
+            if (reopened || moved) {
+                Log.info("[autopilot] menuanswer {} result={} after {} tick(s): {} tick={}",
+                    wantNo ? "no" : "yes", menu == nullptr ? "menu-gone" : menu_proc_name(menuProc),
+                    sElapsed, describe_death_menu(), sTicks);
+                duration = sElapsed + 1;
+                break;
+            }
+        } else if (asking && sElapsed % 12 < 4) {
+            // Still asking: the first press, or another if the key wait swallowed the last one.
+            const int want = wantNo ? 1 : 0;
+            if (explain->getSelectCursor() != want) {
+                status.stickY = stick_value(wantNo ? -1.0 : 1.0);
+            } else {
+                status.button = PAD_BUTTON_A;
+                sMenuAnswerPressed = true;
+            }
+        }
+        if (sElapsed + 1 >= command.frames) {
+            Log.error("[autopilot] menuanswer {} result=timeout after {} ticks ({}) tick={}",
+                wantNo ? "no" : "yes", command.frames, describe_death_menu(), sTicks);
         }
         break;
     }

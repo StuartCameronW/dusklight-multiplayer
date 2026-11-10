@@ -92,8 +92,10 @@ struct MultiplayerPolicy {
     /// rather than assume a single world state. tpmp reached the same answer.
     Ownership transform = Ownership::Individual;
 
-    /// RespawnSelf: "death respawns only that player" (Stuart). Read nowhere yet (2026-11-10), so
-    /// this is the decision recorded rather than behaviour; see DeathRule::RespawnSelf.
+    /// RespawnSelf: "death respawns only that player" (Stuart). Vanilla Retry already is that
+    /// (mp-death-rule.md). Read by death_menu_hides_title() (network_manager.cpp): with
+    /// RespawnSelf in a live session the death menu offers only Retry, never "Return to the
+    /// title screen" (d_menu_save.cpp retryQuestion1, hook H1). The other rules are not built.
     DeathRule onDeath = DeathRule::RespawnSelf;
 
     // --- Presentation. Not ownership decisions, but they belong in the same settings object so

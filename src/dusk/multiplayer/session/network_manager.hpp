@@ -110,11 +110,24 @@ public:
     /// End the session immediately: hang up on everyone, despawn every puppet, release the world
     /// clock. Must run on the game thread outside the actor pass. Save stays disabled on a guest
     /// regardless (save_guard.hpp) — nothing here touches that flag.
-    void shutdown();
+    /// @p reason is what everyone else is told in the hang-up.
+    void shutdown(DisconnectReason reason = DisconnectReason::Left);
 
     /// Leave (client) or end (host) the session, from UI. Deferred to the next pre_actor_tick, so
     /// a button press can never destroy puppet actors in the middle of a frame.
     void leave_session() { mLeaveRequested = is_active(); }
+
+    /// Batch 7 (death rule H2, mp-death-rule.md): this machine's save memory was reset or replaced
+    /// after the session had a world (back to the title, a soft reset, a save reloaded). Host:
+    /// end the session for everyone (DisconnectReason::SaveReset) rather than send them a
+    /// different world. Guest: leave. Deferred like leave_session(), so it never runs inside the
+    /// game's own reset code.
+    void leave_session_for_save_reset() {
+        if (is_active()) {
+            mLeaveRequested = true;
+            mLeaveForSaveReset = true;
+        }
+    }
 
     SessionStatus status() const;
 
@@ -233,6 +246,8 @@ private:
     bool mInitialized = false;
     StartupRequest mStartup;
     bool mLeaveRequested = false;
+    /// The pending leave is leave_session_for_save_reset()'s, not the player's own choice.
+    bool mLeaveForSaveReset = false;
 
     /// Client: when join() started, and whether the host has accepted us yet.
     std::chrono::steady_clock::time_point mJoinStarted{};

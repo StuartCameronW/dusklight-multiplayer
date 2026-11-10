@@ -26,6 +26,7 @@
 #include "dusk/interp/user_interface.h"
 #include "dusk/menu_pointer.h"
 #include "dusk/mods/svc/save.hpp"
+#include "dusk/multiplayer.hpp"
 #include "dusk/settings.h"
 #include "dusk/version.hpp"
 #endif
@@ -1642,6 +1643,19 @@ void dMenu_save_c::retryQuestion1() {
             mSaveStatus = 3;
             mMenuProc = PROC_SAVE_WAIT;
         } else {
+#if TARGET_PC
+            /* Dusk (multiplayer, death rule H1): in a live co-op session death offers only Retry.
+             * Going on to "Return to the title screen?" would let the title wipe the save info
+             * under the session (mp-death-rule.md). Ask "Retry?" again instead, exactly as
+             * retryQuestion2's "No" does, and say where leaving lives. */
+            if (dusk::mp::death_menu_hides_title()) {
+                dusk::mp::death_menu_title_refused();
+                field_0x2190 = 1;
+                mYesNoCursor = CURSOR_YES;
+                msgTxtSet(0x4BC, false);  // Retry?
+                return;
+            }
+#endif
             field_0x2190 = 1;
             mYesNoCursor = CURSOR_NO;
             msgTxtSet(0x4BF, false);  // Return to the title screen?

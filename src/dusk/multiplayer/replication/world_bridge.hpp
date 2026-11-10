@@ -75,7 +75,8 @@ void overwrite_world(const world::WorldView& v);
 int live_tbl();
 
 /// Bumped every time the save info was bulk-reset or bulk-loaded (dSv_info_c::init, card_to_memory,
-/// title/file select). The world_sync layer drops to Unsynced when it changes.
+/// title/file select). The world_sync layer drops to Unsynced when it changes, and (batch 7, death
+/// rule H2) ends or leaves the session if this end had already had a loaded game in it.
 std::uint32_t reset_epoch();
 /// True from install_host_world's reload in place until the reloaded stage has loaded its flags
 /// (hook H1). A warp issued in that window is dropped by the scene change already under way.

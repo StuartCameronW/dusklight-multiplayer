@@ -177,6 +177,9 @@ struct State {
 
     bool haveEpoch = false;
     std::uint32_t epoch = 0;
+    /// Batch 7 (death rule H2): this end has been in a loaded game (world_ready) at some point in
+    /// this session. Before that, a reset epoch change is just a file being loaded at the title.
+    bool hadWorld = false;
 
     // --- host
     std::uint32_t worldSeq = 0;
@@ -1116,6 +1119,25 @@ void tick() {
 
     const bool ready = world_bridge::world_ready();
     const std::uint32_t epoch = world_bridge::reset_epoch();
+    if (s.haveEpoch && epoch != s.epoch && s.hadWorld) {
+        /* Batch 7 (death rule H2, mp-death-rule.md): the save memory was reset or replaced after
+         * this end had a loaded game in this session: back to the title (death menu, soft reset,
+         * the credits), or a save reloaded. The old answer, a host recapturing and broadcasting
+         * its new world, silently rolled every guest back (or swapped in a different file) under
+         * live actors. Now the host ends the session and a guest leaves it.
+         *
+         * This runs from post_actor_tick, after the reset code that bumped the epoch has
+         * returned, and the leave itself waits for the next pre_actor_tick, outside the actor
+         * pass. Nothing else this tick: what is in memory is no longer the session's world. */
+        Log.warn("[mp-world] {}: reset epoch {} -> {} after this session had a world; {} the "
+                 "session instead of resyncing",
+            is_host() ? "host" : "guest", s.epoch, epoch, is_host() ? "ending" : "leaving");
+        s.epoch = epoch;
+        go_unsynced("save reset; the session ends");
+        s.deferred.clear();
+        net.leave_session_for_save_reset();
+        return;
+    }
     if (s.haveEpoch && epoch != s.epoch) {
         Log.warn("[mp-world] {}: reset epoch {} -> {}; this machine's world was replaced",
             is_host() ? "host" : "guest", s.epoch, epoch);
@@ -1136,6 +1158,9 @@ void tick() {
     }
     s.epoch = epoch;
     s.haveEpoch = true;
+    if (ready) {
+        s.hadWorld = true;
+    }
 
     if (net.role() == Role::Host) {
         host_tick(ready);

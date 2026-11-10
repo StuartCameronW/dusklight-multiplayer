@@ -18,6 +18,7 @@
 #include "../net/enet_transport.hpp"
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
+#include "../policy/mp_policy.hpp"
 #include "../replication/item_claims.hpp"
 #include "../replication/object_channel.hpp"
 #include "../replication/player_bridge.hpp"
@@ -318,6 +319,8 @@ const char* reason_text(std::uint32_t reason) {
         return "handshake timed out";
     case DisconnectReason::ModMismatch:
         return "gameplay mods differ";
+    case DisconnectReason::SaveReset:
+        return "save reset";
     }
     return "unknown reason";
 }
@@ -381,6 +384,21 @@ void split_address(const std::string& input, std::string& host, std::uint16_t& p
 NetworkManager& network_manager() {
     static NetworkManager sInstance;
     return sInstance;
+}
+
+// --- batch 7: death (decomp hooks, declared in dusk/multiplayer.hpp) ----------------------------
+
+bool death_menu_hides_title() {
+    // The first reader of MultiplayerPolicy::onDeath. RespawnSelf means death respawns only the
+    // player who died, through vanilla Retry, which never touches the card. "Return to the title"
+    // would wipe the save info under a live session (mp-death-rule.md, H1).
+    const NetworkManager& net = network_manager();
+    return net.is_active() && net.session_live() && g_mpPolicy.onDeath == DeathRule::RespawnSelf;
+}
+
+void death_menu_title_refused() {
+    notify("Retry is the only choice in co-op",
+        "Leave the session from the multiplayer menu to return to the title.", 5);
 }
 
 void NetworkManager::set_startup_options(const StartupOptions& options) {
@@ -548,14 +566,14 @@ NetworkManager::~NetworkManager() {
     }
 }
 
-void NetworkManager::shutdown() {
+void NetworkManager::shutdown(DisconnectReason reason) {
     if (mRole == Role::Client && !mJoined) {
         // Never accepted, so nothing of the host's was applied (every host packet waits for the
         // handshake). Saving comes back; a session that did get going stays latched.
         abandon_guest_join();
     }
     if (mTransport) {
-        mTransport->disconnect_all(static_cast<std::uint32_t>(DisconnectReason::Left));
+        mTransport->disconnect_all(static_cast<std::uint32_t>(reason));
         mTransport.reset();
     }
     // Every puppet goes, and the clock stops being anyone else's: with the role back to Inactive,
@@ -582,6 +600,7 @@ void NetworkManager::shutdown() {
     mLocalPlayerId = 0;
     mNextPlayerId = 1;
     mLeaveRequested = false;
+    mLeaveForSaveReset = false;
     trace::close();
     Log.info("Session ended");
 }
@@ -605,7 +624,26 @@ void NetworkManager::pre_actor_tick() {
     if (mLeaveRequested) {
         const bool wasClient = mRole == Role::Client;
         const bool wasJoined = mJoined;
-        shutdown();
+        const bool forSaveReset = mLeaveForSaveReset;
+        shutdown(forSaveReset ? DisconnectReason::SaveReset : DisconnectReason::Left);
+        if (forSaveReset) {
+            // Batch 7 (death rule H2): world_sync saw this machine's save memory reset under a
+            // live session. Said in terms of what the player just did, not "you left".
+            if (wasClient) {
+                mLastEndMessage = "Going back to the title screen took you out of the session.";
+                notify("Left the co-op session", "Going back to the title screen (or reloading a "
+                                                 "save) ends your part in the session.");
+                if (wasJoined) {
+                    notify_save_disabled_after_session_end(SessionEnd::LeftByChoice);
+                }
+            } else {
+                mLastEndMessage = "Going back to the title screen ended the session.";
+                notify("Co-op session ended", "Going back to the title screen (or reloading your "
+                                              "save) ends the session. Everyone who was connected "
+                                              "has been told.");
+            }
+            return;
+        }
         if (wasClient) {
             mLastEndMessage = "You left the session.";
             notify("Left the co-op session", "You are playing on your own now.");
@@ -757,6 +795,14 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
         case DisconnectReason::Left:
             end_client_session("Co-op session ended", fmt::format("{} ended the session.", host));
             break;
+        case DisconnectReason::SaveReset:
+            // Batch 7 (death rule H2): the host's own world was replaced, so it ended the session
+            // instead of overwriting ours with a different one.
+            end_client_session("Co-op session ended",
+                fmt::format("{} went back to the title screen or reloaded their save, which ends "
+                            "the session.",
+                    host));
+            break;
         case DisconnectReason::VersionMismatch:
             end_client_session("Couldn't join",
                 "The host is running a different version of Dusklight. Both players need the "
@@ -841,6 +887,9 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
         // We removed them (recheck_peer_mods), and already said why.
     } else if (reason == static_cast<std::uint32_t>(DisconnectReason::Left)) {
         notify(fmt::format("{} left", session.nickname), "They left the session.", 4);
+    } else if (reason == static_cast<std::uint32_t>(DisconnectReason::SaveReset)) {
+        notify(fmt::format("{} left", session.nickname),
+            "They went back to the title screen or reloaded their save.", 5);
     } else {
         notify(fmt::format("{} lost connection", session.nickname),
             "They stopped responding and were removed from the session.", 5);
