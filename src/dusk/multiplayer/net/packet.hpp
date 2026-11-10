@@ -160,8 +160,12 @@ namespace dusk::mp {
  * 20-25 (the replicated-object channel) on a new reliable channel 2. A v21 peer would drop them as
  * unknown and silently stay in its own world, so this is a refused handshake instead of a quiet
  * desync. Specs: .claude/future-plans/mp-m4-m5-world.md, mp-object-channel.md.
+ *
+ * 23: Batch 6. ClaimRequest/ClaimReply (17/18) go live for chests and floor items; the world ops
+ * gain the Dan and Zone domains (dungeon and room temporary switches); the object channel carries
+ * arrows, pellets, bombs, the boomerang and the Dominion Rod ball.
  */
-inline constexpr std::uint32_t kProtocolVersion = 22;
+inline constexpr std::uint32_t kProtocolVersion = 23;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

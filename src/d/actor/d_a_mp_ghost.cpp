@@ -32,6 +32,13 @@ constexpr borealis::Log Log{"dusk::mp"};
 namespace objects = dusk::mp::objects;
 
 constexpr u8 l_kindDebug = static_cast<u8>(objects::ObjKind::Debug);
+constexpr u8 l_kindArrow = static_cast<u8>(objects::ObjKind::Arrow);
+constexpr u8 l_kindPellet = static_cast<u8>(objects::ObjKind::Pellet);
+constexpr u8 l_kindBomb = static_cast<u8>(objects::ObjKind::Bomb);
+constexpr u8 l_kindWaterBomb = static_cast<u8>(objects::ObjKind::WaterBomb);
+constexpr u8 l_kindBombling = static_cast<u8>(objects::ObjKind::Bombling);
+constexpr u8 l_kindBoomerang = static_cast<u8>(objects::ObjKind::Boomerang);
+constexpr u8 l_kindRodBall = static_cast<u8>(objects::ObjKind::RodBall);
 
 /// "Alink" resource indices (d_a_arrow.cpp:27-42): the normal arrow.
 constexpr int l_arrowNormalBmd = 0x1c;
@@ -62,6 +69,17 @@ int daMpGhost_c::createHeap() {
     switch (mKind) {
     case l_kindDebug:
         return createHeapDebug();
+    case l_kindArrow:
+    case l_kindPellet:
+        return createHeapArrow();
+    case l_kindBomb:
+    case l_kindWaterBomb:
+    case l_kindBombling:
+        return createHeapBomb();
+    case l_kindBoomerang:
+        return createHeapBoom();
+    case l_kindRodBall:
+        return createHeapCrod();
     default:
         return FALSE;
     }
@@ -79,6 +97,10 @@ int daMpGhost_c::create() {
         Log.warn("[mp-obj] ghost: kind 0x{:02X} has no ghost in this build", mKind);
         return cPhs_ERROR_e;
     }
+    // Default cull box, set before the heap so a kind's createHeap can replace it.
+    // Generous: the arrow model runs ~110 units along +Z from its origin (d_a_arrow.cpp:1180).
+    fopAcM_SetMin(this, -30.0f, -30.0f, -30.0f);
+    fopAcM_SetMax(this, 30.0f, 30.0f, 130.0f);
     if (!fopAcM_entrySolidHeap(this, daMpGhost_createHeap, info->ghostHeap)) {
         Log.warn("[mp-obj] ghost: heap/model setup failed for kind 0x{:02X} ({}), heap 0x{:X}",
             mKind, info->name, info->ghostHeap);
@@ -88,9 +110,6 @@ int daMpGhost_c::create() {
     if (mpModel != NULL) {
         fopAcM_SetMtx(this, mpModel->getBaseTRMtx());
     }
-    // Generous: the arrow model runs ~110 units along +Z from its origin (d_a_arrow.cpp:1180).
-    fopAcM_SetMin(this, -30.0f, -30.0f, -30.0f);
-    fopAcM_SetMax(this, 30.0f, 30.0f, 130.0f);
     // Not something to lock on to, talk to or lift.
     attention_info.flags = 0;
     updateMatrix();
@@ -139,13 +158,26 @@ void daMpGhost_c::setNetworkState(const cXyz& i_pos, const csXyz& i_angle, u8 i_
 }
 
 void daMpGhost_c::onNetworkEvent(u8 i_event, const u8* i_blob, u8 i_blobLen) {
-    (void)i_blob;
-    (void)i_blobLen;
     mEventCount++;
     switch (mKind) {
     case l_kindDebug:
         Log.info("[mp-obj] ghost proc {} (debug) event {} (#{})", fopAcM_GetID(this), i_event,
             mEventCount);
+        break;
+    case l_kindArrow:
+    case l_kindPellet:
+        eventArrow(i_event, i_blob, i_blobLen);
+        break;
+    case l_kindBomb:
+    case l_kindWaterBomb:
+    case l_kindBombling:
+        eventBomb(i_event, i_blob, i_blobLen);
+        break;
+    case l_kindBoomerang:
+        eventBoom(i_event, i_blob, i_blobLen);
+        break;
+    case l_kindRodBall:
+        eventCrod(i_event, i_blob, i_blobLen);
         break;
     default:
         break;
@@ -161,6 +193,21 @@ int daMpGhost_c::execute() {
     case l_kindDebug:
         executeDebug();
         break;
+    case l_kindArrow:
+    case l_kindPellet:
+        executeArrow();
+        break;
+    case l_kindBomb:
+    case l_kindWaterBomb:
+    case l_kindBombling:
+        executeBomb();
+        break;
+    case l_kindBoomerang:
+        executeBoom();
+        break;
+    case l_kindRodBall:
+        executeCrod();
+        break;
     default:
         break;
     }
@@ -175,6 +222,17 @@ int daMpGhost_c::draw() {
     switch (mKind) {
     case l_kindDebug:
         return drawDebug();
+    case l_kindArrow:
+    case l_kindPellet:
+        return drawArrow();
+    case l_kindBomb:
+    case l_kindWaterBomb:
+    case l_kindBombling:
+        return drawBomb();
+    case l_kindBoomerang:
+        return drawBoom();
+    case l_kindRodBall:
+        return drawCrod();
     default:
         return 1;
     }
@@ -449,3 +507,11 @@ void census_tick() {
 }
 
 }  // namespace dusk::mp::objects::engine
+
+/* ---- per-kind ghosts (one file per phase-1 agent) ---------------------------------------------
+ */
+
+#include "d_a_mp_ghost_arrow.inc"
+#include "d_a_mp_ghost_bomb.inc"
+#include "d_a_mp_ghost_boom.inc"
+#include "d_a_mp_ghost_crod.inc"

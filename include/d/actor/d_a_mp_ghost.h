@@ -81,7 +81,36 @@ private:
     u32 mExecuteCount;
     u32 mEventCount;
 
-    /* --- per-kind member blocks: one per phase-1 .inc, appended below. --- */
+    /* --- per-kind blocks. Each is owned by one d_a_mp_ghost_<kind>.inc; add that kind's members
+     * inside its own block only. --- */
+
+    /* ==== Arrow + pellet (ObjKind Arrow 0x01, Pellet 0x02): d_a_mp_ghost_arrow.inc ==== */
+    int createHeapArrow();
+    void executeArrow();
+    int drawArrow();
+    void eventArrow(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    /* ==== end arrow ==== */
+
+    /* ==== Bomb, water bomb, bombling (0x03-0x05): d_a_mp_ghost_bomb.inc ==== */
+    int createHeapBomb();
+    void executeBomb();
+    int drawBomb();
+    void eventBomb(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    /* ==== end bomb ==== */
+
+    /* ==== Gale Boomerang (0x07): d_a_mp_ghost_boom.inc ==== */
+    int createHeapBoom();
+    void executeBoom();
+    int drawBoom();
+    void eventBoom(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    /* ==== end boom ==== */
+
+    /* ==== Dominion Rod ball (0x08): d_a_mp_ghost_crod.inc ==== */
+    int createHeapCrod();
+    void executeCrod();
+    int drawCrod();
+    void eventCrod(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    /* ==== end crod ==== */
 };
 
 #endif /* D_A_MP_GHOST_H */

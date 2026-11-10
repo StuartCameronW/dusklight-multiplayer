@@ -1715,6 +1715,11 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/world_bridge.cpp
         src/dusk/multiplayer/replication/world_bridge.hpp
         src/dusk/multiplayer/replication/object_channel.cpp
+        src/dusk/multiplayer/replication/object_capture_arrow.cpp
+        src/dusk/multiplayer/replication/object_capture_bomb.cpp
+        src/dusk/multiplayer/replication/object_capture_boom.cpp
+        src/dusk/multiplayer/replication/object_capture_crod.cpp
+        src/dusk/multiplayer/replication/object_capture.hpp
         src/dusk/multiplayer/replication/object_channel.hpp
         src/dusk/multiplayer/replication/object_kinds.hpp
         src/dusk/multiplayer/session/presence.cpp

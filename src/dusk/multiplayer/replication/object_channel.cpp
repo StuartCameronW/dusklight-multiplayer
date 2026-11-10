@@ -11,6 +11,7 @@
 #include "../session/network_manager.hpp"
 #include "../session/trace.hpp"
 #include "dusk/logging.h"
+#include "object_capture.hpp"
 #include "player_bridge.hpp"
 #include "player_state.hpp"
 #include "replication_manager.hpp"
@@ -1075,6 +1076,10 @@ void tick() {
     }
     engine::census_tick();
     expire_tombstones();
+    capture::tick_arrow();
+    capture::tick_bomb();
+    capture::tick_boomerang();
+    capture::tick_rodball();
     owner_tick();
     receiver_tick();
     if (s.localTick % 300 == 0 && (s.droppedStates != 0 || !s.remote.empty() || !s.owned.empty())) {
@@ -1121,6 +1126,10 @@ void reset() {
             engine::destroy_ghost(entry.second.ghost);
         }
     }
+    capture::reset_arrow();
+    capture::reset_bomb();
+    capture::reset_boomerang();
+    capture::reset_rodball();
     const std::uint64_t localTick = s.localTick;
     s = State();
     s.localTick = localTick;
