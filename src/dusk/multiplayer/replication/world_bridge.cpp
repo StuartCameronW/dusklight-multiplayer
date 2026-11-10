@@ -113,6 +113,8 @@ bool rupees_shared() {
     return g_mpPolicy.rupees == Ownership::Shared;
 }
 
+}  // namespace
+
 bool domain_shared(world::Domain d) {
     switch (d) {
     case world::Domain::Event:
@@ -131,6 +133,8 @@ bool domain_shared(world::Domain d) {
         return false;
     }
 }
+
+namespace {
 
 // --- raw access ----------------------------------------------------------------------------------
 

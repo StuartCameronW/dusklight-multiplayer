@@ -32,6 +32,7 @@
 #include "fmt/format.h"
 #include "m_Do/m_Do_MemCard.h"
 #include "mod_check.hpp"
+#include "policy_sync.hpp"
 #include "presence.hpp"
 #include "save_guard.hpp"
 #include "trace.hpp"
@@ -500,6 +501,8 @@ bool NetworkManager::host(std::uint16_t port) {
     mSentMods = local_mod_fingerprint();
     Log.info("Session started as HOST (protocol v{})", kProtocolVersion);
     Log.info("Mods: hosting with {}", describe_mod_fingerprint(mSentMods));
+    // v24: the session's policy is this machine's, with the persisted MP settings on top.
+    policy_sync::on_host_started();
     // Once per session, before any guest can have changed anything (II.8 c).
     backup_host_card_for_session();
     notify("Hosting a co-op session", fmt::format("Waiting for players on UDP port {}.", port));
@@ -570,6 +573,8 @@ void NetworkManager::shutdown() {
     objects::reset();
     // v23: every chest / floor-item lease and pending claim belonged to this session.
     item_claims::reset();
+    // v24: a guest ran the host's policy; its own comes back.
+    policy_sync::reset();
     mLastPresence.clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
@@ -1228,6 +1233,9 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // Presence is sent only on change, so a newcomer would otherwise never learn where anyone
         // already is until they moved (mp-m4-m5-world.md I.3: "sent on change and once on join").
         send_cached_presence(peer, playerId);
+        // v24: the session's policy, before the guest can ask for (and so receive) a WorldSync:
+        // same ordered channel, so the world it installs is read under the host's policy.
+        policy_sync::send_to(playerId);
 
         replication_manager().add_player(playerId, nickname, assignedColor);
         Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
@@ -1613,6 +1621,12 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
     case PacketId::ObjClaim:        // host-bound: judged by the host, never relayed
     case PacketId::ObjClaimResult:  // client-bound: the host's verdict
         objects::on_packet(id, r, sender->second.playerId);
+        break;
+    case PacketId::PolicySync:  // v24, client-bound: the host's session-wide policy
+        // Not in the clientBound list above (kept out of that shared expression so parallel
+        // packet additions merge cleanly); on_packet refuses it on anything but a Client, which
+        // is the same lock. A guest only reaches here once admitted (the mJoined gate above).
+        policy_sync::on_packet(r);
         break;
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);

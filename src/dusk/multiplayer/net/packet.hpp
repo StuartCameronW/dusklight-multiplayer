@@ -164,6 +164,10 @@ namespace dusk::mp {
  * 23: Batch 6. ClaimRequest/ClaimReply (17/18) go live for chests and floor items; the world ops
  * gain the Dan and Zone domains (dungeon and room temporary switches); the object channel carries
  * arrows, pellets, bombs, the boomerang and the Dominion Rod ball.
+ *
+ * 24 (batch 7, policy): PolicySync (26, host -> guest) makes the host's MultiplayerPolicy the
+ * session's. A v23 guest would drop it as unknown and diff the world under its own compiled-in
+ * policy, so a host on "Per player" wallets would see a v23 guest's wallet merged into its own.
  */
 inline constexpr std::uint32_t kProtocolVersion = 23;
 
@@ -269,6 +273,11 @@ enum class PacketId : std::uint8_t {
     ObjDespawn = 23,        ///< owner -> host -> others, kChannelObjects
     ObjClaim = 24,          ///< any -> host, kChannelObjects
     ObjClaimResult = 25,    ///< host -> all, kChannelObjects
+
+    /// v24, host -> guest, reliable, kChannelControl: the host's session-wide MultiplayerPolicy.
+    /// Sent at admission (before any WorldSync) and again whenever the host changes a field.
+    /// Layout and append rules: session/policy_sync.hpp.
+    PolicySync = 26,
 };
 
 /**

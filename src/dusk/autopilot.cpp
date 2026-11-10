@@ -26,6 +26,7 @@
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 #include "dusk/multiplayer/replication/world_bridge.hpp"
 #include "dusk/multiplayer/session/network_manager.hpp"
+#include "dusk/multiplayer/session/policy_sync.hpp"
 #include "dusk/multiplayer/session/presence.hpp"
 #include "dusk/multiplayer/session/world_sync.hpp"
 #include "dusk/settings.h"
@@ -122,6 +123,9 @@ enum class Op {
     BombArrows,
     Ammo,
     FacePartner,
+    /* --- batch 7: policy --- */
+    Policy,
+    ExpectPolicy,
 };
 
 struct Command {
@@ -1285,6 +1289,43 @@ void run_arrow_command(const Command& command) {
     }
 }
 
+/* --- batch 7: policy ---
+ * "policy rupees shared|individual" (host only): changes the session's wallet policy the way the
+ * MP menu does, minus the persisted setting, and sends it to every guest (policy_sync.hpp).
+ * "expectpolicy rupees shared|individual": PASS/FAIL on this end's g_mpPolicy.rupees. On a guest
+ * that is the host's value once its PolicySync has landed (a few ticks: `wait 30` first).
+ * The field is in `text` (only RUPEES so far), the value in `layer` (1 Shared, 0 Individual).
+ */
+void run_policy_command(const Command& command) {
+    namespace ps = mp::policy_sync;
+    const mp::Ownership want =
+        command.layer != 0 ? mp::Ownership::Shared : mp::Ownership::Individual;
+    switch (command.op) {
+    case Op::Policy: {
+        if (mp::network_manager().role() == mp::Role::Client) {
+            Log.error("[autopilot] policy: only the host may change the session's policy; skipped "
+                      "tick={}",
+                sTicks);
+            break;
+        }
+        Log.info("[autopilot] policy rupees {} (was {}; rupees now {}) tick={}",
+            ps::ownership_name(want), ps::ownership_name(mp::g_mpPolicy.rupees),
+            dComIfGs_getRupee(), sTicks);
+        ps::host_set_rupees(want, "autopilot");
+        break;
+    }
+    case Op::ExpectPolicy: {
+        const mp::Ownership got = mp::g_mpPolicy.rupees;
+        log_expect(got == want, "expectpolicy",
+            fmt::format("rupees want={} got={} fromHost={}", ps::ownership_name(want),
+                ps::ownership_name(got), ps::from_host() ? 1 : 0));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -1433,6 +1474,12 @@ bool settle_program_counter() {
             } else {
                 run_arrow_command(command);
             }
+            sPc++;
+            continue;
+        /* --- batch 7: policy --- */
+        case Op::Policy:
+        case Op::ExpectPolicy:
+            run_policy_command(command);
             sPc++;
             continue;
 
@@ -1820,6 +1867,15 @@ void load_script(const std::filesystem::path& path) {
         } else if (verb == "FACEPARTNER") {
             // "facepartner": turn on the spot toward the nearest remote player's puppet.
             command.op = Op::FacePartner;
+            /* --- batch 7: policy --- */
+        } else if (verb == "POLICY" || verb == "EXPECTPOLICY") {
+            // "policy rupees shared|individual" (host) / "expectpolicy rupees shared|individual".
+            command.op = verb == "POLICY" ? Op::Policy : Op::ExpectPolicy;
+            command.text = to_upper(a);
+            const std::string value = to_upper(b);
+            const bool individual = value == "INDIVIDUAL" || value == "PERPLAYER";
+            command.layer = value == "SHARED" ? 1 : (individual ? 0 : -1);
+            ok = command.text == "RUPEES" && command.layer >= 0;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;

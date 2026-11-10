@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "../policy/mp_policy.hpp"
 #include "../replication/world_bridge.hpp"
 #include "../replication/world_state.hpp"
 #include "dusk/logging.h"
@@ -55,6 +56,8 @@ enum class RequestReason : std::uint8_t {
     Unsynced = 0,     ///< joined, or had no world and has one now
     Digest = 1,       ///< the host's digest disagreed with ours at the same worldSeq
     SelfRefused = 2,  ///< our own diff was over the host's limits, so we never sent it
+    /* --- batch 7: policy --- */
+    PolicyChange = 3,  ///< the host made quest flags or inventory Shared; its copy wins
 };
 
 const char* reason_text(std::uint8_t reason) {
@@ -65,6 +68,8 @@ const char* reason_text(std::uint8_t reason) {
         return "digest mismatch";
     case RequestReason::SelfRefused:
         return "own diff over the limits";
+    case RequestReason::PolicyChange:
+        return "policy switch";
     }
     return "unknown";
 }
@@ -200,6 +205,11 @@ struct State {
     int engineDriftDigests = 0;
     std::deque<std::uint64_t> installTicks;
     bool installGaveUp = false;
+    /* --- batch 7: policy --- */
+    /// A switch made quest flags / inventory Shared: ask for the host's world at the next tick
+    /// this end has one (guest_tick), and say "policy switch" rather than "RESYNC" when it lands.
+    bool policySyncOwed = false;
+    bool policySyncInFlight = false;
 
     // --- both: Dan/Zone temp bits
     TempState temp;
@@ -701,7 +711,16 @@ void host_on_propose(Reader& r, std::uint32_t fromPlayerId) {
 
     std::vector<world::WorldOp> committed;
     committed.reserve(ops.size());
+    /* --- batch 7: policy --- */
+    std::size_t individualOps = 0;
     for (world::WorldOp op : ops) {
+        if (!world::is_temp(op.domain) && !world_bridge::domain_shared(op.domain)) {
+            // Proposed before this guest heard of a switch that made the domain Individual (a
+            // pickup crossing "wallet: per player" in flight). It is the guest's own now: its
+            // engine already has it, and it must not reach the shared shadow or this wallet.
+            ++individualOps;
+            continue;
+        }
         if (op.domain == world::Domain::KeyNum && op.tbl == world::kLocalOnlyKeyTbl) {
             // Never replicated (world_state.hpp); an honest guest's diff never emits it.
             Log.warn(
@@ -730,6 +749,13 @@ void host_on_propose(Reader& r, std::uint32_t fromPlayerId) {
         }
         world_bridge::apply_to_engine(op, value);
         committed.push_back(op);
+    }
+
+    if (individualOps != 0) {
+        Log.info(
+            "[mp-policy] host: dropped {} op(s) of proposal #{} from player {} for domains the "
+            "policy makes Individual (crossed a policy switch in flight)",
+            individualOps, proposeSeq, fromPlayerId);
     }
 
     if (verdict.eventClears > 0) {
@@ -827,6 +853,13 @@ void guest_tick(bool ready) {
     }
 
     drain_deferred();
+
+    /* --- batch 7: policy --- */
+    if (s.policySyncOwed && !s.requestOutstanding) {
+        s.policySyncOwed = false;
+        s.policySyncInFlight = true;
+        guest_send_request(RequestReason::PolicyChange);
+    }
 
     if (test_world_flood() && !s.floodSent && now_tick() - s.syncedAtTick >= 90) {
         guest_send_flood();
@@ -929,11 +962,22 @@ void guest_on_sync(Reader& r) {
         install_temp_mirrors(std::move(mirrors), true);
     } else {
         world_bridge::overwrite_world(view);
-        Log.warn("[mp-world] guest: RESYNC — overwrote the world with the host's at seq={} "
-                 "digest=0x{:08X} (was seq={} digest=0x{:08X}). A resync means a bug somewhere.",
-            seq, masked_digest(view), s.lastApplied, s.haveShadow ? masked_digest(s.shadow) : 0u);
+        if (s.policySyncInFlight) {
+            // Asked for on purpose (batch 7): a group just became Shared and the host's copy wins.
+            Log.info("[mp-policy] guest: host world installed for the policy switch at seq={} "
+                     "digest=0x{:08X}",
+                seq, masked_digest(view));
+        } else {
+            Log.warn("[mp-world] guest: RESYNC — overwrote the world with the host's at seq={} "
+                     "digest=0x{:08X} (was seq={} digest=0x{:08X}). A resync means a bug "
+                     "somewhere.",
+                seq, masked_digest(view), s.lastApplied,
+                s.haveShadow ? masked_digest(s.shadow) : 0u);
+        }
         install_temp_mirrors(std::move(mirrors), false);
     }
+    s.policySyncInFlight = false;
+    s.policySyncOwed = false;
 
     s.shadow = view;
     s.haveShadow = true;
@@ -982,6 +1026,7 @@ void guest_on_commit(Reader& r) {
     }
 
     std::uint32_t bad = 0;
+    std::uint32_t individual = 0;
     for (world::WorldOp op : ops) {
         if (world::is_temp(op.domain)) {
             if (!world::op_in_range(op)) {
@@ -991,6 +1036,14 @@ void guest_on_commit(Reader& r) {
             // Re-applied for our own ops too, for the same reason as the bits below: the host's
             // order is the one every end must end up with.
             temp_receive(op, origin);
+            continue;
+        }
+        /* --- batch 7: policy --- */
+        if (!world_bridge::domain_shared(op.domain)) {
+            // The host never commits one under the policy it sent us; this is one that was
+            // committed before a switch and held here (deferred) past the PolicySync. Keeping it
+            // out of the shadow is what the host's own rebase did to its copy.
+            ++individual;
             continue;
         }
         if (world::is_counter(op.domain)) {
@@ -1015,6 +1068,11 @@ void guest_on_commit(Reader& r) {
         describe_ops(ops));
     if (bad != 0) {
         Log.error("[mp-world] guest: {} op(s) in commit seq={} did not apply", bad, seq);
+    }
+    if (individual != 0) {
+        Log.info("[mp-policy] guest: skipped {} op(s) in commit seq={} for domains the policy now "
+                 "makes Individual",
+            individual, seq);
     }
 }
 
@@ -1369,6 +1427,133 @@ void log_temp(const char* tag) {
 
 void reset() {
     st() = State{};
+}
+
+/* --- batch 7: policy --- */
+
+namespace {
+
+/// The view groups a MultiplayerPolicy decides, as world_bridge's capture() reads them.
+struct PolicyGroups {
+    bool quest = false;      ///< questFlags: event, mem (keyNum included), mem2
+    bool inventory = false;  ///< inventory: firstGet, player bytes, maxLife, poh
+    bool rupees = false;     ///< rupees: the wallet
+    bool any() const { return quest || inventory || rupees; }
+};
+
+PolicyGroups changed_groups(const MultiplayerPolicy& before) {
+    PolicyGroups g;
+    g.quest = before.questFlags != g_mpPolicy.questFlags;
+    g.inventory = before.inventory != g_mpPolicy.inventory;
+    g.rupees = before.rupees != g_mpPolicy.rupees;
+    return g;
+}
+
+/// The fields of the groups in @p g, from @p from into @p to; the rest of @p to is left alone.
+void copy_groups(const PolicyGroups& g, const world::WorldView& from, world::WorldView& to) {
+    if (g.quest) {
+        to.event = from.event;
+        to.mem = from.mem;
+        to.mem2 = from.mem2;
+    }
+    if (g.inventory) {
+        to.firstGet = from.firstGet;
+        to.player = from.player;
+        to.maxLife = from.maxLife;
+        to.poh = from.poh;
+    }
+    if (g.rupees) {
+        to.rupee = from.rupee;
+    }
+}
+
+const char* ownership_name(Ownership o) {
+    return o == Ownership::Shared ? "Shared" : "Individual";
+}
+
+}  // namespace
+
+void host_on_policy_changed(const MultiplayerPolicy& before) {
+    State& s = st();
+    const PolicyGroups g = changed_groups(before);
+    if (!g.any()) {
+        return;
+    }
+    if (!s.haveShadow) {
+        Log.info("[mp-policy] host: no shared world yet; the first capture is taken under the new "
+                 "policy");
+        return;
+    }
+    const std::uint32_t was = masked_digest(s.shadow);
+    // Under the NEW policy: zero for every group now Individual, this engine's values for every
+    // group now Shared. Read from the save struct even mid stage change (mMemory belongs to no
+    // table then, and capture reads mSave, which putSave has just written); a reset is handled by
+    // the epoch check in tick(), which drops this shadow anyway.
+    world_bridge::capture(s.cur);
+    copy_groups(g, s.cur, s.shadow);
+    Log.info("[mp-policy] host: shadow rebased for the switch (rupees {}, inventory {}, questFlags "
+             "{}; shared wallet {}); digest 0x{:08X} -> 0x{:08X}, no ops emitted{}",
+        ownership_name(g_mpPolicy.rupees), ownership_name(g_mpPolicy.inventory),
+        ownership_name(g_mpPolicy.questFlags), s.shadow.rupee, was, masked_digest(s.shadow),
+        world_bridge::world_ready() ? "" : " (world away: rebased from the saved tables)");
+}
+
+std::int32_t host_wallet() {
+    const State& s = st();
+    return g_mpPolicy.rupees == Ownership::Shared && s.haveShadow ? s.shadow.rupee : -1;
+}
+
+void guest_on_policy_changed(const MultiplayerPolicy& before, std::int32_t hostWallet) {
+    State& s = st();
+    const PolicyGroups g = changed_groups(before);
+    if (!g.any()) {
+        return;
+    }
+    if (g.rupees) {
+        // Predictions for the wallet belong to the policy that made them. Shared -> Individual:
+        // the host drops those ops (host_on_propose), so they would never be answered with a
+        // value. Individual -> Shared: there are none (an Individual wallet is never proposed).
+        s.pendingDelta.erase(static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(world::Domain::Rupee) << 8 | world::kNoTbl));
+    }
+    if (!s.haveShadow || !s.synced) {
+        Log.info("[mp-policy] guest: not synced yet; the coming WorldSync is installed under the "
+                 "new policy");
+        return;
+    }
+
+    // Under the NEW policy, from this end's own engine: zero for groups now Individual, our own
+    // values for groups now Shared, so nothing diffs. The host's values go in below.
+    world_bridge::capture(s.cur);
+    const std::int32_t ownWallet = s.cur.rupee;
+    copy_groups(g, s.cur, s.shadow);
+
+    if (g.rupees && g_mpPolicy.rupees == Ownership::Individual) {
+        Log.info("[mp-policy] guest: wallet now per player; keeping this end's own (nothing sent)");
+    } else if (g.rupees) {
+        if (hostWallet >= 0) {
+            world::WorldOp op;
+            op.domain = world::Domain::Rupee;
+            op.tbl = world::kNoTbl;
+            world_bridge::apply_to_engine(op, hostWallet);
+            s.shadow.rupee = std::min<std::int32_t>(hostWallet, 9999);
+            Log.info("[mp-policy] guest: wallet now Shared; installed the host's wallet {} over "
+                     "ours {}",
+                hostWallet, ownWallet);
+        } else {
+            Log.info("[mp-policy] guest: wallet now Shared but the host sent no wallet; asking for "
+                     "its world");
+            s.policySyncOwed = true;
+        }
+    }
+    if ((g.quest && g_mpPolicy.questFlags == Ownership::Shared) ||
+        (g.inventory && g_mpPolicy.inventory == Ownership::Shared))
+    {
+        Log.info("[mp-policy] guest: quest flags or inventory now Shared; asking for the host's "
+                 "world");
+        s.policySyncOwed = true;
+    }
+    s.engineDriftDigests = 0;
 }
 
 }  // namespace dusk::mp::world_sync
