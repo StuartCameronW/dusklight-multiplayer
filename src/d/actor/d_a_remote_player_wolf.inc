@@ -238,6 +238,7 @@ int daRemotePlayer_c::createHeapWolf() {
     /* The override's buffer and six anm heaps, last as for the human. For a wolf this is the
      * whole of locomotion, so a short heap here leaves a puppet holding the wait pose. */
     setupActionAnimation();
+    setupTransformFx(); // transform blob (wolf piece C); a wolf puppet loads no fur
 
     const u32 freeAfter = heap != NULL ? heap->getFreeSize() : 0;
     JKRSolidHeap* dataHeap = mOwnRes.getDataHeap();
@@ -411,8 +412,8 @@ void daRemotePlayer_c::executeWolf() {
     soundFramework();
     traceCalc("wolf: setMatrix");
     wolfSetMatrix();
-    /* [piece C] the transform visuals' per-tick update goes here, after the body's calc, as it
-     * does after setMatrix() in execute(). */
+    // The transform visuals (piece C), after the body's calc as in execute().
+    updateTransformFx();
     traceCalc("wolf: execute done");
     if (mCalcTraced < l_calcTraceNum) {
         mCalcTraced++;
@@ -1042,6 +1043,10 @@ int daRemotePlayer_c::drawWolf() {
      * kPlayerFormChanging) daAlink_c draws nothing but the black blob and returns
      * (d_a_alink.cpp:19505-19522), and the metamorphose TevColor tint (field_0x300e, :19531-19536)
      * overrides the ladder above. Both belong between the tint and the first model. */
+    if (drawTransformBlob()) {
+        return 1;
+    }
+    applyTransformTint();
 
     dComIfGd_setListDark();
     traceCalc("wolf draw: body");
