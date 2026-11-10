@@ -2609,8 +2609,12 @@ int daRemotePlayer_c::create() {
      * because 0x20000 already failed to fit in some rooms. SWAITA buys roughly a quarter of a
      * standing player's idle ticks (measured: `idle applied: wait 74%, service 26%`), which is
      * worth 55 KB; if a room is ever found where this does not fit, drop ANM_SERVICE_WAIT before
-     * dropping the other two — it is 78% of the added weight. */
-    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x80000)) {
+     * dropping the other two — it is 78% of the added weight.
+     *
+     * 0x90000 since the bottle contents (fairy/worm/bee models + 5 BTKs, ~50 KB): at 0x80000 they
+     * were refused to keep 64 KB free for the loads after them. entrySolidHeap shrinks the heap
+     * to what create actually used, so the lasting cost is only what is loaded. */
+    if (!fopAcM_entrySolidHeap(this, daRemotePlayer_createHeap, 0x90000)) {
         // Either the heap estimate was too small or a resource was missing. Say so: a silent
         // cPhs_ERROR_e here surfaces later as a puppet that simply never appears.
         Log.warn("Puppet heap/model setup failed for the remote player actor");
