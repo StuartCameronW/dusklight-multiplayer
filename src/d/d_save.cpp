@@ -27,6 +27,7 @@
 
 #if TARGET_PC
 #include "dusk/game_mode.hpp"
+#include "dusk/multiplayer.hpp"
 #include "dusk/settings.h"
 #include "dusk/version.hpp"
 #include "helpers/string.hpp"
@@ -1504,6 +1505,11 @@ void dSv_info_c::init() {
     initDan(-1);
     initZone();
     mTmp.init();
+#if TARGET_PC
+    /* Dusk (multiplayer M5): a bulk reset is lifecycle, not 2,000 gameplay clears. World sync
+     * stops diffing until a game is loaded again. */
+    dusk::mp::world_on_save_reset();
+#endif
 
 #if DEBUG
     unk_0x0 = 0;
@@ -1872,6 +1878,10 @@ int dSv_info_c::card_to_memory(char* i_cardPtr, int i_dataNum) {
     dSv_save_c* pSave = dComIfGs_getSaveData();
     memcpy(pSave, i_cardPtr, sizeof(dSv_save_c));
     i_cardPtr += sizeof(dSv_save_c);
+#if TARGET_PC
+    /* Dusk (multiplayer M5): the whole save was replaced; see dSv_info_c::init. */
+    dusk::mp::world_on_save_reset();
+#endif
 
 #if PLATFORM_GCN
     if (OSGetSoundMode() == OS_SOUND_MODE_MONO) {
