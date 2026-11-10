@@ -138,7 +138,7 @@ namespace dusk::mp {
  */
 /*
  * 20: PlayerState grew a 2-byte effects block after the iron ball block, always on the wire: u8
- * fxFlags (lantern lit, sword trail, spin, charge ready, damage tint kind) and u8 dmgFlash (the
+ * fxFlags (lantern lit, sword trail, spin, sword charging, damage tint kind) and u8 dmgFlash (the
  * damage-flash timer). A v19 peer's read() would stop two bytes short and drop every pose.
  */
 inline constexpr std::uint32_t kProtocolVersion = 20;

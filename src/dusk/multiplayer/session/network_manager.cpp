@@ -1384,6 +1384,15 @@ PlayerState NetworkManager::wire_local_state() {
         return PlayerState{};
     }
     PlayerState held = mLastLocalState;
+    /* The held pose is a still frame, so nothing that is an event of one tick may repeat in it: a
+     * swing caught as the cutscene began would otherwise keep its hitbox live on the far end for
+     * the whole scene, and the spin and charge particles and the hit flash would play on a frozen
+     * puppet. The lantern's flame is a state, not an event, and stays. */
+    held.atMask = 0;
+    held.fxFlags &= static_cast<std::uint8_t>(
+        ~(kPlayerFxSwordTrail | kPlayerFxSpin | kPlayerFxSwordCharge | kPlayerFxVariantMask |
+            kPlayerFxDmgTintMask));
+    held.dmgFlash = 0;
     /* Leaving the scene is the one gap where holding the pose is wrong: the load that follows can
      * stall this process for seconds, and the far end would show us frozen at the exit the whole
      * time (~2 s mid-roll, measured). Cleared in-world flag = the far end despawns the puppet,
