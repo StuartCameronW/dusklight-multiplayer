@@ -2,10 +2,12 @@
 
 #include "world_clock.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <unordered_map>
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
@@ -1394,6 +1396,49 @@ static void fill_location(fopAc_ac_c* link, PlayerState& out) {
     out.locEpoch = s_epoch;
 }
 
+/* --- v19: the live sword hitbox, for friendly fire. ------------------------------------------ */
+/**
+ * Live exactly while daAlink_c's own sword hitbox is: setSwordAtCollision raises FLG0_CUT_AT_FLG
+ * and each capsule's set bit for the frames the blade can hit, and resetAtCollision drops both
+ * (d_a_alink.cpp:6190-6247, :6348-6367). Sword attacks only: capsule 0 also carries the hookshot
+ * and the lantern swing, which friendly fire leaves out.
+ */
+void fill_attack(daAlink_c* alink, PlayerState& out) {
+    out.atMask = 0;
+    out.atRadius = 0;
+    out.atSpl = 0;
+    std::fill(std::begin(out.atPt), std::end(out.atPt), std::int16_t{0});
+    if (alink == nullptr || alink->checkWolf() || !alink->getCutAtFlg()) {
+        return;
+    }
+    dCcD_Cps* cps = alink->mAtCps;
+    if ((cps[0].GetAtType() & (AT_TYPE_NORMAL_SWORD | AT_TYPE_MASTER_SWORD)) == 0) {
+        return;
+    }
+    std::uint8_t mask = 0;
+    for (int i = 0; i < 3; i++) {
+        if (cps[i].ChkAtSet()) {
+            mask |= static_cast<std::uint8_t>(1 << i);
+        }
+    }
+    if (mask == 0) {
+        return;
+    }
+    const cXyz& origin = alink->current.pos;
+    const cXyz* points[3] = {cps[0].GetStartP(), cps[0].GetEndP(), cps[1].GetStartP()};
+    for (int p = 0; p < 3; p++) {
+        const cXyz rel = *points[p] - origin;
+        const float axes[3] = {rel.x, rel.y, rel.z};
+        for (int k = 0; k < 3; k++) {
+            out.atPt[p * 3 + k] =
+                static_cast<std::int16_t>(std::lround(std::clamp(axes[k], -32767.0f, 32767.0f)));
+        }
+    }
+    out.atMask = mask;
+    out.atRadius = static_cast<std::uint8_t>(std::clamp(cps[0].GetR(), 1.0f, 255.0f));
+    out.atSpl = static_cast<std::uint8_t>(cps[0].GetAtSpl());
+}
+
 bool capture_local_player(PlayerState& out) {
     if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
@@ -1549,6 +1594,8 @@ bool capture_local_player(PlayerState& out) {
     fill_held_item(alink, out);
     // v16: location
     fill_location(link, out);
+    // v19: attack
+    fill_attack(alink, out);
 
     return true;
 }
@@ -1755,6 +1802,14 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
     // block (3): held item
     puppet->setNetworkHeldItem(state.heldItem, state.heldFlags, state.heldMat, state.upper2Idx,
         state.upper2_frame(), state.upper2_ratio(), static_cast<f32>(state.upper2Morf));
+    // v19: the sword hitbox, back in world space around the position the puppet is drawn at.
+    cXyz atPoints[3];
+    for (int p = 0; p < 3; p++) {
+        atPoints[p].set(pos.x + static_cast<f32>(state.atPt[p * 3 + 0]),
+            pos.y + static_cast<f32>(state.atPt[p * 3 + 1]),
+            pos.z + static_cast<f32>(state.atPt[p * 3 + 2]));
+    }
+    puppet->setNetworkAttack(state.atMask, static_cast<f32>(state.atRadius), state.atSpl, atPoints);
 }
 
 bool read_puppet_pose(std::uint32_t playerId, PlayerState& out) {

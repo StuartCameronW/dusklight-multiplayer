@@ -4,6 +4,7 @@
 #include "Z2AudioLib/Z2Creature.h"
 #include "Z2AudioLib/Z2SoundStarter.h"
 #include "d/actor/d_a_player.h"
+#include "d/d_cc_d.h"
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_lin_chk.h"
 #include "d/d_resorce.h"
@@ -272,6 +273,9 @@ public:
      * means no UPPER_2 overlay. Plain values, decoded by the bridge. */
     void setNetworkHeldItem(u8 i_kind, u8 i_flags, u8 i_mat, u16 i_upper2Idx, f32 i_upper2Frame,
         f32 i_upper2Ratio, f32 i_upper2Morf);
+    /* --- v19: friendly fire. The sender's live sword hitbox in world space: capsule 0 is
+     * i_points[0]-[1], 1 is [2]-[1], 2 is [0]-[2]; bit i of i_mask = capsule i is live. */
+    void setNetworkAttack(u8 i_mask, f32 i_radius, u8 i_spl, const cXyz* i_points);
     /* What the puppet DREW for --mp-trace's actor row: the kind/flags/mat of the models it entered
      * last pass (none if the model failed to load), and the overlay installed in upper slot 2 with
      * that animation object's own frame and the pack's ratio. */
@@ -1321,6 +1325,19 @@ private:
     bool mLoggedHeldMissing[9];
     bool mLoggedHeldDraw[9];
     bool mLoggedLantern;
+
+    // --- v19: friendly fire (coordinator) ---
+    void initFriendlyFire();
+    void registerFriendlyFire();
+    dCcD_Stts mFfStts;
+    dCcD_Cps mFfCps[3];
+    cXyz mFfPoints[3];
+    f32 mFfRadius;
+    u8 mFfMask;
+    u8 mFfSpl;
+    /// Set once a swing has hit, so one slash costs one hit; cleared when the swing ends.
+    bool mFfSwingHit;
+    u16 mFfHitLogs;
 };
 
 /**

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 
 #include "dusk/player_atn.hpp"
 #include "dusk/player_equip.hpp"
@@ -22,6 +24,9 @@
  */
 
 namespace dusk::mp {
+
+/// v19: the three sword capsules of PlayerState::atMask.
+constexpr std::uint8_t kPlayerAtCapsuleMask = 0x07;
 
 /// Bit flags in PlayerState::flags.
 enum PlayerStateFlags : std::uint8_t {
@@ -582,9 +587,31 @@ struct PlayerState {
     std::uint32_t stageHash = 0;
     std::int8_t roomNo = -1;
     std::uint8_t locEpoch = 0;
+
+    // v19 attack block: the sender's live sword hitbox, for friendly fire
+    /**
+     * daAlink_c's sword hitbox is three capsules (mAtCps, set in setSwordAtCollision,
+     * d_a_alink.cpp:6190-6247) over three points: A = the blade root, B = the tip, C = the tip's
+     * position last frame. Capsule 0 is A-B, 1 is C-B, 2 is A-C, so three points carry all three.
+     *
+     *   atMask    bit i = capsule i is live this tick (kPlayerAtCapsuleMask). 0 = no attack, and
+     *             then nothing else in the block is on the wire.
+     *   atRadius  capsule radius, world units.
+     *   atSpl     the attack's dCcG_At_Spl (normal, large, huge...), which picks the victim's
+     *             reaction: a spin attack knocks him down where a slash only flinches him.
+     *   atPt      A, B, C as x,y,z each, relative to (posX, posY, posZ), world units.
+     *
+     * Only sword attacks are sent (AT_TYPE_NORMAL_SWORD / AT_TYPE_MASTER_SWORD), not the hookshot
+     * or the lantern, which reuse capsule 0 for other things.
+     */
+    std::uint8_t atMask = 0;
+    std::uint8_t atRadius = 0;
+    std::uint8_t atSpl = 0;
+    std::int16_t atPt[9] = {};
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
 
+    bool attacking() const { return (atMask & kPlayerAtCapsuleMask) != 0; }
     bool in_world() const { return (flags & kPlayerStateInWorld) != 0; }
     bool sharp_turn() const { return (flags & kPlayerStateSharpTurn) != 0; }
     bool zero_speed() const { return (flags & kPlayerStateZeroSpeed) != 0; }
@@ -662,6 +689,15 @@ struct PlayerState {
         w.write_u32(stageHash);
         w.write_u8(static_cast<std::uint8_t>(roomNo));
         w.write_u8(locEpoch);
+        // v19 attack block: one byte when idle, 21 while a swing is live
+        w.write_u8(atMask);
+        if (attacking()) {
+            w.write_u8(atRadius);
+            w.write_u8(atSpl);
+            for (const std::int16_t v : atPt) {
+                w.write_s16(v);
+            }
+        }
     }
 
     bool read(Reader& r) {
@@ -694,9 +730,26 @@ struct PlayerState {
                 r.read_u16(upper2Idx) && r.read_u16(upper2Frame) && r.read_u8(upper2Ratio) &&
                 r.read_u8(upper2Morf) &&
                 // v16: location
-                r.read_u32(stageHash) && r.read_u8(room) && r.read_u8(locEpoch)))
+                r.read_u32(stageHash) && r.read_u8(room) && r.read_u8(locEpoch) &&
+                // v19 attack block
+                r.read_u8(atMask)))
         {
             return false;
+        }
+        atMask &= kPlayerAtCapsuleMask;
+        if (attacking()) {
+            if (!(r.read_u8(atRadius) && r.read_u8(atSpl))) {
+                return false;
+            }
+            for (std::int16_t& v : atPt) {
+                if (!r.read_s16(v)) {
+                    return false;
+                }
+            }
+        } else {
+            atRadius = 0;
+            atSpl = 0;
+            std::fill(std::begin(atPt), std::end(atPt), std::int16_t{0});
         }
         roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
@@ -906,6 +959,23 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.stageHash = b.stageHash;
     out.roomNo = b.roomNo;
     out.locEpoch = b.locEpoch;
+
+    // v19 attack block. Which capsules are live is discrete. The points blend only when both
+    // samples have a live swing, so the hitbox follows the drawn blade between ticks instead of
+    // jumping a tick ahead of it; t is clamped so a starved buffer never extrapolates a blade.
+    out.atMask = b.atMask;
+    out.atRadius = b.atRadius;
+    out.atSpl = b.atSpl;
+    if (a.attacking() && b.attacking()) {
+        const float atT = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        for (int i = 0; i < 9; i++) {
+            const float v =
+                static_cast<float>(a.atPt[i]) + static_cast<float>(b.atPt[i] - a.atPt[i]) * atT;
+            out.atPt[i] = static_cast<std::int16_t>(std::lround(v));
+        }
+    } else {
+        std::copy(std::begin(b.atPt), std::end(b.atPt), std::begin(out.atPt));
+    }
     return out;
 }
 

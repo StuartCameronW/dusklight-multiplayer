@@ -31,6 +31,7 @@
 #include "dusk/player_equip.hpp"
 #include "dusk/player_held.hpp"
 #include "dusk/player_idle.hpp"
+#include "dusk/settings.h"
 #include "f_op/f_op_actor_mng.h"
 #include "m_Do/m_Do_dvd_thread.h"
 // The sword and sheath resource indices. Safe to include even though the per-outfit headers are
@@ -2588,6 +2589,7 @@ int daRemotePlayer_c::create() {
         l_outfits[mOutfit].arcName);
     // Only now, so a puppet whose create failed never owns a sound handle.
     initSound();
+    initFriendlyFire();
     // Last line, deliberately: this is the network layer's ONLY trustworthy "creation succeeded"
     // signal. See createComplete() in the header for why findability is not one.
     mCreateComplete = true;
@@ -7745,6 +7747,112 @@ void daRemotePlayer_c::traceCalc(const char* i_step) {
     }
 }
 
+/* --- v19: friendly fire. ---------------------------------------------------------------------- */
+
+/**
+ * The puppet's copy of the sender's sword hitbox, set up the way an enemy's weapon is rather than
+ * the way Link's own sword is:
+ *
+ *   - Hit group 0x4 ONLY (SPrm 0x5). Link's hurtbox is group 0x4 (l_cylSrc's TG SPrm 5,
+ *     d_a_alink.cpp:1489) and his own sword aims at 0x1A (l_atCpsSrc, :1534), which is exactly why
+ *     one Link can never hit another. Enemies, objects and grass are never in 0x4, so the
+ *     puppet's blade can only ever touch the local player: it cannot kill this end's copy of an
+ *     enemy, which nobody else would see die.
+ *   - AT_TYPE_CSTATUE_SWING, the type enemy melee weapons use (d_a_e_gb.cpp:1638,
+ *     d_a_e_mf.cpp:3215). Link's hurtbox accepts it, and his damage code treats it as an ordinary
+ *     hit: a shield blocks it, and the reaction comes from the attack's dCcG_At_Spl.
+ *   - Power 2, a Moblin's. The game's damage multiplier applies on top.
+ *
+ * Victim-authoritative on purpose: this end decides whether its own player was hit, against the
+ * blade it is DRAWING, so a hit always lands where the player saw the sword. It also makes the
+ * setting each player's own (multiplayer.friendlyFire): it arms the puppets he sees.
+ */
+static dCcD_SrcCps l_ffCpsSrc = {
+    {
+        {0, {{AT_TYPE_CSTATUE_SWING, 2, 0x5}, {0, 0}, 0}},
+        {dCcD_SE_SWORD, 1, 0, 0, {1}},
+        {dCcD_SE_NONE, 0, 0, 0, {0}},
+        {0},
+    },
+    {{
+        {0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f},
+        20.0f,
+    }},
+};
+
+void daRemotePlayer_c::initFriendlyFire() {
+    mFfStts.Init(0xFF, 0xFF, this);
+    for (int i = 0; i < 3; i++) {
+        mFfCps[i].Set(l_ffCpsSrc);
+        mFfCps[i].SetStts(&mFfStts);
+        mFfPoints[i] = cXyz::Zero;
+    }
+    mFfRadius = 20.0f;
+    mFfMask = 0;
+    mFfSpl = 0;
+    mFfSwingHit = false;
+    mFfHitLogs = 0;
+}
+
+void daRemotePlayer_c::setNetworkAttack(u8 i_mask, f32 i_radius, u8 i_spl, const cXyz* i_points) {
+    mFfMask = i_mask & 0x07;
+    mFfRadius = i_radius > 0.0f ? i_radius : 20.0f;
+    mFfSpl = i_spl;
+    for (int i = 0; i < 3; i++) {
+        mFfPoints[i] = i_points[i];
+    }
+}
+
+void daRemotePlayer_c::registerFriendlyFire() {
+    // A hit is reported on the tick after the collision pass that found it.
+    for (int i = 0; i < 3; i++) {
+        if (mFfCps[i].ChkAtHit()) {
+            if (!mFfSwingHit && mFfHitLogs < 64) {
+                mFfHitLogs++;
+                Log.info("Friendly fire: player {}'s sword hit the local player (capsules {:#x}, "
+                         "spl {}, local life now {})",
+                    mPlayerId, static_cast<unsigned>(mFfMask), static_cast<unsigned>(mFfSpl),
+                    static_cast<unsigned>(dComIfGs_getLife()));
+            }
+            mFfSwingHit = true;
+        }
+        mFfCps[i].ResetAtHit();
+    }
+
+    if (mFfMask == 0) {
+        // The swing is over: the next one may hit again.
+        mFfSwingHit = false;
+        for (int i = 0; i < 3; i++) {
+            mFfCps[i].OffAtSetBit();
+        }
+        return;
+    }
+    if (mFfSwingHit || !dusk::getSettings().multiplayer.friendlyFire.getValue()) {
+        return;
+    }
+
+    // setSwordAtCollision's layout (d_a_alink.cpp:6225-6227): A-B, C-B, A-C.
+    const cXyz* ends[3][2] = {
+        {&mFfPoints[0], &mFfPoints[1]},
+        {&mFfPoints[2], &mFfPoints[1]},
+        {&mFfPoints[0], &mFfPoints[2]},
+    };
+    cXyz swing = mFfPoints[1] - mFfPoints[2];
+    for (int i = 0; i < 3; i++) {
+        if ((mFfMask & (1 << i)) == 0) {
+            mFfCps[i].OffAtSetBit();
+            continue;
+        }
+        mFfCps[i].SetStartEnd(*ends[i][0], *ends[i][1]);
+        mFfCps[i].SetR(mFfRadius);
+        mFfCps[i].SetAtSpl(static_cast<dCcG_At_Spl>(mFfSpl));
+        mFfCps[i].SetAtVec(swing);
+        mFfCps[i].OnAtSetBit();
+        dComIfG_Ccsp()->Set(&mFfCps[i]);
+    }
+}
+
 int daRemotePlayer_c::execute() {
     if (!mHasPose) {
         // No network pose yet. Skipping calc keeps the puppet from flashing at its spawn point.
@@ -7796,6 +7904,8 @@ int daRemotePlayer_c::execute() {
     groundCheck();
     traceCalc("setRoomInfo");
     setRoomInfo();
+    traceCalc("registerFriendlyFire");
+    registerFriendlyFire();
     // After animePlay() (the frames) and setRoomInfo() (the floor and reverb): daAlink_c's order.
     traceCalc("soundFramework");
     soundFramework();

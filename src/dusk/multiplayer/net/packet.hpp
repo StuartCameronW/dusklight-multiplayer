@@ -122,7 +122,14 @@ namespace dusk::mp {
  * re-sends the fingerprint when it changes mid-session (a save loaded, a mod toggled) so the host
  * can re-check an admitted guest; a v17 peer would log it as an unknown id and never re-check.
  */
-inline constexpr std::uint32_t kProtocolVersion = 18;
+/*
+ * 19: PlayerState grew a trailing attack block after locEpoch: u8 atMask, and while it is non-zero
+ * u8 atRadius, u8 atSpl and 9 x s16 points (the sender's live sword hitbox, relative to his
+ * position), so 77 bytes idle and 97 mid-swing. The receiver turns it into a hitbox on the puppet
+ * that only the local player's hurtbox can touch: friendly fire. A v18 peer's read() would stop a
+ * byte short and drop every pose.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 19;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;

@@ -1,5 +1,6 @@
 #include "multiplayer_window.hpp"
 
+#include "bool_button.hpp"
 #include "dusk/config.hpp"
 #include "dusk/settings.h"
 #include "number_button.hpp"
@@ -211,6 +212,22 @@ MultiplayerWindow::MultiplayerWindow(LaunchCallback launch) : mLaunch(std::move(
                         });
                 }
                 pane.add_text("Automatic lets the host give every player a different colour.");
+            });
+
+        leftPane.register_control(
+            leftPane.add_child<BoolButton>(BoolButton::Props{
+                .key = "Friendly Fire",
+                .getValue = [&settings] { return settings.friendlyFire.getValue(); },
+                .setValue =
+                    [&settings](bool value) {
+                        settings.friendlyFire.setValue(value);
+                        config::save();
+                    },
+            }),
+            rightPane, [](Pane& pane) {
+                add_help(pane,
+                    "Lets other players' sword attacks hurt you. Each player chooses this for "
+                    "themselves: turning it on only makes YOU hittable.");
             });
 
         leftPane.register_control(

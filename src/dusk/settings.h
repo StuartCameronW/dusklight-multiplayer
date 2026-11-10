@@ -7,8 +7,8 @@
 
 namespace dusk {
 
-using config::ConfigVar;
 using config::ActionBindConfigVar;
+using config::ConfigVar;
 
 enum class BloomMode : int {
     Off = 0,
@@ -83,9 +83,9 @@ enum class MagicArmorMode : u8 {
 
 enum class AudioOutputMode : u8 {
     StereoSpeakers = 0,
-    StereoHeadphones = 1,   // spatial audio
-    Surround6ch = 2,        // discrete 5.1
-    Surround8ch = 3,        // discrete 7.1
+    StereoHeadphones = 1,  // spatial audio
+    Surround6ch = 2,       // discrete 5.1
+    Surround8ch = 3,       // discrete 7.1
 };
 
 namespace config {
@@ -358,6 +358,9 @@ struct UserSettings {
         ConfigVar<std::string> lastJoinAddress;
         /// "RRGGBB" hex, or empty to let the host assign a colour automatically.
         ConfigVar<std::string> color;
+        /// Whether other players' swords can hurt this player. Decided by each player for himself:
+        /// it arms the hitbox on the puppets HE sees, so nobody can switch it on for someone else.
+        ConfigVar<bool> friendlyFire;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports
@@ -380,8 +383,7 @@ void applyResampler(Resampler resampler);
 
 inline bool isLetterboxingDisabled(bool inCutscene) {
     const auto mode = getSettings().game.disableLetterboxing.getValue();
-    return mode == LetterboxMode::On ||
-           (mode == LetterboxMode::CutsceneOnly && inCutscene) ||
+    return mode == LetterboxMode::On || (mode == LetterboxMode::CutsceneOnly && inCutscene) ||
            (mode == LetterboxMode::GameplayOnly && !inCutscene);
 }
 
