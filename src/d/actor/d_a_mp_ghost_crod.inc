@@ -56,7 +56,7 @@ int daMpGhost_c::createHeapCrod() {
     }
     J3DModelData* modelData = static_cast<J3DModelData*>(dComIfG_getObjectRes(arc, CROD_RES_BMD));
     if (modelData == NULL) {
-        Log.warn("[mp-obj] ghost rodball: '{}' has no ball model 0x{:X}", arc, CROD_RES_BMD);
+        Log.warn("[mp-obj] ghost rodball: '{}' has no ball model 0x{:X}", arc, static_cast<int>(CROD_RES_BMD));
         return FALSE;
     }
     // daCrod_c::createHeap's own flags (d_a_crod.cpp:35).
@@ -68,7 +68,7 @@ int daMpGhost_c::createHeapCrod() {
     J3DAnmTransform* bck =
         static_cast<J3DAnmTransform*>(dComIfG_getObjectRes(arc, CROD_BCK_WAIT_A_T));
     if (bck == NULL) {
-        Log.warn("[mp-obj] ghost rodball: '{}' has no ball BCK {}", arc, CROD_BCK_WAIT_A_T);
+        Log.warn("[mp-obj] ghost rodball: '{}' has no ball BCK {}", arc, static_cast<int>(CROD_BCK_WAIT_A_T));
         mpModel = NULL;
         return FALSE;
     }

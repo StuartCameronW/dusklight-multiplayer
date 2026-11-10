@@ -604,6 +604,31 @@ void upkeep_ghost(RemoteObj& o, bool reached, RemoteLocation loc, bool playable,
     }
 }
 
+/**
+ * Deliver every queued event with an origin tick <= `upTo` to the object's ghost, in order.
+ * Returns false (and keeps the rest queued) while the ghost exists but its create() has not
+ * finished: an event that reaches playback the tick its ghost is requested (a point-blank bomb
+ * arrow, a bomb arrow exploding in the hand) must wait for it, not be dropped. With no ghost at
+ * all (hidden room, unimplemented kind) the events are logged and dropped, as before.
+ */
+bool deliver_events(RemoteObj& o, std::uint64_t upTo, std::uint64_t played) {
+    while (!o.events.empty() && o.events.front().tick <= upTo) {
+        const PendingEvent& ev = o.events.front();
+        const engine::GhostLookup look =
+            o.ghost != kNoGhost ? engine::look_up_ghost(o.ghost) : engine::GhostLookup::Gone;
+        if (look == engine::GhostLookup::Creating) {
+            return false;
+        }
+        Log.info("[mp-obj] event {} id={} originTick={} played={}{}", o.ref.str(), ev.event,
+            ev.tick, played, look == engine::GhostLookup::Alive ? "" : " (no ghost)");
+        if (look == engine::GhostLookup::Alive) {
+            engine::ghost_event(o.ghost, ev.event, ev.blob);
+        }
+        o.events.pop_front();
+    }
+    return true;
+}
+
 void receiver_tick() {
     State& s = S();
     const bool playable = world_is_playable();
@@ -629,8 +654,13 @@ void receiver_tick() {
             continue;
         }
 
-        if (o.despawnPending &&
-            (played >= o.despawnTick || s.localTick - o.despawnSeenLocal > kDespawnGraceTicks))
+        const bool despawnGraceOver = o.despawnPending &&
+                                      s.localTick - o.despawnSeenLocal > kDespawnGraceTicks;
+        if (o.despawnPending && (played >= o.despawnTick || despawnGraceOver) &&
+            // Every event comes before its object's despawn on the authority's timeline, so play
+            // them all first (an explode sent on the despawn tick used to be dropped unseen). A
+            // ghost still being created holds the despawn until it can take them, within grace.
+            (deliver_events(o, o.despawnTick, played) || despawnGraceOver))
         {
             Log.info("[mp-obj] despawn {} kind={} originTick={} played={} reason={}{}", o.ref.str(),
                 kind_name(o.kind), o.despawnTick, played, o.despawnReason,
@@ -661,16 +691,7 @@ void receiver_tick() {
 
         upkeep_ghost(o, reached, loc, playable, pose, blob, played);
 
-        while (!o.events.empty() && o.events.front().tick <= played) {
-            const PendingEvent& ev = o.events.front();
-            Log.info("[mp-obj] event {} id={} originTick={} played={}{}", o.ref.str(), ev.event,
-                ev.tick, played, o.ghost != kNoGhost ? "" : " (no ghost)");
-            if (o.ghost != kNoGhost && engine::look_up_ghost(o.ghost) == engine::GhostLookup::Alive)
-            {
-                engine::ghost_event(o.ghost, ev.event, ev.blob);
-            }
-            o.events.pop_front();
-        }
+        deliver_events(o, played, played);
 
         if (reached && trace::enabled()) {
             Log.info("[mp-obj] ghost {} played={} pos=({:.2f}, {:.2f}, {:.2f}) yaw={} loc={} "

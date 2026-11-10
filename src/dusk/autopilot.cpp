@@ -896,6 +896,11 @@ void run_temp_command(const Command& command) {
         dComIfGp_roomControl_zoneCountCheck(room);
         break;
 
+    default:
+        break;
+    }
+}
+
 /* --- batch 6: bombs --- */
 
 /**
