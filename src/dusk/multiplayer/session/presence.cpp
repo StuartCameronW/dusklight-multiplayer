@@ -249,6 +249,15 @@ const Info* get(std::uint32_t playerId) {
     return it != s_peers.end() ? &it->second : nullptr;
 }
 
+std::vector<Info> peers() {
+    std::vector<Info> out;
+    out.reserve(s_peers.size());
+    for (const auto& entry : s_peers) {
+        out.push_back(entry.second);
+    }
+    return out;
+}
+
 std::uint32_t first_remote_player_id() {
     std::uint32_t best = kNoPlayer;
     for (const auto& [id, player] : replication_manager().players()) {

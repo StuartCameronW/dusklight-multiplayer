@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -71,8 +72,10 @@ enum class Domain : std::uint8_t {
     FirstGet = 3,  ///< view.firstGet; tbl = 0xFF
     Items = 4,     ///< view.items, view.itemMax, view.collect, crystal, mirror, walletSize (see
                    ///< kPlayerBytes for the byte map); tbl = 0xFF
-    Dan = 5,       ///< reserved for Batch W-B (dungeon-temporary bits)
-    Zone = 6,      ///< reserved for Batch W-B; index = room << 8 | byte
+    Dan = 5,       ///< dungeon-temporary bits (mDan); tbl = dan stage table; index = byte, see
+                   ///< "temporary domains" below. NOT saved world state.
+    Zone = 6,      ///< room-temporary bits (mZone); tbl = stage table; index = room << 8 | byte.
+                   ///< NOT saved world state.
     // counter domains: op = delta + resulting absolute
     Rupee = 16,    ///< tbl = 0xFF
     KeyNum = 17,   ///< tbl = stage table (never kLocalOnlyKeyTbl)
@@ -148,24 +151,131 @@ void diff(const WorldView& shadow, const WorldView& cur, std::vector<WorldOp>& o
 /// out of range); nothing is written then.
 bool apply_op(WorldView& view, WorldView& shadow, const WorldOp& op, bool useAbsolute);
 
-/// Validity check without applying (same rules as apply_op's return value).
+/// Validity check without applying. Same rules as apply_op's return value for the saved domains;
+/// for Dan/Zone it is the temp layout below (apply_op itself refuses Dan/Zone: they are not in the
+/// WorldView).
 bool op_in_range(const WorldOp& op);
+
+// --- temporary domains: Dan and Zone (spec II.7, Batch W-B) --------------------------------------
+//
+// ★ NOT SAVED WORLD STATE. dSv_info_c::mDan and mZone live outside mSavedata, so they never reach a
+// save file on any machine (memory_to_card writes mSavedata only). They are not in the WorldView,
+// not in the digest, and not in write_view; WorldSync carries them as a separate trailer
+// (write_temp_mirrors). A digest therefore never resyncs over them while players are in different
+// stages.
+//
+// ★ SHARED ONLY BETWEEN CO-LOCATED PLAYERS. Each machine diffs only the table it is standing in
+// (TempView). Every machine also keeps a TempMirror per stage table that someone occupies, fed by
+// every Dan/Zone op; a player entering that table is seeded from it (hooks H6/H7). Who occupies
+// what, and when a mirror is dropped, is the session layer's business (world_sync.cpp).
+//
+// ★ MIRROR-ONLY OPS. A machine that enters a table (or creates a room's zone) WITHOUT seeding from
+// a mirror has fresh, vanilla-reset bits, and every other machine's mirror for it may be stale.
+// It announces its whole state as ops with kTempMirrorOnly set in the index: receivers overwrite
+// their MIRROR with it and never touch their engine. That is what makes "the bits reset only when
+// everyone has left" hold on every machine, without one player's lifecycle ever clearing bits a
+// partner is still standing on.
+
+/// dSv_danBit_c::mSwitch[2] + mItem[4] (offsets 0x04..0x1C), raw engine bytes (host-native u32s,
+/// so byte * 8 + bit is the switch / item number: 0-63 switches, 64-191 item bits 0-127).
+/// mStageNo, unk1 and unk28[] are not replicated.
+constexpr std::size_t kDanBytes = 24;
+constexpr std::size_t kDanSwitchBytes = 8;
+/// dSv_zoneBit_c up to (not including) unk12, raw engine bytes: six BE u16s, in order mSwitch[0],
+/// mSwitch[1], mRoomSwitch (one-zone), mItem[0], mItem[1], mRoomItem (one-zone). dSv_zoneActor_c
+/// (enemies that stay dead in a zone) is M6 and is deliberately NOT here.
+constexpr std::size_t kZoneBytes = 12;
+/// dStage_roomControl_c::mStatus[0x40]: room numbers 0..63.
+constexpr std::size_t kZoneRooms = 64;
+/// In a temp op's index (low byte): write receivers' mirrors only, never their engine.
+constexpr std::uint16_t kTempMirrorOnly = 0x80;
+
+inline bool is_temp(Domain d) { return d == Domain::Dan || d == Domain::Zone; }
+/// The temp byte a Dan/Zone op addresses (the mirror-only flag stripped).
+inline std::uint8_t temp_byte(std::uint16_t index) {
+    return static_cast<std::uint8_t>(index & 0x7F);
+}
+inline bool temp_mirror_only(std::uint16_t index) { return (index & kTempMirrorOnly) != 0; }
+inline std::uint8_t zone_room(std::uint16_t index) { return static_cast<std::uint8_t>(index >> 8); }
+inline std::uint16_t zone_index(std::size_t room, std::size_t byte, bool mirrorOnly = false) {
+    return static_cast<std::uint16_t>(room << 8 | byte | (mirrorOnly ? kTempMirrorOnly : 0));
+}
+/// Zone bytes that live as long as the zone does (mSwitch, mItem). The others (mRoomSwitch,
+/// mRoomItem) are one-zone bits: vanilla clears them on every room change, so a player's visit
+/// always starts with them clear, and H7 seeds only the persistent bytes.
+inline bool zone_byte_persistent(std::size_t byte) {
+    return byte < 4 || (byte >= 6 && byte < 10);
+}
+
+/// One machine's temp bits for the stage table it stands in (what the bridge captures each tick).
+struct TempView {
+    /// The dan stage table these bits belong to; -1 = none (diff_temp then emits nothing).
+    std::int8_t tbl = -1;
+    std::array<std::uint8_t, kDanBytes> dan{};
+    /// Bit r set: this machine has a zone for room r, and zone[r] holds its bytes.
+    std::uint64_t rooms = 0;
+    std::array<std::array<std::uint8_t, kZoneBytes>, kZoneRooms> zone{};
+};
+
+/// What a machine knows about one occupied stage table's temp bits (keyed by table elsewhere).
+struct TempMirror {
+    std::array<std::uint8_t, kDanBytes> dan{};
+    /// Bit r set: zone[r] has been written at least once (by an op or an announcement).
+    std::uint64_t rooms = 0;
+    std::array<std::array<std::uint8_t, kZoneBytes>, kZoneRooms> zone{};
+};
+using TempMirrors = std::map<std::uint8_t, TempMirror>;
+
+/// Gameplay changes only: Dan ops for every changed dan byte, Zone ops for every changed byte of a
+/// room present in BOTH views. Nothing when the tables differ or either is -1 (a stage change is
+/// lifecycle), and nothing for a room that appeared or disappeared (zone create/remove is too).
+void diff_temp(const TempView& shadow, const TempView& cur, std::vector<WorldOp>& out);
+
+/// Applies a (validated) temp op to a mirror; mirror-only ops too. False for a non-temp or
+/// malformed op.
+bool apply_temp_op(TempMirror& m, const WorldOp& op);
+
+/// Applies a (validated) temp op to a view when it addresses that view's table (and, for Zone, a
+/// room the view has). Ignores the mirror-only flag: callers skip those for anything but mirrors.
+/// Returns true when it wrote.
+bool apply_temp_op(TempView& v, const WorldOp& op);
+
+/// Mirror-only ops that overwrite a receiver's mirror of `tbl` with `dan` (set = byte,
+/// clr = ~byte, every byte).
+void announce_dan(std::uint8_t tbl, const std::array<std::uint8_t, kDanBytes>& dan,
+    std::vector<WorldOp>& out);
+/// The same for one room's zone bytes.
+void announce_zone(std::uint8_t tbl, std::uint8_t room,
+    const std::array<std::uint8_t, kZoneBytes>& zone, std::vector<WorldOp>& out);
+
+/// The WorldSync trailer: [u8 format][u8 n] then per mirror [u8 tbl][kDanBytes][u64 rooms]
+/// [kZoneBytes per set room bit, ascending].
+void write_temp_mirrors(Writer& w, const TempMirrors& m);
+bool read_temp_mirrors(Reader& r, TempMirrors& out);
 
 // --- host-side proposal limits (spec II.8 b) -----------------------------------------------------
 
 struct ProposalVerdict {
     bool accept = true;
-    std::uint32_t bitsTouched = 0;     ///< popcount(set | clr) over all bit ops
+    std::uint32_t bitsTouched = 0;     ///< popcount(set | clr) over all SAVED bit ops
     std::uint32_t eventClears = 0;     ///< popcount(clr) over Event ops
     std::uint32_t badOps = 0;          ///< ops failing op_in_range
+    std::uint32_t tempBitsTouched = 0; ///< popcount(set | clr) over Dan/Zone ops
 };
 constexpr std::uint32_t kMaxProposalBits = 64;
 constexpr std::uint32_t kMaxProposalEventClears = 8;
+/// Dan/Zone ops cannot reach anyone's save (see "temporary domains"), so the save-protection limit
+/// does not apply to them; this one only bounds garbage. A stage entry legitimately announces the
+/// whole dan block plus every loaded room's zone in one tick, so it allows one full table
+/// overwrite plus a tick of gameplay.
+constexpr std::uint32_t kMaxProposalTempBits =
+    static_cast<std::uint32_t>((kDanBytes + kZoneRooms * kZoneBytes) * 8) + kMaxProposalBits;
 
-/// The host refuses a guest proposal touching more than kMaxProposalBits bits, carrying more than
-/// kMaxProposalEventClears saved-event clears, or containing any malformed op. Real gameplay
-/// changes a handful of bits per tick; a refusal means a guest bug (e.g. dSv_info_c::init while
-/// synced), and the host answers it with a fresh WorldSync instead of saving it.
+/// The host refuses a guest proposal touching more than kMaxProposalBits saved bits, carrying more
+/// than kMaxProposalEventClears saved-event clears, more than kMaxProposalTempBits temp bits, or
+/// any malformed op. Real gameplay changes a handful of bits per tick; a refusal means a guest bug
+/// (e.g. dSv_info_c::init while synced), and the host answers it with a fresh WorldSync instead of
+/// saving it.
 ProposalVerdict judge_proposal(const std::vector<WorldOp>& ops);
 
 // --- whole-view transfer + digest ----------------------------------------------------------------
@@ -179,7 +289,9 @@ std::uint32_t digest(const WorldView& v);
 // --- self-test -----------------------------------------------------------------------------------
 
 /// Engine-free self-test of everything above (diff/apply round-trip and the shadow update, mask
-/// merge, counter paths and clamps, view transfer + digest, proposal limits, truncated input).
+/// merge, counter paths and clamps, view transfer + digest, proposal limits, truncated input, and
+/// the Dan/Zone temp domains: co-location diff, mirrors, mirror-only announcements, the WorldSync
+/// trailer).
 /// Returns false with a message in `failure` on the first failed check.
 bool selftest(std::string& failure);
 

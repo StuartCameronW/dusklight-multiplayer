@@ -52,6 +52,17 @@ static_assert(sizeof(dSv_player_collect_c::mItem) == world::kCollectBytes,
 constexpr std::size_t kMemPadStart = 0x1E;
 static_assert(offsetof(dSv_memBit_c, mDungeonItem) + 1 == kMemPadStart, "dSv_memBit_c padding");
 
+// --- the temp domains' byte layouts (world_state.hpp, "temporary domains") ----------------------
+
+static_assert(offsetof(dSv_danBit_c, mItem) ==
+                  offsetof(dSv_danBit_c, mSwitch) + world::kDanSwitchBytes,
+    "kDanSwitchBytes vs dSv_danBit_c::mSwitch");
+static_assert(offsetof(dSv_danBit_c, unk28) == offsetof(dSv_danBit_c, mSwitch) + world::kDanBytes,
+    "kDanBytes vs dSv_danBit_c::mSwitch + mItem");
+static_assert(offsetof(dSv_zoneBit_c, unk12) == world::kZoneBytes,
+    "kZoneBytes vs dSv_zoneBit_c (everything before unk12)");
+static_assert(dSv_info_c::ZONE_MAX == 32, "zone ids");
+
 // --- the Items-domain byte map (world_state.hpp, kPlayerBytes) ---------------------------------
 
 constexpr std::size_t kPbItems = 0;
@@ -68,6 +79,8 @@ static_assert(kPbWallet + 1 == world::kPlayerBytes, "Items byte map vs kPlayerBy
 int s_liveTbl = -1;
 std::uint32_t s_resetEpoch = 0;
 bool s_reloadPending = false;
+/// See temp_epoch(): bumped by H1 and by a save reset.
+std::uint32_t s_tempEpoch = 0;
 /// A stage has loaded its table since the last bulk reset/load (a game is actually in progress).
 bool s_loadedSinceReset = false;
 
@@ -355,8 +368,8 @@ void capture(world::WorldView& out) {
 }
 
 void apply_to_engine(const world::WorldOp& op, std::int32_t value) {
-    if (op.domain == world::Domain::Dan || op.domain == world::Domain::Zone) {
-        log_dropped(s_loggedReservedDomain, op, "Dan/Zone are Batch W-B");
+    if (world::is_temp(op.domain)) {
+        log_dropped(s_loggedReservedDomain, op, "Dan/Zone go through apply_temp_to_engine");
         return;
     }
     if (!domain_shared(op.domain)) {
@@ -509,6 +522,125 @@ bool reload_pending() {
     return s_reloadPending;
 }
 
+// --- temporary bits (Dan, Zone) ------------------------------------------------------------------
+
+namespace {
+
+/// mDan.mSwitch[0] .. mItem[3], as raw bytes (world::kDanBytes of them).
+std::uint8_t* dan_bytes() {
+    return reinterpret_cast<std::uint8_t*>(&info().getDan().mSwitch[0]);
+}
+
+std::uint8_t* zone_bytes(int zoneNo) {
+    return bytes_of(info().getZone(zoneNo).getBit());
+}
+
+/// The temp bits of `tbl` are this machine's live ones: a world, mMemory owned by `tbl` (so the
+/// stage really is that table, not mid-change) and mDan initialised for it. Between dStage_Delete
+/// (H2) and the next stage's getSave (H1) this is false for every table, which is what keeps a
+/// stage change from ever being diffed or written as temp ops.
+bool temp_table_live(int tbl) {
+    return tbl >= 0 && tbl == s_liveTbl && info().getDan().mStageNo == tbl && world_ready();
+}
+
+}  // namespace
+
+int zone_no(int room) {
+    if (room < 0 || room >= static_cast<int>(world::kZoneRooms)) {
+        return -1;
+    }
+    const int zoneNo = dComIfGp_roomControl_getZoneNo(room);
+    if (zoneNo < 0 || zoneNo >= dSv_info_c::ZONE_MAX) {
+        return -1;
+    }
+    // Both directions must agree: dStage_roomStatus_c::mZoneNo says which slot, and the slot's own
+    // room number says it was not freed (removeZone) and handed to another room since.
+    if (info().getZone(zoneNo).getRoomNo() != room) {
+        return -1;
+    }
+    return zoneNo;
+}
+
+int stay_room() {
+    return dComIfGp_roomControl_getStayNo();
+}
+
+int dan_stage_no() {
+    return info().getDan().mStageNo;
+}
+
+std::uint32_t temp_epoch() {
+    return s_tempEpoch;
+}
+
+bool capture_temp(world::TempView& out) {
+    out = world::TempView{};
+    if (!temp_table_live(s_liveTbl)) {
+        return false;
+    }
+    out.tbl = static_cast<std::int8_t>(s_liveTbl);
+    std::memcpy(out.dan.data(), dan_bytes(), world::kDanBytes);
+    for (int room = 0; room < static_cast<int>(world::kZoneRooms); room++) {
+        const int zoneNo = zone_no(room);
+        if (zoneNo < 0) {
+            continue;
+        }
+        out.rooms |= std::uint64_t{1} << room;
+        std::memcpy(out.zone[room].data(), zone_bytes(zoneNo), world::kZoneBytes);
+    }
+    return true;
+}
+
+bool apply_temp_to_engine(const world::WorldOp& op) {
+    if (!world::is_temp(op.domain) || !world::op_in_range(op) ||
+        world::temp_mirror_only(op.index) || !temp_table_live(op.tbl))
+    {
+        return false;
+    }
+    std::uint8_t* b = nullptr;
+    if (op.domain == world::Domain::Dan) {
+        b = dan_bytes() + world::temp_byte(op.index);
+    } else {
+        const int zoneNo = zone_no(world::zone_room(op.index));
+        if (zoneNo < 0) {
+            // Zone ids are per machine: no zone here for that room means the room is not loaded
+            // here, and room-temporary state only matters where the room is loaded.
+            return false;
+        }
+        b = zone_bytes(zoneNo) + world::temp_byte(op.index);
+    }
+    *b = mask_apply(*b, op.set, op.clr);
+    return true;
+}
+
+void seed_dan(const std::array<std::uint8_t, world::kDanBytes>& dan) {
+    std::memcpy(dan_bytes(), dan.data(), world::kDanBytes);
+}
+
+bool seed_zone(
+    int room, const std::array<std::uint8_t, world::kZoneBytes>& bytes, bool persistentOnly) {
+    const int zoneNo = zone_no(room);
+    if (zoneNo < 0) {
+        return false;
+    }
+    std::uint8_t* dst = zone_bytes(zoneNo);
+    for (std::size_t i = 0; i < world::kZoneBytes; i++) {
+        if (!persistentOnly || world::zone_byte_persistent(i)) {
+            dst[i] = bytes[i];
+        }
+    }
+    return true;
+}
+
+bool read_zone(int room, std::array<std::uint8_t, world::kZoneBytes>& out) {
+    const int zoneNo = zone_no(room);
+    if (zoneNo < 0) {
+        return false;
+    }
+    std::memcpy(out.data(), zone_bytes(zoneNo), world::kZoneBytes);
+    return true;
+}
+
 }  // namespace world_bridge
 
 // --- decomp hooks (declared in dusk/multiplayer.hpp) ---------------------------------------------
@@ -524,6 +656,8 @@ void world_on_memory_loaded(int stageNo) {
     world_bridge::s_liveTbl = stageNo;
     world_bridge::s_reloadPending = false;
     world_bridge::s_loadedSinceReset = true;
+    // A new stage's tables: whatever temp shadow world sync holds is from before the change.
+    world_bridge::s_tempEpoch++;
 }
 
 void world_on_memory_stored(int stageNo) {
@@ -538,6 +672,7 @@ void world_on_memory_stored(int stageNo) {
 
 void world_on_save_reset() {
     world_bridge::s_resetEpoch++;
+    world_bridge::s_tempEpoch++;
     // dSv_info_c::init re-inits mMemory and card_to_memory replaces mSave under it, so mMemory
     // belongs to no table of the save now in memory until the next getSave.
     world_bridge::s_liveTbl = -1;

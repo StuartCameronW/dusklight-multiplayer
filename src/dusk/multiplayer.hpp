@@ -94,4 +94,26 @@ void world_on_memory_stored(int stageNo);
 /// the world sync layer must stop diffing until a game is loaded and resynced.
 void world_on_save_reset();
 
+/*
+ * Temporary bits (Batch W-B, spec II.7): dungeon bits (mDan) and room bits (mZone) shared between
+ * players in the same stage table / room. Never saved. Implemented in
+ * multiplayer/session/world_sync.cpp; no-ops outside a synced session.
+ */
+
+/// H6, d_stage.cpp dStage_stagInfoInit, right AFTER dComIfGs_initDan(stageNo): if a partner is in
+/// that stage table, overwrite mDan's bits with the shared copy (vanilla's reset/keep decision and
+/// its carry-object save flag are left as they are).
+void world_on_dan_init(int stageNo);
+
+/// H7, d_s_room.cpp room phase_2, right after a zone was created for `roomNo` and before the
+/// room's actors exist: seed it from the shared copy if a partner stands in that room.
+void world_on_zone_created(int roomNo);
+
+/// H8, around the room-lifecycle clears of zone bits (dStage_roomControl_c::zoneCountCheck, and
+/// the room-kill clear in d_s_room.cpp): `begin` sends any gameplay change made before the clear,
+/// `end` adopts the clear without sending it. One player's room change is his own lifecycle and
+/// must never clear a puzzle a partner is standing in.
+void world_on_zone_lifecycle_begin();
+void world_on_zone_lifecycle_end();
+
 }  // namespace dusk::mp

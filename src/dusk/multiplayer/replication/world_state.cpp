@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <limits>
+#include <utility>
 
 namespace dusk::mp::world {
 namespace {
@@ -10,6 +11,8 @@ namespace {
 /// write_view's layout version. Bump it whenever the field order or any array size changes, so a
 /// mismatched peer fails the read instead of installing shifted bytes.
 constexpr std::uint8_t kViewFormatVersion = 1;
+/// write_temp_mirrors' layout version (the WorldSync trailer); same rule as kViewFormatVersion.
+constexpr std::uint8_t kTempFormatVersion = 1;
 
 constexpr std::int32_t kRupeeMax = 9999;
 constexpr std::int32_t kMaxLifeMax = 400;
@@ -273,9 +276,12 @@ bool op_in_range(const WorldOp& op) {
     case Domain::Items:
         return op.tbl == kNoTbl && op.index < kPlayerBytes;
     case Domain::Dan:
+        // Not saved state; the stage table is the dan stage number (a save table, 0..31).
+        return op.tbl < kMemTbls && (op.index >> 8) == 0 && temp_byte(op.index) < kDanBytes;
     case Domain::Zone:
-        // Reserved for Batch W-B: nothing in the view holds them yet.
-        return false;
+        // index = room << 8 | byte, plus kTempMirrorOnly.
+        return op.tbl < kMemTbls && zone_room(op.index) < kZoneRooms &&
+               temp_byte(op.index) < kZoneBytes;
     case Domain::KeyNum:
         return op.tbl < kMemTbls && op.tbl != kLocalOnlyKeyTbl;
     case Domain::Rupee:
@@ -287,7 +293,8 @@ bool op_in_range(const WorldOp& op) {
 }
 
 bool apply_op(WorldView& view, WorldView& shadow, const WorldOp& op, bool useAbsolute) {
-    if (!op_in_range(op)) {
+    // Dan/Zone are not in the WorldView: they go to a TempMirror / TempView (apply_temp_op).
+    if (is_temp(op.domain) || !op_in_range(op)) {
         return false;
     }
     if (is_counter(op.domain)) {
@@ -316,15 +323,151 @@ ProposalVerdict judge_proposal(const std::vector<WorldOp>& ops) {
         if (is_counter(op.domain)) {
             continue;
         }
-        v.bitsTouched +=
+        const auto touched =
             static_cast<std::uint32_t>(std::popcount(static_cast<std::uint8_t>(op.set | op.clr)));
+        if (is_temp(op.domain)) {
+            // Never saved (see world_state.hpp), so not counted against the save's limit.
+            v.tempBitsTouched += touched;
+            continue;
+        }
+        v.bitsTouched += touched;
         if (op.domain == Domain::Event) {
             v.eventClears += static_cast<std::uint32_t>(std::popcount(op.clr));
         }
     }
     v.accept = v.badOps == 0 && v.bitsTouched <= kMaxProposalBits &&
-               v.eventClears <= kMaxProposalEventClears;
+               v.eventClears <= kMaxProposalEventClears &&
+               v.tempBitsTouched <= kMaxProposalTempBits;
     return v;
+}
+
+// --- temporary domains (Dan, Zone) ---------------------------------------------------------------
+
+void diff_temp(const TempView& shadow, const TempView& cur, std::vector<WorldOp>& out) {
+    if (cur.tbl < 0 || shadow.tbl != cur.tbl) {
+        return;
+    }
+    const auto tbl = static_cast<std::uint8_t>(cur.tbl);
+    for (std::size_t i = 0; i < kDanBytes; ++i) {
+        emit_bit_op(Domain::Dan, tbl, i, shadow.dan[i], cur.dan[i], out);
+    }
+    const std::uint64_t both = shadow.rooms & cur.rooms;
+    for (std::size_t room = 0; room < kZoneRooms; ++room) {
+        if ((both >> room & 1) == 0) {
+            continue;
+        }
+        for (std::size_t i = 0; i < kZoneBytes; ++i) {
+            if (shadow.zone[room][i] != cur.zone[room][i]) {
+                emit_bit_op(Domain::Zone, tbl, zone_index(room, i), shadow.zone[room][i],
+                    cur.zone[room][i], out);
+            }
+        }
+    }
+}
+
+bool apply_temp_op(TempMirror& m, const WorldOp& op) {
+    if (!is_temp(op.domain) || !op_in_range(op)) {
+        return false;
+    }
+    if (op.domain == Domain::Dan) {
+        apply_bits(m.dan[temp_byte(op.index)], op);
+    } else {
+        const std::uint8_t room = zone_room(op.index);
+        apply_bits(m.zone[room][temp_byte(op.index)], op);
+        m.rooms |= std::uint64_t{1} << room;
+    }
+    return true;
+}
+
+bool apply_temp_op(TempView& v, const WorldOp& op) {
+    if (!is_temp(op.domain) || !op_in_range(op) || v.tbl < 0 ||
+        static_cast<std::uint8_t>(v.tbl) != op.tbl)
+    {
+        return false;
+    }
+    if (op.domain == Domain::Dan) {
+        apply_bits(v.dan[temp_byte(op.index)], op);
+        return true;
+    }
+    const std::uint8_t room = zone_room(op.index);
+    if ((v.rooms >> room & 1) == 0) {
+        return false;
+    }
+    apply_bits(v.zone[room][temp_byte(op.index)], op);
+    return true;
+}
+
+void announce_dan(std::uint8_t tbl, const std::array<std::uint8_t, kDanBytes>& dan,
+    std::vector<WorldOp>& out) {
+    for (std::size_t i = 0; i < kDanBytes; ++i) {
+        WorldOp op;
+        op.domain = Domain::Dan;
+        op.tbl = tbl;
+        op.index = static_cast<std::uint16_t>(i | kTempMirrorOnly);
+        op.set = dan[i];
+        op.clr = static_cast<std::uint8_t>(~dan[i]);
+        out.push_back(op);
+    }
+}
+
+void announce_zone(std::uint8_t tbl, std::uint8_t room,
+    const std::array<std::uint8_t, kZoneBytes>& zone, std::vector<WorldOp>& out) {
+    for (std::size_t i = 0; i < kZoneBytes; ++i) {
+        WorldOp op;
+        op.domain = Domain::Zone;
+        op.tbl = tbl;
+        op.index = zone_index(room, i, true);
+        op.set = zone[i];
+        op.clr = static_cast<std::uint8_t>(~zone[i]);
+        out.push_back(op);
+    }
+}
+
+void write_temp_mirrors(Writer& w, const TempMirrors& m) {
+    w.write_u8(kTempFormatVersion);
+    // There are only 32 tables; the clamp just keeps the count byte honest.
+    const std::size_t n = std::min<std::size_t>(m.size(), kMemTbls);
+    w.write_u8(static_cast<std::uint8_t>(n));
+    std::size_t written = 0;
+    for (const auto& [tbl, mirror] : m) {
+        if (written++ == n) {
+            break;
+        }
+        w.write_u8(tbl);
+        write_bytes(w, mirror.dan);
+        w.write_u64(mirror.rooms);
+        for (std::size_t room = 0; room < kZoneRooms; ++room) {
+            if ((mirror.rooms >> room & 1) != 0) {
+                write_bytes(w, mirror.zone[room]);
+            }
+        }
+    }
+}
+
+bool read_temp_mirrors(Reader& r, TempMirrors& out) {
+    std::uint8_t version = 0;
+    std::uint8_t n = 0;
+    if (!r.read_u8(version) || version != kTempFormatVersion || !r.read_u8(n) || n > kMemTbls) {
+        return false;
+    }
+    TempMirrors parsed;
+    for (std::uint8_t i = 0; i < n; ++i) {
+        std::uint8_t tbl = 0;
+        TempMirror mirror;
+        if (!r.read_u8(tbl) || tbl >= kMemTbls || !read_bytes(r, mirror.dan) ||
+            !r.read_u64(mirror.rooms))
+        {
+            return false;
+        }
+        for (std::size_t room = 0; room < kZoneRooms; ++room) {
+            if ((mirror.rooms >> room & 1) != 0 && !read_bytes(r, mirror.zone[room])) {
+                return false;
+            }
+        }
+        parsed[tbl] = mirror;
+    }
+    out = std::move(parsed);
+    return true;
 }
 
 // --- whole-view transfer + digest ----------------------------------------------------------------
@@ -672,6 +815,185 @@ bool selftest(std::string& failure) {
         Reader ru(unknown.data().data(), unknown.size());
         WorldOp op;
         WS_CHECK(!read_op(ru, op), "read_op accepted an unknown domain");
+    }
+
+    // 7. Temporary domains (Dan, Zone): not in the view, co-location diff, mirrors, announcements.
+    {
+        // Ranges and the wire.
+        WS_CHECK(op_in_range(bit_op(Domain::Dan, 0, 0, 1, 0)), "op_in_range refused Dan byte 0");
+        WS_CHECK(op_in_range(bit_op(Domain::Dan, 31, kDanBytes - 1, 1, 0)),
+            "op_in_range refused the last Dan byte");
+        WS_CHECK(op_in_range(bit_op(Domain::Dan, 3, 5 | kTempMirrorOnly, 1, 0)),
+            "op_in_range refused a mirror-only Dan op");
+        WS_CHECK(!op_in_range(bit_op(Domain::Dan, 32, 0, 1, 0)), "op_in_range accepted Dan tbl 32");
+        WS_CHECK(!op_in_range(bit_op(Domain::Dan, kNoTbl, 0, 1, 0)),
+            "op_in_range accepted Dan with no table");
+        WS_CHECK(!op_in_range(bit_op(Domain::Dan, 0, kDanBytes, 1, 0)),
+            "op_in_range accepted Dan byte 24");
+        WS_CHECK(!op_in_range(bit_op(Domain::Dan, 0, 0x100, 1, 0)),
+            "op_in_range accepted a Dan index with a room part");
+        WS_CHECK(op_in_range(bit_op(Domain::Zone, 0, zone_index(63, kZoneBytes - 1), 1, 0)),
+            "op_in_range refused zone room 63 byte 11");
+        WS_CHECK(!op_in_range(bit_op(Domain::Zone, 0, zone_index(64, 0), 1, 0)),
+            "op_in_range accepted zone room 64");
+        WS_CHECK(!op_in_range(bit_op(Domain::Zone, 0, zone_index(1, kZoneBytes), 1, 0)),
+            "op_in_range accepted zone byte 12 (unk12 / dSv_zoneActor_c are not replicated)");
+        WS_CHECK(zone_room(zone_index(37, 4, true)) == 37 &&
+                     temp_byte(zone_index(37, 4, true)) == 4 &&
+                     temp_mirror_only(zone_index(37, 4, true)) &&
+                     !temp_mirror_only(zone_index(37, 4)),
+            "zone index encoding does not round-trip");
+
+        WorldView view;
+        WorldView shadow;
+        WS_CHECK(!apply_op(view, shadow, bit_op(Domain::Dan, 0, 0, 1, 0), false),
+            "apply_op wrote a Dan op into the saved view");
+        WS_CHECK(!apply_op(view, shadow, bit_op(Domain::Zone, 0, zone_index(1, 0), 1, 0), false),
+            "apply_op wrote a Zone op into the saved view");
+
+        // diff_temp: gameplay only, co-located only.
+        TempView a;
+        a.tbl = 16;
+        a.rooms = (std::uint64_t{1} << 3) | (std::uint64_t{1} << 5);
+        TempView b = a;
+        b.dan[0] = 0x21;
+        b.dan[kDanBytes - 1] = 0x80;
+        b.zone[3][4] = 0x01;  // a one-zone switch in room 3
+        b.zone[5][0] = 0x40;  // a zone switch in room 5
+        b.rooms |= std::uint64_t{1} << 9;  // room 9 appeared: lifecycle, no ops
+        b.zone[9][0] = 0xFF;
+        std::vector<WorldOp> ops;
+        diff_temp(a, b, ops);
+        WS_CHECK(ops.size() == 4, "diff_temp did not emit exactly the 4 gameplay changes");
+        for (const WorldOp& op : ops) {
+            WS_CHECK(op.tbl == 16 && op_in_range(op) && !temp_mirror_only(op.index),
+                "diff_temp emitted a bad or mirror-only op");
+            WS_CHECK(!(op.domain == Domain::Zone && zone_room(op.index) == 9),
+                "diff_temp reported a newly created zone");
+        }
+        std::vector<WorldOp> none;
+        TempView elsewhere = b;
+        elsewhere.tbl = 17;
+        diff_temp(a, elsewhere, none);
+        WS_CHECK(none.empty(), "diff_temp reported a stage-table change as ops");
+        TempView noTbl = b;
+        noTbl.tbl = -1;
+        diff_temp(noTbl, noTbl, none);
+        diff_temp(a, noTbl, none);
+        WS_CHECK(none.empty(), "diff_temp emitted ops with no table");
+        TempView gone = a;
+        gone.rooms = std::uint64_t{1} << 5;
+        gone.zone[3][4] = 0xFF;
+        diff_temp(a, gone, none);
+        WS_CHECK(none.empty(), "diff_temp reported a removed zone");
+
+        // Through the wire, then into a co-located view and a mirror.
+        Writer w;
+        write_ops(w, ops);
+        Reader r(w.data().data(), w.size());
+        std::vector<WorldOp> wireOps;
+        WS_CHECK(read_ops(r, wireOps) && wireOps.size() == ops.size(),
+            "temp ops did not survive the wire");
+        TempView there = a;
+        TempMirror mirror;
+        for (const WorldOp& op : wireOps) {
+            WS_CHECK(apply_temp_op(there, op), "apply_temp_op(view) refused a co-located op");
+            WS_CHECK(apply_temp_op(mirror, op), "apply_temp_op(mirror) refused an op");
+        }
+        WS_CHECK(there.dan == b.dan && there.zone[3] == b.zone[3] && there.zone[5] == b.zone[5],
+            "the co-located view did not end up equal to the sender");
+        WS_CHECK(mirror.dan == b.dan && mirror.zone[5] == b.zone[5] &&
+                     mirror.rooms == ((std::uint64_t{1} << 3) | (std::uint64_t{1} << 5)),
+            "the mirror did not record the ops");
+        std::vector<WorldOp> echo;
+        TempView thereShadow = there;
+        diff_temp(thereShadow, there, echo);
+        WS_CHECK(echo.empty(), "applying temp ops to view + shadow still diffs (ping-pong)");
+
+        // A view for another table, or without that room, is not written.
+        TempView other;
+        other.tbl = 2;
+        WS_CHECK(!apply_temp_op(other, wireOps[0]), "apply_temp_op wrote another table's dan");
+        TempView noRoom = a;
+        noRoom.rooms = 0;
+        const WorldOp zoneOp = bit_op(Domain::Zone, 16, zone_index(5, 0), 0x40, 0);
+        WS_CHECK(!apply_temp_op(noRoom, zoneOp), "apply_temp_op wrote a zone the view lacks");
+
+        // Mask merge: two players, two bits of one dan byte, either order.
+        TempMirror m1;
+        TempMirror m2;
+        const WorldOp p1 = bit_op(Domain::Dan, 16, 2, 0x01, 0);
+        const WorldOp p2 = bit_op(Domain::Dan, 16, 2, 0x10, 0);
+        apply_temp_op(m1, p1);
+        apply_temp_op(m1, p2);
+        apply_temp_op(m2, p2);
+        apply_temp_op(m2, p1);
+        WS_CHECK(m1.dan[2] == 0x11 && m2.dan[2] == 0x11, "dan bits did not merge");
+
+        // Announcements overwrite a stale mirror exactly.
+        TempMirror stale;
+        stale.dan.fill(0xA5);
+        stale.zone[7].fill(0x5A);
+        std::array<std::uint8_t, kDanBytes> fresh{};
+        fresh[1] = 0x02;
+        std::array<std::uint8_t, kZoneBytes> freshZone{};
+        freshZone[0] = 0x80;
+        std::vector<WorldOp> ann;
+        announce_dan(16, fresh, ann);
+        announce_zone(16, 7, freshZone, ann);
+        WS_CHECK(ann.size() == kDanBytes + kZoneBytes, "announcement op count");
+        for (const WorldOp& op : ann) {
+            WS_CHECK(temp_mirror_only(op.index) && op_in_range(op),
+                "announcement op not mirror-only / out of range");
+            apply_temp_op(stale, op);
+        }
+        WS_CHECK(stale.dan == fresh && stale.zone[7] == freshZone && (stale.rooms >> 7 & 1) != 0,
+            "announcement did not overwrite the stale mirror");
+
+        // Proposal limits: temp bits are not counted against the save limit, but are bounded.
+        std::vector<WorldOp> mixed;
+        for (std::uint16_t i = 0; i < 8; ++i) {
+            mixed.push_back(bit_op(Domain::MemBit, 1, i, 0xFF, 0));
+        }
+        announce_dan(16, fresh, mixed);
+        const ProposalVerdict mv = judge_proposal(mixed);
+        WS_CHECK(mv.accept && mv.bitsTouched == 64 && mv.tempBitsTouched == kDanBytes * 8,
+            "judge_proposal counted temp bits against the saved-bit limit");
+        std::vector<WorldOp> fullTable;
+        announce_dan(16, fresh, fullTable);
+        for (std::size_t room = 0; room < kZoneRooms; ++room) {
+            announce_zone(16, static_cast<std::uint8_t>(room), freshZone, fullTable);
+        }
+        WS_CHECK(judge_proposal(fullTable).accept, "judge_proposal refused a full-table announce");
+        const std::vector<WorldOp> once = fullTable;
+        fullTable.insert(fullTable.end(), once.begin(), once.end());
+        WS_CHECK(!judge_proposal(fullTable).accept,
+            "judge_proposal accepted two full-table overwrites");
+
+        // The WorldSync trailer.
+        TempMirrors mirrors;
+        mirrors[16] = mirror;
+        mirrors[0].dan[0] = 0x01;
+        mirrors[31].rooms = std::uint64_t{1} << 63;
+        mirrors[31].zone[63][11] = 0x7F;
+        Writer tw;
+        write_temp_mirrors(tw, mirrors);
+        Reader tr(tw.data().data(), tw.size());
+        TempMirrors back;
+        WS_CHECK(read_temp_mirrors(tr, back) && tr.remaining() == 0,
+            "read_temp_mirrors failed on write_temp_mirrors output");
+        WS_CHECK(back.size() == 3 && back[16].dan == mirror.dan &&
+                     back[16].rooms == mirror.rooms && back[16].zone[5] == mirror.zone[5] &&
+                     back[0].dan[0] == 0x01 && back[31].zone[63][11] == 0x7F,
+            "read_temp_mirrors did not reproduce the mirrors");
+        Reader trs(tw.data().data(), tw.size() - 1);
+        TempMirrors sink;
+        WS_CHECK(!read_temp_mirrors(trs, sink), "read_temp_mirrors accepted truncated data");
+        Writer empty;
+        write_temp_mirrors(empty, TempMirrors{});
+        Reader er(empty.data().data(), empty.size());
+        WS_CHECK(read_temp_mirrors(er, sink) && sink.empty() && er.remaining() == 0,
+            "an empty mirror set did not round-trip");
     }
 
 #undef WS_CHECK

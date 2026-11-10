@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "world_state.hpp"
@@ -52,7 +53,8 @@ void capture(world::WorldView& out);
 /// final value for counter domains (the caller decides absolute vs predicted).
 ///
 /// Ops for a domain the policy makes Individual, the keyNum of kLocalOnlyKeyTbl, the keyNum byte
-/// as a MemBit op, and the reserved Dan/Zone domains are ignored (logged once each).
+/// as a MemBit op, and Dan/Zone ops (those go through apply_temp_to_engine) are ignored (logged
+/// once each).
 void apply_to_engine(const world::WorldOp& op, std::int32_t value);
 
 /// Guest join: asserts the save latch is engaged (refuse + log ERROR otherwise), writes the view
@@ -78,5 +80,45 @@ std::uint32_t reset_epoch();
 /// True from install_host_world's reload in place until the reloaded stage has loaded its flags
 /// (hook H1). A warp issued in that window is dropped by the scene change already under way.
 bool reload_pending();
+
+// --- temporary bits: Dan (mDan) and Zone (mZone), Batch W-B, spec II.7 ---------------------------
+//
+// Engine access only; who shares what with whom is world_sync.cpp's. None of this touches
+// mSavedata, so nothing here can reach a save file.
+
+/// Engine -> the temp bits of the stage table the local player is in. False (and `out.tbl = -1`)
+/// whenever that table is not known for certain: no world, mMemory owned by no table (mid stage
+/// change), or mDan not (yet) initialised for that table. Never send temp ops on false.
+bool capture_temp(world::TempView& out);
+
+/// Writes a (validated, NOT mirror-only) temp op into the engine when this machine holds it: Dan
+/// when the op's table is the live one and mDan belongs to it; Zone additionally only when this
+/// machine has a zone for the op's room (zone ids are per machine, so the room is mapped through
+/// dStage_roomControl_c::getZoneNo here). Returns true when it wrote.
+bool apply_temp_to_engine(const world::WorldOp& op);
+
+/// H6 (and a resync): overwrite mDan's switch and item bits, never mStageNo / unk1 / unk28. Only
+/// call while mDan belongs to the table the bits are for (right after dComIfGs_initDan(stageNo),
+/// or when capture_temp() just reported that table).
+void seed_dan(const std::array<std::uint8_t, world::kDanBytes>& dan);
+
+/// H7: overwrite one room's zone bytes, only the persistent ones (world::zone_byte_persistent)
+/// when `persistentOnly`. False when this machine has no zone for that room.
+bool seed_zone(int room, const std::array<std::uint8_t, world::kZoneBytes>& bytes,
+    bool persistentOnly);
+
+/// One room's zone bytes as they are now; false when this machine has no zone for that room.
+bool read_zone(int room, std::array<std::uint8_t, world::kZoneBytes>& out);
+
+/// Bumped whenever the temp bits change owner wholesale: a stage's tables were loaded (H1) or the
+/// save info was reset. A temp shadow from an older epoch must be rebased, never diffed.
+std::uint32_t temp_epoch();
+
+/// mDan.mStageNo (-1 = reset), for logs.
+int dan_stage_no();
+/// The zone id this machine uses for `room`, or -1 when it has none (or the table is not live).
+int zone_no(int room);
+/// The room Link stands in (dStage_roomControl_c stay number), for logs and autopilot.
+int stay_room();
 
 }  // namespace dusk::mp::world_bridge

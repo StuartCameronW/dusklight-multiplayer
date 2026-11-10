@@ -1,6 +1,8 @@
 #include "world_sync.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdlib>
 #include <deque>
@@ -13,8 +15,10 @@
 #include "../replication/world_bridge.hpp"
 #include "../replication/world_state.hpp"
 #include "dusk/logging.h"
+#include "dusk/multiplayer.hpp"
 #include "fmt/format.h"
 #include "network_manager.hpp"
+#include "presence.hpp"
 #include "save_guard.hpp"
 
 namespace dusk::mp::world_sync {
@@ -86,6 +90,64 @@ struct PendingProposal {
     std::vector<std::pair<std::uint16_t, std::int32_t>> deltas;
 };
 
+/**
+ * Temporary bits (Dan, Zone; spec II.7). Not saved world state: never in the WorldView, the
+ * shadow or the digest. See world_state.hpp "temporary domains" for the model; this is who shares
+ * them with whom.
+ *
+ * DESIGN (choices the spec left open, all deliberate):
+ *  - ROUTING: Dan/Zone ops ride the same Propose/Commit stream as saved ops, so they keep one
+ *    order with everything else (a guest's switch and the chest it opens arrive together). The
+ *    host applies them to its MIRRORS and, when co-located, to its engine; never to the shadow, so
+ *    they cannot reach the digest, a WorldSync view, or the save (mDan/mZone are outside
+ *    mSavedata anyway). judge_proposal counts them separately (kMaxProposalTempBits).
+ *  - DIGEST: excludes them entirely. A mismatch can therefore never resync temp bits, and
+ *    players in different stages can never trigger a resync through them. The test oracle for
+ *    them is `worldlog` / `templog` on both ends.
+ *  - OCCUPANCY: a table is occupied when this machine stands in it (its live table, or the last
+ *    one while mid stage change), when a partner's Presence last named it (a partner who is
+ *    loading still counts for the table he was last in), or when a partner's op for it arrived in
+ *    the last kTempOpGraceTicks (an op can overtake his Presence). A mirror is kept exactly while
+ *    its table is occupied, so "the bits reset only when everyone has left" holds.
+ *  - H6 (after dComIfGs_initDan): a mirror exists AND a partner occupies the table -> mDan's bits
+ *    := the mirror. Otherwise the stage entry is vanilla, and the next rebase announces this
+ *    machine's dan as mirror-only ops, which overwrites any stale mirror elsewhere.
+ *  - H7 (a zone was just created): a partner STANDS in that room -> seed the persistent zone
+ *    bytes from the mirror (one-zone bits start clear: vanilla clears them on every room change,
+ *    so every visit starts clear). Otherwise announce the fresh zone, mirror-only.
+ *  - H8 (zoneCountCheck and the room-kill clear in d_s_room): flush the diff before, rebase the
+ *    shadow after. Those clears are the LOCAL player's room lifecycle and are never sent.
+ *  - LATE JOIN: the host's WorldSync carries all its mirrors after the view (write_temp_mirrors),
+ *    so a joiner entering an occupied table is seeded by H6 like anyone else.
+ */
+struct TempState {
+    world::TempMirrors mirrors;
+    /// Per table: the tick a partner's op for it last arrived (see OCCUPANCY).
+    std::unordered_map<std::uint8_t, std::uint64_t> lastRemoteOpTick;
+    /// Per partner: the last stage table his Presence named (a loading partner reports -1; this
+    /// keeps the last real one).
+    std::unordered_map<std::uint32_t, std::int8_t> remoteTbl;
+    /// The last local table capture_temp reported; stands in while mMemory belongs to no table.
+    int lastLocalTbl = -1;
+
+    world::TempView shadow;
+    bool shadowValid = false;
+    std::uint32_t shadowEpoch = 0;
+    world::TempView scratch;
+
+    /// H6 entered `danAnnounceTbl` without seeding: announce its dan at the next rebase.
+    bool danAnnouncePending = false;
+    int danAnnounceTbl = -1;
+    /// Ops produced inside decomp hooks (H7 announcements, H8 flushes), sent with the next tick's
+    /// diff and before it.
+    std::vector<world::WorldOp> pending;
+};
+
+/// How long a partner's op for a table keeps its mirror alive without a Presence naming it.
+constexpr std::uint64_t kTempOpGraceTicks = 150;
+/// Hook-produced ops held for a tick at most; past this something is not draining them.
+constexpr std::size_t kMaxTempPending = 4096;
+
 struct GuestState {
     std::uint32_t lastProposeSeq = 0;
     bool owedSync = false;
@@ -138,6 +200,9 @@ struct State {
     int engineDriftDigests = 0;
     std::deque<std::uint64_t> installTicks;
     bool installGaveUp = false;
+
+    // --- both: Dan/Zone temp bits
+    TempState temp;
 };
 
 State& st() {
@@ -223,6 +288,221 @@ bool is_host() {
     return network_manager().role() == Role::Host;
 }
 
+// --- temp bits (Dan, Zone) -----------------------------------------------------------------------
+
+/// Hooks run with multiplayer inactive too; this keeps them no-ops then. The host keeps sharing
+/// temp bits through its own stage changes (it is Unsynced while its world is away but keeps the
+/// shadow); a guest only while Synced.
+bool temp_active() {
+    const NetworkManager& net = network_manager();
+    if (!net.is_active() || !net.session_live()) {
+        return false;
+    }
+    const State& s = st();
+    if (net.role() == Role::Host) {
+        return s.haveShadow;
+    }
+    return net.role() == Role::Client && s.synced;
+}
+
+int local_tbl() {
+    const int live = world_bridge::live_tbl();
+    return live >= 0 ? live : st().temp.lastLocalTbl;
+}
+
+/// Presence -> remoteTbl: the last real stage table each partner named.
+void refresh_remote_tbls() {
+    TempState& t = st().temp;
+    const std::vector<presence::Info> peers = presence::peers();
+    for (auto it = t.remoteTbl.begin(); it != t.remoteTbl.end();) {
+        const bool present = std::any_of(peers.begin(), peers.end(),
+            [&](const presence::Info& p) { return p.valid && p.playerId == it->first; });
+        it = present ? std::next(it) : t.remoteTbl.erase(it);
+    }
+    for (const presence::Info& p : peers) {
+        if (p.valid && p.saveTbl >= 0 && p.saveTbl < static_cast<int>(world::kMemTbls)) {
+            t.remoteTbl[p.playerId] = p.saveTbl;
+        }
+    }
+}
+
+bool remote_occupies(int tbl) {
+    const TempState& t = st().temp;
+    for (const auto& entry : t.remoteTbl) {
+        if (entry.second == tbl) {
+            return true;
+        }
+    }
+    const auto it = t.lastRemoteOpTick.find(static_cast<std::uint8_t>(tbl));
+    return it != t.lastRemoteOpTick.end() && now_tick() - it->second < kTempOpGraceTicks;
+}
+
+/// A partner whose Link stands in `room` of `tbl` right now (not loading). His zone for that room
+/// is live, so the mirror's bytes for it are current.
+bool remote_in_room(int tbl, int room) {
+    for (const presence::Info& p : presence::peers()) {
+        if (p.valid && (p.flags & presence::kFlagLoading) == 0 && p.saveTbl == tbl &&
+            p.room == room)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Drop every mirror whose table nobody occupies any more (vanilla resets temps when you leave;
+/// co-op does when EVERYONE has).
+void drop_unoccupied_mirrors() {
+    TempState& t = st().temp;
+    const int local = local_tbl();
+    for (auto it = t.mirrors.begin(); it != t.mirrors.end();) {
+        const int tbl = it->first;
+        if (tbl == local || remote_occupies(tbl)) {
+            ++it;
+            continue;
+        }
+        Log.info("[mp-world] temp: nobody is in stage table {} any more; its dan/zone mirror is "
+                 "dropped (the next player in starts with vanilla-reset bits)",
+            tbl);
+        it = t.mirrors.erase(it);
+    }
+}
+
+/// This machine's own table: its engine is the truth for the dan bits (H6 seeded it from this very
+/// mirror, or nobody else is in the table), and for any room the mirror has never heard of.
+/// Rooms the mirror already has are left alone: their one-zone bytes may have been cleared here by
+/// this player's own room lifecycle (H8), which is not news for anyone else.
+void adopt_local_into_mirror(const world::TempView& cur) {
+    if (cur.tbl < 0) {
+        return;
+    }
+    world::TempMirror& m = st().temp.mirrors[static_cast<std::uint8_t>(cur.tbl)];
+    m.dan = cur.dan;
+    const std::uint64_t unknown = cur.rooms & ~m.rooms;
+    for (std::size_t room = 0; room < world::kZoneRooms; ++room) {
+        if ((unknown >> room & 1) != 0) {
+            m.zone[room] = cur.zone[room];
+        }
+    }
+    m.rooms |= cur.rooms;
+}
+
+/// Before a WorldSync goes out: make sure it carries the sender's own table as it is right now
+/// (the first sync can leave before the first temp capture of the session).
+void write_sync_trailer(Writer& w) {
+    TempState& t = st().temp;
+    if (world_bridge::capture_temp(t.scratch)) {
+        adopt_local_into_mirror(t.scratch);
+    }
+    world::write_temp_mirrors(w, t.mirrors);
+}
+
+/// An incoming temp op (a commit on a guest, an accepted proposal on the host): the mirror always;
+/// the engine (and the temp shadow, so it is not sent back) when this machine holds that table
+/// and, for Zone, that room. Mirror-only ops stop at the mirror.
+void temp_receive(const world::WorldOp& op, std::uint32_t origin) {
+    TempState& t = st().temp;
+    world::apply_temp_op(t.mirrors[op.tbl], op);
+    if (origin != network_manager().local_player_id()) {
+        t.lastRemoteOpTick[op.tbl] = now_tick();
+    }
+    if (world::temp_mirror_only(op.index)) {
+        return;
+    }
+    if (world_bridge::apply_temp_to_engine(op) && t.shadowValid) {
+        world::apply_temp_op(t.shadow, op);
+    }
+}
+
+/// This tick's local temp changes, appended to `out` after anything the decomp hooks queued.
+/// Rebases (no ops) whenever the temp bits changed owner wholesale: a stage change, a reset, the
+/// first capture, or a capture that failed meanwhile.
+void temp_collect(std::vector<world::WorldOp>& out) {
+    State& s = st();
+    TempState& t = s.temp;
+    refresh_remote_tbls();
+
+    std::vector<world::WorldOp> diffs;
+    world::TempView& cur = t.scratch;
+    if (!world_bridge::capture_temp(cur)) {
+        t.shadowValid = false;
+    } else {
+        const auto tbl = static_cast<std::uint8_t>(cur.tbl);
+        const std::uint32_t epoch = world_bridge::temp_epoch();
+        t.lastLocalTbl = cur.tbl;
+        world::TempMirror& mirror = t.mirrors[tbl];
+        if (!t.shadowValid || t.shadowEpoch != epoch || t.shadow.tbl != cur.tbl) {
+            // Lifecycle, never ops. This machine's dan for its own table is the truth here: either
+            // H6 just seeded it from this very mirror, or nobody else is in the table.
+            t.shadow = cur;
+            t.shadowValid = true;
+            t.shadowEpoch = epoch;
+            adopt_local_into_mirror(cur);
+            const bool announce = t.danAnnouncePending && t.danAnnounceTbl == cur.tbl;
+            if (announce) {
+                world::announce_dan(tbl, cur.dan, t.pending);
+            }
+            t.danAnnouncePending = false;
+            Log.info("[mp-world] temp: tracking stage table {} (epoch {}, {} zone(s) here){}", tbl,
+                epoch, std::popcount(cur.rooms),
+                announce ? "; announcing this machine's fresh dan to everyone's mirror" : "");
+        } else {
+            world::diff_temp(t.shadow, cur, diffs);
+            for (const world::WorldOp& op : diffs) {
+                world::apply_temp_op(mirror, op);
+            }
+            t.shadow = cur;
+        }
+    }
+
+    drop_unoccupied_mirrors();
+
+    out.insert(out.end(), t.pending.begin(), t.pending.end());
+    t.pending.clear();
+    out.insert(out.end(), diffs.begin(), diffs.end());
+}
+
+void temp_queue(std::vector<world::WorldOp>&& ops) {
+    TempState& t = st().temp;
+    if (t.pending.size() + ops.size() > kMaxTempPending) {
+        Log.error("[mp-world] temp: {} hook ops waiting to be sent; dropping {} more (nothing is "
+                  "draining them)",
+            t.pending.size(), ops.size());
+        return;
+    }
+    t.pending.insert(t.pending.end(), ops.begin(), ops.end());
+}
+
+/// Guest: the host's mirrors arrived with a WorldSync. The host's merged copy wins, except for
+/// this end's own table when the host has none for it yet (our Presence has not reached it).
+/// `reloading`: an install, whose reload in place runs H6 against these mirrors. Otherwise (a
+/// resync) the shared dan goes straight into the engine when a partner is here, and the shadow
+/// is rebased so the overwrite is not sent back.
+void install_temp_mirrors(world::TempMirrors&& mirrors, bool reloading) {
+    TempState& t = st().temp;
+    refresh_remote_tbls();
+    const int local = local_tbl();
+    if (local >= 0 && mirrors.count(static_cast<std::uint8_t>(local)) == 0) {
+        const auto own = t.mirrors.find(static_cast<std::uint8_t>(local));
+        if (own != t.mirrors.end()) {
+            mirrors[own->first] = own->second;
+        }
+    }
+    t.mirrors = std::move(mirrors);
+    Log.info("[mp-world] guest: {} temp mirror(s) from the host ({})", t.mirrors.size(),
+        reloading ? "install" : "resync");
+    if (reloading || local < 0) {
+        return;
+    }
+    const auto it = t.mirrors.find(static_cast<std::uint8_t>(local));
+    if (it != t.mirrors.end() && remote_occupies(local) && world_bridge::capture_temp(t.scratch) &&
+        t.scratch.tbl == local)
+    {
+        world_bridge::seed_dan(it->second.dan);
+    }
+    t.shadowValid = false;
+}
+
 /// Beyond this many held packets something is stuck; fall back to a resync.
 constexpr std::size_t kMaxDeferred = 512;
 
@@ -265,6 +545,7 @@ void host_send_sync(std::uint32_t playerId, const char* why) {
     w.write_u8(static_cast<std::uint8_t>(PacketId::WorldSync));
     w.write_u32(s.worldSeq);
     world::write_view(w, s.shadow);
+    write_sync_trailer(w);
     network_manager().send_to_player(playerId, w, kChannelControl, true);
     GuestState& g = s.guests[playerId];
     g.owedSync = false;
@@ -340,6 +621,7 @@ void host_tick(bool ready) {
             w.write_u8(static_cast<std::uint8_t>(PacketId::WorldSync));
             w.write_u32(s.worldSeq);
             world::write_view(w, s.shadow);
+            write_sync_trailer(w);
             network_manager().send_to_session(w, kChannelControl, true);
             for (auto& entry : s.guests) {
                 GuestState& g = entry.second;
@@ -357,6 +639,8 @@ void host_tick(bool ready) {
     world_bridge::capture(s.cur);
     s.ops.clear();
     world::diff(s.shadow, s.cur, s.ops);
+    // Dan/Zone ride along; they never touch the shadow (temp_collect keeps its own).
+    temp_collect(s.ops);
     if (!s.ops.empty()) {
         // diff(shadow, cur) applied to the shadow IS cur.
         s.shadow = s.cur;
@@ -423,6 +707,12 @@ void host_on_propose(Reader& r, std::uint32_t fromPlayerId) {
             Log.warn(
                 "[mp-world] host: dropped a key-count op for local-only table {} from player {}",
                 op.tbl, fromPlayerId);
+            continue;
+        }
+        if (world::is_temp(op.domain)) {
+            // Not saved state: mirrors (+ this engine when co-located), never the shadow.
+            temp_receive(op, fromPlayerId);
+            committed.push_back(op);
             continue;
         }
         // Counters as deltas onto the host's own value: absolutes would lose one of two pickups
@@ -525,6 +815,8 @@ void guest_tick(bool ready) {
     }
 
     if (!s.synced) {
+        // Hook ops from before we fell out of sync describe a world the coming WorldSync replaces.
+        s.temp.pending.clear();
         if (s.installGaveUp) {
             return;
         }
@@ -543,6 +835,7 @@ void guest_tick(bool ready) {
     world_bridge::capture(s.cur);
     s.ops.clear();
     world::diff(s.shadow, s.cur, s.ops);
+    temp_collect(s.ops);
     if (s.ops.empty()) {
         return;
     }
@@ -585,7 +878,10 @@ void guest_on_sync(Reader& r) {
     State& s = st();
     std::uint32_t seq = 0;
     world::WorldView view;
-    if (!r.read_u32(seq) || !world::read_view(r, view) || !r.ok()) {
+    world::TempMirrors mirrors;
+    if (!r.read_u32(seq) || !world::read_view(r, view) ||
+        !world::read_temp_mirrors(r, mirrors) || !r.ok())
+    {
         Log.error("[mp-world] guest: malformed WorldSync; asking again");
         s.requestOutstanding = false;
         return;
@@ -630,11 +926,13 @@ void guest_on_sync(Reader& r) {
         s.installedThisEpoch = true;
         Log.info("[mp-world] guest: installed host world seq={} digest=0x{:08X} (reload in place)",
             seq, masked_digest(view));
+        install_temp_mirrors(std::move(mirrors), true);
     } else {
         world_bridge::overwrite_world(view);
         Log.warn("[mp-world] guest: RESYNC — overwrote the world with the host's at seq={} "
                  "digest=0x{:08X} (was seq={} digest=0x{:08X}). A resync means a bug somewhere.",
             seq, masked_digest(view), s.lastApplied, s.haveShadow ? masked_digest(s.shadow) : 0u);
+        install_temp_mirrors(std::move(mirrors), false);
     }
 
     s.shadow = view;
@@ -685,6 +983,16 @@ void guest_on_commit(Reader& r) {
 
     std::uint32_t bad = 0;
     for (world::WorldOp op : ops) {
+        if (world::is_temp(op.domain)) {
+            if (!world::op_in_range(op)) {
+                ++bad;
+                continue;
+            }
+            // Re-applied for our own ops too, for the same reason as the bits below: the host's
+            // order is the one every end must end up with.
+            temp_receive(op, origin);
+            continue;
+        }
         if (world::is_counter(op.domain)) {
             // The host's value plus whatever this end has proposed and not yet heard back about, so
             // a pickup never visibly bounces (II.4).
@@ -816,6 +1124,8 @@ void tick() {
         // Held packets belong to the old world. The host resends its new world to everyone; a
         // guest asks for it.
         s.deferred.clear();
+        // So do the temp mirrors: the host's WorldSync brings the session's back.
+        s.temp = TempState{};
         if (is_host()) {
             // A different world: recapture and resend it rather than diff old against new.
             s.haveShadow = false;
@@ -979,6 +1289,82 @@ void log_state(const char* tag) {
     line.clear();
     append_bits(line, view.player.data(), view.player.size());
     Log.info("[mp-world] {} items:{}", t, line);
+
+    log_temp(tag);
+}
+
+namespace {
+
+/// "sw: 0 5 | item: 3" for the dan bytes (host-native u32s: byte * 8 + bit is the number).
+std::string describe_dan(const std::array<std::uint8_t, world::kDanBytes>& dan) {
+    std::string sw;
+    std::string item;
+    append_bits(sw, dan.data(), world::kDanSwitchBytes);
+    append_bits(
+        item, dan.data() + world::kDanSwitchBytes, world::kDanBytes - world::kDanSwitchBytes);
+    return fmt::format("sw:{} | item:{}", sw, item);
+}
+
+/// The six BE u16 fields of a zone, decoded: zone switches 0-31, one-zone switches 0-15, zone
+/// items 0-31, one-zone items 0-15. In `zoneswitch N` numbering, N < 32 is "sw N" and N >= 32 is
+/// "one N-32".
+std::string describe_zone(const std::array<std::uint8_t, world::kZoneBytes>& z) {
+    static constexpr const char* kNames[6] = {"sw", "sw", "one", "item", "item", "oneitem"};
+    std::string out;
+    for (int f = 0; f < 6; ++f) {
+        if (f == 0 || f == 2 || f == 3 || f == 5) {
+            fmt::format_to(std::back_inserter(out), "{}{}:", f == 0 ? "" : " | ", kNames[f]);
+        }
+        const unsigned value = static_cast<unsigned>(z[2 * f]) << 8 | z[2 * f + 1];
+        const int base = (f == 1 || f == 4) ? 16 : 0;
+        for (int bit = 0; bit < 16; ++bit) {
+            if ((value >> bit & 1) != 0) {
+                fmt::format_to(std::back_inserter(out), " {}", base + bit);
+            }
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+void log_temp(const char* tag) {
+    State& s = st();
+    TempState& t = s.temp;
+    const char* tg = tag != nullptr ? tag : "";
+    refresh_remote_tbls();
+
+    std::string occupants;
+    for (const auto& [id, tbl] : t.remoteTbl) {
+        fmt::format_to(std::back_inserter(occupants), " {}:{}", id, static_cast<int>(tbl));
+    }
+    std::string mirrorList;
+    for (const auto& entry : t.mirrors) {
+        fmt::format_to(std::back_inserter(mirrorList), " {}", static_cast<int>(entry.first));
+    }
+    const int room = world_bridge::stay_room();
+    world::TempView cur;
+    const bool live = world_bridge::capture_temp(cur);
+    Log.info("[mp-world] {} temp localTbl={} live={} danStageNo={} room={} zoneNo={} active={} "
+             "shadow={} mirrors=[{} ] partners=[{} ] pending={}",
+        tg, local_tbl(), live ? 1 : 0, world_bridge::dan_stage_no(), room,
+        world_bridge::zone_no(room), temp_active() ? 1 : 0, t.shadowValid ? 1 : 0, mirrorList,
+        occupants, t.pending.size());
+
+    const int tbl = live ? cur.tbl : local_tbl();
+    const auto mit = tbl >= 0 ? t.mirrors.find(static_cast<std::uint8_t>(tbl)) : t.mirrors.end();
+    Log.info("[mp-world] {} dan tbl={} engine {} || mirror {}", tg, tbl,
+        live ? describe_dan(cur.dan) : std::string("(not live)"),
+        mit != t.mirrors.end() ? describe_dan(mit->second.dan) : std::string("(none)"));
+
+    const bool haveZone = live && room >= 0 && room < static_cast<int>(world::kZoneRooms) &&
+                          (cur.rooms >> room & 1) != 0;
+    const bool mirrorZone = mit != t.mirrors.end() && room >= 0 &&
+                            room < static_cast<int>(world::kZoneRooms) &&
+                            (mit->second.rooms >> room & 1) != 0;
+    Log.info("[mp-world] {} zone tbl={} room={} engine {} || mirror {}", tg, tbl, room,
+        haveZone ? describe_zone(cur.zone[room]) : std::string("(no zone)"),
+        mirrorZone ? describe_zone(mit->second.zone[room]) : std::string("(none)"));
 }
 
 void reset() {
@@ -986,3 +1372,126 @@ void reset() {
 }
 
 }  // namespace dusk::mp::world_sync
+
+// --- decomp hooks (declared in dusk/multiplayer.hpp) ---------------------------------------------
+
+namespace dusk::mp {
+
+using world_sync::st;
+
+void world_on_dan_init(int stageNo) {
+    world_sync::TempState& t = st().temp;
+    t.danAnnouncePending = false;
+    if (!world_sync::temp_active() || stageNo < 0 ||
+        stageNo >= static_cast<int>(world::kMemTbls))
+    {
+        return;
+    }
+    world_sync::refresh_remote_tbls();
+    const auto it = t.mirrors.find(static_cast<std::uint8_t>(stageNo));
+    const bool partner = world_sync::remote_occupies(stageNo);
+    if (it != t.mirrors.end() && partner) {
+        // initDan has run: mDan belongs to stageNo, with its bits reset (we came from another
+        // table) or kept (same table). Either way the shared copy is the truth now. The carry
+        // save flag is left as vanilla set it: clrSaveFlag on a reset, so iron balls use their
+        // default positions (their saved positions are static data this machine never wrote for
+        // this visit); setSaveFlag only when this machine never left the table.
+        world_bridge::seed_dan(it->second.dan);
+        world_sync::Log.info("[mp-world] temp: H6 entered stage table {} where a partner is; dan "
+                             "seeded from the shared copy ({})",
+            stageNo, world_sync::describe_dan(it->second.dan));
+        return;
+    }
+    if (partner) {
+        // Should not happen (an occupied table always has a mirror). Keep our bits, and do not
+        // announce them: that would overwrite the partner's in everyone's mirror.
+        world_sync::Log.warn("[mp-world] temp: H6 stage table {} has a partner but no mirror here; "
+                             "keeping vanilla dan bits, not announcing",
+            stageNo);
+        return;
+    }
+    t.danAnnouncePending = true;
+    t.danAnnounceTbl = stageNo;
+    world_sync::Log.info("[mp-world] temp: H6 entered stage table {} with nobody else in it; dan "
+                         "is vanilla's, to be announced",
+        stageNo);
+}
+
+void world_on_zone_created(int roomNo) {
+    if (!world_sync::temp_active() || roomNo < 0 ||
+        roomNo >= static_cast<int>(world::kZoneRooms))
+    {
+        return;
+    }
+    const int tbl = world_bridge::live_tbl();
+    if (tbl < 0) {
+        return;
+    }
+    world_sync::TempState& t = st().temp;
+    const bool partnerHere = world_sync::remote_in_room(tbl, roomNo);
+    const auto it = t.mirrors.find(static_cast<std::uint8_t>(tbl));
+    if (partnerHere && it != t.mirrors.end() && (it->second.rooms >> roomNo & 1) != 0) {
+        world_bridge::seed_zone(roomNo, it->second.zone[roomNo], true);
+        world_sync::Log.info("[mp-world] temp: H7 room {} (table {}) zone created where a partner "
+                             "stands; persistent bits seeded ({})",
+            roomNo, tbl, world_sync::describe_zone(it->second.zone[roomNo]));
+        return;
+    }
+    if (partnerHere) {
+        // His zone for this room has never been reported (nothing set in it yet): fresh is equal.
+        return;
+    }
+    std::array<std::uint8_t, world::kZoneBytes> bytes{};
+    if (!world_bridge::read_zone(roomNo, bytes)) {
+        return;
+    }
+    std::vector<world::WorldOp> ann;
+    world::announce_zone(static_cast<std::uint8_t>(tbl), static_cast<std::uint8_t>(roomNo), bytes,
+        ann);
+    world::TempMirror& mirror = t.mirrors[static_cast<std::uint8_t>(tbl)];
+    for (const world::WorldOp& op : ann) {
+        world::apply_temp_op(mirror, op);
+    }
+    world_sync::temp_queue(std::move(ann));
+}
+
+void world_on_zone_lifecycle_begin() {
+    if (!world_sync::temp_active()) {
+        return;
+    }
+    world_sync::TempState& t = st().temp;
+    world::TempView& cur = t.scratch;
+    if (!t.shadowValid || !world_bridge::capture_temp(cur) || cur.tbl != t.shadow.tbl ||
+        world_bridge::temp_epoch() != t.shadowEpoch)
+    {
+        return;
+    }
+    // Gameplay changes made earlier this tick, before the lifecycle clear can hide them.
+    std::vector<world::WorldOp> diffs;
+    world::diff_temp(t.shadow, cur, diffs);
+    if (!diffs.empty()) {
+        world::TempMirror& mirror = t.mirrors[static_cast<std::uint8_t>(cur.tbl)];
+        for (const world::WorldOp& op : diffs) {
+            world::apply_temp_op(mirror, op);
+        }
+        world_sync::temp_queue(std::move(diffs));
+    }
+    t.shadow = cur;
+}
+
+void world_on_zone_lifecycle_end() {
+    if (!world_sync::temp_active()) {
+        return;
+    }
+    world_sync::TempState& t = st().temp;
+    world::TempView& cur = t.scratch;
+    if (!t.shadowValid || !world_bridge::capture_temp(cur) || cur.tbl != t.shadow.tbl ||
+        world_bridge::temp_epoch() != t.shadowEpoch)
+    {
+        return;
+    }
+    // The clears (and any zone removal) are this player's room lifecycle: adopt them silently.
+    t.shadow = cur;
+}
+
+}  // namespace dusk::mp

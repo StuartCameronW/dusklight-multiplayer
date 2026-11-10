@@ -369,6 +369,11 @@ int dStage_roomControl_c::loadRoom(int roomCount, u8* rooms, bool param_2) {
 }
 
 void dStage_roomControl_c::zoneCountCheck(int i_roomNo) const {
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H8): the one-zone clears and zone removals below are this player's
+     * room change, not gameplay: never sent to a partner who may be standing in that room. */
+    dusk::mp::world_on_zone_lifecycle_begin();
+#endif
     dStage_roomStatus_c* status = mStatus;
     for (int i = 0; i < 0x40; i++) {
         if (status->mZoneNo >= 0 && status->mZoneCount > 0) {
@@ -387,6 +392,9 @@ void dStage_roomControl_c::zoneCountCheck(int i_roomNo) const {
         status++;
     }
 
+#if TARGET_PC
+    dusk::mp::world_on_zone_lifecycle_end();
+#endif
     setStayNo(i_roomNo);
 }
 
@@ -2030,6 +2038,12 @@ static int dStage_stagInfoInit(dStage_dt_c* i_stage, void* i_data, int entryNum,
     }
 #endif
     dComIfGs_initDan(stageNo);
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H6): a partner already in this stage table shares his dungeon bits.
+     * After initDan, not before: vanilla's reset/keep decision (and the carry-object save flag it
+     * sets with it) stays exactly as on this machine alone. */
+    dusk::mp::world_on_dan_init(stageNo);
+#endif
 #if DEBUG
     dComIfGs_getSaveInfo()->unk_0x0 = 0;
 #endif

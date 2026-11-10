@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "../net/serializer.hpp"
 
@@ -86,6 +87,10 @@ void force_resend();
 
 /// A remote player's last presence, or nullptr when none has arrived.
 const Info* get(std::uint32_t playerId);
+
+/// Every remote player's last presence (a copy; there are a handful). For the shared world's
+/// "who is in which stage table / room" checks (world_sync.cpp, Dan/Zone temp bits).
+std::vector<Info> peers();
 
 /// The remote player with the lowest id (on a guest, the host), or kNoPlayer when there is none.
 /// For the autopilot's `joinpartner` verb.

@@ -20,7 +20,8 @@
  * WorldSync from the host, which it requests itself as soon as it has a world to put it in.
  *
  * Wire layouts (all reliable, kChannelControl):
- *   WorldSync         host -> guest  [u32 worldSeq][WorldView]
+ *   WorldSync         host -> guest  [u32 worldSeq][WorldView][temp mirrors]   (v23: the Dan/Zone
+ *                                    mirrors trailer, world::write_temp_mirrors)
  *   WorldPropose      guest -> host  [u32 proposeSeq][ops]
  *   WorldCommit       host -> all    [u32 worldSeq][u32 originPlayer][u32 ackProposeSeq][ops]
  *   WorldSyncRequest  guest -> host  [u32 lastAppliedSeq][u8 reason]
@@ -64,6 +65,16 @@ std::uint32_t current_digest();
 /// A bit index is byte * 8 + bit, bit 0 being mask 0x01. For a little-endian u32 switch array that
 /// is the switch number itself. The keyNum byte is left out of membit.
 void log_state(const char* tag);
+
+/// The autopilot `templog` verb (and the tail of `worldlog`): the Dan/Zone temp bits, "[mp-world]
+/// <tag>" lines:
+///   - temp localTbl=T live=0|1 danStageNo=D room=R zoneNo=Z active=0|1 shadow=0|1 mirrors=[..]
+///     partners=[id:tbl ..] pending=N
+///   - dan tbl=T engine sw: .. | item: .. || mirror sw: .. | item: ..
+///   - zone tbl=T room=R engine sw: .. | one: .. | item: .. | oneitem: .. || mirror (same)
+/// Switch numbers are relative to their range: dan sw N is game switch 0x80+N, zone sw N is
+/// 0xC0+N, one N is 0xE0+N.
+void log_temp(const char* tag);
 
 /// Session over: back to Unsynced with nothing remembered.
 void reset();

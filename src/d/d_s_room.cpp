@@ -18,6 +18,9 @@
 #ifndef __MWERKS__
 #include "dusk/extras.h"
 #endif
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"
+#endif
 
 static int dScnRoom_Draw(room_of_scene_class* i_this) {
     fpc_ProcID id = fpcM_GetID(i_this);
@@ -252,8 +255,16 @@ static bool objectSetCheck(room_of_scene_class* i_this) {
         // "Object deleted! <%d>"
         OS_REPORT("\x1b[32mオブジェクト削除！<%d>\n\x1b[m", roomNo);
 
+#if TARGET_PC
+        /* Dusk (multiplayer W-B, H8): this room was unloaded on THIS machine; its one-zone clear
+         * is local lifecycle, never sent to a partner who may still be standing in it. */
+        dusk::mp::world_on_zone_lifecycle_begin();
+#endif
         dComIfGs_clearRoomSwitch(dComIfGp_roomControl_getZoneNo(roomNo));
         dComIfGs_clearRoomItem(dComIfGp_roomControl_getZoneNo(roomNo));
+#if TARGET_PC
+        dusk::mp::world_on_zone_lifecycle_end();
+#endif
         dComIfGp_roomControl_offStatusFlag(roomNo, 0x20);
         i_this->field_0x1d4 = 0;
     } else if (status_flag_20) {
@@ -436,6 +447,11 @@ static int phase_2(room_of_scene_class* i_this) {
 
     if (dComIfGp_roomControl_getZoneNo(roomNo) < 0) {
         dComIfGp_roomControl_setZoneNo(roomNo, dComIfGs_createZone(roomNo));
+#if TARGET_PC
+        /* Dusk (multiplayer W-B, H7): a fresh zone, before this room's actors are created (they
+         * read their zone bits at create): seed it if a partner stands in this room. */
+        dusk::mp::world_on_zone_created(roomNo);
+#endif
     }
 
     i_this->roomDt = dComIfGp_roomControl_getStatusRoomDt(roomNo);

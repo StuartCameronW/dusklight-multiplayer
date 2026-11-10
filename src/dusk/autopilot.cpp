@@ -93,6 +93,13 @@ enum class Op {
     ExpectKeys,
     ExpectRupees,
     WaitEvent,
+    /* --- batch 6: temp flags --- */
+    DanSwitch,
+    ZoneSwitch,
+    ExpectDan,
+    ExpectZone,
+    TempLog,
+    ZoneCountCheck,
 };
 
 struct Command {
@@ -765,6 +772,113 @@ void run_world_command(const Command& command) {
     }
 }
 
+/* --- batch 6: temp flags ---
+ * Dungeon bits (mDan, game switches 0x80-0xBF) and room bits (mZone, 0xC0-0xEF) for the W-B
+ * temp-bit tests (spec II.7). Numbers are relative to their range: `danswitch 5` is game switch
+ * 0x85; `zoneswitch N` is 0xC0+N, so N 0-31 is a zone switch (lives as long as the zone) and
+ * N 32-47 a one-zone switch (cleared by every room change of the player who holds it). Zone verbs
+ * act on the room Link stands in. Writes go through dComIfGs_onSwitch like an actor's; reads go
+ * to the engine, never the multiplayer layer. */
+
+/// Dan switches (dSv_danBit_c::mSwitch[2]) and zone + one-zone switches.
+constexpr int kDanSwitchCount = dSv_info_c::DAN_SWITCH;
+constexpr int kZoneSwitchCount = dSv_info_c::ZONE_SWITCH + dSv_info_c::ONEZONE_SWITCH;
+constexpr int kDanSwitchBase = dSv_info_c::MEMORY_SWITCH;
+constexpr int kZoneSwitchBase = dSv_info_c::MEMORY_SWITCH + dSv_info_c::DAN_SWITCH;
+
+void run_temp_command(const Command& command) {
+    const int tbl = live_stage_table();
+    const int room = current_room();
+    const int zoneNo = mp::world_bridge::zone_no(room);
+    switch (command.op) {
+    case Op::DanSwitch:
+        if (tbl < 0) {
+            Log.error("[{}] line {}: danswitch needs a stage; skipped", sTicks, command.line);
+            break;
+        }
+        if (command.layer != 0) {
+            dComIfGs_onSwitch(kDanSwitchBase + command.point, room);
+        } else {
+            dComIfGs_offSwitch(kDanSwitchBase + command.point, room);
+        }
+        Log.info("[{}] dan switch {} (0x{:02X}) {} (stage table {}, mDan stage {})", sTicks,
+            command.point, kDanSwitchBase + command.point, command.layer ? "on" : "off", tbl,
+            mp::world_bridge::dan_stage_no());
+        break;
+
+    case Op::ZoneSwitch:
+        // dSv_info_c::onSwitch asserts a zone exists and would index mZone[-1] without one.
+        if (tbl < 0 || zoneNo < 0) {
+            Log.error("[{}] line {}: zoneswitch needs a room with a zone (room {}, zone {}); "
+                      "skipped",
+                sTicks, command.line, room, zoneNo);
+            break;
+        }
+        if (command.layer != 0) {
+            dComIfGs_onSwitch(kZoneSwitchBase + command.point, room);
+        } else {
+            dComIfGs_offSwitch(kZoneSwitchBase + command.point, room);
+        }
+        Log.info("[{}] zone switch {} (0x{:02X}, {}) {} (room {}, zone {}, stage table {})",
+            sTicks, command.point, kZoneSwitchBase + command.point,
+            command.point < dSv_info_c::ZONE_SWITCH ? "zone" : "one-zone",
+            command.layer ? "on" : "off", room, zoneNo, tbl);
+        break;
+
+    case Op::ExpectDan: {
+        if (tbl < 0) {
+            log_expect(false, "expectdan",
+                fmt::format("no={} want={} got=? (no stage)", command.point, command.layer));
+            break;
+        }
+        const bool got = dComIfGs_isSwitch(kDanSwitchBase + command.point, room) != FALSE;
+        log_expect(got == (command.layer != 0), "expectdan",
+            fmt::format("no={} want={} got={} tbl={} danStage={}", command.point, command.layer,
+                got ? 1 : 0, tbl, mp::world_bridge::dan_stage_no()));
+        break;
+    }
+
+    case Op::ExpectZone: {
+        if (tbl < 0 || zoneNo < 0) {
+            log_expect(false, "expectzone",
+                fmt::format("no={} want={} got=? (room {} has no zone here)", command.point,
+                    command.layer, room));
+            break;
+        }
+        const bool got = dComIfGs_isSwitch(kZoneSwitchBase + command.point, room) != FALSE;
+        log_expect(got == (command.layer != 0), "expectzone",
+            fmt::format("no={} want={} got={} tbl={} room={} zone={}", command.point,
+                command.layer, got ? 1 : 0, tbl, room, zoneNo));
+        break;
+    }
+
+    case Op::TempLog: {
+        const char* tag = command.text.empty() ? "autopilot" : command.text.c_str();
+        Log.info("[{}] templog '{}': stage table {}, room {}", sTicks, tag, tbl, room);
+        mp::world_sync::log_temp(tag);
+        break;
+    }
+
+    case Op::ZoneCountCheck:
+        /* What a room change does to the zones (dStage_RoomCheck -> zoneCountCheck), aimed at the
+         * room Link already stands in: every zone's one-zone bits are cleared. That is the H8
+         * lifecycle path; reaching it by walking needs a room boundary the script cannot find.
+         * In a non-field stage it also counts every zone down once (2 -> 1 after a fresh load), so
+         * one call never removes a zone; don't call it twice in a row there. */
+        if (tbl < 0) {
+            Log.error("[{}] line {}: zonecountcheck needs a stage; skipped", sTicks, command.line);
+            break;
+        }
+        Log.info("[{}] zonecountcheck: room-change lifecycle on room {} (zone {})", sTicks, room,
+            zoneNo);
+        dComIfGp_roomControl_zoneCountCheck(room);
+        break;
+
+    default:
+        break;
+    }
+}
+
 /// Steer toward a world XZ point: the same mapping as the StickTo case in tick().
 void steer_toward(PADStatus& status, double targetX, double targetZ, double maxMagnitude) {
     fopAc_ac_c* link = dComIfGp_getPlayer(0);
@@ -933,6 +1047,17 @@ bool settle_program_counter() {
         case Op::ExpectKeys:
         case Op::ExpectRupees:
             run_world_command(command);
+            sPc++;
+            continue;
+
+        /* --- batch 6: temp flags --- */
+        case Op::DanSwitch:
+        case Op::ZoneSwitch:
+        case Op::ExpectDan:
+        case Op::ExpectZone:
+        case Op::TempLog:
+        case Op::ZoneCountCheck:
+            run_temp_command(command);
             sPc++;
             continue;
 
@@ -1213,6 +1338,31 @@ void load_script(const std::filesystem::path& path) {
             command.frames = 1800;
             ok = parse_event_flag(a, command.point) &&
                  (b.empty() || parse_int(b, command.frames)) && command.frames > 0;
+        /* --- batch 6: temp flags --- */
+        } else if (verb == "DANSWITCH" || verb == "ZONESWITCH") {
+            // "danswitch 5 on" (0-63, game switch 0x80+N) / "zoneswitch 33 off" (0-47, 0xC0+N; 32+
+            // are one-zone switches) in the room Link stands in.
+            command.op = verb == "DANSWITCH" ? Op::DanSwitch : Op::ZoneSwitch;
+            const int limit = command.op == Op::DanSwitch ? kDanSwitchCount : kZoneSwitchCount;
+            const std::string state = to_upper(b);
+            command.layer = state == "ON" ? 1 : (state == "OFF" ? 0 : -1);
+            ok = parse_int(a, command.point) && command.point >= 0 && command.point < limit &&
+                 command.layer >= 0;
+        } else if (verb == "EXPECTDAN" || verb == "EXPECTZONE") {
+            // "expectdan 5 1" / "expectzone 33 0": same numbering as danswitch / zoneswitch.
+            command.op = verb == "EXPECTDAN" ? Op::ExpectDan : Op::ExpectZone;
+            const int limit = command.op == Op::ExpectDan ? kDanSwitchCount : kZoneSwitchCount;
+            ok = parse_int(a, command.point) && command.point >= 0 && command.point < limit &&
+                 (b == "0" || b == "1");
+            command.layer = b == "1" ? 1 : 0;
+        } else if (verb == "ZONECOUNTCHECK") {
+            // "zonecountcheck": run the room-change zone lifecycle on the current room (H8 test).
+            command.op = Op::ZoneCountCheck;
+        } else if (verb == "TEMPLOG") {
+            // "templog [tag]": dan bits of this stage table and zone bits of this room, engine and
+            // shared copy (worldlog prints the same lines at its end).
+            command.op = Op::TempLog;
+            command.text = a;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
