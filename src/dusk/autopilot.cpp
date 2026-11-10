@@ -324,6 +324,12 @@ void run_setup_command(const Command& command) {
         dComIfGs_onItemFirstBit(static_cast<u8>(command.room));
         dMeter2Info_setShield(static_cast<u8>(command.room), false);
         daAlink_getAlinkActorClass()->setShieldChange();
+        /* His shield reload (loadShieldModelDVD) only runs from statusWindowExecute, while the
+         * collection menu pauses him (d_a_alink_swindow.inc:300-306). Outside the menu the swap
+         * never lands, so checkShieldDraw() stays false and no shield is drawn. Do NOT pump it
+         * from here: it nulls mShieldModel while his execute still runs, and setCollision then
+         * dereferences it (measured crash). Issue `shield` BEFORE a `warp` instead: the new Link
+         * loads the shield normally and the old one finishes the reload in daAlink_Delete. */
         Log.info("[{}] wearing shield item 0x{:02X}", sTicks, command.room);
         break;
     case Op::ShieldBurn: {
