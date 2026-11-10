@@ -89,6 +89,19 @@ public:
     u32 checkWaterBomb() const { return checkStateFlg0(FLG0_WATER_BOMB); }
     u32 checkPlayerMake() const { return checkStateFlg0(FLG0_PLAYER_MAKE); }
 
+#if TARGET_PC
+    /* Dusk multiplayer: another player's explosion, replayed on this machine
+     * (daMpGhost_spawnRemoteExplosion, d_a_mp_ghost_bomb.inc). OR'd into the create parameter of
+     * an explosion-only bomb (PRM_NORMAL_BOMB_EXPLODE / PRM_WATER_BOMB_EXPLODE); create() strips
+     * them back out of the parameter and keeps them in mStateFlg0, whose vanilla bits stop at
+     * 0x20000. A remote explosion draws, sounds and rumbles as the game's own, but its attack can
+     * reach only the local Link, and only when DUSK_MP_FRIENDLY_FIRE is set.
+     * Spec: .claude/future-plans/mp-object-channel.md §2.2, §3. */
+    static const u32 DUSK_MP_REMOTE_EXPLODE = 0x80000000;
+    static const u32 DUSK_MP_FRIENDLY_FIRE = 0x40000000;
+    u32 checkDuskMpRemote() const { return mStateFlg0 & DUSK_MP_REMOTE_EXPLODE; }
+#endif
+
     s16 getExTime() { return mExTime; }
 
     static DUSK_GAME_DATA const char* m_arcNameList[6];
@@ -135,5 +148,11 @@ public:
     /* 0xC2C */ cXyz field_0xc2c;
     /* 0xC38 */ BOOL (daNbomb_c::*mProcFunc)();
 };
+
+#if TARGET_PC
+/// Dusk multiplayer (d_a_mp_ghost_bomb.inc): a remote explosion's attack hit something. Its
+/// attack is masked to the local Link (hit group 0x4), so that is the only thing it can be.
+void daMpGhost_onRemoteExplosionHit(daNbomb_c* i_bomb, fopAc_ac_c* i_hitActor);
+#endif
 
 #endif /* D_A_NBOMB_H */

@@ -96,6 +96,46 @@ private:
     void executeBomb();
     int drawBomb();
     void eventBomb(u8 i_event, const u8* i_blob, u8 i_blobLen);
+    void setBombAnime(bool i_walking);
+    void setBombEffect();
+
+    /// The fuse sparks' particle emitters (daNbomb_c::setEffect). A member with its own
+    /// destructor because the spark emitter's trace callback points INTO this actor
+    /// (setUserWork(&mTrace)): the destructor unhooks it, as ~daNbomb_c does
+    /// (d_a_nbomb.cpp:409-412), whichever way the ghost dies.
+    struct BombFx {
+        BombFx();
+        ~BombFx();
+        u32 mEmitterIds[5];
+        /// The fuse tip (daNbomb_c::setSmokePos), this tick and last.
+        cXyz mPos;
+        cXyz mLastPos;
+        /// The trace callback's user work (daNbomb_c::field_0xbe4).
+        cXyz mTrace;
+    };
+    BombFx mBombFx;
+    /// Fuse sizzle and bounce, as daNbomb_c::mSound.
+    Z2SoundObjSimple mBombSound;
+    /// Bombling only: walk (0x14) / held (0x15) BCK, in this actor's solid heap.
+    mDoExt_bckAnm* mpBombBck;
+    /// The local fuse countdown, re-synced from BombBlob whenever its fuseSeq changes.
+    s16 mBombFuse;
+    u8 mBombFuseSeq;
+    u8 mBombBounceSeq;
+    /// The last BombBlob flags (object_kind_bomb.hpp kBomb*).
+    u8 mBombNetFlags;
+    bool mBombSynced;
+    /// The floor under it, probed once a tick: blob shadow and lighting room.
+    bool mBombHasGround;
+    f32 mBombGroundH;
+    cXyz mBombGroundNorm;
+    bool mBombWalking;
+    /// The Explode event arrived: draw nothing more (the replayed explosion takes over).
+    bool mBombExploded;
+    /// Hang 4 guard (d_a_remote_player.cpp draw()): the sim tick (g_Counter.mCounter0) of the
+    /// last entry-draw.
+    bool mBombHasDrawnTick;
+    u32 mBombDrawnTick;
     /* ==== end bomb ==== */
 
     /* ==== Gale Boomerang (0x07): d_a_mp_ghost_boom.inc ==== */
