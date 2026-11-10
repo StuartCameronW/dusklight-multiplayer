@@ -80,6 +80,9 @@ private:
     u8 mBlob[BLOB_MAX];
     u32 mExecuteCount;
     u32 mEventCount;
+    /// Sim tick of the last real (sim-frame) draw: one J3D entry per pass (draw()).
+    u32 mDrawnSimTick;
+    bool mHasDrawnSimTick;
 
     /* --- per-kind blocks. Each is owned by one d_a_mp_ghost_<kind>.inc; add that kind's members
      * inside its own block only. --- */

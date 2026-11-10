@@ -63,6 +63,7 @@ enum class Op {
     Hold,
     Stick,
     StickTo,
+    SetPos,
     Repeat,
     End,
     Say,
@@ -1417,6 +1418,20 @@ bool settle_program_counter() {
             run_claims_command(command);
             sPc++;
             continue;
+        case Op::SetPos: {
+            daAlink_c* link = daAlink_getAlinkActorClass();
+            if (!in_world() || link == nullptr) {
+                Log.error("[{}] line {}: setpos needs the world; skipped", sTicks, command.line);
+            } else {
+                const cXyz pos(static_cast<f32>(command.targetX), static_cast<f32>(command.radius),
+                    static_cast<f32>(command.targetZ));
+                // TRUE: apply outside an event too (d_a_alink.cpp setPlayerPosAndAngle ignores it otherwise).
+                link->setPlayerPosAndAngle(&pos, link->shape_angle.y, TRUE);
+                Log.info("[{}] setpos ({:.0f}, {:.0f}, {:.0f})", sTicks, pos.x, pos.y, pos.z);
+            }
+            sPc++;
+            continue;
+        }
         /* --- batch 6: bombs --- */
         case Op::Bombs:
         case Op::ExpectBombs:
@@ -1520,6 +1535,12 @@ void load_script(const std::filesystem::path& path) {
                  command.frames > 0 && (d.empty() || parse_buttons(d, command.buttons));
             command.stickX = stick_value(x);
             command.stickY = stick_value(y);
+        } else if (verb == "SETPOS") {
+            // `setpos X Y Z`: teleport the local Link (test setup only: put him in front of a
+            // chest the stage's spawn points are far from). Keeps his facing.
+            command.op = Op::SetPos;
+            ok = parse_double(a, command.targetX) && parse_double(b, command.radius) &&
+                 parse_double(c, command.targetZ);
         } else if (verb == "STICKTO") {
             // `stickto X Z frames [buttons]`: steer toward a world point, re-aimed every tick.
             // Plain `stick` is camera-relative, so a swinging camera curves the path; ledge and

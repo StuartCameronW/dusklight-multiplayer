@@ -17,6 +17,8 @@
 #include "d/actor/d_a_mp_ghost.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_kankyo.h"
+#include "SSystem/SComponent/c_counter.h"
+#include "dusk/game_clock.h"
 #include "dusk/logging.h"
 #include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/player_bridge.hpp"
@@ -50,7 +52,8 @@ static_assert(daMpGhost_c::BLOB_MAX == static_cast<int>(objects::kMaxKindBlob),
 
 daMpGhost_c::daMpGhost_c()
     : mpModel(NULL), mKind(0), mAuthority(0), mNetFlags(0), mVisible(false), mHasPose(false),
-      mCreateComplete(false), mBlobLen(0), mExecuteCount(0), mEventCount(0) {
+      mCreateComplete(false), mBlobLen(0), mExecuteCount(0), mEventCount(0), mDrawnSimTick(0),
+      mHasDrawnSimTick(false) {
     std::memset(mBlob, 0, sizeof(mBlob));
 }
 
@@ -218,6 +221,19 @@ int daMpGhost_c::execute() {
 int daMpGhost_c::draw() {
     if (!mHasPose || !mVisible) {
         return 1;
+    }
+    /* One J3D entry per pass, for every kind (memory j3d-one-entry-per-pass; d_a_remote_player.cpp
+     * draw()). A ghost is created from a network event mid-session, which is exactly when an actor
+     * can be drawn twice on one sim tick; entering one J3DModel twice in a pass links its packet
+     * chain to itself, and the renderer then floods Aurora's frame buffer until it aborts (measured:
+     * the boomerang and rod-ball ghosts, 2026-11-10). Interpolated frames are never skipped. */
+    if (dusk::game_clock::is_sim_frame()) {
+        const u32 simTick = g_Counter.mCounter0;
+        if (mHasDrawnSimTick && mDrawnSimTick == simTick) {
+            return 1;
+        }
+        mDrawnSimTick = simTick;
+        mHasDrawnSimTick = true;
     }
     switch (mKind) {
     case l_kindDebug:
