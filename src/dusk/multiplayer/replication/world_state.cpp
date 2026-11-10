@@ -377,8 +377,16 @@ bool read_view(Reader& r, WorldView& out) {
 std::uint32_t digest(const WorldView& v) {
     Fnv1a f;
     f.bytes(v.event);
-    for (const auto& t : v.mem) {
-        f.bytes(t);
+    for (std::size_t tbl = 0; tbl < kMemTbls; ++tbl) {
+        if (tbl == kLocalOnlyKeyTbl) {
+            // Table 6's key count is local (see kLocalOnlyKeyTbl): diff() never sends it, so the
+            // two ends may legitimately differ there. Hash it as 0 or every digest would mismatch.
+            auto t = v.mem[tbl];
+            t[kMemKeyNumOffset] = 0;
+            f.bytes(t);
+        } else {
+            f.bytes(v.mem[tbl]);
+        }
     }
     for (const auto& t : v.mem2) {
         f.bytes(t);
