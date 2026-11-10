@@ -196,7 +196,7 @@ enum PlayerGearFlags : std::uint8_t {
 };
 
 /**
- * v19 block B, the iron ball: where the ball is, in units of 1/kPlayerIronBallPosScale relative
+ * v19 iron ball block: where the ball is, in units of 1/kPlayerIronBallPosScale relative
  * to the sender's own position (posX/Y/Z). 4 steps a unit is +-8191 units, and the ball never gets
  * further from him than its chain allows: setIronBallPos clamps it to 1000 units from his hand
  * (d_a_alink_ironball.inc:579-580), and at most 100 links of 10 units can be paid out (:563-564).
@@ -329,7 +329,8 @@ inline std::uint32_t location_stage_hash(const char* name) {
 /// 1-byte `gear` (offset 47), then the protocol-15 fields, in order: `locPhase` (offset 48),
 /// 12 bytes of action slot 1 / swim (block 4, offset 49), 9 bytes of held item (block 3,
 /// offset 61), then the protocol-16 location (offset 70: u32 stageHash, s8 roomNo at 74,
-/// u8 locEpoch at 75). Sent unreliably at the sim rate, so it has to stay small.
+/// u8 locEpoch at 75). Protocol 19 appends after locEpoch; its block A (bow) is 2 bytes: u8
+/// heldBck, u8 heldBckFrame. Sent unreliably at the sim rate, so it has to stay small.
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -569,7 +570,8 @@ struct PlayerState {
      * (player_bridge.cpp fill_held_item):
      *
      *   heldItem      PlayerHeldItem: the mHeldItemModel he placed AND checkItemDraw() let through.
-     *   heldFlags     PlayerHeldFlags: lantern, which hand, the bottle cork, the second clawshot.
+     *   heldFlags     PlayerHeldFlags: lantern, which hand, the bottle cork, the second clawshot,
+     *                 and (v19) a nocked arrow.
      *   heldMat       the held model's material animation frames (see player_held.hpp).
      *   upper2Idx     mUpperAnmHeap[UPPER_2].getIdx(), the item hold/aim overlay BCK (ALANM only);
      *                 kPlayerActNone = no overlay.
@@ -632,7 +634,27 @@ struct PlayerState {
     std::uint8_t atSpl = 0;
     std::int16_t atPt[9] = {};
 
-    // v19 block B: iron ball (after the attack block)
+    // v19 bow block (after the attack block)
+    /**
+     * The bow / slingshot model's own animation (daAlink_c's mItemBck), and the nocked arrow's
+     * kind. 2 bytes, read after his setItemMatrix entered them (player_bridge.cpp fill_held_item):
+     *
+     *   heldBck       bits 0-3 PlayerHeldItemBck: which BCK is in mItemBck (0 = none / not a bow or
+     *                 slingshot); bit 4 kPlayerHeldBckBombArrow: the arrow flagged by
+     *                 kPlayerHeldArrowNocked is a bomb arrow.
+     *   heldBckFrame  that BCK's entered frame / getFrameMax(), x255.
+     *
+     * The id and the arrow bit are discrete; the frame blends within one BCK — see lerp_state.
+     */
+    std::uint8_t heldBck = 0;
+    std::uint8_t heldBckFrame = 0;
+
+    std::uint8_t held_bck_id() const {
+        return static_cast<std::uint8_t>(heldBck & kPlayerHeldBckIdMask);
+    }
+    float held_bck_frame_unit() const { return static_cast<float>(heldBckFrame) / 255.0f; }
+
+    // v19 iron ball block (after the bow block)
     /**
      * Where the sender's ball is, while heldItem is kPlayerHeldIronBall. 12 bytes:
      *
@@ -750,6 +772,9 @@ struct PlayerState {
                 w.write_s16(v);
             }
         }
+        // v19 bow block (after the attack block)
+        w.write_u8(heldBck);
+        w.write_u8(heldBckFrame);
         // v19 iron ball block: only while the ball is out
         if (iron_ball_out()) {
             w.write_s16(ironBallX);
@@ -812,6 +837,10 @@ struct PlayerState {
             atRadius = 0;
             atSpl = 0;
             std::fill(std::begin(atPt), std::end(atPt), std::int16_t{0});
+        }
+        // v19 bow block (after the attack block)
+        if (!(r.read_u8(heldBck) && r.read_u8(heldBckFrame))) {
+            return false;
         }
         // v19 iron ball block: only while the ball is out
         if (iron_ball_out()) {
@@ -1052,7 +1081,23 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
         std::copy(std::begin(b.atPt), std::end(b.atPt), std::begin(out.atPt));
     }
 
-    // v19 block B: iron ball (after the attack block)
+    // v19 bow block (after the attack block). The id and the arrow bit are discrete. The frame
+    // blends only within one BCK and only forward — block 3's overlay rule: a release or reload
+    // swaps the BCK (changeItemBck), and the wait free-runs into the end clamp, so anything else
+    // takes b whole.
+    out.heldBck = b.heldBck;
+    out.heldBckFrame = b.heldBckFrame;
+    if (a.held_bck_id() != kPlayerHeldBckNone && a.held_bck_id() == b.held_bck_id() &&
+        b.heldBckFrame >= a.heldBckFrame)
+    {
+        const float frameT = t > 1.0f ? 1.0f : t;
+        const float frame =
+            a.held_bck_frame_unit() + (b.held_bck_frame_unit() - a.held_bck_frame_unit()) * frameT;
+        out.heldBckFrame = static_cast<std::uint8_t>(
+            frame <= 0.0f ? 0.0f : (frame >= 1.0f ? 255.0f : frame * 255.0f + 0.5f));
+    }
+
+    // v19 iron ball block (after the bow block)
     /* The link count and the state are discrete. The ball's position and rotation blend only while
      * BOTH samples have it out: the other side's zeroes mean "no ball", and blending out of them
      * would fly it in from his feet. t is clamped to 1, as for the joint aim: a swung ball circles

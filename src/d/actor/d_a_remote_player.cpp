@@ -318,12 +318,68 @@ u16 warp_material_count(J3DModelData* i_modelData) {
  * and unlike the pointer it is a property of the data rather than of which copy of it we hold —
  * which is why the pointer test measured FALSE for every one of the puppet's private mounts on
  * 2026-08-12 and left all four body models dissolving.
+ *
+ * ★★ RED BOTTLE (2026-11-10). "Slot 3 is occupied" was a FALSE POSITIVE on every handheld item.
+ * Those are BMDR models (ARAM AlAnm, and the Alink mount's BMDR section): loaderBasicBmd never
+ * calls addWarpMaterial on them (d_resorce.cpp:305-307), so daAlink_c's pointer test says no and
+ * he builds them WITHOUT the bracket (setBottleModel's initModelEnv, setBowModel's initModel ...).
+ * But their TEV blocks are TVB2: the factory sizes a block to max(stages, the loader flag's
+ * TevStageNum) (J3DMaterialFactory.cpp:131-145), which is 2 for a plain BMD's 0x59020010 and 4 for
+ * BMWR's 0x59040030 (d_resorce.cpp:243-250) — the room the dissolve stage needs. A TVB2's mTexNo
+ * holds 2 entries (J3DMatBlock.h:1065): getTexNo(3) read past it into mTevOrder[0] and came back
+ * "occupied". Measured, in every run's `Puppet init_model held ...` line:
+ *
+ *   held bottle: warp bracket TAKEN | data sig 0x0100 -> built from 0x02ff -> restored 0x02ff
+ *
+ * onWarpMaterial raised every material from 1 stage to 2 — onto an UNUSED stage slot (texmap
+ * 0xFF), not a dissolve stage — and offWarpMaterial, which only undoes a stage reading texmap 3,
+ * left it raised for good. The shared DL was compiled at load with one stage (J3DTevBlock2::load
+ * emits stages i < mTevStageNum only, J3DMatBlock.cpp:634-636), and the bracket's 0x2000400
+ * added KonstColor, which re-emits GenMode with the RAISED count on every draw
+ * (J3DMaterial.cpp:260-263). So GX ran a second stage per material whose combiner this material
+ * never set: whatever the previous draw left in stage 1, fed this material's registers — where
+ * the bottle's contents BRK keeps its colour, red at frame 0 for an empty bottle.
+ *
+ * So the predicate asks what the bracket will actually ENABLE: "the stage onWarpMaterial counts,
+ * or has counted, reads texmap 3" — addWarpMaterial's tev order (d_resorce.cpp:144, :300-303).
+ * Still structural, still order-independent, and every read is bounded by the block's real size.
+ * Every model that took the bracket correctly before (body, face, head, hands, swords, sheaths,
+ * shields: `built from 0x?203/0x?303`) still takes it; the held items no longer do.
  */
+/// How many stages a TEV block can hold (the size of its mTevOrder array, J3DMatBlock.h).
+u32 tev_block_stage_capacity(J3DTevBlock* i_tevBlock) {
+    switch (i_tevBlock->getType()) {
+    case 'TVB1':
+        return 1;
+    case 'TVB2':
+        return 2;
+    case 'TVB4':
+        return 4;
+    case 'TVPT':
+        return 8;
+    case 'TV16':
+        return 16;
+    default:
+        return 0;
+    }
+}
+
 bool warp_texture_installed(J3DModelData* i_modelData) {
     if (i_modelData == NULL || i_modelData->getMaterialNum() == 0) {
         return false;
     }
-    return i_modelData->getMaterialNodePointer(0)->getTevBlock()->getTexNo(3) != 0xFFFF;
+    J3DTevBlock* tevBlock = i_modelData->getMaterialNodePointer(0)->getTevBlock();
+    const u32 capacity = tev_block_stage_capacity(tevBlock);
+    const u32 stageNum = tevBlock->getTevStageNum();
+    if (stageNum == 0 || stageNum > capacity) {
+        return false;
+    }
+    // Counted (on): the last stage is the dissolve.
+    if (tevBlock->getTevOrder(stageNum - 1)->getTexMap() == 3) {
+        return true;
+    }
+    // Dormant (off): the first uncounted stage is, which is the one onWarpMaterial would count.
+    return stageNum < capacity && tevBlock->getTevOrder(stageNum)->getTexMap() == 3;
 }
 
 /**
