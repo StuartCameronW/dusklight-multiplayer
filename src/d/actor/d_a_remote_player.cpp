@@ -2672,6 +2672,7 @@ daRemotePlayer_c::~daRemotePlayer_c() {
     deletePuppetEmitters(); // no particle emitter outlives its puppet (agent D)
     deleteSwordFx(); // sword fx (agent F): hide its emitters, free the trail's texture object
     deleteGearFx(); // the shield fire's second emitter (agent G)
+    deleteNetworkEvent(); // the item-get model, its heap and its archive reference (agent EV)
     // Nothing to release by hand. mOwnRes is a member, so ~dRes_info_c runs after this body and
     // unmounts the archive and frees its resources — the whole reason the private mount is a member
     // rather than a registration in the global table.
@@ -8251,6 +8252,7 @@ int daRemotePlayer_c::execute() {
     updateSwordFx(); // sword trail + spin/charge fx (agent F): needs this tick's sword and joints
     updateGearFx(); // armour BRK, Zora mask, shield burn (agent G): after setMatrix's shield pose
     updateFootFx(); // footstep dust, ripples, splashes (agent J): needs this tick's foot joints
+    updateNetworkEvent(); // item-get model above his head (agent EV): needs this tick's foot joint
     // After setMatrix, not before: the aim is measured from the head joint's world matrix, which
     // only exists once modelCalc() has run.
     traceCalc("setEyeMove");
@@ -8550,6 +8552,11 @@ int daRemotePlayer_c::draw() {
         mHasDrawnSimTick = true;
     }
 
+    // Hidden by his event or by my cutscene: nothing at all. Else the item-get model (agent EV).
+    if (drawNetworkEvent()) {
+        return 1;
+    }
+
     // 10 is the light type daAlink_c uses for human Link (d_a_alink.cpp:19470), so the puppet is
     // lit consistently with the local player rather than as scenery.
     //
@@ -8653,3 +8660,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_gear.inc"
 // Footstep dust, ripples, splashes and wet footprints (agent J). Uses the fx file's emitter slots.
 #include "d/actor/d_a_remote_player_footfx.inc"
+// The sender's events: hidden, the name-tag kind, the item above his head (agent EV).
+#include "d/actor/d_a_remote_player_event.inc"

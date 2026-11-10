@@ -68,6 +68,29 @@ constexpr float kFarScale = 0.55f;
 /// Smallest text drawn, in ImGui logical units. Below this the font is unreadable anyway.
 constexpr float kMinTextSize = 8.0f;
 
+/// The event badge (agent EV) over the name, as a fraction of the name's size.
+constexpr float kBadgeScale = 0.7f;
+
+/// A short label for what the partner is busy with: PlayerState::evt's kind, as his puppet received
+/// it (puppet-events.md §6, Stuart's answer to question 3). None for no event, and for in-place
+/// tool use and the scripted walk-ins, which read for themselves.
+const char* event_badge(std::uint8_t kind) {
+    switch (kind) {
+    case mp::kPlayerEvtTalk:
+        return "talking";
+    case mp::kPlayerEvtChest:
+        return "opening";
+    case mp::kPlayerEvtGetItem:
+        return "got item";
+    case mp::kPlayerEvtDoor:
+        return "door";
+    case mp::kPlayerEvtCutscene:
+        return "cutscene";
+    default:
+        return nullptr;
+    }
+}
+
 float distance_scale(float distance) {
     if (distance <= kShrinkStart) {
         return 1.0f;
@@ -306,6 +329,12 @@ void ShowNameTags() {
         const mp::RemotePlayer& player = playerIt->second;
         TagLog& log = s_tagLog[player.playerId];
 
+        // His event hides him (warp, cannon), or this end is in a cutscene: the tag goes too.
+        if (entry.puppet->isEventHidden()) {
+            note_cull(log, "hidden by his event", player.playerId);
+            continue;
+        }
+
         cXyz head;
         if (!entry.puppet->getNameTagAnchor(&head)) {
             note_cull(log, "no anchor (no pose or body yet)", player.playerId);
@@ -353,6 +382,20 @@ void ShowNameTags() {
         }
         drawList->AddText(font, textSize, pos, color, name);
 
+        // The event badge, smaller, just above the name (agent EV).
+        const char* badge = event_badge(entry.puppet->getNetEventKind());
+        if (badge != nullptr) {
+            const float badgeSize = std::max(kMinTextSize, textSize * kBadgeScale);
+            const ImVec2 badgeExtent = font->CalcTextSizeA(badgeSize, FLT_MAX, 0.0f, badge);
+            const ImVec2 badgePos(
+                std::floor(at.x - badgeExtent.x * 0.5f), std::floor(pos.y - badgeExtent.y));
+            for (const ImVec2& o : kOffsets) {
+                drawList->AddText(font, badgeSize,
+                    ImVec2(badgePos.x + o.x * outline, badgePos.y + o.y * outline), shadow, badge);
+            }
+            drawList->AddText(font, badgeSize, badgePos, IM_COL32(235, 235, 235, alpha), badge);
+        }
+
         note_cull(log, nullptr, player.playerId);
         if (!log.everShown || now - log.lastLog >= std::chrono::seconds(3)) {
             // The puppet's feet through the same projection, so the log alone says whether the tag
@@ -363,13 +406,14 @@ void ShowNameTags() {
                 "Name tag {} for player {} '{}' #{:06X}: tag ({:.0f},{:.0f}) feet "
                 "{}({:.0f},{:.0f}) "
                 "in game rect ({:.0f},{:.0f} {:.0f}x{:.0f}), dist {:.0f}, alpha {}, size {:.1f}, "
-                "mirror {}, interp {}",
+                "mirror {}, interp {}, badge '{}'",
                 log.everShown ? "at" : "FIRST SHOWN", player.playerId, name, player.color, at.x,
                 at.y, feetOk ? "" : "behind ", feet.x, feet.y, rect.x, rect.y, rect.w, rect.h,
                 at.distance, alpha, textSize, getSettings().game.enableMirrorMode ? "on" : "off",
                 getSettings().game.enableFrameInterpolation.getValue() != FrameInterpMode::Off ?
                     "on" :
-                    "off");
+                    "off",
+                badge != nullptr ? badge : "");
             log.everShown = true;
             log.lastLog = now;
         }

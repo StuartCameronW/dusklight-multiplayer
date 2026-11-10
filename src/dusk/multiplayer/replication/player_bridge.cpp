@@ -14,6 +14,7 @@
 #include "SSystem/SComponent/c_counter.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_arrow.h"
+#include "d/actor/d_a_demo_item.h"  // events (agent EV): the item-get partner
 #include "d/actor/d_a_remote_player.h"
 #include "d/d_com_inf_game.h"
 #include "dusk/logging.h"
@@ -2429,6 +2430,62 @@ static void apply_sword_fx(daRemotePlayer_c* puppet, const PlayerState& state) {
         (fx & kPlayerFxSwordCharge) != 0);
 }
 
+// --- events (agent EV) ---
+static_assert(static_cast<int>(LocalEventKind::None) == kPlayerEvtNone &&
+                  static_cast<int>(LocalEventKind::Talk) == kPlayerEvtTalk &&
+                  static_cast<int>(LocalEventKind::Chest) == kPlayerEvtChest &&
+                  static_cast<int>(LocalEventKind::GetItem) == kPlayerEvtGetItem &&
+                  static_cast<int>(LocalEventKind::Door) == kPlayerEvtDoor &&
+                  static_cast<int>(LocalEventKind::InPlace) == kPlayerEvtInPlace &&
+                  static_cast<int>(LocalEventKind::Scripted) == kPlayerEvtScripted &&
+                  static_cast<int>(LocalEventKind::Cutscene) == kPlayerEvtCutscene,
+    "LocalEventKind and the wire's PlayerEventKind share one numbering (puppet-events.md §6)");
+
+/**
+ * v21 event byte, P3 of puppet-events.md §6. The kind is local_event_kind(), the sender's own proc
+ * and demo type. The hidden bit is FLG0_PLAYER_NO_DRAW ALONE (§5.5): checkPlayerNoDraw() is also
+ * true in his own first-person view (d_a_alink_link.inc:436-439), where he hides from himself, not
+ * from the partner.
+ *
+ * During an item get the item comes from the event's item partner, the daDitem_c that
+ * procCoGetItemInit creates and registers (d_a_alink_demo.inc:2322-2326), or that a chest or an NPC
+ * registered before him. Its DISPLAY item, as daDitem_c::create loads it (d_a_demo_item.cpp:
+ * 466-469): the model the sender actually sees above his head, which a randomiser-style give can
+ * make differ from the item granted. The scale is its scale.x, chased 0 -> 1 by daDitem_c::execute
+ * once chkDraw() (:517-526), so 0 until it shows. Anything else as the partner (no partner yet, a
+ * field item) sends dItemNo_NONE_e and the receiver draws nothing. Read-only: the partner's save
+ * write (execItemGet) stays entirely on this end.
+ */
+void fill_event(PlayerState& out) {
+    const LocalEventKind kind = local_event_kind();
+    out.evt = static_cast<std::uint8_t>(static_cast<std::uint8_t>(kind) & kPlayerEvtKindMask);
+    out.evtItem = 0;
+    out.evtItemScale = 0;
+
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr || fpcM_IsCreating(fopAcM_GetID(alink))) {
+        return;
+    }
+    if (alink->checkNoResetFlg0(daPy_py_c::FLG0_PLAYER_NO_DRAW) != 0) {
+        out.evt |= kPlayerEvtHidden;
+    }
+    if (kind != LocalEventKind::GetItem) {
+        return;
+    }
+    out.evtItem = dItemNo_NONE_e;
+    fopAc_ac_c* partner = fopAcM_getItemEventPartner(alink);
+    if (partner == nullptr || fpcM_GetName(partner) != fpcNm_Demo_Item_e) {
+        return;
+    }
+    daDitem_c* item = static_cast<daDitem_c*>(partner);
+    out.evtItem = item->getDisplayItemNo();
+    if (!fpcM_IsCreating(fopAcM_GetID(item)) && item->chkDraw()) {
+        // mMaxScale can ask for more than 1 (d_a_demo_item.cpp:519-521); the byte tops out at 1.
+        const f32 scale = std::clamp(item->scale.x, 0.0f, 1.0f);
+        out.evtItemScale = static_cast<std::uint8_t>(scale * 255.0f + 0.5f);
+    }
+}
+
 bool capture_local_player(PlayerState& out) {
     if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
@@ -2612,6 +2669,7 @@ bool capture_local_player(PlayerState& out) {
     fill_lantern_fx(alink, out);    // fxFlags bit 0, after fill_held_item (agent D)
     fill_sword_fx(alink, out); // sword trail + spin/charge fx (agent F): bits 1-3, 6-7
     fill_clawshot(alink, out); // v20 clawshot block, gated on the held item's kind
+    fill_event(out); // v21 event byte + item-get item (agent EV)
     fill_form(alink, out);     // v21 form block (wolf piece A)
 
     return true;
@@ -2844,6 +2902,9 @@ void apply_puppet_state(std::uint32_t playerId, const PlayerState& state) {
         state.dmgFlash, (state.fxFlags & kPlayerFxLanternLit) != 0);  // v20 (agent D)
     apply_sword_fx(puppet, state); // v20 fxFlags bits 1-3, 6-7: sword trail + spin/charge (agent F)
     apply_clawshot(puppet, state); // v20 clawshot block
+    // v21 event byte (agent EV). The last argument is THIS end's cutscene (spec question 4).
+    puppet->setNetworkEvent(state.evt_kind(), state.evt_stand_in(), state.evt_hidden(),
+        state.evtItem, state.evtItemScale, local_event_kind() == LocalEventKind::Cutscene);
     puppet->setNetworkJointAim(
         state.neckX, state.neckY, state.bodyX, state.bodyTwist, state.bodyZ, state.bankZ);
     // Block (2), decoded from the wire's fixed point here so the actor never sees the wire layout.

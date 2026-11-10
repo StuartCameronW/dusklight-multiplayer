@@ -1,6 +1,7 @@
 #ifndef D_A_REMOTE_PLAYER_H
 #define D_A_REMOTE_PLAYER_H
 
+#include "SSystem/SComponent/c_phase.h"  // events (agent EV): mEvtItemPhase
 #include "Z2AudioLib/Z2Creature.h"
 #include "Z2AudioLib/Z2SoundStarter.h"
 #include "d/actor/d_a_player.h"
@@ -1843,6 +1844,57 @@ private:
     u8 mNetForm;
     s8 mNetMetaTint;
     u8 mNetFurFrame;
+
+    // --- events (agent EV) ---
+    /* v21 event byte (PlayerState::evt, .claude/future-plans/puppet-events.md §6, P4/P5): which
+     * event the SENDER is in, whether his pose is the stand-in idle, whether he is hidden
+     * (FLG0_PLAYER_NO_DRAW), and during an item get the item he holds up. i_localCutscene is THIS
+     * end's answer (spec question 4): the local player is in an STB cutscene, so the partner is
+     * not drawn inside it. Plain values, decoded by the bridge, as for every other setter here.
+     * See d_a_remote_player_event.inc. All zeroed by fopAcM_ct, which is the idle state. */
+public:
+    void setNetworkEvent(u8 i_kind, bool i_standIn, bool i_hidden, u8 i_item, u8 i_itemScale,
+        bool i_localCutscene);
+    /// PlayerEventKind as received (0 none). For the name-tag badge and --mp-trace.
+    u8 getNetEventKind() const { return mNetEvtKind; }
+    /// The puppet draws nothing this frame: the sender is hidden, or this end is in a cutscene.
+    bool isEventHidden() const { return mNetEvtHidden || mEvtLocalCutscene; }
+
+private:
+    /// execute(), after setMatrix: the item model's load, release and placement. Once a tick.
+    void updateNetworkEvent();
+    /// draw(), after the one-entry-per-sim-tick guard. True = draw nothing else (hidden).
+    bool drawNetworkEvent();
+    /// ~daRemotePlayer_c: release the model, its heap and the archive reference.
+    void deleteNetworkEvent();
+    void releaseEventItem();
+    bool buildEventItemModel();
+
+    u8 mNetEvtKind;
+    bool mNetEvtStandIn;
+    bool mNetEvtHidden;
+    bool mEvtLocalCutscene;
+    /// The sender's daDitem_c display item and its scale.x * 255 (0 = not shown yet).
+    bool mNetEvtItemValid;
+    u8 mNetEvtItem;
+    u8 mNetEvtItemScale;
+    /// The item whose archive this puppet holds a dComIfG_resLoad reference to (or is loading).
+    bool mEvtItemHeld;
+    bool mEvtItemLoading;
+    /// Released while its load was still in flight: keep polling, then drop the reference.
+    bool mEvtItemOrphan;
+    bool mEvtItemFailed;
+    u8 mEvtItemNo;
+    const char* mEvtItemArc;
+    request_of_phase_process_class mEvtItemPhase;
+    /// The item's J3DModel, on its own small solid heap carved from the game heap at runtime.
+    JKRSolidHeap* mpEvtItemHeap;
+    J3DModel* mpEvtItemModel;
+    dKy_tevstr_c mEvtItemTevStr;
+    s16 mEvtItemAngle;
+    bool mEvtItemPosed;
+    bool mEvtItemLoggedDraw;
+    u16 mEvtLogCount;
 };
 
 /**
