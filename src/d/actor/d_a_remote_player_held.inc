@@ -165,9 +165,11 @@ const u32 l_heldItemBckBufSize = 0x800;
 /**
  * The wire's PlayerHeldItemBck ids, and the resource and held kind each one is. Every BCK
  * setBowModel / setSlingModel / changeItemBck can leave in his mItemBck for a bow or slingshot
- * (d_a_alink_bow.inc:55-68, :204-252, :282-300, :367, :511-543). The ONE table both ends use: the
- * sender maps through daRemotePlayer_heldItemBckToWire, the puppet indexes it. The indices are the
- * same in every region's AlAnm.h.
+ * (d_a_alink_bow.inc:55-68, :204-252, :282-300, :367, :511-543), and the clawshot gun's HS_SPIN
+ * (setHookshotModel, d_a_alink_hook.inc:428-433), whose kind is kPlayerHeldClawshot for both
+ * clawshots because they share the one model. The ONE table both ends use: the sender maps through
+ * daRemotePlayer_heldItemBckToWire, the puppet indexes it. The indices are the same in every
+ * region's AlAnm.h.
  */
 struct HeldItemBckEntry {
     u16 mResIdx;
@@ -184,6 +186,8 @@ const HeldItemBckEntry l_heldItemBck[dusk::mp::kPlayerHeldBckNum] = {
     {dRes_ID_ALANM_BCK_PWAIT_e, dusk::mp::kPlayerHeldSlingshot},
     {dRes_ID_ALANM_BCK_PSHOOT_e, dusk::mp::kPlayerHeldSlingshot},
     {dRes_ID_ALANM_BCK_PRELORD_e, dusk::mp::kPlayerHeldSlingshot},
+    // --- clawshot chain + tip (agent E) ---
+    {dRes_ID_ALANM_BCK_HS_SPIN_e, dusk::mp::kPlayerHeldClawshot},
 };
 
 /// daArrow_c::createHeap's models for types 0 and 1 (d_a_arrow.cpp:31-39), in the private mount.
@@ -205,8 +209,8 @@ u8 daRemotePlayer_heldItemBckToWire(u16 i_resIdx, u8 i_kind) {
  * same reason mpSwordModel is a bare 3. STATIC_ASSERT is a no-op off the GC target (see the shield
  * one); held_kind() is the real guard. */
 STATIC_ASSERT(dusk::mp::kPlayerHeldKindNum == 10);
-// Likewise mpHeldItemBckAnm's bare 10; setHeldItemBck bounds the id against the enum at runtime.
-STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 10);
+// Likewise mpHeldItemBckAnm's bare 11; setHeldItemBck bounds the id against the enum at runtime.
+STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 11);
 
 /**
  * Build every handheld item model the puppet might need, once, at createHeap time. Called LAST in
@@ -230,9 +234,11 @@ STATIC_ASSERT(dusk::mp::kPlayerHeldBckNum == 10);
  * can hold for them, read with mAnmHeap9's 0x800 — on one mDoExt_bckAnm as his is; and the two
  * arrow models daArrow_c draws while nocked (AL_ARROW / AL_ARROWB, from the private Alink mount).
  *
- * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the clawshot's
- * item BCKs (spin, tip open), the lantern glow, the clawshot chain, the bomb arrow's fuse smoke
- * particles. Every load is individually non-fatal.
+ * The clawshot's gun spin (HS_SPIN) is in the same BCK table; its tip-open BCK and its chain are
+ * built right after this, by setupClawshot (d_a_remote_player_hookshot.inc).
+ *
+ * NOT built: the bottle's slosh/drink BTKs, the fairy/worm/bee contents models, the lantern glow,
+ * the bomb arrow's fuse smoke particles. Every load is individually non-fatal.
  */
 void daRemotePlayer_c::setupHeldItems() {
     for (int i = 0; i < dusk::mp::kPlayerHeldKindNum; i++) {
@@ -539,32 +545,13 @@ void daRemotePlayer_c::setHeldItemMatrix() {
             setHeldItemBck(held, kind);
             break;
         case dusk::mp::kPlayerHeldClawshot:
-        case dusk::mp::kPlayerHeldDoubleClawshot: {
-            /* setHookshotPos (d_a_alink_hook.inc:848-870): a left-hand and a right-hand placement,
-             * and field_0x3020 decides which model takes which. The single clawshot is always DRAWN
-             * in the left hand — changeHookshotDrawModel swaps the right-hand one out before the
-             * draw (:346-356) — so it takes the left placement here unconditionally. */
-            const bool primaryRight = kind == dusk::mp::kPlayerHeldDoubleClawshot &&
-                                      (mNetHeldFlags & dusk::mp::kPlayerHeldClawRight) != 0;
-            J3DModel* left = primaryRight ? mpHeldClaw2Model : held;
-            J3DModel* right = primaryRight ? held : mpHeldClaw2Model;
-            if (kind == dusk::mp::kPlayerHeldClawshot) {
-                right = NULL;
-            }
-            if (left != NULL) {
-                mDoMtx_stack_c::copy(model->getAnmMtx(l_leftItemJointNo));
-                mDoMtx_stack_c::transM(-2.0f, 1.0f, 1.0f);
-                mDoMtx_stack_c::XYZrotM(cM_deg2s(5.7f), cM_deg2s(162.0f), 0);
-                left->setBaseTRMtx(mDoMtx_stack_c::get());
-            }
-            if (right != NULL) {
-                mDoMtx_stack_c::copy(model->getAnmMtx(l_rightItemJointNo));
-                mDoMtx_stack_c::transM(-2.0f, 0.0f, 1.0f);
-                mDoMtx_stack_c::XYZrotM(cM_deg2s(-78.0f), cM_deg2s(182.0f), cM_deg2s(-99.0f));
-                right->setBaseTRMtx(mDoMtx_stack_c::get());
-            }
+        case dusk::mp::kPlayerHeldDoubleClawshot:
+            /* setHookshotPos (d_a_alink_hook.inc:848-1245): both guns, their HS_SPIN, both tips
+             * (on the gun, or where the wire says they flew) and the chains' ends. The single
+             * clawshot is always DRAWN in the left hand — changeHookshotDrawModel swaps the
+             * right-hand set out before the draw (:346-356). d_a_remote_player_hookshot.inc. */
+            setClawshotMatrix(held, kind);
             break;
-        }
         case dusk::mp::kPlayerHeldCopyRod:
             // The default branch (:6069-6080), with the glow frame the sender's rod is showing.
             if (mpHeldCopyRodBrk != NULL) {
@@ -595,28 +582,6 @@ void daRemotePlayer_c::setHeldItemMatrix() {
         }
 
         held->calc();
-
-        if (held_is_clawshot(kind)) {
-            /* The tip at rest on its gun: base * transM(hookRoot), the placement his second tip
-             * takes when it is not flying (:1230-1233) and the point his first one fires from
-             * (:1032-1034). A fired tip is NOT followed — that is a world position. */
-            J3DModel* guns[2] = {held, mpHeldClaw2Model};
-            const int gunNum = kind == dusk::mp::kPlayerHeldDoubleClawshot ? 2 : 1;
-            for (int i = 0; i < gunNum; i++) {
-                if (guns[i] == NULL) {
-                    continue;
-                }
-                if (i == 1) {
-                    guns[i]->calc();
-                }
-                if (mpHeldClawTip[i] != NULL) {
-                    mDoMtx_stack_c::copy(guns[i]->getBaseTRMtx());
-                    mDoMtx_stack_c::transM(l_heldHookRoot.x, l_heldHookRoot.y, l_heldHookRoot.z);
-                    mpHeldClawTip[i]->setBaseTRMtx(mDoMtx_stack_c::get());
-                    mpHeldClawTip[i]->calc();
-                }
-            }
-        }
     }
 
     // v19 block A: the nocked arrow, its own actor's placement.
@@ -663,6 +628,7 @@ void daRemotePlayer_c::drawHeldItems() {
                 drawModel(mpHeldClaw2Model);
                 drawModel(mpHeldClawTip[1]);
             }
+            drawClawshot(); // the chains, right after the guns and tips as his are
         }
         mHeldDrawnKind = kind;
         mHeldDrawnFlags = static_cast<u8>(mNetHeldFlags & ~(dusk::mp::kPlayerHeldLanternShown |
@@ -715,13 +681,7 @@ void daRemotePlayer_c::addHeldItemShadow() {
     {
         dComIfGd_addRealShadow(mShadowKey, mpHeldModel[kind]);
         if (held_is_clawshot(kind)) {
-            dComIfGd_addRealShadow(mShadowKey, mpHeldClawTip[0]);
-            if ((mHeldDrawnFlags & dusk::mp::kPlayerHeldClawBoth) != 0 &&
-                kind == dusk::mp::kPlayerHeldDoubleClawshot)
-            {
-                dComIfGd_addRealShadow(mShadowKey, mpHeldClaw2Model);
-                dComIfGd_addRealShadow(mShadowKey, mpHeldClawTip[1]);
-            }
+            addClawshotShadow(kind); // the tips' and second gun's gates (hookshot.inc)
         }
     }
     if ((mHeldDrawnFlags & dusk::mp::kPlayerHeldLanternShown) != 0) {

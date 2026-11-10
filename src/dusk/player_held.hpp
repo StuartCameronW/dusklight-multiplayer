@@ -72,8 +72,11 @@ enum PlayerHeldFlags : std::uint8_t {
     /// The bottle's joint 1 (its cork) is in the right hand: bottleModelCallBack's `mItemMode != 0`
     /// (d_a_alink_bottle.inc:13-21), only while the callback is installed (not pouring).
     kPlayerHeldBottleCork = 1 << 4,
-    /// Double clawshot: the PRIMARY one (mHeldItemModel, the one that fires) is in the right hand —
-    /// setHookshotPos's `field_0x3020 != 0` (d_a_alink_hook.inc:848-870).
+    /// Either clawshot: the PRIMARY one (mHeldItemModel, the one that fires) is in the right hand —
+    /// setHookshotPos's `field_0x3020 != 0` (d_a_alink_hook.inc:848-870). For the single clawshot
+    /// this means changeHookshotDrawModel draws his SECOND pair (field_0x0710 / 0714, the one in
+    /// the left hand) in its place (d_a_alink_hook.inc:346-356) — a roof or wall hang flips it
+    /// (:1736-1741, :1996-2001). Sent for the single clawshot since the v20 clawshot block.
     kPlayerHeldClawRight = 1 << 5,
     /// Double clawshot: the second one is drawn too — not guarding (d_a_alink.cpp:19779-19789).
     kPlayerHeldClawBoth = 1 << 6,
@@ -91,6 +94,11 @@ enum PlayerHeldFlags : std::uint8_t {
  * with field_0x33dc every tick by setItemMatrix (:6083-6089). These are every resource
  * setBowModel / setSlingModel / changeItemBck can put there (d_a_alink_bow.inc); the puppet maps
  * the id back to the resource. Ids are the wire's, not resource numbers, so they fit in 4 bits.
+ *
+ * Since the v20 clawshot block also the clawshot's gun spin, HS_SPIN, which setHookshotModel puts
+ * in mAnmHeap9 / mItemBck (d_a_alink_hook.inc:428-433) and setHookshotPos steps forward while the
+ * tip flies out and back while it returns (:872-890). Its table row names kPlayerHeldClawshot for
+ * BOTH clawshot kinds: the id says which MODEL it poses, and the two kinds share one model.
  */
 enum PlayerHeldItemBck : std::uint8_t {
     kPlayerHeldBckNone = 0,
@@ -103,7 +111,8 @@ enum PlayerHeldItemBck : std::uint8_t {
     kPlayerHeldBckSlingWait = 7,        ///< PWAIT: setSlingModel's, and setBowNormalAnime's
     kPlayerHeldBckSlingShoot = 8,       ///< PSHOOT
     kPlayerHeldBckSlingReload = 9,      ///< PRELORD
-    kPlayerHeldBckNum = 10,
+    kPlayerHeldBckClawSpin = 10,        ///< HS_SPIN: the clawshot gun (v20 clawshot block)
+    kPlayerHeldBckNum = 11,
 };
 constexpr std::uint8_t kPlayerHeldBckIdMask = 0x0F;
 /// heldBck bit 4: the nocked arrow (kPlayerHeldArrowNocked) is a bomb arrow — daArrow_c type 1,
@@ -113,7 +122,9 @@ constexpr std::uint8_t kPlayerHeldBckBombArrow = 0x10;
 /* PlayerState::heldBckFrame (v19 block A): the frame that BCK was entered with — mItemBck's
  * animation frame after setItemMatrix clamped field_0x33dc below getFrameMax() — as a fraction of
  * getFrameMax(), x255. 255 is "the end", which the receiver clamps to frameMax - 0.001 as he does.
- * Meaningless while the id is kPlayerHeldBckNone. */
+ * Meaningless while the id is kPlayerHeldBckNone. For a single clawshot drawn swapped
+ * (kPlayerHeldClawRight) it is 0: the gun he then draws is field_0x0710, which setHookshotPos
+ * enters at frame 0 (d_a_alink_hook.inc:911). */
 
 /* PlayerState::heldMat, per kind. The material animation frames Link's held model is showing.
  *
@@ -125,6 +136,29 @@ constexpr std::uint8_t kPlayerHeldMatBottleBrkMask = 0x0F;
 constexpr std::uint8_t kPlayerHeldMatBottleBtpShift = 4;
 constexpr std::uint8_t kPlayerHeldMatBottleBtpMask = 0x30;
 constexpr std::uint8_t kPlayerHeldMatBottleMat0Hidden = 0x40;
+
+/* PlayerState::clawFlags (v20 clawshot block), while heldItem is a clawshot. Two SLOTS, named for
+ * daAlink_c's two sets, not for hands (kPlayerHeldClawRight says which hand slot 0 is in):
+ *   slot 0: mHeldItemModel + mpHookTipModel; its chain runs mHeldItemRootPos -> mHookshotTopPos
+ *   slot 1: field_0x0710 + field_0x0714; its chain runs field_0x3810 -> mIronBallBgChkPos
+ * (setHookshotPos, d_a_alink_hook.inc:848-1245; hsChainShape_c::draw, :147-245). */
+/// Slot 0's tip is off its gun: `mHeldItemRootPos.abs(mHookshotTopPos) > 1`, the very test his draw
+/// makes before it draws the chain (d_a_alink.cpp:19793-19796). Its position is on the wire then.
+constexpr std::uint8_t kPlayerClawTipOut0 = 1 << 0;
+/// Slot 1's tip is off its gun: `field_0x3810.abs(mIronBallBgChkPos) > 1` — hanging from it, or
+/// it is still flying back (field_0x3024, :1213-1238). Its position is on the wire then.
+constexpr std::uint8_t kPlayerClawTipOut1 = 1 << 1;
+/// checkHookshotWait() (mode 0/1, :392-394): his slot-0 tip casts into the body's shadow only then
+/// (d_a_alink.cpp:19324-19326).
+constexpr std::uint8_t kPlayerClawWait = 1 << 2;
+/// dComIfGp_checkPlayerStatus1(0, 0x10000), the roof hang: no tip shadows at all then
+/// (d_a_alink.cpp:19324-19335).
+constexpr std::uint8_t kPlayerClawRoofHang = 1 << 3;
+/// Bits 4-7: field_0x3026 (getHookshotStopTime), clamped to 15. setHookshotCatchNow sets 5 and it
+/// counts down; the slot-0 chain's wobble is 2.5 x this, its sign flipping on odd values
+/// (d_a_alink_hook.inc:170-174, :396-398).
+constexpr std::uint8_t kPlayerClawStopShift = 4;
+constexpr std::uint8_t kPlayerClawStopMask = 0xF0;
 
 /* PlayerState::ironBallState (v19 block B), while kPlayerHeldIronBall is out. */
 /// mItemVar0.field_0x3018 in the low nibble: the throw state (0 carried .. 8 caught again), which

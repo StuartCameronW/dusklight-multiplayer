@@ -204,6 +204,14 @@ enum PlayerGearFlags : std::uint8_t {
 constexpr float kPlayerIronBallPosScale = 4.0f;
 
 /**
+ * v20 clawshot block: where a fired tip is, in units of 1/kPlayerClawPosScale relative to the
+ * sender's own position. +-8191 units against a chain that stops at HIO mMaxLength - 15 from his
+ * gun (2000, or mBossMaxLength 3000 in D_MN07A; setHookshotPos, d_a_alink_hook.inc:924-1104).
+ * Only the "super clawshot" cheat (69420, :933-937) can pass it; that is sent clamped.
+ */
+constexpr float kPlayerClawPosScale = 4.0f;
+
+/**
  * v20 effects byte (PlayerState::fxFlags). Each bit is owned by one feature; a bit nobody sets is 0.
  *   bit 0       the lantern is lit (its glow, flame and light).
  *   bit 1       a sword trail is live (m_swordBlur).
@@ -753,6 +761,41 @@ struct PlayerState {
      */
     std::uint8_t fxFlags = 0;
     std::uint8_t dmgFlash = 0;
+
+    // v20 clawshot block (after the effects block): only while heldItem is a clawshot
+    /**
+     * His two clawshot sets ("slots", see kPlayerClawTipOut0 in dusk/player_held.hpp), read after
+     * setHookshotPos placed them (player_bridge.cpp fill_clawshot). 3 bytes, plus 10 per tip that
+     * is off its gun:
+     *
+     *   clawFlags        kPlayerClawTipOut0/1, kPlayerClawWait, kPlayerClawRoofHang, and the
+     *                    chain-wobble stop time in bits 4-7.
+     *   clawTipFrame[s]  the HS_TIP_OPEN frame slot s's tip was entered with: field_0x33e0 for
+     *                    slot 0, 0 or 14 for slot 1 (d_a_alink_hook.inc:872-905, :1208,
+     *                    :1212-1243).
+     *   clawTipPos[s*3]  ONLY while slot s's tip is out: its anchor (mHookshotTopPos /
+     *                    mIronBallBgChkPos) relative to posX/Y/Z, x kPlayerClawPosScale...
+     *   clawTipAng[s*2]  ...and its model's rotation x / y, read off the tip's base matrix. His
+     *                    out-of-gun placements never roll it (z = 0, :1195-1229).
+     *
+     * A tip on its gun is not sent at all: the receiver puts it on its own gun's muzzle, so it can
+     * never lag the puppet's hand. Nor is the chain (up to 600 links): it is a pure function of its
+     * two ends and the stop time, so the receiver draws it with hsChainShape_c::draw's own loop.
+     */
+    std::uint8_t clawFlags = 0;
+    std::uint8_t clawTipFrame[2] = {};
+    std::int16_t clawTipPos[6] = {};
+    std::int16_t clawTipAng[4] = {};
+
+    bool clawshot_out() const {
+        return heldItem == kPlayerHeldClawshot || heldItem == kPlayerHeldDoubleClawshot;
+    }
+    bool claw_tip_out(int slot) const {
+        return (clawFlags & (kPlayerClawTipOut0 << slot)) != 0;
+    }
+    float claw_tip_pos(int i) const {
+        return static_cast<float>(clawTipPos[i]) / kPlayerClawPosScale;
+    }
     float upper2_frame() const { return static_cast<float>(upper2Frame) / kPlayerActFrameScale; }
     float upper2_ratio() const { return static_cast<float>(upper2Ratio) / 255.0f; }
 
@@ -860,6 +903,21 @@ struct PlayerState {
         // v20 effects block
         w.write_u8(fxFlags);
         w.write_u8(dmgFlash);
+        // v20 clawshot block: only while a clawshot is drawn, and each tip only while it is out
+        if (clawshot_out()) {
+            w.write_u8(clawFlags);
+            w.write_u8(clawTipFrame[0]);
+            w.write_u8(clawTipFrame[1]);
+            for (int s = 0; s < 2; s++) {
+                if (claw_tip_out(s)) {
+                    w.write_s16(clawTipPos[s * 3 + 0]);
+                    w.write_s16(clawTipPos[s * 3 + 1]);
+                    w.write_s16(clawTipPos[s * 3 + 2]);
+                    w.write_s16(clawTipAng[s * 2 + 0]);
+                    w.write_s16(clawTipAng[s * 2 + 1]);
+                }
+            }
+        }
     }
 
     bool read(Reader& r) {
@@ -935,6 +993,32 @@ struct PlayerState {
             return false;
         }
         fxFlags &= kPlayerFxKnownMask;
+        // v20 clawshot block: only while a clawshot is drawn, and each tip only while it is out
+        if (clawshot_out()) {
+            if (!(r.read_u8(clawFlags) && r.read_u8(clawTipFrame[0]) &&
+                    r.read_u8(clawTipFrame[1])))
+            {
+                return false;
+            }
+            for (int s = 0; s < 2; s++) {
+                if (claw_tip_out(s)) {
+                    if (!(r.read_s16(clawTipPos[s * 3 + 0]) && r.read_s16(clawTipPos[s * 3 + 1]) &&
+                            r.read_s16(clawTipPos[s * 3 + 2]) &&
+                            r.read_s16(clawTipAng[s * 2 + 0]) && r.read_s16(clawTipAng[s * 2 + 1])))
+                    {
+                        return false;
+                    }
+                } else {
+                    clawTipPos[s * 3 + 0] = clawTipPos[s * 3 + 1] = clawTipPos[s * 3 + 2] = 0;
+                    clawTipAng[s * 2 + 0] = clawTipAng[s * 2 + 1] = 0;
+                }
+            }
+        } else {
+            clawFlags = 0;
+            clawTipFrame[0] = clawTipFrame[1] = 0;
+            std::fill(std::begin(clawTipPos), std::end(clawTipPos), std::int16_t{0});
+            std::fill(std::begin(clawTipAng), std::end(clawTipAng), std::int16_t{0});
+        }
         roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
         actPitch = act_decode_turn(pitch);
@@ -1203,6 +1287,33 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     // v20 effects block: discrete, take b.
     out.fxFlags = b.fxFlags;
     out.dmgFlash = b.dmgFlash;
+
+    // v20 clawshot block (after the effects block)
+    /* The flags (which tips are out, the stop time) and the tip-open frames are discrete. A tip's
+     * position and rotation blend only while BOTH samples have that tip out: the other side's
+     * zeroes mean "on its gun", and blending out of them would fly it in from his feet. t is
+     * clamped to 1, the iron ball's rule: a tip flying out at 100 units a tick and stopping dead on
+     * a wall must not be extrapolated through it. */
+    out.clawFlags = b.clawFlags;
+    out.clawTipFrame[0] = b.clawTipFrame[0];
+    out.clawTipFrame[1] = b.clawTipFrame[1];
+    std::copy(std::begin(b.clawTipPos), std::end(b.clawTipPos), std::begin(out.clawTipPos));
+    std::copy(std::begin(b.clawTipAng), std::end(b.clawTipAng), std::begin(out.clawTipAng));
+    if (a.clawshot_out() && b.clawshot_out()) {
+        for (int s = 0; s < 2; s++) {
+            if (!(a.claw_tip_out(s) && b.claw_tip_out(s))) {
+                continue;
+            }
+            for (int i = s * 3; i < s * 3 + 3; i++) {
+                out.clawTipPos[i] = act_encode_s16(
+                    a.claw_tip_pos(i) + (b.claw_tip_pos(i) - a.claw_tip_pos(i)) * aimT,
+                    kPlayerClawPosScale);
+            }
+            for (int i = s * 2; i < s * 2 + 2; i++) {
+                out.clawTipAng[i] = lerp_angle(a.clawTipAng[i], b.clawTipAng[i], aimT);
+            }
+        }
+    }
     return out;
 }
 

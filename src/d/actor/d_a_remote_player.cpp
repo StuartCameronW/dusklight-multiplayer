@@ -1501,6 +1501,7 @@ int daRemotePlayer_c::createHeap() {
     // block (3): held item. Every handheld item model, preloaded; after the override so a short
     // heap costs items, never the override. Each load is non-fatal (d_a_remote_player_held.inc).
     setupHeldItems();
+    setupClawshot(); // the clawshot chain + tip-open BCK (d_a_remote_player_hookshot.inc)
 
     // The standing pivot (turn-in-place). Last, so a short heap costs only the pivot pose and its
     // footsteps.
@@ -8635,3 +8636,5 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_REMOTE_PLAYER
 #include "d/actor/d_a_remote_player_fx.inc"
 // Sword trail, spin attack and charge effects (agent F). Uses own_archive_idx and currentSword().
 #include "d/actor/d_a_remote_player_swordfx.inc"
+// The clawshot's fired tips and chains, after both: it uses the held loaders and the ball's chain.
+#include "d/actor/d_a_remote_player_hookshot.inc"
