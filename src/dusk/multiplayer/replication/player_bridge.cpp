@@ -1679,24 +1679,166 @@ bool world_is_playable() {
 }
 
 /**
- * An event Link starts on himself and plays out in place: drinking from a bottle, pouring lantern
- * oil, the grass whistle, catching the boomerang (~23 procs). Each calls event_compulsory() and
- * setSpecialDemoType(), so world_is_playable() reads false, yet he is standing in the room
- * animating. Without this the far end froze on the first frame of the drink for ~3.6 s.
+ * Which event the local Link is in. Spec: .claude/future-plans/puppet-events.md §1 and §6.
  *
- * DEMO_TYPE_SPECIAL_e is the game's own label for that case (set by those procs' Init). A queued
- * scene change (death, lava return, warp) cuts it off before the load starts.
+ * Read from what he is doing, not from inputs. setDemoData forces the TOOL type whenever a
+ * dDemo_actor_c drives him, which is an STB cutscene (d_a_alink_demo.inc:636-656). Otherwise it
+ * sets SYSTEM, and checkDemoAction picks the proc. The procs below are the frequent ones the spec
+ * lists.
+ *
+ * SPECIAL is tested first so the in-place events keep exactly the classification
+ * link_acting_in_place gave them before. A demo-archive BCK in slot 0 (mArcNo != 0xFFFF,
+ * daPy_anmHeap_c::loadData, d_a_player.cpp:300-331) counts as a cutscene even under SYSTEM. The
+ * receiver has none of those archives, so live capture would only send "no override" for them
+ * (fill_action_anim) and the puppet would glide.
+ */
+LocalEventKind local_event_kind() {
+    fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    if (link == nullptr || !dComIfGp_event_runCheck() || fopAcM_SearchByName(fpcNm_TITLE_e) != NULL)
+    {
+        return LocalEventKind::None;
+    }
+    daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    /* dComIfGp_setPlayer runs at the very top of daAlink_c::create (d_a_alink.cpp:4937), long
+     * before his heaps and model exist, so a Link that is still being created has nothing to
+     * classify. fpcM_IsCreating is the game's own test (d_a_alink_demo.inc:2541). */
+    if (alink == nullptr || fpcM_IsCreating(fopAcM_GetID(alink))) {
+        return LocalEventKind::None;
+    }
+
+    const int demoType = alink->mDemo.getDemoType();
+    if (demoType == daPy_demo_c::DEMO_TYPE_SPECIAL_e) {
+        return LocalEventKind::InPlace;
+    }
+    const daPy_anmHeap_c& under = alink->mUnderAnmHeap[0];
+    const daPy_anmHeap_c& upper = alink->mUpperAnmHeap[0];
+    if (demoType == daPy_demo_c::DEMO_TYPE_TOOL_e || alink->mProcID == daAlink_c::PROC_TOOL_DEMO ||
+        !under.checkNoSetArcNo() || (!upper.checkNoSetIdx() && !upper.checkNoSetArcNo()))
+    {
+        return LocalEventKind::Cutscene;
+    }
+    switch (alink->mProcID) {
+    case daAlink_c::PROC_TALK:
+        return LocalEventKind::Talk;
+    case daAlink_c::PROC_OPEN_TREASURE:
+        return LocalEventKind::Chest;
+    case daAlink_c::PROC_GET_ITEM:
+        return LocalEventKind::GetItem;
+    case daAlink_c::PROC_DOOR_OPEN:
+        return LocalEventKind::Door;
+    default:
+        return LocalEventKind::Scripted;
+    }
+}
+
+const char* local_event_kind_name(LocalEventKind kind) {
+    switch (kind) {
+    case LocalEventKind::None:
+        return "none";
+    case LocalEventKind::Talk:
+        return "talk";
+    case LocalEventKind::Chest:
+        return "chest";
+    case LocalEventKind::GetItem:
+        return "get-item";
+    case LocalEventKind::Door:
+        return "door";
+    case LocalEventKind::InPlace:
+        return "in-place";
+    case LocalEventKind::Scripted:
+        return "scripted";
+    case LocalEventKind::Cutscene:
+        return "cutscene";
+    }
+    return "?";
+}
+
+/**
+ * Link is in an event, but what he draws is still his own ALANM animation, so his real pose is
+ * worth sending. Block 2 carries it as it is: ANM_TALK, TRES_OPEN_*, GET_A, DOOR_OPEN_* are all
+ * ALANM indices and none of those procs is in puppet_reproduces_proc (puppet-events.md §2).
+ *
+ * This widens the old link_acting_in_place carve-out, which covered DEMO_TYPE_SPECIAL_e only:
+ * drinking from a bottle, pouring oil, the whistle, the boomerang catch (~23 procs). Without that
+ * one the far end froze on the first frame of the drink for ~3.6 s. Talk, chest, item get, door and
+ * the stage-entry walk-in froze the same way, mid-stride, until now.
+ *
+ * The scene-change and title tests come first, as before. A queued scene change (death, lava
+ * return, warp, a door to another stage) cuts the event off before the load starts. STB cutscenes
+ * stay out: they teleport him onto the cast's marks and play demo-archive BCKs that the receiver
+ * cannot resolve. wire_local_state sends a standing idle for those instead (P2).
+ *
+ * Hidden Link (FLG0_PLAYER_NO_DRAW alone, set by the warp, the cannon, boss doors, Henna's boat)
+ * stays out too, so the far end keeps the last visible pose rather than a puppet standing inside a
+ * cannon. checkPlayerNoDraw() is NOT that test: it is also true in his own first-person view
+ * (d_a_alink_link.inc:436-439). In-place events skip the hidden test, which keeps them exactly as
+ * they were.
  *
  * Capture only: puppet spawning, name tags and the receive side still use world_is_playable().
  */
-bool link_acting_in_place() {
-    if (dComIfGp_getPlayer(0) == nullptr || fopAcM_SearchByName(fpcNm_TITLE_e) != NULL ||
-        dComIfGp_isEnableNextStage())
-    {
+static bool link_in_live_event(LocalEventKind kind) {
+    // local_event_kind() has already answered None for no Link and for the title's attract demo.
+    if (dComIfGp_isEnableNextStage()) {
+        return false;
+    }
+    if (kind == LocalEventKind::None || kind == LocalEventKind::Cutscene) {
         return false;
     }
     daAlink_c* alink = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
-    return alink != nullptr && alink->mDemo.getDemoType() == daPy_demo_c::DEMO_TYPE_SPECIAL_e;
+    // local_event_kind already refused a Link that is still being created; the model check is
+    // what the readers below assume.
+    if (alink == nullptr || alink->mpLinkModel == nullptr) {
+        return false;
+    }
+    if (kind == LocalEventKind::InPlace) {
+        return true;
+    }
+    return alink->checkNoResetFlg0(daPy_py_c::FLG0_PLAYER_NO_DRAW) == 0;
+}
+
+/**
+ * One line per change of event kind and of how the pose goes out, so the two ends' logs can be
+ * lined up against "Puppet N action override" on the receiver. Edge-keyed, so the several calls
+ * per tick (capture twice, the trace readers) log it once. Capped.
+ */
+static void log_local_event_edge(LocalEventKind kind, bool live) {
+    static LocalEventKind s_lastKind = LocalEventKind::None;
+    static bool s_lastLive = true;
+    static int s_logCount = 0;
+    if (kind == s_lastKind && live == s_lastLive) {
+        return;
+    }
+    const LocalEventKind was = s_lastKind;
+    s_lastKind = kind;
+    s_lastLive = live;
+    if (s_logCount >= 200) {
+        return;
+    }
+    s_logCount++;
+
+    const char* how =
+        live ? "live pose" : (kind == LocalEventKind::Cutscene ? "stand-in idle" : "held pose");
+    const daAlink_c* alink = static_cast<const daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (alink == nullptr || kind == LocalEventKind::None) {
+        Log.info("Local event {} -> {} ({})", local_event_kind_name(was),
+            local_event_kind_name(kind), how);
+        return;
+    }
+    Log.info("Local event {} -> {} ({}): proc 0x{:X}, demo type {}, mode {}, actUnder {} arc {}, "
+             "hidden {}",
+        local_event_kind_name(was), local_event_kind_name(kind), how,
+        static_cast<unsigned>(alink->mProcID), alink->mDemo.getDemoType(),
+        static_cast<unsigned>(alink->mDemo.getDemoMode()), alink->mUnderAnmHeap[0].getIdx(),
+        alink->mUnderAnmHeap[0].getArcNo(),
+        alink->checkNoResetFlg0(daPy_py_c::FLG0_PLAYER_NO_DRAW) != 0 ? 1 : 0);
+}
+
+/// The process id of the Link the last successful capture read. See local_player_is_last_captured.
+static fpc_ProcID s_lastCapturedLink = fpcM_ERROR_PROCESS_ID_e;
+
+bool local_player_is_last_captured() {
+    fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    return link != nullptr && fopAcM_GetID(link) == s_lastCapturedLink;
 }
 
 bool local_scene_change_queued() {
@@ -1728,7 +1870,8 @@ bool local_scene_change_queued() {
     return s_leaving;
 }
 
-/// The gate for reading Link's pose: in play, or acting in place during his own event.
+/// The gate for reading Link's pose: in play, or in one of his own events that still draws his
+/// own animation (link_in_live_event).
 bool local_pose_is_live() {
     /* A queued scene change counts as gone. The load that follows can stall this process for
      * seconds without a tick, so whatever we sent last is what the far end holds: an "in world"
@@ -1737,7 +1880,14 @@ bool local_pose_is_live() {
     if (local_scene_change_queued()) {
         return false;
     }
-    return world_is_playable() || link_acting_in_place();
+    if (world_is_playable()) {
+        log_local_event_edge(LocalEventKind::None, true);
+        return true;
+    }
+    const LocalEventKind kind = local_event_kind();
+    const bool live = link_in_live_event(kind);
+    log_local_event_edge(kind, live);
+    return live;
 }
 
 /**
@@ -2098,6 +2248,7 @@ bool capture_local_player(PlayerState& out) {
     }
 
     fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    s_lastCapturedLink = fopAcM_GetID(link);
     /* The same actor through the accessor that is documented to hold a daAlink_c — the one the rest
      * of the puppet code reads Link from (d_a_remote_player.cpp:414). Null-checked at every use
      * below; nothing here may assume a scene. */
