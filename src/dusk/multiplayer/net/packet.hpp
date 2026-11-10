@@ -257,8 +257,8 @@ enum class PacketId : std::uint8_t {
     WorldPropose = 14,      ///< guest -> host: ops the guest's own diff produced
     WorldCommit = 15,       ///< host -> all: ops the host accepted, in worldSeq order
     WorldSyncRequest = 16,  ///< guest -> host: "send me WorldSync" (digest mismatch, join)
-    ClaimRequest = 17,      ///< reserved for Batch W-B (chest / floor-item claims)
-    ClaimReply = 18,        ///< reserved for Batch W-B
+    ClaimRequest = 17,      ///< guest -> host: [u8 kind][u8 tbl][u16 no][u32 serial] (item_claims.hpp)
+    ClaimReply = 18,        ///< host -> guest: request echoed + [u8 granted][u8 reason]
     WorldDigest = 19,       ///< host -> all: [u32 worldSeq][u32 digest], every 60 ticks
 
     // --- v22: the replicated-object channel. Spec: .claude/future-plans/mp-object-channel.md

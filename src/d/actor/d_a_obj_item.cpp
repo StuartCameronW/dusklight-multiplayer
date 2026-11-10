@@ -15,6 +15,9 @@
 #include "d/d_s_play.h"
 #include "f_op/f_op_camera_mng.h"
 #include "m_Do/m_Do_mtx.h"
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"
+#endif
 
 static f32 Reflect(cXyz* i_vec, cBgS_PolyInfo const& i_polyinfo, f32 i_scale) {
     cM3dGPla plane;
@@ -327,6 +330,22 @@ int daItem_c::_daItem_create() {
 }
 
 int daItem_c::_daItem_execute() {
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H5): create refuses an item whose save bit is set (_daItem_create),
+     * but an item that already exists never looks again, so a heart or rupee with a save bit that
+     * the partner picked up stayed here to be taken a second time. Once the partner's bit arrives
+     * through the world sync, remove this copy quietly. Items with no bit (0xFF: grass and enemy
+     * drops) are local and untouched, and so is an item this player is already picking up
+     * (FLAG_INIT_GET_ITEM_e: its own pickup set the bit). */
+    if (dusk::mp::claims_active() && mItemBitNo != 0xFF && !checkFlag(FLAG_INIT_GET_ITEM_e) &&
+        !checkFlag(FLAG_DELETE_ITEM_e) && fopAcM_isItem(this, mItemBitNo))
+    {
+        dusk::mp::claims_note_item_removed(mItemBitNo, true);
+        hide();
+        deleteItem();
+        return 1;
+    }
+#endif
     field_0x950 = speed;
     CountTimer();
 
@@ -848,6 +867,29 @@ void daItem_c::setTevStr() {
 
 void daItem_c::itemGetNextExecute() {
     if (!checkFlag(FLAG_DELETE_ITEM_e) && !checkFlag(FLAG_INIT_GET_ITEM_e)) {
+#if TARGET_PC
+        /* Dusk (multiplayer W-B, H4/H5): two players touching one bit-tracked item. Ask the host
+         * before anything is granted or the bit is set. Pending: not this tick; the item stays and
+         * the next contact (the Co/Tg callbacks fire every tick of overlap) asks again. Denied:
+         * the partner has it, so this copy goes without granting anything. claim_item grants at
+         * once for an item with no save bit or one outside the saved range, so those behave as in
+         * vanilla. A forced get (an item spawned to be handed straight over) and the boomerang's
+         * own get event are never held: both are scripted gives, not two players racing. */
+        if (dusk::mp::claims_active() && getStatus() != STATUS_FORCE_GET_e &&
+            mOriginalItemNo != dItemNo_BOOMERANG_e)
+        {
+            const int claim = dusk::mp::claim_item(static_cast<int>(mItemBitNo));
+            if (claim == dusk::mp::kClaimPending) {
+                return;
+            }
+            if (claim == dusk::mp::kClaimDenied) {
+                dusk::mp::claims_note_item_removed(static_cast<int>(mItemBitNo), false);
+                hide();
+                deleteItem();
+                return;
+            }
+        }
+#endif
         setFlag(FLAG_INIT_GET_ITEM_e);
         BOOL haveItem = false;
 

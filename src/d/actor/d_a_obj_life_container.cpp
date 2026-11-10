@@ -12,6 +12,9 @@
 #include "d/d_item_data.h"
 #include "SSystem/SComponent/c_math.h"
 #include <cstring>
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"
+#endif
 
 const static dCcD_SrcCyl l_cyl_src = {
     {
@@ -347,6 +350,28 @@ int daObjLife_c::actionWait() {
 }
 
 int daObjLife_c::initActionOrderGetDemo() {
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H4/H5): a heart piece or container is the worst duplicate of all,
+     * because its save bit is only set when the get demo ENDS (actionGetDemo), seconds after the
+     * pickup, so two players touching it inside that window would both get it. Ask the host
+     * first. Pending: not this tick; the next contact asks again (actionWait's Co hit fires every
+     * tick of overlap). Denied: the partner has it, so this copy goes without granting anything.
+     * claim_item grants at once for a piece with no save bit or one outside the saved range. */
+    if (dusk::mp::claims_active() && getSaveBitNo() != 0xFF) {
+        const int claim = dusk::mp::claim_item(getSaveBitNo());
+        if (claim == dusk::mp::kClaimPending) {
+            return 1;
+        }
+        if (claim == dusk::mp::kClaimDenied) {
+            dusk::mp::claims_note_item_removed(getSaveBitNo(), false);
+            endEffect00();
+            endEffect02();
+            hide();
+            fopAcM_delete(this);
+            return 1;
+        }
+    }
+#endif
     mCcCyl.OffTgSPrmBit(1);
     mCcCyl.OffCoSPrmBit(1);
     mCcCyl.ClrTgHit();
@@ -495,6 +520,25 @@ int daObjLife_c::execute() {
         &daObjLife_c::actionWait2,
     };
 
+#if TARGET_PC
+    /* Dusk (multiplayer W-B, H5). Lying here: create refuses a piece whose bit is set, but this
+     * one already exists and never looks again, so remove it once the partner's bit arrives
+     * through the world sync. Being picked up (order / get demo): keep renewing the claim until
+     * actionGetDemo sets the bit, so a long read of the text box can't let the host's lease lapse
+     * and hand the same piece to the partner. */
+    if (dusk::mp::claims_active() && getSaveBitNo() != 0xFF) {
+        if (chkStatus(STATUS_ORDER_GET_DEMO_e) || chkStatus(STATUS_GET_DEMO_e)) {
+            (void)dusk::mp::claim_item(getSaveBitNo());
+        } else if (fopAcM_isItem(this, getSaveBitNo())) {
+            dusk::mp::claims_note_item_removed(getSaveBitNo(), true);
+            endEffect00();
+            endEffect02();
+            hide();
+            fopAcM_delete(this);
+            return 1;
+        }
+    }
+#endif
     mPrevSpeed = speed;
     mCounter++;
 

@@ -116,4 +116,40 @@ void world_on_zone_created(int roomNo);
 void world_on_zone_lifecycle_begin();
 void world_on_zone_lifecycle_end();
 
+/**
+ * Batch 6 (W-B): chest and floor-item claims, hooks H3-H5 (mp-m4-m5-world.md II.6), called from
+ * d_a_tbox.cpp and d_a_obj_item.cpp inside #if TARGET_PC. Implemented in
+ * multiplayer/replication/item_claims.cpp. Outside a live session with shared quest flags,
+ * claims_active() is false and every claim is granted at once: vanilla behaviour.
+ */
+
+/// What claim_tbox / claim_item return.
+enum ClaimResult {
+    kClaimGranted = 0,  ///< take it
+    kClaimDenied = 1,   ///< someone else has it (or the host never answered): don't
+    kClaimPending = 2,  ///< asked the host; not this tick
+};
+
+/// True in a live session whose quest flags (chests, item bits) are shared.
+bool claims_active();
+
+/// Chest `tboxNo` (0-63) of the stage table mMemory holds. A ClaimResult.
+int claim_tbox(int tboxNo);
+
+/// Floor item with save bit `itemBitNo`, numbered as dSv_info_c::onItem numbers it. Only the saved
+/// range (0x80-0x9F) is claimed; any other bit is granted at once. A ClaimResult.
+int claim_item(int itemBitNo);
+
+/// Logging for the hooks: a chest whose bit the partner set (H3), and whether my own open event
+/// had already started when it was noticed.
+void claims_note_tbox_opened(int tboxNo, bool eventAlreadyStarted);
+
+/// Logging for the hooks: a floor item removed because the partner took it (H5 re-check) or
+/// because its claim was denied.
+void claims_note_item_removed(int itemBitNo, bool takenByPartner);
+
+/// Logging for the hooks: a floor small key (its "taken" state is tbox bit `tboxNo`) removed
+/// because the partner picked it up.
+void claims_note_key_taken(int tboxNo);
+
 }  // namespace dusk::mp
