@@ -7,6 +7,7 @@
 #include <ctime>
 #include <filesystem>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -18,7 +19,9 @@
 #include "../net/enet_transport.hpp"
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
+#include "../net/upnp.hpp"
 #include "../policy/mp_policy.hpp"
+#include "../rendezvous/rendezvous_client.hpp"
 #include "../replication/enemy_sync.hpp"  // batch 8: enemies
 #include "../replication/item_claims.hpp"
 #include "../replication/object_channel.hpp"
@@ -30,6 +33,7 @@
 #include "../replication/world_state.hpp"
 #include "dusk/logging.h"
 #include "dusk/save_manager.hpp"
+#include "dusk/settings.h"
 #include "dusk/ui/ui.hpp"
 #include "dusk/version.hpp"
 #include "fmt/format.h"
@@ -87,6 +91,120 @@ constexpr std::chrono::seconds kHelloTimeout{5};
 /// player who makes it one too many, and they wait out a timeout and are told "unreachable". With
 /// one, we can accept the connection just long enough to tell them the session is full.
 constexpr std::size_t kSpareConnectionSlots = 2;
+
+// --- Internet play (mp-internet-play.md §3-§6) ---
+
+/// How long STUN may retry before we go with whatever addresses we have.
+constexpr int kStunTimeoutMs = 3000;
+/// Host: the longest the candidate gathering waits on STUN and UPnP before registering the room.
+constexpr std::chrono::seconds kGatherBudget{4};
+/// Guest: the longest the rendezvous may take to answer a join before we call it unreachable.
+constexpr std::chrono::seconds kRendezvousTimeout{20};
+/// Host: a join request the rendezvous announced is forgotten if its Hello has not come by then.
+constexpr std::chrono::seconds kPendingJoinLifetime{60};
+/// Host: how long a join-code guest waits on Allow / Deny before it is declined on its own.
+constexpr std::chrono::seconds kApprovalTimeout{30};
+/// Host: how long to send DUSKPUNCH toward each of a new guest's public candidates.
+constexpr int kPunchDurationMs = 6000;
+/// Guest: per-candidate connect budget, LAN then public.
+constexpr std::chrono::milliseconds kLanAttemptBudget{2000};
+constexpr std::chrono::milliseconds kPublicAttemptBudget{6000};
+
+const char* const kStrictRouterMessage =
+    "Couldn't connect — one of you is behind a strict router. Try Tailscale (see "
+    "docs/multiplayer-internet.md), or join by address under Advanced.";
+
+}  // namespace
+
+/// The UPnP request, run on its own thread because miniupnpc blocks for seconds. The game thread
+/// only ever reads it under the lock.
+struct UpnpJob {
+    std::mutex mutex;
+    bool done = false;
+    bool ok = false;
+    std::string externalIp;
+    /// The session ended before the request did: the thread removes the mapping it just made.
+    bool cancelled = false;
+};
+
+namespace {
+
+/// "ABC123" -> "ABC-123", the way codes are shown and read out.
+std::string display_code(const std::string& code) {
+    return code.size() == 6 ? code.substr(0, 3) + "-" + code.substr(3) : code;
+}
+
+/// First four characters and an ellipsis: enough to match two log lines, never the whole secret.
+std::string token_prefix(const std::string& token) {
+    return token.size() <= 4 ? std::string("…") : token.substr(0, 4) + "…";
+}
+
+/// "host:port", port defaulting to the standard STUN 3478. False if there is no host.
+bool parse_stun_server(const std::string& text, std::string& host, std::uint16_t& port) {
+    host.clear();
+    port = 3478;
+    const std::size_t colon = text.rfind(':');
+    host = colon == std::string::npos ? text : text.substr(0, colon);
+    if (colon != std::string::npos) {
+        const long parsed = std::strtol(text.c_str() + colon + 1, nullptr, 10);
+        if (parsed > 0 && parsed <= 0xFFFF) {
+            port = static_cast<std::uint16_t>(parsed);
+        }
+    }
+    return !host.empty();
+}
+
+void begin_configured_stun(ITransport& transport) {
+    std::string host;
+    std::uint16_t port = 0;
+    const std::string configured = getSettings().multiplayer.stunServer.getValue();
+    if (!parse_stun_server(configured, host, port)) {
+        Log.warn("[mp-net] multiplayer.stunServer '{}' has no host; skipping STUN", configured);
+        return;
+    }
+    transport.begin_stun(host, port, kStunTimeoutMs);
+}
+
+std::string rendezvous_url() {
+    const std::string url = getSettings().multiplayer.rendezvousUrl.getValue();
+    return url.empty() ? std::string(kDefaultRendezvousUrl) : url;
+}
+
+/// Adds @p c unless an identical ip:port is already there (a UPnP address is often the STUN one).
+void add_candidate(std::vector<rdv::Candidate>& out, rdv::Candidate c) {
+    if (c.ip.empty() || c.port == 0) {
+        return;
+    }
+    for (const auto& existing : out) {
+        if (existing.ip == c.ip && existing.port == c.port) {
+            return;
+        }
+    }
+    out.push_back(std::move(c));
+}
+
+/// A Client's destructor closes a hosted room and joins its thread (up to ~2 s), which the game
+/// thread must not wait for. Let a short-lived thread do it.
+void destroy_rdv_async(std::unique_ptr<rdv::Client> client) {
+    if (!client) {
+        return;
+    }
+    std::thread([c = std::move(client)]() mutable { c.reset(); }).detach();
+}
+
+/// UPnP only where it is built (not phones/TVs, which only join) and the player has it on.
+bool upnp_wanted() {
+#ifdef DUSK_MP_HAS_UPNP
+    // Loopback-only test runs have nothing for a router to forward.
+    if (const char* loop = std::getenv("DUSK_MP_BIND_LOOPBACK"); loop != nullptr && loop[0] == '1')
+    {
+        return false;
+    }
+    return getSettings().multiplayer.upnp.getValue();
+#else
+    return false;
+#endif
+}
 
 /// Heartbeats older than this are forgotten unanswered. They are broadcast, so one sequence number
 /// is answered once per peer; keeping it around until it ages out is what lets every peer's reply
@@ -325,6 +443,10 @@ const char* reason_text(std::uint32_t reason) {
         return "gameplay mods differ";
     case DisconnectReason::SaveReset:
         return "save reset";
+    case DisconnectReason::BadToken:
+        return "unknown join token";
+    case DisconnectReason::Declined:
+        return "join declined";
     }
     return "unknown reason";
 }
@@ -418,6 +540,8 @@ void NetworkManager::set_startup_options(const StartupOptions& options) {
     mStartup.nickname = options.nickname != nullptr ? options.nickname : "";
     mStartup.color = options.color != nullptr ? options.color : "";
     mStartup.trace = options.trace != nullptr ? options.trace : "";
+    mStartup.hostWithCode = options.hostWithCode;
+    mStartup.joinCode = options.joinCode != nullptr ? options.joinCode : "";
 }
 
 void NetworkManager::ensure_initialized() {
@@ -466,8 +590,14 @@ void NetworkManager::ensure_initialized() {
 
     const char* envTarget = env_or_null("DUSK_MP_CONNECT");
     const char* target = !mStartup.connect.empty() ? mStartup.connect.c_str() : envTarget;
-    const bool wantsHost = mStartup.host || env_or_null("DUSK_MP_HOST") != nullptr;
+    const bool wantsHostCode = mStartup.hostWithCode;
+    const bool wantsHost = wantsHostCode || mStartup.host || env_or_null("DUSK_MP_HOST") != nullptr;
+    const bool wantsJoinCode = !mStartup.joinCode.empty();
 
+    if (wantsJoinCode && (wantsHost || target != nullptr)) {
+        Log.warn("A join code and another session were both requested; not starting a session");
+        return;
+    }
     if (target != nullptr && wantsHost) {
         // Both were asked for. Hosting and joining are mutually exclusive, and guessing which one
         // was meant is worse than refusing: pick neither and say why.
@@ -480,6 +610,11 @@ void NetworkManager::ensure_initialized() {
         trace::open(mStartup.trace, wantsHost ? "host" : "client");
     }
 
+    if (wantsJoinCode) {
+        join_by_code(mStartup.joinCode);
+        return;
+    }
+
     if (target != nullptr) {
         std::string address;
         std::uint16_t targetPort = port;
@@ -488,7 +623,9 @@ void NetworkManager::ensure_initialized() {
         return;
     }
 
-    if (wantsHost) {
+    if (wantsHostCode) {
+        host_with_code(port);
+    } else if (wantsHost) {
         host(port);
     }
 }
@@ -543,11 +680,18 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
         return false;
     }
 
+    begin_client_session(std::move(transport), fmt::format("{}:{}", address, port));
+    Log.info("Session started as CLIENT (protocol v{})", kProtocolVersion);
+    return true;
+}
+
+void NetworkManager::begin_client_session(
+    std::unique_ptr<ITransport> transport, std::string endpoint) {
     mTransport = std::move(transport);
     mRole = Role::Client;
     mJoined = false;
     mJoinStarted = std::chrono::steady_clock::now();
-    mEndpoint = fmt::format("{}:{}", address, port);
+    mEndpoint = std::move(endpoint);
     mHostNickname.clear();
     mLastEndMessage.clear();
     mHaveHostMods = false;
@@ -559,8 +703,445 @@ bool NetworkManager::join(const std::string& address, std::uint16_t port) {
     // sticky for the life of the process when the host accepts us (HelloAck); a join that never
     // gets that far gives saving back in shutdown() — see save_guard.hpp.
     begin_guest_join();
-    Log.info("Session started as CLIENT (protocol v{})", kProtocolVersion);
+}
+
+// --- Internet play: host side ---
+
+bool NetworkManager::host_with_code(std::uint16_t port) {
+    if (!host(port)) {
+        return false;
+    }
+
+    mHostCode = {};
+    mHostCode.phase = HostCodeState::Phase::Gathering;
+    mHostCode.startedAt = std::chrono::steady_clock::now();
+    mHostCode.port = port;
+    mHostCode.status = "Getting your public address…";
+
+    // Both run while the game carries on: STUN inside the transport's poll(), UPnP on a thread
+    // of its own because miniupnpc blocks for seconds.
+    begin_configured_stun(*mTransport);
+    if (upnp_wanted()) {
+        auto job = std::make_shared<UpnpJob>();
+        mHostCode.upnp = job;
+        std::thread([job, port] {
+            std::string externalIp;
+            const bool ok = upnp::map_udp(port, &externalIp);
+            bool unmapNow = false;
+            {
+                std::lock_guard lock(job->mutex);
+                job->done = true;
+                job->ok = ok;
+                job->externalIp = externalIp;
+                unmapNow = ok && job->cancelled;
+            }
+            if (unmapNow) {
+                // The session ended while we were asking; nobody else will remove it.
+                upnp::unmap_udp(port);
+            }
+        }).detach();
+    } else {
+        Log.info("[mp-net] UPnP off for this session");
+    }
+    Log.info(
+        "[mp-rdv] hosting with a join code: gathering addresses (rendezvous {})", rendezvous_url());
     return true;
+}
+
+void NetworkManager::tick_host_code() {
+    auto& hc = mHostCode;
+    const auto now = std::chrono::steady_clock::now();
+
+    switch (hc.phase) {
+    case HostCodeState::Phase::Off:
+    case HostCodeState::Phase::Failed:
+        return;
+
+    case HostCodeState::Phase::Gathering: {
+        Endpoint stunPublic;
+        const StunState stun = mTransport->stun_state(&stunPublic);
+        const bool stunSettled = stun != StunState::Pending;
+        bool upnpSettled = true;
+        bool upnpOk = false;
+        std::string upnpIp;
+        if (hc.upnp) {
+            std::lock_guard lock(hc.upnp->mutex);
+            upnpSettled = hc.upnp->done;
+            upnpOk = hc.upnp->ok;
+            upnpIp = hc.upnp->externalIp;
+        }
+        if (!(stunSettled && upnpSettled) && now - hc.startedAt < kGatherBudget) {
+            return;
+        }
+
+        std::vector<rdv::Candidate> candidates;
+        for (const Endpoint& e : mTransport->lan_endpoints()) {
+            add_candidate(candidates, {e.ip, e.port, true});
+        }
+        if (stun == StunState::Done) {
+            add_candidate(candidates, {stunPublic.ip, stunPublic.port, false});
+        }
+        if (upnpOk && !upnpIp.empty()) {
+            add_candidate(candidates, {upnpIp, hc.port, false});
+        }
+        const auto gatherMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - hc.startedAt);
+        Log.info("[mp-net] host candidates after {} ms: {} (STUN {}, UPnP {})", gatherMs.count(),
+            candidates.size(),
+            stun == StunState::Done    ? "ok" :
+            stun == StunState::Pending ? "still waiting" :
+                                         "failed",
+            !hc.upnp     ? "off" :
+            !upnpSettled ? "still waiting" :
+            upnpOk       ? "mapped" :
+                           "failed");
+        for (const auto& c : candidates) {
+            Log.debug("[mp-net]   host candidate {}:{}{}", c.ip, c.port, c.lan ? " (lan)" : "");
+        }
+
+        hc.rdv = std::make_unique<rdv::Client>(rendezvous_url());
+        hc.rdv->create_room(std::move(candidates), static_cast<int>(max_players()));
+        hc.phase = HostCodeState::Phase::Creating;
+        hc.status = "Getting a join code…";
+        return;
+    }
+
+    case HostCodeState::Phase::Creating: {
+        std::string code;
+        const rdv::Status s = hc.rdv->create_status(&code);
+        if (s == rdv::Status::Pending) {
+            return;
+        }
+        if (s != rdv::Status::Ok) {
+            hc.phase = HostCodeState::Phase::Failed;
+            hc.status = fmt::format("Couldn't reach the join-code service: {}. Players can still "
+                                    "join by address.",
+                rdv::status_name(s));
+            Log.warn("[mp-rdv] could not create a room: {}", rdv::status_name(s));
+            notify("No join code", hc.status, 8);
+            return;
+        }
+        hc.code = code;
+        hc.phase = HostCodeState::Phase::Ready;
+        hc.status = "Join code ready";
+        // ★ Exact wording: the test harness greps for it.
+        Log.info("[mp-rdv] room code {} ready", code);
+        notify("Join code ready",
+            fmt::format("Give {} to the other player. It is also on the menu's Session page.",
+                display_code(code)),
+            10);
+        return;
+    }
+
+    case HostCodeState::Phase::Ready: {
+        if (hc.rdv->create_status(nullptr) != rdv::Status::Ok) {
+            hc.phase = HostCodeState::Phase::Failed;
+            hc.status = "The join code stopped working. Players already in stay; new players can "
+                        "join by address.";
+            Log.warn("[mp-rdv] room {} ended by the service", hc.code);
+            notify("Join code expired", hc.status, 8);
+            return;
+        }
+        for (rdv::JoinRequest& join : hc.rdv->take_joins()) {
+            std::size_t punched = 0;
+            for (const auto& c : join.candidates) {
+                Log.debug(
+                    "[mp-net]   guest candidate {}:{}{}", c.ip, c.port, c.lan ? " (lan)" : "");
+                if (!c.lan && c.port != 0) {
+                    mTransport->punch({c.ip, c.port}, kPunchDurationMs);
+                    ++punched;
+                }
+            }
+            Log.info("[mp-rdv] join request from '{}' (token {}), {} candidate(s), punching {}",
+                join.name, token_prefix(join.token), join.candidates.size(), punched);
+            if (join.token.empty()) {
+                continue;
+            }
+            hc.pendingJoins[join.token] = {
+                std::move(join.name), std::move(join.joinId), now + kPendingJoinLifetime};
+        }
+        for (auto it = hc.pendingJoins.begin(); it != hc.pendingJoins.end();) {
+            if (now > it->second.expires) {
+                Log.info("[mp-rdv] join request from '{}' expired unused", it->second.name);
+                it = hc.pendingJoins.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return;
+    }
+    }
+}
+
+void NetworkManager::answer_join_request(PeerId peer, bool allow) {
+    if (mRole != Role::Host) {
+        return;
+    }
+    if (auto it = mPeers.find(peer); it != mPeers.end() && it->second.awaitingApproval) {
+        it->second.approvalDecision = allow ? 1 : 2;
+    }
+}
+
+void NetworkManager::tick_join_approvals() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& [id, session] : mPeers) {
+        if (!session.awaitingApproval || session.refused) {
+            continue;
+        }
+        const bool timedOut = now - session.approvalAskedAt > kApprovalTimeout;
+        if (session.approvalDecision == 1 && !timedOut) {
+            session.awaitingApproval = false;
+            // Re-checked: the session may have filled, or the mods changed, while they waited.
+            std::size_t admitted = 0;
+            for (const auto& entry : mPeers) {
+                if (entry.second.handshakeComplete) {
+                    ++admitted;
+                }
+            }
+            const ModFingerprint ourMods = local_mod_fingerprint();
+            const std::uint32_t color =
+                session.helloColorExplicit != 0 ? session.helloPreferredColor : kPlayerColors[0];
+            if (admitted + 1 >= max_players()) {
+                Log.warn(
+                    "[mp-rdv] '{}' allowed, but the session filled meanwhile", session.nickname);
+                send_hello_ack(id, false, 0, color, ourMods);
+                refuse_peer(session, DisconnectReason::SessionFull);
+                continue;
+            }
+            if (diff_mod_fingerprints(ourMods, session.mods, "we", session.nickname)
+                    .gameplayMismatch)
+            {
+                Log.warn("[mp-rdv] '{}' allowed, but the gameplay mods changed meanwhile",
+                    session.nickname);
+                send_hello_ack(id, false, 0, color, ourMods);
+                refuse_peer(session, DisconnectReason::ModMismatch);
+                continue;
+            }
+            Log.info("[mp-rdv] host allowed '{}' after {} ms", session.nickname,
+                ms_since(session.approvalAskedAt));
+            admit_peer(id, ourMods);
+        } else if (session.approvalDecision == 2 || timedOut) {
+            session.awaitingApproval = false;
+            Log.info("[mp-rdv] join by '{}' {}", session.nickname,
+                timedOut ? "not answered in time; declining" : "denied by the host");
+            if (timedOut) {
+                notify(fmt::format("{} wasn't let in", session.nickname),
+                    "Nobody answered their join request in time.", 5);
+            }
+            refuse_peer(session, DisconnectReason::Declined);
+        }
+    }
+}
+
+// --- Internet play: guest side ---
+
+bool NetworkManager::join_by_code(const std::string& typed) {
+    if (mRole != Role::Inactive) {
+        Log.warn("Already in a session");
+        return false;
+    }
+
+    const std::string code = rdv::normalize_code(typed);
+    if (code.empty()) {
+        notify("Couldn't join",
+            fmt::format(
+                "'{}' isn't a join code. Codes are six letters and digits, like ABC-123.", typed),
+            8);
+        return false;
+    }
+
+    // One socket for STUN and the connect, so the public address STUN reports (and the host
+    // punches toward) is the one the connection really comes from.
+    auto transport = std::make_unique<EnetTransport>();
+    if (!transport->open_client()) {
+        notify("Couldn't join", "Dusklight couldn't open a network socket.", 8);
+        return false;
+    }
+    begin_configured_stun(*transport);
+
+    begin_client_session(std::move(transport), fmt::format("join code {}", display_code(code)));
+    mCodeJoin = {};
+    mCodeJoin.phase = CodeJoinState::Phase::Stun;
+    mCodeJoin.code = code;
+    mCodeJoin.startedAt = std::chrono::steady_clock::now();
+    mCodeJoin.phaseStartedAt = mCodeJoin.startedAt;
+    mCodeJoin.status = "Getting your public address…";
+    Log.info(
+        "Session started as CLIENT (protocol v{}), joining by code {}", kProtocolVersion, code);
+    return true;
+}
+
+void NetworkManager::fail_code_join(const std::string& message) {
+    Log.warn("[mp-rdv] join by code failed: {}", message);
+    end_client_session("Couldn't join", message);
+}
+
+void NetworkManager::start_code_join_attempt() {
+    auto& cj = mCodeJoin;
+    const rdv::Candidate& c = cj.hostCandidates[cj.attempt];
+
+    // ENet's client socket takes exactly one connect, so each attempt needs its own socket. The
+    // first public attempt gets the one STUN measured: that is the address the host was told and
+    // is punching toward. LAN addresses need no NAT mapping, so they use fresh sockets.
+    std::unique_ptr<ITransport> next;
+    if (!c.lan && !cj.stunSocketUsed) {
+        next = cj.stunTransport ? std::move(cj.stunTransport) : std::move(mTransport);
+        cj.stunSocketUsed = true;
+    } else {
+        if (!cj.stunSocketUsed && !cj.stunTransport) {
+            cj.stunTransport = std::move(mTransport);
+        }
+        next = std::make_unique<EnetTransport>();
+    }
+    // Replaces (and so closes) the previous attempt's socket, which never connected.
+    mTransport = std::move(next);
+    cj.attemptFailed = false;
+    cj.phaseStartedAt = std::chrono::steady_clock::now();
+    cj.status = fmt::format("Connecting ({} of {})…", cj.attempt + 1, cj.hostCandidates.size());
+    Log.debug("[mp-net] trying host candidate {}:{}{}", c.ip, c.port, c.lan ? " (lan)" : "");
+    if (!mTransport->connect(c.ip, c.port)) {
+        cj.attemptFailed = true;
+    }
+}
+
+void NetworkManager::tick_code_join() {
+    auto& cj = mCodeJoin;
+    const auto now = std::chrono::steady_clock::now();
+
+    switch (cj.phase) {
+    case CodeJoinState::Phase::None:
+    case CodeJoinState::Phase::Connected:
+        return;
+
+    case CodeJoinState::Phase::Stun: {
+        Endpoint stunPublic;
+        const StunState stun = mTransport->stun_state(&stunPublic);
+        if (stun == StunState::Pending && now - cj.phaseStartedAt < kGatherBudget) {
+            return;
+        }
+        std::vector<rdv::Candidate> candidates;
+        for (const Endpoint& e : mTransport->lan_endpoints()) {
+            add_candidate(candidates, {e.ip, e.port, true});
+        }
+        if (stun == StunState::Done) {
+            add_candidate(candidates, {stunPublic.ip, stunPublic.port, false});
+        } else {
+            Log.warn("[mp-net] STUN gave no public address; the host can only reach us on the LAN");
+        }
+        Log.info("[mp-net] guest candidates after {} ms: {}", ms_since(cj.phaseStartedAt),
+            candidates.size());
+        for (const auto& c : candidates) {
+            Log.debug("[mp-net]   guest candidate {}:{}{}", c.ip, c.port, c.lan ? " (lan)" : "");
+        }
+        cj.rdv = std::make_unique<rdv::Client>(rendezvous_url());
+        cj.rdv->join(cj.code, mLocalNickname, std::move(candidates));
+        cj.phase = CodeJoinState::Phase::Rendezvous;
+        cj.phaseStartedAt = now;
+        cj.status = "Looking up the join code…";
+        return;
+    }
+
+    case CodeJoinState::Phase::Rendezvous: {
+        std::vector<rdv::Candidate> host;
+        std::string token;
+        const rdv::Status s = cj.rdv->join_status(&host, &token);
+        switch (s) {
+        case rdv::Status::Pending:
+            if (now - cj.phaseStartedAt > kRendezvousTimeout) {
+                fail_code_join("Couldn't reach the join-code service: it did not answer. Check "
+                               "your internet connection, or join by address under Advanced.");
+            }
+            return;
+        case rdv::Status::NoRoom:
+            fail_code_join("No game with that code. Check it with the host: a code stops working "
+                           "when they stop hosting.");
+            return;
+        case rdv::Status::Full:
+            fail_code_join("That game is full.");
+            return;
+        case rdv::Status::RateLimited:
+            fail_code_join("Too many join attempts from this network. Wait a minute and try "
+                           "again.");
+            return;
+        case rdv::Status::NetworkError:
+        case rdv::Status::ServerError:
+            fail_code_join(fmt::format("Couldn't reach the join-code service ({}). Check your "
+                                       "internet connection, or join by address under Advanced.",
+                rdv::status_name(s)));
+            return;
+        case rdv::Status::Ok:
+            break;
+        }
+
+        cj.token = token;
+        // LAN first, so players in one house never need the internet; the order within each group
+        // is the host's.
+        cj.hostCandidates.clear();
+        for (const bool lan : {true, false}) {
+            for (const auto& c : host) {
+                if (c.lan == lan) {
+                    add_candidate(cj.hostCandidates, c);
+                }
+            }
+        }
+        std::size_t lanCount = 0;
+        for (const auto& c : cj.hostCandidates) {
+            lanCount += c.lan ? 1 : 0;
+            Log.debug("[mp-net]   host candidate {}:{}{}", c.ip, c.port, c.lan ? " (lan)" : "");
+        }
+        Log.info("[mp-rdv] code {} found after {} ms: host has {} candidate(s) ({} LAN), token {}",
+            cj.code, ms_since(cj.phaseStartedAt), cj.hostCandidates.size(), lanCount,
+            token_prefix(token));
+        destroy_rdv_async(std::move(cj.rdv));
+        if (cj.hostCandidates.empty()) {
+            fail_code_join(kStrictRouterMessage);
+            return;
+        }
+        cj.phase = CodeJoinState::Phase::Connecting;
+        cj.attempt = 0;
+        start_code_join_attempt();
+        return;
+    }
+
+    case CodeJoinState::Phase::Connecting: {
+        const rdv::Candidate& c = cj.hostCandidates[cj.attempt];
+        const auto budget = c.lan ? kLanAttemptBudget : kPublicAttemptBudget;
+        if (!cj.attemptFailed && now - cj.phaseStartedAt < budget) {
+            return;
+        }
+        Log.info("[mp-net] host candidate {} of {} ({}) {} after {} ms", cj.attempt + 1,
+            cj.hostCandidates.size(), c.lan ? "LAN" : "public",
+            cj.attemptFailed ? "failed" : "timed out", ms_since(cj.phaseStartedAt));
+        if (++cj.attempt >= cj.hostCandidates.size()) {
+            fail_code_join(kStrictRouterMessage);
+            return;
+        }
+        start_code_join_attempt();
+        return;
+    }
+    }
+}
+
+void NetworkManager::teardown_internet() {
+    // Host: the room goes (the Client's destructor closes it), off the game thread.
+    destroy_rdv_async(std::move(mHostCode.rdv));
+    if (mHostCode.upnp) {
+        bool unmapNow = false;
+        {
+            std::lock_guard lock(mHostCode.upnp->mutex);
+            mHostCode.upnp->cancelled = true;
+            unmapNow = mHostCode.upnp->done && mHostCode.upnp->ok;
+        }
+        if (unmapNow) {
+            const std::uint16_t port = mHostCode.port;
+            std::thread([port] { upnp::unmap_udp(port); }).detach();
+        }
+        // Not yet done: its thread sees `cancelled` and removes the mapping itself.
+    }
+    mHostCode = {};
+
+    destroy_rdv_async(std::move(mCodeJoin.rdv));
+    mCodeJoin = {};
 }
 
 NetworkManager::~NetworkManager() {
@@ -582,6 +1163,8 @@ void NetworkManager::shutdown(DisconnectReason reason) {
         mTransport->disconnect_all(static_cast<std::uint32_t>(reason));
         mTransport.reset();
     }
+    // Internet play: the join code stops working and the router forward goes, both off-thread.
+    teardown_internet();
     // Every puppet goes, and the clock stops being anyone else's: with the role back to Inactive,
     // WorldClock::should_advance and reconcile hand control straight back to vanilla. The save
     // flag is deliberately NOT touched — see save_guard.hpp for why leaving does not undo joining.
@@ -707,6 +1290,18 @@ void NetworkManager::pre_actor_tick() {
         }
     }
 
+    // Internet play: candidate gathering and join requests (host), the rendezvous and the
+    // connect attempts (guest). After the drain, so a connect that just landed is not retried.
+    if (mRole == Role::Host) {
+        tick_host_code();
+        tick_join_approvals();
+    } else if (mRole == Role::Client) {
+        tick_code_join();
+    }
+    if (!mTransport) {
+        return;
+    }
+
     check_handshake_deadlines();
     if (!mTransport) {
         return;
@@ -780,6 +1375,19 @@ void NetworkManager::handle_event(const TransportEvent& event) {
         session.heardAtAttentive = mAttentiveTime;
         mPeers[event.peer] = session;
         Log.info("Peer {} connected ({} total)", event.peer, mPeers.size());
+        if (mRole == Role::Client && mCodeJoin.phase == CodeJoinState::Phase::Connecting) {
+            const rdv::Candidate& c = mCodeJoin.hostCandidates[mCodeJoin.attempt];
+            Log.info("[mp-net] connected to the host via {}:{} ({} candidate {} of {}) after {} "
+                     "ms; {} ms since the code was entered",
+                c.ip, c.port, c.lan ? "LAN" : "public", mCodeJoin.attempt + 1,
+                mCodeJoin.hostCandidates.size(), ms_since(mCodeJoin.phaseStartedAt),
+                ms_since(mCodeJoin.startedAt));
+            mCodeJoin.phase = CodeJoinState::Phase::Connected;
+            // The handshake deadline counts from here, not from when the code was typed.
+            mJoinStarted = std::chrono::steady_clock::now();
+            mCodeJoin.stunTransport.reset();
+            mCodeJoin.status = "Waiting for the host to let you in…";
+        }
         // The client speaks first so the host can vet its protocol version.
         if (mRole == Role::Client) {
             send_hello(event.peer);
@@ -806,6 +1414,12 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
     Log.info("Peer {} disconnected ({}), silent for {} ms", peer, reason_text(reason),
         known != mPeers.end() ? ms_since(known->second.lastHeard) : 0);
 
+    if (mRole == Role::Client && mCodeJoin.phase == CodeJoinState::Phase::Connecting) {
+        // One of the host's candidates did not answer. tick_code_join() moves on to the next one.
+        mCodeJoin.attemptFailed = true;
+        return;
+    }
+
     if (mRole == Role::Client) {
         // A client has exactly one connection, so whatever this was, the session is over. Say why
         // in terms of what the player was doing: a join that never landed reads differently from
@@ -830,6 +1444,14 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
             break;
         case DisconnectReason::SessionFull:
             end_client_session("Couldn't join", "The session is full.");
+            break;
+        case DisconnectReason::BadToken:
+            end_client_session("Couldn't join", "The host didn't recognise this join request. Ask "
+                                                "for the code again and retry.");
+            break;
+        case DisconnectReason::Declined:
+            end_client_session("Couldn't join",
+                "The host didn't let you in (they pressed Deny, or didn't answer in time).");
             break;
         case DisconnectReason::HandshakeTimeout:
             end_client_session("Couldn't join", "The host stopped waiting for us to introduce "
@@ -949,8 +1571,17 @@ void NetworkManager::check_handshake_deadlines() {
     const auto now = std::chrono::steady_clock::now();
 
     if (mRole == Role::Client) {
-        if (!mJoined && now - mJoinStarted > kJoinTimeout) {
-            Log.warn("No HelloAck from {} after {} s; giving up", mEndpoint, kJoinTimeout.count());
+        // A join by code has its own deadlines until it is connected (tick_code_join), and then
+        // may wait on the host's Allow / Deny, which the host itself times out.
+        const bool codeJoin = mCodeJoin.phase != CodeJoinState::Phase::None;
+        if (codeJoin && mCodeJoin.phase != CodeJoinState::Phase::Connected) {
+            return;
+        }
+        const auto deadline = codeJoin && !mCodeJoin.token.empty() ?
+                                  std::chrono::seconds(kJoinTimeout + kApprovalTimeout) :
+                                  kJoinTimeout;
+        if (!mJoined && now - mJoinStarted > deadline) {
+            Log.warn("No HelloAck from {} after {} s; giving up", mEndpoint, deadline.count());
             end_client_session("Couldn't join",
                 fmt::format("No answer from {}. Check the address and that the host is running, "
                             "and that UDP is not blocked by a firewall.",
@@ -960,7 +1591,8 @@ void NetworkManager::check_handshake_deadlines() {
     }
 
     for (auto& [id, session] : mPeers) {
-        if (!session.handshakeComplete && !session.refused &&
+        // A guest waiting on Allow / Deny did say Hello; tick_join_approvals() times it out.
+        if (!session.handshakeComplete && !session.refused && !session.awaitingApproval &&
             now - session.connectedAt > kHelloTimeout)
         {
             refuse_peer(session, DisconnectReason::HandshakeTimeout);
@@ -1019,6 +1651,31 @@ SessionStatus NetworkManager::status() const {
     out.localColor = mLocalColor;
     out.localPlayerId = mLocalPlayerId;
     out.lastEndMessage = mLastEndMessage;
+    if (mRole == Role::Host && mHostCode.phase != HostCodeState::Phase::Off) {
+        out.internetStatus = mHostCode.status;
+        if (mHostCode.phase == HostCodeState::Phase::Ready) {
+            out.roomCode = display_code(mHostCode.code);
+        }
+    } else if (mRole == Role::Client && mCodeJoin.phase != CodeJoinState::Phase::None && !mJoined) {
+        out.internetStatus = mCodeJoin.status;
+    }
+    if (mRole == Role::Host) {
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& [id, session] : mPeers) {
+            if (!session.awaitingApproval || session.refused) {
+                continue;
+            }
+            const auto waited =
+                std::chrono::duration_cast<std::chrono::seconds>(now - session.approvalAskedAt);
+            JoinApproval a;
+            a.peer = id;
+            a.nickname = session.nickname;
+            a.secondsLeft = waited < kApprovalTimeout ?
+                                static_cast<std::uint32_t>((kApprovalTimeout - waited).count()) :
+                                0;
+            out.approvals.push_back(std::move(a));
+        }
+    }
 
     // Direct connections first: on a client that is just the host.
     for (const auto& [id, session] : mPeers) {
@@ -1060,8 +1717,76 @@ void NetworkManager::send_hello(PeerId peer) {
     w.write_u32(mLocalColor);
     mSentMods = local_mod_fingerprint();
     write_mod_fingerprint(w, mSentMods);
+    // v28: the join-code session token, empty for a direct-IP join.
+    const std::string& token = mCodeJoin.token;
+    const std::size_t tokenLength = std::min(token.size(), kMaxJoinTokenLength);
+    w.write_u8(static_cast<std::uint8_t>(tokenLength));
+    for (std::size_t i = 0; i < tokenLength; ++i) {
+        w.write_u8(static_cast<std::uint8_t>(token[i]));
+    }
     Log.info("Mods sent in Hello: {}", describe_mod_fingerprint(mSentMods));
+    if (tokenLength != 0) {
+        Log.info("[mp-rdv] Hello carries join token {}", token_prefix(token));
+    }
     mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
+}
+
+void NetworkManager::send_hello_ack(PeerId peer, bool accepted, std::uint32_t playerId,
+    std::uint32_t assignedColor, const ModFingerprint& ourMods) {
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::HelloAck));
+    w.write_u8(accepted ? 1 : 0);
+    w.write_u32(kProtocolVersion);
+    w.write_u32(playerId);
+    w.write_u32(assignedColor);
+    w.write_string(mLocalNickname);
+    w.write_u32(mLocalColor);
+    write_mod_fingerprint(w, ourMods);
+    mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
+}
+
+void NetworkManager::admit_peer(PeerId peer, const ModFingerprint& ourMods) {
+    const auto peerIt = mPeers.find(peer);
+    if (peerIt == mPeers.end()) {
+        return;
+    }
+    PeerSession& session = peerIt->second;
+    const std::string nickname = session.nickname;
+
+    // World identity comes from our own counter, never from the transport's peer id — see
+    // PeerSession::playerId for why reusing ENet's id space would collide with the host.
+    const std::uint32_t playerId = mNextPlayerId++;
+
+    // The host owns colour assignment — otherwise its record of a peer goes stale the moment
+    // the peer picks a different one, and the puppet would be tinted wrong at M1.
+    const std::uint32_t assignedColor = session.helloColorExplicit != 0 ?
+                                            session.helloPreferredColor :
+                                            kPlayerColors[playerId % std::size(kPlayerColors)];
+
+    send_hello_ack(peer, true, playerId, assignedColor, ourMods);
+
+    session.playerId = playerId;
+    session.color = assignedColor;
+    session.handshakeComplete = true;
+
+    // Order matters: the newcomer must learn the existing roster before anyone is told about
+    // the newcomer, so no client can receive a PeerJoined for a session it has an incomplete
+    // view of.
+    send_peer_list(peer);
+    broadcast_peer_joined(session);
+    // Presence is sent only on change, so a newcomer would otherwise never learn where anyone
+    // already is until they moved (mp-m4-m5-world.md I.3: "sent on change and once on join").
+    send_cached_presence(peer, playerId);
+    // v24: the session's policy, before the guest can ask for (and so receive) a WorldSync:
+    // same ordered channel, so the world it installs is read under the host's policy.
+    policy_sync::send_to(playerId);
+    /* --- batch 8: enemies --- */
+    enemies::on_peer_joined(playerId);
+
+    replication_manager().add_player(playerId, nickname, assignedColor);
+    Log.info(
+        "Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname, assignedColor);
+    notify(fmt::format("{} joined", nickname), "They are now in your world.", 4);
 }
 
 void NetworkManager::send_mods_update(PeerId peer, const ModFingerprint& fp) {
@@ -1205,7 +1930,9 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
 
     switch (id) {
     case PacketId::Hello: {
-        if (sender->second.handshakeComplete || sender->second.refused) {
+        if (sender->second.handshakeComplete || sender->second.refused ||
+            sender->second.awaitingApproval)
+        {
             // Already decided. A second Hello must not mint a second player id and puppet.
             Log.warn("Ignoring repeated Hello from peer {}", peer);
             return;
@@ -1235,10 +1962,25 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         const ModFingerprint ourMods = local_mod_fingerprint();
         bool modsOk = true;
         ModFingerprint theirMods;
+        std::string token;
         if (versionOk) {
             if (!read_mod_fingerprint(r, theirMods)) {
                 Log.warn("Malformed Hello from peer {} (mod list)", peer);
                 return;
+            }
+            // v28: the join-code session token, after the mods.
+            std::uint8_t tokenLength = 0;
+            if (!r.read_u8(tokenLength) || tokenLength > kMaxJoinTokenLength) {
+                Log.warn("Malformed Hello from peer {} (token)", peer);
+                return;
+            }
+            for (std::uint8_t i = 0; i < tokenLength; ++i) {
+                std::uint8_t ch = 0;
+                if (!r.read_u8(ch)) {
+                    Log.warn("Malformed Hello from peer {} (token)", peer);
+                    return;
+                }
+                token.push_back(static_cast<char>(ch));
             }
             const ModDiff diff = diff_mod_fingerprints(ourMods, theirMods, "we", nickname);
             Log.info("Mods: ours {}", describe_mod_fingerprint(ourMods));
@@ -1271,62 +2013,58 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             Log.warn("Rejecting peer {}: session full ({} players)", peer, max_players());
         }
 
-        const auto peerIt = sender;
-
-        // World identity comes from our own counter, never from the transport's peer id — see
-        // PeerSession::playerId for why reusing ENet's id space would collide with the host.
-        const std::uint32_t playerId = accepted ? mNextPlayerId++ : 0;
-
-        // The host owns colour assignment — otherwise its record of a peer goes stale the moment
-        // the peer picks a different one, and the puppet would be tinted wrong at M1.
-        const std::uint32_t assignedColor = colorExplicit != 0 ?
-                                                preferredColor :
-                                                kPlayerColors[playerId % std::size(kPlayerColors)];
-
-        Writer w;
-        w.write_u8(static_cast<std::uint8_t>(PacketId::HelloAck));
-        w.write_u8(accepted ? 1 : 0);
-        w.write_u32(kProtocolVersion);
-        w.write_u32(playerId);
-        w.write_u32(assignedColor);
-        w.write_string(mLocalNickname);
-        w.write_u32(mLocalColor);
-        write_mod_fingerprint(w, ourMods);
-        mTransport->send(peer, w.data().data(), w.size(), kChannelControl, true);
+        PeerSession& session = sender->second;
 
         if (!accepted) {
+            // The host owns colour assignment; a refusal carries what playerId 0 would get.
+            const std::uint32_t assignedColor =
+                colorExplicit != 0 ? preferredColor : kPlayerColors[0];
+            send_hello_ack(peer, false, 0, assignedColor, ourMods);
             // Hang up, not just say no. A refused peer left connected holds a player slot and keeps
             // a puppet-less ghost in the transport until it gives up on its own.
-            refuse_peer(peerIt->second, !versionOk ? DisconnectReason::VersionMismatch :
-                                        !modsOk    ? DisconnectReason::ModMismatch :
-                                                     DisconnectReason::SessionFull);
+            refuse_peer(session, !versionOk ? DisconnectReason::VersionMismatch :
+                                 !modsOk    ? DisconnectReason::ModMismatch :
+                                              DisconnectReason::SessionFull);
             break;
         }
 
-        peerIt->second.playerId = playerId;
-        peerIt->second.nickname = nickname;
-        peerIt->second.color = assignedColor;
-        peerIt->second.mods = std::move(theirMods);
-        peerIt->second.handshakeComplete = true;
+        session.nickname = nickname;
+        session.mods = std::move(theirMods);
+        session.helloColorExplicit = colorExplicit;
+        session.helloPreferredColor = preferredColor;
 
-        // Order matters: the newcomer must learn the existing roster before anyone is told about
-        // the newcomer, so no client can receive a PeerJoined for a session it has an incomplete
-        // view of.
-        send_peer_list(peer);
-        broadcast_peer_joined(peerIt->second);
-        // Presence is sent only on change, so a newcomer would otherwise never learn where anyone
-        // already is until they moved (mp-m4-m5-world.md I.3: "sent on change and once on join").
-        send_cached_presence(peer, playerId);
-        // v24: the session's policy, before the guest can ask for (and so receive) a WorldSync:
-        // same ordered channel, so the world it installs is read under the host's policy.
-        policy_sync::send_to(playerId);
-        /* --- batch 8: enemies --- */
-        enemies::on_peer_joined(playerId);
+        // v28: a guest that came through a join code. Empty = direct IP / LAN, admitted as ever.
+        if (!token.empty()) {
+            const auto pending = mHostCode.pendingJoins.find(token);
+            if (pending == mHostCode.pendingJoins.end()) {
+                // Not one the rendezvous gave us (or expired, or already used): someone who
+                // learned our address but not through a code. No HelloAck: the reason in the
+                // hang-up says it all.
+                Log.warn("[mp-rdv] Rejecting peer {} ('{}'): unknown join token {}", peer, nickname,
+                    token_prefix(token));
+                refuse_peer(session, DisconnectReason::BadToken);
+                break;
+            }
+            Log.info("[mp-rdv] peer {} ('{}') presented the token of join request '{}'", peer,
+                nickname, pending->second.name);
+            // Single use.
+            mHostCode.pendingJoins.erase(pending);
+            if (!getSettings().multiplayer.autoApproveJoins.getValue()) {
+                // §4.2: a code is not an invitation. Nothing of the world goes out until the host
+                // says yes (tick_join_approvals).
+                session.awaitingApproval = true;
+                session.approvalAskedAt = std::chrono::steady_clock::now();
+                session.approvalDecision = 0;
+                Log.info("[mp-rdv] '{}' wants to join; waiting for the host to allow it", nickname);
+                notify(fmt::format("{} wants to join", nickname),
+                    "Open the menu's Session page to Allow or Deny.",
+                    static_cast<int>(kApprovalTimeout.count()));
+                break;
+            }
+            Log.info("[mp-rdv] auto-approving '{}' (multiplayer.autoApproveJoins)", nickname);
+        }
 
-        replication_manager().add_player(playerId, nickname, assignedColor);
-        Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
-            assignedColor);
-        notify(fmt::format("{} joined", nickname), "They are now in your world.", 4);
+        admit_peer(peer, ourMods);
         break;
     }
     case PacketId::HelloAck: {
@@ -2083,6 +2821,18 @@ void NetworkManager::broadcast_snapshot() {
     w.write_f32(world_clock().daytime());
     w.write_u16(world_clock().date());
 
+    // v28 (§4.2): a join-code guest waiting on Allow / Deny is connected but must not see where
+    // anyone is. Only then is it worth sending peer by peer.
+    const bool anyAwaiting = std::any_of(mPeers.begin(), mPeers.end(),
+        [](const auto& entry) { return entry.second.awaitingApproval; });
+    if (anyAwaiting) {
+        for (const auto& entry : mPeers) {
+            if (entry.second.handshakeComplete && !entry.second.refused) {
+                mTransport->send(entry.first, w.data().data(), w.size(), kChannelState, false);
+            }
+        }
+        return;
+    }
     mTransport->broadcast(w.data().data(), w.size(), kChannelState, false);
 }
 

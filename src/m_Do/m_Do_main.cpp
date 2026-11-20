@@ -449,6 +449,7 @@ static void ApplyMultiplayerOptions(const cxxopts::ParseResult& parsed) {
     std::string nickname;
     std::string color;
     std::string trace;
+    std::string joinCode;
 
     dusk::mp::StartupOptions options;
     options.host = parsed["mp-host"].as<bool>();
@@ -471,6 +472,11 @@ static void ApplyMultiplayerOptions(const cxxopts::ParseResult& parsed) {
     if (parsed.count("mp-trace") != 0) {
         trace = parsed["mp-trace"].as<std::string>();
         options.trace = trace.c_str();
+    }
+    options.hostWithCode = parsed["mp-host-code"].as<bool>();
+    if (parsed.count("mp-join-code") != 0) {
+        joinCode = parsed["mp-join-code"].as<std::string>();
+        options.joinCode = joinCode.c_str();
     }
 
     dusk::mp::apply_startup_options(options);
@@ -607,6 +613,8 @@ int game_main(int argc, char* argv[]) {
             ("cvar", "Override configuration variables without modifying config", cxxopts::value<std::vector<std::string>>())
             ("mp-host", "Multiplayer: host a co-op session", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
             ("mp-connect", "Multiplayer: join a session at <address> or <address:port>", cxxopts::value<std::string>())
+            ("mp-host-code", "Multiplayer: host a co-op session and get a join code for it", cxxopts::value<bool>()->default_value("false")->implicit_value("true"))
+            ("mp-join-code", "Multiplayer: join a session by its join code (e.g. ABC-123)", cxxopts::value<std::string>())
             ("mp-port", "Multiplayer: UDP port to host on or join (default 7777)", cxxopts::value<uint16_t>())
             ("mp-name", "Multiplayer: nickname shown to the other players", cxxopts::value<std::string>())
             ("mp-color", "Multiplayer: player tint as RRGGBB hex", cxxopts::value<std::string>())

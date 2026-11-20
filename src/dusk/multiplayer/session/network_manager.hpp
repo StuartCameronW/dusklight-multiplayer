@@ -10,6 +10,7 @@
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
 #include "../net/transport.hpp"
+#include "../rendezvous/rendezvous_client.hpp"
 #include "../replication/player_state.hpp"
 #include "dusk/multiplayer.hpp"
 #include "mod_check.hpp"
@@ -51,7 +52,29 @@ struct PeerSession {
     /// NetworkManager::mAttentiveTime when lastHeard was last set: the silence watchdog's clock,
     /// which does not run while this process itself is stalled. See check_peer_silence().
     std::chrono::steady_clock::duration heardAtAttentive{};
+
+    /// v28, host: a join-code guest whose Hello checked out (version, mods, room, token), held
+    /// before its HelloAck until the host presses Allow or Deny. Nothing of the world is sent to
+    /// it meanwhile. nickname and mods above already hold what its Hello said.
+    bool awaitingApproval = false;
+    std::chrono::steady_clock::time_point approvalAskedAt{};
+    /// Set from the UI (answer_join_request), acted on in the next pre_actor_tick: 0 undecided,
+    /// 1 allow, 2 deny.
+    std::uint8_t approvalDecision = 0;
+    std::uint8_t helloColorExplicit = 0;
+    std::uint32_t helloPreferredColor = 0;
 };
+
+/// Host: one join-code guest waiting for Allow / Deny.
+struct JoinApproval {
+    PeerId peer = kInvalidPeer;
+    std::string nickname;
+    /// Until the request is declined on its own.
+    std::uint32_t secondsLeft = 0;
+};
+
+/// Host side of hosting with a join code. Shared with the thread doing the UPnP request.
+struct UpnpJob;
 
 /// One player as the UI should show it. Built fresh by NetworkManager::status(); holds no state.
 struct PlayerStatus {
@@ -82,6 +105,13 @@ struct SessionStatus {
     std::vector<PlayerStatus> players;
     /// Why the last session ended, in words meant for the player. Empty if none has.
     std::string lastEndMessage;
+    /// Internet play, host: the join code as "ABC-123" once the rendezvous issued one, else empty.
+    std::string roomCode;
+    /// Internet play: where getting (host) or using (guest) a join code has got to, in words for
+    /// the player. Empty when no join code is involved.
+    std::string internetStatus;
+    /// Host: join-code guests waiting for Allow / Deny.
+    std::vector<JoinApproval> approvals;
 };
 
 /**
@@ -133,6 +163,18 @@ public:
 
     bool host(std::uint16_t port);
     bool join(const std::string& address, std::uint16_t port);
+
+    /// Internet play (mp-internet-play.md §3): host() and then, in the background, learn this
+    /// machine's addresses (LAN, STUN, UPnP) and register them with the rendezvous for a join
+    /// code. Progress and the code are in status().
+    bool host_with_code(std::uint16_t port);
+    /// Internet play: look @p code up at the rendezvous and connect to the host it names, LAN
+    /// addresses first. Every step after the first is asynchronous; failures end the session with
+    /// a message, like a direct join.
+    bool join_by_code(const std::string& code);
+    /// Host, from UI: Allow (true) or Deny a join-code guest from status().approvals. Acted on in
+    /// the next pre_actor_tick, so the button press never spawns a puppet mid-frame.
+    void answer_join_request(PeerId peer, bool allow);
 
     /// Drain the transport and apply inbound state. Called before the actor pass.
     void pre_actor_tick();
@@ -188,6 +230,26 @@ private:
     std::string player_name(std::uint32_t playerId) const;
     void handle_packet(PeerId peer, const std::uint8_t* data, std::size_t size);
     void send_hello(PeerId peer);
+    void send_hello_ack(PeerId peer, bool accepted, std::uint32_t playerId,
+        std::uint32_t assignedColor, const ModFingerprint& ourMods);
+    /// Host: let in a peer whose Hello checked out. Its nickname, colour request and mods are
+    /// already on the session.
+    void admit_peer(PeerId peer, const ModFingerprint& ourMods);
+
+    /// Client: what join() and join_by_code() both do once they have a transport.
+    void begin_client_session(std::unique_ptr<ITransport> transport, std::string endpoint);
+
+    // --- Internet play (mp-internet-play.md §3-§6) ---
+    /// Host: gather candidates, get the code, take join requests and punch toward them.
+    void tick_host_code();
+    /// Host: act on Allow / Deny, and decline requests nobody answered.
+    void tick_join_approvals();
+    /// Client: STUN, then the rendezvous, then the host's candidates one by one.
+    void tick_code_join();
+    void start_code_join_attempt();
+    void fail_code_join(const std::string& message);
+    /// Both: stop talking to the rendezvous and release the UPnP mapping, off the game thread.
+    void teardown_internet();
     /// Rebuild this end's mod fingerprint every kModRecheckTicks and, if it changed since the
     /// handshake (a save loaded and so a randomizer seed became known, or a mod was toggled), tell
     /// the other end. The host also re-checks every admitted guest against its new list.
@@ -239,9 +301,55 @@ private:
         std::string nickname;
         std::string color;
         std::string trace;
+        bool hostWithCode = false;
+        std::string joinCode;
+    };
+
+    /// Host side of a join code. Inactive for a plain host().
+    struct HostCodeState {
+        enum class Phase { Off, Gathering, Creating, Ready, Failed };
+        Phase phase = Phase::Off;
+        std::chrono::steady_clock::time_point startedAt{};
+        std::uint16_t port = 0;
+        /// Null when UPnP is off or not built for this platform.
+        std::shared_ptr<UpnpJob> upnp;
+        std::unique_ptr<rdv::Client> rdv;
+        /// The six characters, no dash.
+        std::string code;
+        std::string status;
+        struct PendingJoin {
+            std::string name;
+            std::string joinId;
+            std::chrono::steady_clock::time_point expires{};
+        };
+        /// By session token: guests the rendezvous announced whose Hello has not arrived yet.
+        std::unordered_map<std::string, PendingJoin> pendingJoins;
+    };
+
+    /// Client side of a join by code. Phase None for a plain join().
+    struct CodeJoinState {
+        enum class Phase { None, Stun, Rendezvous, Connecting, Connected };
+        Phase phase = Phase::None;
+        std::string code;
+        /// From the rendezvous; goes in our Hello. Never logged beyond 4 characters.
+        std::string token;
+        std::unique_ptr<rdv::Client> rdv;
+        /// The open_client() socket STUN measured, parked while a LAN attempt uses its own, so the
+        /// first public attempt can still go out through the NAT mapping the host punches toward.
+        std::unique_ptr<ITransport> stunTransport;
+        bool stunSocketUsed = false;
+        /// The host's candidates, LAN first.
+        std::vector<rdv::Candidate> hostCandidates;
+        std::size_t attempt = 0;
+        bool attemptFailed = false;
+        std::chrono::steady_clock::time_point startedAt{};
+        std::chrono::steady_clock::time_point phaseStartedAt{};
+        std::string status;
     };
 
     std::unique_ptr<ITransport> mTransport;
+    HostCodeState mHostCode;
+    CodeJoinState mCodeJoin;
     Role mRole = Role::Inactive;
     bool mInitialized = false;
     StartupRequest mStartup;
