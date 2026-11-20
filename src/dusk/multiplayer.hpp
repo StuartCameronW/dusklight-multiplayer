@@ -36,6 +36,10 @@ struct StartupOptions {
     const char* color = nullptr;
     /// --mp-trace: development pose trace, written per sim tick. See multiplayer/session/trace.hpp.
     const char* trace = nullptr;
+    /// --mp-host-code: host as --mp-host does, and also get a join code from the rendezvous.
+    bool hostWithCode = false;
+    /// --mp-join-code: a join code ("ABC-123" or "ABC123"). Null or empty means none.
+    const char* joinCode = nullptr;
 };
 
 /**

@@ -197,7 +197,18 @@ namespace dusk::mp {
  * rollstab bit (0x80) in its flags byte, so the authority rolls the kill drop on the killer's
  * hearts. A v26 peer would misread EnemyHit. Layouts: replication/enemy_sync.hpp.
  */
-inline constexpr std::uint32_t kProtocolVersion = 27;
+/*
+ * 28: internet play (join codes, mp-internet-play.md §4). Hello grew a trailing session token
+ * ([u8 length][bytes], at most kMaxJoinTokenLength) after its ModFingerprint: the rendezvous hands
+ * the same token to the guest and to the host, and a host refuses a non-empty token it was not
+ * given (DisconnectReason::BadToken, 7). Empty for a direct-IP / LAN join, which is unchanged. A
+ * token join may wait for the host's Allow / Deny before its HelloAck; Deny or no answer in 30 s
+ * hangs up with DisconnectReason::Declined (8). A v27 host would read the token as trailing junk.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 28;
+
+/// v28: longest session token a Hello may carry. The rendezvous issues 32 hex characters.
+inline constexpr std::size_t kMaxJoinTokenLength = 32;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -220,6 +231,8 @@ enum class PacketId : std::uint8_t {
     /// [u32 protocolVersion][string nickname][u8 colorExplicit][u32 preferredColorRgb]
     /// [ModFingerprint] — the sender's active mods (session/mod_check.hpp), so the host can refuse
     /// a guest whose gameplay mods differ from its own. Only parsed when the version matches.
+    /// [u8 tokenLength][tokenLength bytes] (v28) — the join-code session token, empty for a
+    /// direct-IP join; at most kMaxJoinTokenLength.
     Hello = 1,
     /// Host -> client. The host assigns the colour authoritatively so no two players collide,
     /// and includes its own identity so both ends know each other after one exchange.
@@ -362,6 +375,11 @@ enum class DisconnectReason : std::uint32_t {
     /// or replaced mid-session (back to the title, a soft reset, a save reloaded). From the host,
     /// the session ended. A peer that predates it reads it as ConnectionLost.
     SaveReset = 6,
+    /// v28: Host -> client: the Hello carried a join-code token this host was never given (or one
+    /// that expired or was already used).
+    BadToken = 7,
+    /// v28: Host -> client: the host pressed Deny on the join request, or did not answer in time.
+    Declined = 8,
 };
 
 /// The host occupies a fixed player id so both ends can name it without a lookup.

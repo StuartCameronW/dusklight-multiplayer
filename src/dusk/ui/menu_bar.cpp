@@ -29,6 +29,7 @@
 #include "m_Do/m_Do_audio.h"
 
 #include <RmlUi/Core.h>
+#include <SDL3/SDL_clipboard.h>
 #include <aurora/rmlui.hpp>
 #include <fmt/format.h>
 #include <imgui.h>
@@ -94,7 +95,54 @@ private:
         if (s.role == mp::Role::Client) {
             key += fmt::format("|wallet:{}", static_cast<int>(mp::g_mpPolicy.rupees));
         }
+        // Internet play: the code arriving, its status line, and each Allow / Deny request.
+        key += fmt::format("|code:{}|{}", s.roomCode, s.internetStatus);
+        for (const auto& a : s.approvals) {
+            key += fmt::format("|ask:{}", a.peer);
+        }
         return key;
+    }
+
+    /// Internet play: the join code big enough to read out, with Copy, and the status line.
+    static void add_join_code(Pane& pane, const mp::SessionStatus& s) {
+        if (s.roomCode.empty() && s.internetStatus.empty()) {
+            return;
+        }
+        pane.add_section("Join code");
+        if (!s.roomCode.empty()) {
+            pane.add_rml(
+                fmt::format(R"(<span style="font-size: 2.5em; letter-spacing: 0.1em;">{}</span>)",
+                    escape(s.roomCode)));
+            const std::string code = s.roomCode;
+            pane.add_button("Copy code").on_pressed([code] {
+                if (SDL_SetClipboardText(code.c_str())) {
+                    mDoAud_seStartMenu(kSoundClick);
+                }
+            });
+        }
+        if (!s.internetStatus.empty()) {
+            pane.add_text(s.internetStatus);
+        }
+    }
+
+    /// Host: one Allow / Deny pair per join-code guest waiting to be let in (plan §4.2).
+    static void add_join_requests(Pane& pane, const mp::SessionStatus& s) {
+        for (const auto& a : s.approvals) {
+            pane.add_section(fmt::format("{} wants to join", a.nickname));
+            pane.add_text(fmt::format(
+                "They have your join code. Nothing of your world is sent until you allow it; "
+                "without an answer they are turned away in {} s.",
+                a.secondsLeft));
+            const mp::PeerId peer = a.peer;
+            pane.add_button("Allow").on_pressed([peer] {
+                mDoAud_seStartMenu(kSoundClick);
+                mp::network_manager().answer_join_request(peer, true);
+            });
+            pane.add_button("Deny").on_pressed([peer] {
+                mDoAud_seStartMenu(kSoundClick);
+                mp::network_manager().answer_join_request(peer, false);
+            });
+        }
     }
 
     static std::string colored(const std::string& text, std::uint32_t rgb) {
@@ -238,6 +286,8 @@ private:
         }
         pane.add_rml(fmt::format(
             "You: {} (player {})", colored(s.localNickname, s.localColor), s.localPlayerId));
+        add_join_code(pane, s);
+        add_join_requests(pane, s);
 
         pane.add_section(fmt::format("Other players ({})", s.players.size()));
         if (s.players.empty()) {

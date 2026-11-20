@@ -27,6 +27,8 @@ struct CommandLineRequest {
     std::string nickname;
     std::string color;
     std::string trace;
+    bool hostWithCode = false;
+    std::string joinCode;
 };
 
 CommandLineRequest sCommandLine;
@@ -56,6 +58,8 @@ void apply_startup_options(const StartupOptions& options) {
     sCommandLine.nickname = copy_or_empty(options.nickname);
     sCommandLine.color = copy_or_empty(options.color);
     sCommandLine.trace = copy_or_empty(options.trace);
+    sCommandLine.hostWithCode = options.hostWithCode;
+    sCommandLine.joinCode = copy_or_empty(options.joinCode);
     network_manager().set_startup_options(options);
 }
 
@@ -66,17 +70,26 @@ void defer_session_start() {
 void begin_deferred_session(const StartupOptions* lobby) {
     if (lobby != nullptr) {
         StartupOptions merged;
-        const bool commandLineChoseSession = sCommandLine.host || !sCommandLine.connect.empty();
+        const bool commandLineChoseSession = sCommandLine.host || !sCommandLine.connect.empty() ||
+                                             sCommandLine.hostWithCode ||
+                                             !sCommandLine.joinCode.empty();
         if (commandLineChoseSession) {
-            if (lobby->host || (lobby->connect != nullptr && lobby->connect[0] != '\0')) {
-                Log.warn("The command line already chose a session (--mp-host/--mp-connect); "
-                         "ignoring the Multiplayer menu's choice");
+            if (lobby->host || lobby->hostWithCode ||
+                (lobby->connect != nullptr && lobby->connect[0] != '\0') ||
+                (lobby->joinCode != nullptr && lobby->joinCode[0] != '\0'))
+            {
+                Log.warn("The command line already chose a session (--mp-host/--mp-connect/"
+                         "--mp-host-code/--mp-join-code); ignoring the Multiplayer menu's choice");
             }
             merged.host = sCommandLine.host;
             merged.connect = prefer(sCommandLine.connect, nullptr);
+            merged.hostWithCode = sCommandLine.hostWithCode;
+            merged.joinCode = prefer(sCommandLine.joinCode, nullptr);
         } else {
             merged.host = lobby->host;
             merged.connect = prefer(sCommandLine.connect, lobby->connect);
+            merged.hostWithCode = lobby->hostWithCode;
+            merged.joinCode = prefer(sCommandLine.joinCode, lobby->joinCode);
         }
         merged.port = sCommandLine.port != 0 ? sCommandLine.port : lobby->port;
         merged.nickname = prefer(sCommandLine.nickname, lobby->nickname);

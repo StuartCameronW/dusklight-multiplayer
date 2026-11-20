@@ -10,6 +10,11 @@ namespace dusk {
 using config::ConfigVar;
 using config::ActionBindConfigVar;
 
+/// The join-code rendezvous every build uses unless multiplayer.rendezvousUrl says otherwise.
+/// The one place to change it (internet play plan §6).
+inline constexpr const char* kDefaultRendezvousUrl =
+    "https://dusk-mp-rendezvous.mp-rendezvous.workers.dev";
+
 enum class BloomMode : int {
     Off = 0,
     Classic = 1,
@@ -376,6 +381,16 @@ struct UserSettings {
         /// Debug/test knob for M6: an item number (0-254) a synced authority enemy's kill drop
         /// always rolls, e.g. 1 = green rupee, so a test can count the ONE shared drop. -1 = off.
         ConfigVar<int> enemyForceDropItem;
+        /// Internet play: base URL of the join-code rendezvous service (tools/mp-rendezvous), so a
+        /// self-hosting fork can point elsewhere. Defaults to kDefaultRendezvousUrl.
+        ConfigVar<std::string> rendezvousUrl;
+        /// Internet play: ask the router (UPnP-IGD) to forward the host's port while hosting.
+        ConfigVar<bool> upnp;
+        /// Test knob: admit join-code guests without the host's Allow / Deny prompt.
+        ConfigVar<bool> autoApproveJoins;
+        /// Internet play: "host:port" of the STUN server used to learn this machine's public
+        /// address.
+        ConfigVar<std::string> stunServer;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports

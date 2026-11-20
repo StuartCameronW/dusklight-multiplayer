@@ -2,6 +2,7 @@
 
 #include "bool_button.hpp"
 #include "dusk/config.hpp"
+#include "dusk/multiplayer/rendezvous/rendezvous_client.hpp"
 #include "dusk/settings.h"
 #include "number_button.hpp"
 #include "pane.hpp"
@@ -26,6 +27,8 @@ namespace {
 constexpr int kMaxNicknameLength = 16;
 /// "255.255.255.255:65535" is 21; leave room for a LAN host name.
 constexpr int kMaxAddressLength = 64;
+/// "ABC-123" plus slack for stray spaces.
+constexpr int kMaxJoinCodeLength = 12;
 constexpr int kMinPort = 1;
 constexpr int kMaxPort = 65535;
 
@@ -100,9 +103,21 @@ MultiplayerWindow::MultiplayerWindow(LaunchCallback launch) : mLaunch(std::move(
         auto& settings = getSettings().multiplayer;
 
         leftPane.add_section("Host");
+        leftPane.register_control(leftPane.add_button("Host with join code").on_pressed([this] {
+            start(StartMode::HostWithCode);
+        }),
+            rightPane, [](Pane& pane) {
+                pane.clear();
+                pane.add_text("Start the game and get a six-character join code, like ABC-123, "
+                              "to give the other players. It appears on the menu's Session page "
+                              "once the game is running.");
+                pane.add_text("Works over the internet with most home routers, no port "
+                              "forwarding needed. You are asked to Allow or Deny each player "
+                              "who joins with the code.");
+            });
         leftPane.register_control(
-            leftPane.add_button("Host Game").on_pressed([this] { start(true); }), rightPane,
-            [](Pane& pane) {
+            leftPane.add_button("Host Game").on_pressed([this] { start(StartMode::Host); }),
+            rightPane, [](Pane& pane) {
                 pane.clear();
                 pane.add_text("Start the game and wait for other players to join.");
                 pane.add_text(fmt::format(
@@ -114,6 +129,33 @@ MultiplayerWindow::MultiplayerWindow(LaunchCallback launch) : mLaunch(std::move(
             });
 
         leftPane.add_section("Join");
+        leftPane.register_control(
+            leftPane.add_child<StringButton>(StringButton::Props{
+                .key = "Join code",
+                .getValue =
+                    [this] {
+                        return mJoinCode.empty() ? Rml::String{"Not set"} : Rml::String{mJoinCode};
+                    },
+                .setValue = [this](Rml::String value) { mJoinCode = trimmed(value); },
+                .maxLength = kMaxJoinCodeLength,
+            }),
+            rightPane, [](Pane& pane) {
+                add_help(pane, "The code the host gave you, like ABC-123. Upper or lower case, "
+                               "with or without the dash.");
+            });
+        leftPane.register_control(
+            leftPane
+                .add_button({
+                    .text = "Join",
+                    .isDisabled = [this] { return mp::rdv::normalize_code(mJoinCode).empty(); },
+                })
+                .on_pressed([this] { start(StartMode::JoinCode); }),
+            rightPane, [](Pane& pane) {
+                add_help(pane, "Start the game and join the host whose code is above. The host "
+                               "has to Allow you in.");
+            });
+
+        leftPane.add_section("Advanced");
         leftPane.register_control(
             leftPane.add_child<StringButton>(StringButton::Props{
                 .key = "Address",
@@ -136,14 +178,14 @@ MultiplayerWindow::MultiplayerWindow(LaunchCallback launch) : mLaunch(std::move(
             });
         leftPane.register_control(leftPane
                                       .add_button({
-                                          .text = "Join Game",
+                                          .text = "Join by address",
                                           .isDisabled =
                                               [&settings] {
                                                   return !is_usable_address(
                                                       settings.lastJoinAddress.getValue());
                                               },
                                       })
-                                      .on_pressed([this] { start(false); }),
+                                      .on_pressed([this] { start(StartMode::JoinAddress); }),
             rightPane, [](Pane& pane) {
                 add_help(pane, "Start the game and connect to the host at the address above.");
             });
@@ -271,7 +313,7 @@ void MultiplayerWindow::update() {
     Window::update();
 }
 
-void MultiplayerWindow::start(bool host) {
+void MultiplayerWindow::start(StartMode mode) {
     if (!mLaunch) {
         return;
     }
@@ -281,14 +323,20 @@ void MultiplayerWindow::start(bool host) {
     const std::string address = trimmed(settings.lastJoinAddress.getValue());
     const std::string nickname = trimmed(settings.nickname.getValue());
     const std::string color = settings.color.getValue();
+    const std::string code = mp::rdv::normalize_code(mJoinCode);
 
-    if (!host && !is_usable_address(address)) {
+    if (mode == StartMode::JoinAddress && !is_usable_address(address)) {
+        return;
+    }
+    if (mode == StartMode::JoinCode && code.empty()) {
         return;
     }
 
     mp::StartupOptions options;
-    options.host = host;
-    options.connect = host ? nullptr : address.c_str();
+    options.host = mode == StartMode::Host;
+    options.hostWithCode = mode == StartMode::HostWithCode;
+    options.connect = mode == StartMode::JoinAddress ? address.c_str() : nullptr;
+    options.joinCode = mode == StartMode::JoinCode ? code.c_str() : nullptr;
     options.port = static_cast<unsigned short>(configured_port());
     options.nickname = nickname.empty() ? nullptr : nickname.c_str();
     options.color = color.empty() ? nullptr : color.c_str();

@@ -199,6 +199,10 @@ UserSettings g_userSettings = {
         .enemyHostHoldTicks {"multiplayer.enemyHostHoldTicks", 15},
         .enemyGhostAttacks {"multiplayer.enemyGhostAttacks", true},
         .enemyForceDropItem {"multiplayer.enemyForceDropItem", -1},
+        .rendezvousUrl {"multiplayer.rendezvousUrl", kDefaultRendezvousUrl},
+        .upnp {"multiplayer.upnp", true},
+        .autoApproveJoins {"multiplayer.autoApproveJoins", false},
+        .stunServer {"multiplayer.stunServer", "stun.cloudflare.com:3478"},
     },
 
     // Not sure if there's a better way to declare this
@@ -431,6 +435,10 @@ void registerSettings() {
     Register(g_userSettings.multiplayer.enemyHostHoldTicks);
     Register(g_userSettings.multiplayer.enemyGhostAttacks);
     Register(g_userSettings.multiplayer.enemyForceDropItem);
+    Register(g_userSettings.multiplayer.rendezvousUrl);
+    Register(g_userSettings.multiplayer.upnp);
+    Register(g_userSettings.multiplayer.autoApproveJoins);
+    Register(g_userSettings.multiplayer.stunServer);
 
     Register(g_userSettings.actionBindings.firstPersonCamera[0]);
     Register(g_userSettings.actionBindings.firstPersonCamera[1]);
