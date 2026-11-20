@@ -459,7 +459,11 @@ void host_recompute_table() {
             // Rule 1: the host arrived in a room a guest is simulating. Defer.
             const auto arrived = s.hostArrivedAt.try_emplace(k, s.tick).first->second;
             const std::uint64_t held = s.tick - arrived;
-            const bool hold = held < kHostArrivalMinHoldTicks ||
+            // The minimum hold is the cvar (default 15 = kHostArrivalMinHoldTicks; tests widen it).
+            const int holdCvar = dusk::getSettings().multiplayer.enemyHostHoldTicks.getValue();
+            const std::uint64_t minHold =
+                holdCvar < 0 ? kHostArrivalMinHoldTicks : std::min<std::uint64_t>(holdCvar, kHostArrivalMaxHoldTicks);
+            const bool hold = held < minHold ||
                               (held < kHostArrivalMaxHoldTicks && host_hold_room(k));
             owner = hold ? prev->second.owner : kHostPlayerId;
             if (!hold) {
@@ -1202,7 +1206,8 @@ void ghost_scan_hits(Rec& rec, fopAc_ac_c* actor) {
         w.write_u8(flags);
         w.write_u8(link->getCutType());
         w.write_u16(static_cast<std::uint16_t>(link->shape_angle.y));
-        w.write_u16(static_cast<std::uint16_t>(link->health));
+        // Link's hearts live in the save data, not in fopAc_ac_c::health (always 0 for him).
+        w.write_u16(dComIfGs_getLife());
         send_to_authority(w, rec.authority);
         rec.hitsSent++;
         Log.info("[mp-enemy] hit sent key={:08X} n={} tg={} atType=0x{:X} atp={} spl={} "

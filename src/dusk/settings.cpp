@@ -196,6 +196,7 @@ UserSettings g_userSettings = {
         .friendlyFire {"multiplayer.friendlyFire", false},
         .sharedWallet {"multiplayer.sharedWallet", true},
         .enemySync {"multiplayer.enemySync", false},
+        .enemyHostHoldTicks {"multiplayer.enemyHostHoldTicks", 15},
     },
 
     // Not sure if there's a better way to declare this
@@ -425,6 +426,7 @@ void registerSettings() {
     Register(g_userSettings.multiplayer.friendlyFire);
     Register(g_userSettings.multiplayer.sharedWallet);
     Register(g_userSettings.multiplayer.enemySync);
+    Register(g_userSettings.multiplayer.enemyHostHoldTicks);
 
     Register(g_userSettings.actionBindings.firstPersonCamera[0]);
     Register(g_userSettings.actionBindings.firstPersonCamera[1]);

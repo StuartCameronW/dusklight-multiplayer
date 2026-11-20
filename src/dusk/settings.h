@@ -368,6 +368,9 @@ struct UserSettings {
         /// Debug switch for M6 enemy sync (ghost enemies, nearest-player aggro). Off by default
         /// until M6 phase 3; while off every dusk::mp::enemy_* hook answers "vanilla".
         ConfigVar<bool> enemySync;
+        /// Debug/test knob for M6: how many ticks a guest keeps a room after the host walks in
+        /// (rule 1's minimum hold, clamped to the 300-tick cap). Default 15, the designed value.
+        ConfigVar<int> enemyHostHoldTicks;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports
