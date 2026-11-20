@@ -48,6 +48,8 @@ constexpr std::size_t kWsMaxMessage = 64 * 1024;
 constexpr std::size_t kMaxCandidates = 16;
 constexpr std::size_t kMaxGuestsPerMessage = 16;
 constexpr std::size_t kMaxNameBytes = 32;
+/// Host: joinIds remembered for de-duplication; the oldest is forgotten past this.
+constexpr std::size_t kMaxSeenJoinIds = 256;
 constexpr std::string_view kCodeAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// First 4 characters of a secret, for logs.
@@ -111,6 +113,12 @@ bool plausible_ip(const std::string& ip) {
 json encode_candidates(const std::vector<Candidate>& cands) {
     json arr = json::array();
     for (const Candidate& c : cands) {
+        // The server refuses the whole request over one non-global public candidate (a UPnP
+        // "external" address behind CGNAT is 100.64/10, for one), so leave those out here.
+        if (!c.lan && !is_global_unicast_v4(c.ip)) {
+            Log.debug("[mp-rdv] not sending {} as a public candidate (not global unicast)", c.ip);
+            continue;
+        }
         arr.push_back(json{{"ip", c.ip}, {"port", c.port}, {"lan", c.lan}});
     }
     return arr;
@@ -146,6 +154,12 @@ std::vector<Candidate> decode_candidates(const json& arr) {
         }
         c.port = static_cast<std::uint16_t>(p);
         c.lan = lan != e.end() && lan->is_boolean() && lan->get<bool>();
+        // The host punches public candidates before anyone is let in: never toward loopback, a
+        // private or link-local network, multicast or broadcast, whatever the server let through.
+        if (!c.lan && !is_global_unicast_v4(c.ip)) {
+            Log.debug("[mp-rdv] dropping public candidate {} (not global unicast)", c.ip);
+            continue;
+        }
         out.push_back(std::move(c));
     }
     return out;
@@ -289,11 +303,11 @@ bool is_loopback_authority(std::string_view rest) {
 }
 
 struct Job {
-    enum class Kind { Create, Join, Close } kind;
+    enum class Kind { Create, Join, Close, Release } kind;
     std::uint64_t gen = 0;
     std::vector<Candidate> cands;
     int maxPlayers = 0;
-    std::string code, name, secret;
+    std::string code, name, secret, joinId;
 };
 
 enum class WsOutcome { Retry, RoomGone, Replaced };
@@ -319,6 +333,7 @@ struct Client::Shared {
     std::string code, secret;
     std::vector<JoinRequest> joins;
     std::set<std::string> seenJoinIds;
+    std::deque<std::string> seenJoinOrder;  // oldest first, to keep seenJoinIds bounded
     Clock::time_point wsRetryAt{};
     int wsBackoffS = 0;
 
@@ -354,6 +369,56 @@ struct Client::Shared {
     void accept_guests(const json& msg, std::uint64_t gen);
     std::string room_url(const std::string& c) const { return baseUrl + "/v1/rooms/" + c; }
 };
+
+bool is_global_unicast_v4(const std::string& ip) {
+    std::uint32_t addr = 0;
+    std::size_t i = 0;
+    for (int octet = 0; octet < 4; ++octet) {
+        if (octet > 0) {
+            if (i >= ip.size() || ip[i] != '.') {
+                return false;
+            }
+            ++i;
+        }
+        const std::size_t start = i;
+        std::uint32_t v = 0;
+        while (i < ip.size() && i - start < 3 && ip[i] >= '0' && ip[i] <= '9') {
+            v = v * 10 + static_cast<std::uint32_t>(ip[i] - '0');
+            ++i;
+        }
+        if (i == start || v > 255 || (i - start > 1 && ip[start] == '0')) {
+            return false;
+        }
+        addr = (addr << 8) | v;
+    }
+    if (i != ip.size()) {
+        return false;
+    }
+    // Same list as the Worker's NON_GLOBAL_V4 (tools/mp-rendezvous/src/index.js).
+    static constexpr struct {
+        std::uint32_t base;
+        int bits;
+    } kNonGlobal[] = {
+        {0x00000000u, 8},   // 0/8
+        {0x0A000000u, 8},   // 10/8
+        {0x64400000u, 10},  // 100.64/10
+        {0x7F000000u, 8},   // 127/8
+        {0xA9FE0000u, 16},  // 169.254/16
+        {0xAC100000u, 12},  // 172.16/12
+        {0xC0000000u, 24},  // 192.0.0/24
+        {0xC0A80000u, 16},  // 192.168/16
+        {0xC6120000u, 15},  // 198.18/15
+        {0xE0000000u, 4},   // 224/4
+        {0xF0000000u, 4},   // 240/4 (and broadcast)
+    };
+    for (const auto& r : kNonGlobal) {
+        const std::uint32_t mask = ~0u << (32 - r.bits);
+        if ((addr & mask) == r.base) {
+            return false;
+        }
+    }
+    return true;
+}
 
 const char* status_name(Status s) {
     switch (s) {
@@ -461,6 +526,7 @@ void Client::create_room(std::vector<Candidate> c, int maxPlayers) {
         m->secret.clear();
         m->joins.clear();
         m->seenJoinIds.clear();
+        m->seenJoinOrder.clear();
         m->createStatus = Status::Pending;
         Job job{Job::Kind::Create};
         job.gen = m->hostGen;
@@ -537,6 +603,21 @@ void Client::close_room() {
         m->secret.clear();
         m->joins.clear();
         m->createStatus = Status::NoRoom;
+    }
+    m->cv.notify_all();
+}
+
+void Client::release_join(std::string joinId) {
+    {
+        std::lock_guard lk(m->mu);
+        if (!m->hosting || m->code.empty() || m->secret.empty() || joinId.empty()) {
+            return;
+        }
+        Job job{Job::Kind::Release};
+        job.code = m->code;
+        job.secret = m->secret;
+        job.joinId = std::move(joinId);
+        m->jobs.push_back(std::move(job));
     }
     m->cv.notify_all();
 }
@@ -676,8 +757,16 @@ void Client::Shared::start_job(Job job) {
         break;
     }
     case Job::Kind::Close:
-        // borealis has no DELETE; the Worker's POST .../close has the same semantics (204).
-        req.url = room_url(job.code) + "/close?secret=" + job.secret;
+        // borealis has no DELETE; the Worker's POST .../close has the same semantics (204). The
+        // secret goes in the body so it never sits in a URL.
+        req.url = room_url(job.code) + "/close";
+        req.headers.push_back({"content-type", "application/json"});
+        req.body = dump(json{{"secret", job.secret}});
+        break;
+    case Job::Kind::Release:
+        req.url = room_url(job.code) + "/release";
+        req.headers.push_back({"content-type", "application/json"});
+        req.body = dump(json{{"secret", job.secret}, {"joinId", job.joinId}});
         break;
     }
     InFlight f{std::move(job), borealis::http::start(std::move(req))};
@@ -776,6 +865,16 @@ void Client::Shared::finish_job(const Job& job, const HttpResult& r) {
         }
         break;
     }
+    case Job::Kind::Release: {
+        const int s = r.response.statusCode;
+        if (r.error == borealis::http::Error::None && (s == 204 || s == 200 || s == 404)) {
+            Log.info("[mp-rdv] room {}: released the slot of join {}", job.code, job.joinId);
+        } else {
+            Log.warn("[mp-rdv] room {}: releasing join {} failed: {}", job.code, job.joinId,
+                describe(r, job.secret));
+        }
+        break;
+    }
     }
 }
 
@@ -807,6 +906,11 @@ void Client::Shared::accept_guests(const json& msg, std::uint64_t gen) {
         std::lock_guard lk(mu);
         if (hostGen != gen || !seenJoinIds.insert(jr.joinId).second) {
             continue;
+        }
+        seenJoinOrder.push_back(jr.joinId);
+        while (seenJoinOrder.size() > kMaxSeenJoinIds) {
+            seenJoinIds.erase(seenJoinOrder.front());
+            seenJoinOrder.pop_front();
         }
         Log.info("[mp-rdv] guest '{}' wants to join (joinId {}, {} candidates, token {})", jr.name,
             jr.joinId, jr.candidates.size(), redact(jr.token));

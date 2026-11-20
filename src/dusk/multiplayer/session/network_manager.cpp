@@ -106,6 +106,8 @@ constexpr std::chrono::seconds kPendingJoinLifetime{60};
 constexpr std::chrono::seconds kApprovalTimeout{30};
 /// Host: how long to send DUSKPUNCH toward each of a new guest's public candidates.
 constexpr int kPunchDurationMs = 6000;
+/// Host: the most public candidates of one guest we punch toward.
+constexpr std::size_t kMaxPunchTargets = 4;
 /// Guest: per-candidate connect budget, LAN then public.
 constexpr std::chrono::milliseconds kLanAttemptBudget{2000};
 constexpr std::chrono::milliseconds kPublicAttemptBudget{6000};
@@ -783,6 +785,9 @@ void NetworkManager::tick_host_code() {
         }
         if (upnpOk && !upnpIp.empty()) {
             add_candidate(candidates, {upnpIp, hc.port, false});
+            // Only a global external address means the mapping is reachable from outside: behind
+            // CGNAT the router's "external" address is itself private.
+            hc.upnpMapped = rdv::is_global_unicast_v4(upnpIp);
         }
         const auto gatherMs =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - hc.startedAt);
@@ -842,12 +847,22 @@ void NetworkManager::tick_host_code() {
             notify("Join code expired", hc.status, 8);
             return;
         }
+        // Punching sends UDP to addresses a guest chose, before anyone has let that guest in. So:
+        // global-unicast targets only (rdv already drops the rest), at most kMaxPunchTargets each,
+        // and with Allow / Deny on, only when we need it. Allow / Deny is asked once the guest's
+        // Hello arrives, and without a UPnP mapping that Hello can't get through our NAT until we
+        // have punched, so in that one case the punch must come first. autoApproveJoins counts as
+        // the approval.
+        const bool approved = getSettings().multiplayer.autoApproveJoins.getValue();
+        const bool punchNeeded = approved || !hc.upnpMapped;
         for (rdv::JoinRequest& join : hc.rdv->take_joins()) {
             std::size_t punched = 0;
             for (const auto& c : join.candidates) {
                 Log.debug(
                     "[mp-net]   guest candidate {}:{}{}", c.ip, c.port, c.lan ? " (lan)" : "");
-                if (!c.lan && c.port != 0) {
+                if (punchNeeded && punched < kMaxPunchTargets && !c.lan && c.port != 0 &&
+                    rdv::is_global_unicast_v4(c.ip))
+                {
                     mTransport->punch({c.ip, c.port}, kPunchDurationMs);
                     ++punched;
                 }
@@ -863,6 +878,7 @@ void NetworkManager::tick_host_code() {
         for (auto it = hc.pendingJoins.begin(); it != hc.pendingJoins.end();) {
             if (now > it->second.expires) {
                 Log.info("[mp-rdv] join request from '{}' expired unused", it->second.name);
+                hc.rdv->release_join(it->second.joinId);
                 it = hc.pendingJoins.erase(it);
             } else {
                 ++it;
@@ -884,6 +900,13 @@ void NetworkManager::answer_join_request(PeerId peer, bool allow) {
 
 void NetworkManager::tick_join_approvals() {
     const auto now = std::chrono::steady_clock::now();
+    // A guest turned away gives its rendezvous slot back, so the code keeps working for others.
+    const auto releaseSlot = [this](auto& session) {
+        if (!session.rdvJoinId.empty() && mHostCode.rdv) {
+            mHostCode.rdv->release_join(session.rdvJoinId);
+        }
+        session.rdvJoinId.clear();
+    };
     for (auto& [id, session] : mPeers) {
         if (!session.awaitingApproval || session.refused) {
             continue;
@@ -905,6 +928,7 @@ void NetworkManager::tick_join_approvals() {
                 Log.warn(
                     "[mp-rdv] '{}' allowed, but the session filled meanwhile", session.nickname);
                 send_hello_ack(id, false, 0, color, ourMods);
+                releaseSlot(session);
                 refuse_peer(session, DisconnectReason::SessionFull);
                 continue;
             }
@@ -914,6 +938,7 @@ void NetworkManager::tick_join_approvals() {
                 Log.warn("[mp-rdv] '{}' allowed, but the gameplay mods changed meanwhile",
                     session.nickname);
                 send_hello_ack(id, false, 0, color, ourMods);
+                releaseSlot(session);
                 refuse_peer(session, DisconnectReason::ModMismatch);
                 continue;
             }
@@ -928,6 +953,7 @@ void NetworkManager::tick_join_approvals() {
                 notify(fmt::format("{} wasn't let in", session.nickname),
                     "Nobody answered their join request in time.", 5);
             }
+            releaseSlot(session);
             refuse_peer(session, DisconnectReason::Declined);
         }
     }
@@ -2048,6 +2074,7 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
             Log.info("[mp-rdv] peer {} ('{}') presented the token of join request '{}'", peer,
                 nickname, pending->second.name);
             // Single use.
+            session.rdvJoinId = pending->second.joinId;
             mHostCode.pendingJoins.erase(pending);
             if (!getSettings().multiplayer.autoApproveJoins.getValue()) {
                 // §4.2: a code is not an invitation. Nothing of the world goes out until the host
