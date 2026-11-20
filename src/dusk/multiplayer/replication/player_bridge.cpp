@@ -2486,6 +2486,25 @@ void fill_event(PlayerState& out) {
     }
 }
 
+/* --- batch 8: enemies ---
+ * The cut block (player_state.hpp kPlayerCutAt): what an enemy whose target is THIS player reads
+ * off its stand-in on the far end (getCutType 60 hits, getCutCount 11 in enemy code). Plain members
+ * of daPy_py_c, read off the LINK_PTR slot: slot 0 may be an enemy's stand-in during the actor
+ * pass (enemy_target.cpp), though this runs after it. */
+static void fill_cut(daAlink_c* alink, PlayerState& out) {
+    out.cutType = 0;
+    out.cutCount = 0;
+    out.cutFlags = 0;
+    if (alink == nullptr) {
+        return;
+    }
+    out.cutType = alink->getCutType();
+    out.cutCount = alink->getCutCount();
+    if (alink->getCutAtFlg()) {
+        out.cutFlags |= kPlayerCutAt;
+    }
+}
+
 bool capture_local_player(PlayerState& out) {
     if (!local_pose_is_live()) {
         // Nothing worth sending: no scene, or the pose belongs to the attract demo or a cutscene
@@ -2671,6 +2690,7 @@ bool capture_local_player(PlayerState& out) {
     fill_clawshot(alink, out); // v20 clawshot block, gated on the held item's kind
     fill_event(out); // v21 event byte + item-get item (agent EV)
     fill_form(alink, out);     // v21 form block (wolf piece A)
+    fill_cut(alink, out);      // batch 8 cut block (enemy target stand-in, E2)
 
     return true;
 }

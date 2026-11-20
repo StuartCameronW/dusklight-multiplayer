@@ -286,6 +286,18 @@ enum class PacketId : std::uint8_t {
     /// host granted drop T<owner>:<serial> to player <taker>; everyone else removes their copy
     /// (replication/object_drops.hpp).
     DropTaken = 27,
+    /* --- batch 8: enemies (M6 phase 1). Layouts: replication/enemy_sync.hpp. --- */
+    /// Host -> every guest, reliable on kChannelObjects: the whole per-room enemy authority table
+    /// (who simulates the enemies of each (stage, layer, room), with an epoch per room).
+    EnemyAuthority = 28,
+    /// The authority of a room -> host -> others, unreliable on kChannelState: one batch of enemy
+    /// states for one room on one tick. The host relays a guest's only if the guest owns the room.
+    EnemyUpdate = 29,
+    /// Peer -> host (reliable on change, kChannelObjects), relayed by the host to the other guests;
+    /// the host sends its own to every guest. Which rooms the sender has loaded, plus enemy keys it
+    /// degraded to local-only (cross-check mismatch).
+    RoomsLoaded = 30,
+    /* 31 EnemyHit and 32 EnemyFlagHit: reserved for M6 phase 2. */
 };
 
 /**

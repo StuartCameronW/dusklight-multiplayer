@@ -26,6 +26,7 @@
 #include "d/d_msg_scrn_explain.h"
 #include "dusk/logging.h"
 #include "dusk/mods/item.hpp"
+#include "dusk/multiplayer/replication/enemy_sync.hpp"  // batch 8: enemies
 #include "dusk/multiplayer/replication/item_claims.hpp"
 #include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/object_drops.hpp"  // batch 7: drops
@@ -147,6 +148,19 @@ enum class Op {
     ExpectDrops,
     PickupNear,
     TouchNear,
+    /* --- batch 8: enemies --- */
+    // Synced enemies (replication/enemy_sync.hpp): see run_enemy_command and the WaitEnemy /
+    // WaitTarget cases in tick().
+    EnemyNear,
+    ExpectEnemy,
+    ExpectTarget,
+    ExpectOwner,
+    ExpectEnemyClean,
+    WaitEnemy,
+    WaitTarget,
+    GotoEnemy,
+    SavePos,
+    RestorePos,
 };
 
 struct Command {
@@ -1585,6 +1599,251 @@ void run_drop_command(const Command& command) {
     }
 }
 
+/* --- batch 8: enemies --- */
+
+/**
+ * Synced-enemy verbs (replication/enemy_sync.hpp, M6 phase 1). Result lines start "[autopilot]",
+ * the sync's own "[mp-enemy]", on both ends. `profile` is a number (0x1FE = E_OC, the Bokoblin) or
+ * `*`; "nearest" is nearest to the real local Link, within kEnemyRadius unless given.
+ *   enemynear [profile] [radius]         log every synced enemy near Link: key, mode, authority,
+ *                                        epoch, target, pos, hp, anm, counters
+ *   expectenemy <ghost|authority|local> [profile]   PASS iff the nearest one is in that mode here
+ *   expecttarget <self|partner|none> [profile]      PASS iff the nearest one's target (the
+ *                                        authority's choice; on a ghost the targetPeer it was sent)
+ *                                        is this end's Link / a remote player / nobody
+ *   expectowner <stage> <room> <self|partner|none>  PASS on this end's authority table
+ *   expectenemyclean [profile]           PASS iff the nearest one never ran its own execute while a
+ *                                        ghost and never wrote the real Link during a swap
+ *   waitenemy <mode> [profile] [timeout] block until expectenemy would pass (default 900 ticks)
+ *   waittarget <who> [profile] [timeout] block until expecttarget would pass (default 900 ticks)
+ *   gotoenemy <dist> [profile]           setpos Link `dist` units from the nearest one, on the line
+ *                                        from it toward where Link stands, at its height
+ *   savepos / restorepos                 remember Link's position / setpos back to it
+ */
+constexpr double kEnemyRadius = 8000.0;
+constexpr int kEnemyWaitTicks = 900;
+/// Command.layer values for the mode and target words.
+constexpr int kTargetSelf = 0;
+constexpr int kTargetPartner = 1;
+constexpr int kTargetNone = 2;
+
+bool sHaveSavedPos = false;
+cXyz sSavedPos;
+
+bool parse_enemy_profile(const std::string& token, int& out) {
+    if (token.empty() || token == "*") {
+        out = -1;
+        return true;
+    }
+    return parse_int(token, out) && out >= 0 && out <= 0x7FFF;
+}
+
+int parse_enemy_mode(const std::string& token) {
+    const std::string word = to_upper(token);
+    return word == "LOCAL"     ? static_cast<int>(mp::enemies::Mode::Local) :
+           word == "AUTHORITY" ? static_cast<int>(mp::enemies::Mode::Authority) :
+           word == "GHOST"     ? static_cast<int>(mp::enemies::Mode::Ghost) :
+                                 -1;
+}
+
+int parse_target_word(const std::string& token) {
+    const std::string word = to_upper(token);
+    return word == "SELF"    ? kTargetSelf :
+           word == "PARTNER" ? kTargetPartner :
+           word == "NONE"    ? kTargetNone :
+                               -1;
+}
+
+const char* target_word_name(int word) {
+    return word == kTargetSelf ? "self" : word == kTargetPartner ? "partner" : "none";
+}
+
+/// "self" / "partner" / "none" for a player id, from this end's point of view.
+int target_word_of(std::uint32_t playerId) {
+    if (playerId == mp::enemies::kNoPlayer) {
+        return kTargetNone;
+    }
+    return playerId == mp::network_manager().local_player_id() ? kTargetSelf : kTargetPartner;
+}
+
+std::string pid_text(std::uint32_t playerId) {
+    return playerId == mp::enemies::kNoPlayer ? std::string("none") : std::to_string(playerId);
+}
+
+/// Every synced enemy of `prof` (-1 any) within `radius` of the real Link, nearest first.
+std::vector<std::pair<mp::enemies::EnemyView, double>> enemies_near(int prof, double radius) {
+    std::vector<std::pair<mp::enemies::EnemyView, double>> out;
+    daAlink_c* link = daAlink_getAlinkActorClass();
+    if (link == nullptr) {
+        return out;
+    }
+    for (const mp::enemies::EnemyView& v : mp::enemies::views()) {
+        if (prof >= 0 && static_cast<std::uint16_t>(v.prof) != static_cast<std::uint16_t>(prof)) {
+            continue;
+        }
+        const double dx = v.pos[0] - link->current.pos.x;
+        const double dy = v.pos[1] - link->current.pos.y;
+        const double dz = v.pos[2] - link->current.pos.z;
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (distance <= radius) {
+            out.emplace_back(v, distance);
+        }
+    }
+    std::sort(
+        out.begin(), out.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+    return out;
+}
+
+std::string describe_enemy(const mp::enemies::EnemyView& v, double distance) {
+    return fmt::format("key={:08X} prof=0x{:03X} proc={} mode={}{} owner={} epoch={} target={} "
+                       "({}) hp={} pos=({:.0f}, {:.0f}, {:.0f}) anm={} frame={:.1f} {:.0f} units "
+                       "away ghostTicks={} realExecWhileGhost={} swaps={} absorbed={} "
+                       "realLinkWrites={}",
+        v.key, static_cast<unsigned>(static_cast<std::uint16_t>(v.prof)), v.procId,
+        mp::enemies::mode_name(v.mode), v.degraded ? " (degraded)" : "", pid_text(v.authority),
+        v.epoch, pid_text(v.target), target_word_name(target_word_of(v.target)), v.health, v.pos[0],
+        v.pos[1], v.pos[2], v.anm, v.frame, distance, v.ghostTicks, v.realExecWhileGhost,
+        v.swapTicks, v.absorbedWrites, v.realLinkWrites);
+}
+
+/// The nearest synced enemy for an expect/wait verb, or false (and a description of why).
+bool nearest_enemy(const Command& command, mp::enemies::EnemyView& out, std::string& desc) {
+    const auto hits = enemies_near(command.point, command.radius);
+    if (hits.empty()) {
+        desc = fmt::format("no synced enemy (profile {}) within {:.0f} units",
+            command.point < 0 ? std::string("*") : fmt::format("0x{:03X}", command.point),
+            command.radius);
+        return false;
+    }
+    out = hits.front().first;
+    desc = describe_enemy(out, hits.front().second);
+    return true;
+}
+
+bool enemy_mode_matches(const Command& command, std::string& desc) {
+    mp::enemies::EnemyView v;
+    return nearest_enemy(command, v, desc) && static_cast<int>(v.mode) == command.layer;
+}
+
+bool enemy_target_matches(const Command& command, std::string& desc) {
+    mp::enemies::EnemyView v;
+    return nearest_enemy(command, v, desc) && target_word_of(v.target) == command.layer;
+}
+
+void run_enemy_command(const Command& command) {
+    namespace en = mp::enemies;
+    switch (command.op) {
+    case Op::EnemyNear: {
+        const auto hits = enemies_near(command.point, command.radius);
+        if (hits.empty()) {
+            Log.info("[autopilot] enemynear: no synced enemy within {:.0f} units tick={}",
+                command.radius, sTicks);
+            break;
+        }
+        for (std::size_t i = 0; i < hits.size() && i < 12; i++) {
+            Log.info("[autopilot] enemynear {} {} tick={}", i == 0 ? "nearest" : "  also",
+                describe_enemy(hits[i].first, hits[i].second), sTicks);
+        }
+        for (const en::RoomOwnerView& row : en::authority_table()) {
+            Log.info("[autopilot] enemynear table stage={:08X} layer={} room={} owner={} ({}) "
+                     "epoch={} tick={}",
+                row.stageHash, static_cast<int>(row.layer), static_cast<int>(row.room),
+                pid_text(row.owner), target_word_name(target_word_of(row.owner)), row.epoch,
+                sTicks);
+        }
+        break;
+    }
+    case Op::ExpectEnemy: {
+        std::string desc;
+        const bool pass = enemy_mode_matches(command, desc);
+        log_expect(pass, "expectenemy",
+            fmt::format("want={} {}", en::mode_name(static_cast<en::Mode>(command.layer)), desc));
+        break;
+    }
+    case Op::ExpectTarget: {
+        std::string desc;
+        const bool pass = enemy_target_matches(command, desc);
+        log_expect(
+            pass, "expecttarget", fmt::format("want={} {}", target_word_name(command.layer), desc));
+        break;
+    }
+    case Op::ExpectEnemyClean: {
+        en::EnemyView v;
+        std::string desc;
+        const bool found = nearest_enemy(command, v, desc);
+        log_expect(
+            found && v.realExecWhileGhost == 0 && v.realLinkWrites == 0, "expectenemyclean", desc);
+        break;
+    }
+    case Op::ExpectOwner: {
+        const std::uint32_t stageHash = mp::location_stage_hash(command.text.c_str());
+        std::uint32_t owner = en::kNoPlayer;
+        std::uint16_t epoch = 0;
+        for (const en::RoomOwnerView& row : en::authority_table()) {
+            if (row.stageHash == stageHash && row.room == command.room) {
+                owner = row.owner;
+                epoch = row.epoch;
+            }
+        }
+        log_expect(target_word_of(owner) == command.layer, "expectowner",
+            fmt::format("want={} stage={} room={} owner={} ({}) epoch={}",
+                target_word_name(command.layer), command.text, command.room, pid_text(owner),
+                target_word_name(target_word_of(owner)), epoch));
+        break;
+    }
+    case Op::GotoEnemy: {
+        daAlink_c* link = daAlink_getAlinkActorClass();
+        en::EnemyView v;
+        std::string desc;
+        if (link == nullptr || !nearest_enemy(command, v, desc)) {
+            Log.error(
+                "[autopilot] gotoenemy: {} tick={}", link == nullptr ? "no Link" : desc, sTicks);
+            break;
+        }
+        double dx = link->current.pos.x - v.pos[0];
+        double dz = link->current.pos.z - v.pos[2];
+        const double flat = std::sqrt(dx * dx + dz * dz);
+        if (flat < 1.0) {
+            dx = 0.0;
+            dz = 1.0;
+        } else {
+            dx /= flat;
+            dz /= flat;
+        }
+        const cXyz pos(static_cast<f32>(v.pos[0] + dx * command.targetX),
+            static_cast<f32>(v.pos[1] + 10.0), static_cast<f32>(v.pos[2] + dz * command.targetX));
+        link->setPlayerPosAndAngle(&pos, link->shape_angle.y, TRUE);
+        Log.info("[autopilot] gotoenemy {:.0f}: setpos ({:.0f}, {:.0f}, {:.0f}) for {} tick={}",
+            command.targetX, pos.x, pos.y, pos.z, desc, sTicks);
+        break;
+    }
+    case Op::SavePos:
+    case Op::RestorePos: {
+        daAlink_c* link = daAlink_getAlinkActorClass();
+        if (link == nullptr) {
+            Log.error("[autopilot] {}: no Link tick={}",
+                command.op == Op::SavePos ? "savepos" : "restorepos", sTicks);
+            break;
+        }
+        if (command.op == Op::SavePos) {
+            sSavedPos = link->current.pos;
+            sHaveSavedPos = true;
+            Log.info("[autopilot] savepos ({:.0f}, {:.0f}, {:.0f}) tick={}", sSavedPos.x,
+                sSavedPos.y, sSavedPos.z, sTicks);
+        } else if (!sHaveSavedPos) {
+            Log.error("[autopilot] restorepos: nothing saved tick={}", sTicks);
+        } else {
+            link->setPlayerPosAndAngle(&sSavedPos, link->shape_angle.y, TRUE);
+            Log.info("[autopilot] restorepos ({:.0f}, {:.0f}, {:.0f}) tick={}", sSavedPos.x,
+                sSavedPos.y, sSavedPos.z, sTicks);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -1775,6 +2034,24 @@ bool settle_program_counter() {
                 Log.error("[{}] line {}: needs the world; skipped", sTicks, command.line);
             } else {
                 run_drop_command(command);
+            }
+            sPc++;
+            continue;
+
+        /* --- batch 8: enemies --- */
+        // waitenemy and waittarget take ticks; they are run by tick().
+        case Op::EnemyNear:
+        case Op::ExpectEnemy:
+        case Op::ExpectTarget:
+        case Op::ExpectOwner:
+        case Op::ExpectEnemyClean:
+        case Op::GotoEnemy:
+        case Op::SavePos:
+        case Op::RestorePos:
+            if (!in_world()) {
+                Log.error("[{}] line {}: needs the world; skipped", sTicks, command.line);
+            } else {
+                run_enemy_command(command);
             }
             sPc++;
             continue;
@@ -2229,6 +2506,58 @@ void load_script(const std::filesystem::path& path) {
             ok = (a.empty() || parse_double(a, command.radius)) &&
                  (b.empty() || parse_int(b, command.frames)) && command.radius > 0.0 &&
                  command.frames > 0;
+            /* --- batch 8: enemies --- */
+        } else if (verb == "ENEMYNEAR") {
+            // "enemynear [profile|*] [radius]": log the synced enemies near Link and the table.
+            command.op = Op::EnemyNear;
+            command.radius = kEnemyRadius;
+            ok = parse_enemy_profile(a, command.point) &&
+                 (b.empty() || parse_double(b, command.radius)) && command.radius > 0.0;
+        } else if (verb == "EXPECTENEMY" || verb == "WAITENEMY") {
+            // "expectenemy ghost 0x1FE" / "waitenemy authority 0x1FE [timeout]": the nearest
+            // synced enemy's mode on this end.
+            command.op = verb == "EXPECTENEMY" ? Op::ExpectEnemy : Op::WaitEnemy;
+            command.radius = kEnemyRadius;
+            command.frames = kEnemyWaitTicks;
+            command.layer = parse_enemy_mode(a);
+            ok = command.layer >= 0 && parse_enemy_profile(b, command.point) &&
+                 (command.op == Op::WaitEnemy ? (c.empty() || parse_int(c, command.frames)) :
+                                                c.empty()) &&
+                 command.frames > 0;
+        } else if (verb == "EXPECTTARGET" || verb == "WAITTARGET") {
+            // "expecttarget partner 0x1FE" / "waittarget self 0x1FE [timeout]": whose Link the
+            // nearest synced enemy is after, from this end's point of view.
+            command.op = verb == "EXPECTTARGET" ? Op::ExpectTarget : Op::WaitTarget;
+            command.radius = kEnemyRadius;
+            command.frames = kEnemyWaitTicks;
+            command.layer = parse_target_word(a);
+            ok = command.layer >= 0 && parse_enemy_profile(b, command.point) &&
+                 (command.op == Op::WaitTarget ? (c.empty() || parse_int(c, command.frames)) :
+                                                 c.empty()) &&
+                 command.frames > 0;
+        } else if (verb == "EXPECTOWNER") {
+            // "expectowner D_SB01 0 partner": who this end's authority table says runs that room.
+            command.op = Op::ExpectOwner;
+            command.text = a;
+            command.layer = parse_target_word(c);
+            ok = !a.empty() && parse_int(b, command.room) && command.room >= -1 &&
+                 command.room < 64 && command.layer >= 0;
+        } else if (verb == "EXPECTENEMYCLEAN") {
+            // "expectenemyclean [profile]": no real execute as a ghost, no write into the real
+            // Link.
+            command.op = Op::ExpectEnemyClean;
+            command.radius = kEnemyRadius;
+            ok = parse_enemy_profile(a, command.point);
+        } else if (verb == "GOTOENEMY") {
+            // "gotoenemy 400 0x1FE": put Link 400 units from the nearest synced enemy.
+            command.op = Op::GotoEnemy;
+            command.radius = kEnemyRadius;
+            ok = parse_double(a, command.targetX) && command.targetX >= 0.0 &&
+                 parse_enemy_profile(b, command.point);
+        } else if (verb == "SAVEPOS") {
+            command.op = Op::SavePos;
+        } else if (verb == "RESTOREPOS") {
+            command.op = Op::RestorePos;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -2740,6 +3069,29 @@ void tick() {
         if (sElapsed + 1 >= command.frames) {
             Log.warn("[autopilot] {} result=timeout after {} ticks: {} tick={}", verb,
                 command.frames, describe_drop(item), sTicks);
+        }
+        break;
+    }
+
+    /* --- batch 8: enemies --- */
+    case Op::WaitEnemy:
+    case Op::WaitTarget: {
+        const bool modeVerb = command.op == Op::WaitEnemy;
+        const char* verb = modeVerb ? "waitenemy" : "waittarget";
+        const char* want =
+            modeVerb ? mp::enemies::mode_name(static_cast<mp::enemies::Mode>(command.layer)) :
+                       target_word_name(command.layer);
+        std::string desc;
+        const bool met = in_world() && (modeVerb ? enemy_mode_matches(command, desc) :
+                                                   enemy_target_matches(command, desc));
+        if (met) {
+            Log.info("[autopilot] {} {} PASS after {} tick(s): {} tick={}", verb, want, sElapsed,
+                desc, sTicks);
+            log_expect(true, verb, fmt::format("want={} after {} tick(s)", want, sElapsed));
+            duration = sElapsed + 1;
+        } else if (sElapsed + 1 >= command.frames) {
+            log_expect(false, verb,
+                fmt::format("want={} not reached in {} ticks: {}", want, command.frames, desc));
         }
         break;
     }

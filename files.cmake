@@ -1727,6 +1727,10 @@ set(DUSK_FILES
         src/dusk/multiplayer/replication/object_capture.hpp
         src/dusk/multiplayer/replication/object_channel.hpp
         src/dusk/multiplayer/replication/object_kinds.hpp
+        src/dusk/multiplayer/replication/enemy_sync.cpp
+        src/dusk/multiplayer/replication/enemy_sync.hpp
+        src/dusk/multiplayer/replication/enemy_internal.hpp
+        src/dusk/multiplayer/replication/enemy_target.cpp
         src/dusk/multiplayer/session/presence.cpp
         src/dusk/multiplayer/session/presence.hpp
         src/dusk/multiplayer/session/world_sync.cpp
