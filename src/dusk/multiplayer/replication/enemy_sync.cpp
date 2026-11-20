@@ -2452,7 +2452,7 @@ void enemy_note_killing_blow(const fopAc_ac_c* enemy, const EnemyHitOverride* mp
         return;
     }
     Rec* rec = find_rec(fopAcM_GetID(const_cast<fopAc_ac_c*>(enemy)));
-    if (rec == nullptr || rec->mode != enemies::Mode::Authority || rec->killer != kNoPlayer) {
+    if (rec == nullptr || rec->mode != enemies::Mode::Authority || rec->killer != enemies::kNoPlayer) {
         return;
     }
     if (mpHit != nullptr) {

@@ -514,7 +514,7 @@ bool player_position(std::uint32_t playerId, float out[3]) {
 namespace dusk::mp {
 
 EnemyTargetScope::EnemyTargetScope(fopAc_ac_c* actor)
-    : mSavedPlayer(nullptr), mActive(false), mPrevExecProc(kNoProc), mExecSet(false) {
+    : mSavedPlayer(nullptr), mActive(false), mPrevExecProc(enemies::detail::kNoProc), mExecSet(false) {
     using namespace enemies::detail;
     // ★ Runs for every actor that passes the execute gate, every tick: bail before any map lookup.
     if (!enabled() || actor == nullptr) {
