@@ -1,7 +1,7 @@
 #include "rendezvous_client.hpp"
 
-#include <mbedtls/base64.h>
-#include <mbedtls/sha1.h>
+#include <borealis/http.hpp>
+#include <borealis/ws.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -9,15 +9,15 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <deque>
+#include <exception>
+#include <list>
 #include <mutex>
 #include <set>
 #include <string_view>
 #include <thread>
 
 #include "dusk/logging.h"
-#include "https_client.hpp"
 
 namespace dusk::mp::rdv {
 namespace {
@@ -26,14 +26,20 @@ constexpr borealis::Log Log{"dusk::mp::rdv"};
 
 using Clock = std::chrono::steady_clock;
 using json = nlohmann::json;
+using HttpResult = borealis::http::Result;
 
-constexpr int kRequestTimeoutMs = 10000;
-constexpr int kCloseTimeoutMs = 5000;
-/// Destructor's best-effort DELETE budget, and how long the destructor waits for the worker.
-constexpr int kShutdownDeleteMs = 2000;
+constexpr auto kConnectTimeout = std::chrono::milliseconds(5000);
+constexpr auto kRequestTimeout = std::chrono::milliseconds(10000);
+constexpr std::size_t kMaxHttpBody = 64 * 1024;
+/// Destructor: budget for the best-effort room close, and how long it waits for the worker.
+constexpr auto kShutdownBudget = std::chrono::milliseconds(2000);
 constexpr auto kShutdownJoinWait = std::chrono::milliseconds(3000);
+/// Worker poll cadence while a request or the host socket is live.
+constexpr auto kTick = std::chrono::milliseconds(50);
 /// Host socket: client ping cadence, and the silence after which the socket is presumed dead. The
-/// server's runtime answers every ping, so 35 s without a byte means the path is gone.
+/// server answers every text "ping" with a text "pong", so 35 s without a message means the path
+/// is gone.
+constexpr auto kWsConnectTimeout = std::chrono::milliseconds(10000);
 constexpr auto kWsPingInterval = std::chrono::seconds(30);
 constexpr auto kWsSilenceLimit = std::chrono::seconds(35);
 constexpr int kWsBackoffFirstS = 2;
@@ -47,6 +53,20 @@ constexpr std::string_view kCodeAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// First 4 characters of a secret, for logs.
 std::string redact(const std::string& s) {
     return s.substr(0, 4) + "...";
+}
+
+/// Backend error text may quote the request URL, which carries the host secret.
+std::string scrub(std::string text, const std::string& secret) {
+    if (secret.empty()) {
+        return text;
+    }
+    const std::string r = redact(secret);
+    for (std::size_t pos = text.find(secret); pos != std::string::npos;
+        pos = text.find(secret, pos + r.size()))
+    {
+        text.replace(pos, secret.size(), r);
+    }
+    return text;
 }
 
 bool is_hex(const std::string& s, std::size_t len) {
@@ -141,14 +161,67 @@ std::string dump(const json& j) {
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
-Status map_http(const HttpResponse& r) {
-    if (r.status == 0) {
+const char* http_error_name(borealis::http::Error e) {
+    using E = borealis::http::Error;
+    switch (e) {
+    case E::None:
+        return "none";
+    case E::NoBackend:
+        return "no HTTPS backend";
+    case E::InvalidUrl:
+        return "invalid URL";
+    case E::UnsupportedScheme:
+        return "unsupported URL scheme (https:// only)";
+    case E::Timeout:
+        return "timed out";
+    case E::TooLarge:
+        return "reply too large";
+    case E::Canceled:
+        return "cancelled";
+    case E::Io:
+        return "I/O error";
+    case E::Network:
+        return "network error";
+    }
+    return "?";
+}
+
+const char* ws_error_name(borealis::ws::Error e) {
+    using E = borealis::ws::Error;
+    switch (e) {
+    case E::None:
+        return "none";
+    case E::NoBackend:
+        return "no WebSocket backend";
+    case E::InvalidUrl:
+        return "invalid URL";
+    case E::UnsupportedScheme:
+        return "unsupported URL scheme";
+    case E::Timeout:
+        return "timed out";
+    case E::TooLarge:
+        return "message too large";
+    case E::Canceled:
+        return "cancelled";
+    case E::Network:
+        return "network error";
+    case E::Protocol:
+        return "protocol error";
+    case E::Handshake:
+        return "handshake failed";
+    }
+    return "?";
+}
+
+Status map_http(const HttpResult& r) {
+    if (r.error != borealis::http::Error::None) {
         return Status::NetworkError;
     }
-    if (r.status >= 200 && r.status < 300) {
+    const int s = r.response.statusCode;
+    if (s >= 200 && s < 300) {
         return Status::Ok;
     }
-    switch (r.status) {
+    switch (s) {
     case 404:
         return Status::NoRoom;
     case 409:
@@ -160,8 +233,59 @@ Status map_http(const HttpResponse& r) {
     }
 }
 
-std::string describe(const HttpResponse& r) {
-    return r.status == 0 ? r.error : "HTTP " + std::to_string(r.status);
+std::string describe(const HttpResult& r, const std::string& secret = {}) {
+    if (r.error != borealis::http::Error::None) {
+        std::string s = http_error_name(r.error);
+        if (!r.message.empty()) {
+            s += ": " + scrub(r.message, secret);
+        }
+        return s;
+    }
+    return "HTTP " + std::to_string(r.response.statusCode);
+}
+
+HttpResult take_result(borealis::Task<HttpResult>& task) {
+    HttpResult failed;
+    failed.error = borealis::http::Error::Network;
+    try {
+        if (auto r = task.try_take()) {
+            return std::move(*r);
+        }
+        failed.message = "request produced no result";
+    } catch (const std::exception& e) {
+        failed.message = e.what();
+    } catch (...) {
+        failed.message = "request threw";
+    }
+    return failed;
+}
+
+/// Parses a create reply. Returns the final status; on Ok fills @p code and @p secret.
+Status parse_create(const HttpResult& r, std::string* code, std::string* secret) {
+    Status st = map_http(r);
+    if (st != Status::Ok) {
+        return st;
+    }
+    const json j = json::parse(r.response.body, nullptr, false);
+    *code = normalize_code(jstr(j, "code"));
+    *secret = jstr(j, "hostSecret");
+    if (code->empty() || !is_hex(*secret, 32)) {
+        Log.warn("[mp-rdv] create: malformed reply from server");
+        return Status::ServerError;
+    }
+    return Status::Ok;
+}
+
+/// "host[:port]..." after the scheme: true for loopback hosts only.
+bool is_loopback_authority(std::string_view rest) {
+    rest = rest.substr(0, rest.find('/'));
+    std::string_view host;
+    if (!rest.empty() && rest.front() == '[') {
+        host = rest.substr(0, rest.find(']') + 1);
+    } else {
+        host = rest.substr(0, rest.find(':'));
+    }
+    return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
 }
 
 struct Job {
@@ -172,12 +296,14 @@ struct Job {
     std::string code, name, secret;
 };
 
-enum class WsOutcome { Interrupted, Retry, RoomGone, Replaced };
+enum class WsOutcome { Retry, RoomGone, Replaced };
 
 }  // namespace
 
 struct Client::Shared {
-    std::string baseUrl;
+    std::string baseUrl;    // "https://host[:port]", no trailing '/'
+    std::string wsBaseUrl;  // the same with wss:// (ws:// for a loopback http:// test URL)
+    bool plaintextLoopback = false;
     std::mutex mu;
     std::condition_variable cv;
     std::condition_variable doneCv;
@@ -202,34 +328,31 @@ struct Client::Shared {
     std::vector<Candidate> hostCands;
     std::string token;
 
+    // Worker thread only: no other thread touches a borealis handle.
+    struct InFlight {
+        Job job;
+        borealis::Task<HttpResult> task;
+    };
+    std::list<InFlight> inflight;
+    struct HostSocket {
+        borealis::ws::Connection conn;
+        std::uint64_t gen = 0;
+        std::string code, secret;
+        bool open = false;
+        Clock::time_point lastRx{}, lastPing{};
+    };
+    HostSocket ws;
+
     void worker();
-    void run_job(const Job& job);
-    WsOutcome host_socket(const std::string& code, const std::string& secret, std::uint64_t gen);
+    void shutdown();
+    void start_job(Job job);
+    void finish_job(const Job& job, const HttpResult& r);
+    void pump_requests();
+    void drive_host_socket();
+    WsOutcome classify_close(const borealis::ws::Event& ev) const;
+    void end_socket(WsOutcome outcome, std::uint64_t gen, const std::string& c);
     void accept_guests(const json& msg, std::uint64_t gen);
-    bool still_hosting(std::uint64_t gen) {
-        std::lock_guard lk(mu);
-        return !stop && hosting && hostGen == gen;
-    }
-    bool pop_job(Job* out) {
-        std::lock_guard lk(mu);
-        if (jobs.empty()) {
-            return false;
-        }
-        *out = std::move(jobs.front());
-        jobs.pop_front();
-        return true;
-    }
     std::string room_url(const std::string& c) const { return baseUrl + "/v1/rooms/" + c; }
-    void delete_room(const std::string& c, const std::string& s, int timeoutMs,
-        const std::atomic<bool>* cancel) {
-        const HttpResponse r =
-            https_request("DELETE", room_url(c) + "?secret=" + s, "", timeoutMs, cancel);
-        if (r.status == 204 || r.status == 200 || r.status == 404) {
-            Log.info("[mp-rdv] room {} deleted", c);
-        } else {
-            Log.warn("[mp-rdv] deleting room {} failed: {}", c, describe(r));
-        }
-    }
 };
 
 const char* status_name(Status s) {
@@ -279,9 +402,25 @@ Client::Client(std::string baseUrl) : m(std::make_shared<Shared>()) {
     while (!baseUrl.empty() && baseUrl.back() == '/') {
         baseUrl.pop_back();
     }
-    std::string host, port, target, error;
-    if (!parse_https_url(baseUrl + "/", &host, &port, &target, &error)) {
-        Log.error("[mp-rdv] rendezvous URL '{}' is unusable: {}", baseUrl, error);
+    constexpr std::string_view https = "https://", http = "http://";
+    if (baseUrl.starts_with(https)) {
+        m->wsBaseUrl = "wss://" + baseUrl.substr(https.size());
+    } else if (baseUrl.starts_with(http) &&
+               is_loopback_authority(std::string_view(baseUrl).substr(http.size())))
+    {
+        m->wsBaseUrl = "ws://" + baseUrl.substr(http.size());
+        m->plaintextLoopback = true;
+        Log.warn("[mp-rdv] plaintext rendezvous URL '{}' (loopback test only); note that "
+                 "borealis::http accepts https:// only, so create/join requests will fail",
+            baseUrl);
+    } else {
+        Log.error("[mp-rdv] rendezvous URL '{}' is unusable: it must start with https://", baseUrl);
+    }
+    if (!borealis::http::available()) {
+        Log.error("[mp-rdv] no HTTPS backend on this platform; internet play is unavailable");
+    }
+    if (!borealis::ws::available()) {
+        Log.error("[mp-rdv] no WebSocket backend on this platform; hosting by code is unavailable");
     }
     m->baseUrl = std::move(baseUrl);
     m->thread = std::thread([s = m] { s->worker(); });
@@ -299,8 +438,9 @@ Client::~Client() {
     if (finished) {
         m->thread.join();
     } else {
-        // Stuck in DNS or a TCP connect, which have no timeout. The thread owns a reference to
-        // the shared state, so letting it finish on its own is safe.
+        // Should not happen (every borealis call is non-blocking and the shutdown budget is 2 s),
+        // but the game thread must never hang here. The thread holds its own reference to the
+        // shared state, so letting it finish on its own is safe.
         Log.warn("[mp-rdv] worker still busy at shutdown; detaching it");
         m->thread.detach();
     }
@@ -402,72 +542,91 @@ void Client::close_room() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Worker thread
+// Worker thread. borealis does the I/O on its own backend threads; this thread only starts
+// requests, polls their Tasks and the host socket, and runs the host-socket timers.
 
 void Client::Shared::worker() {
     for (;;) {
-        std::unique_lock lk(mu);
-        if (stop) {
-            break;
-        }
-        if (!jobs.empty()) {
-            Job job = std::move(jobs.front());
-            jobs.pop_front();
-            lk.unlock();
-            run_job(job);
-            continue;
-        }
-        if (hosting && Clock::now() >= wsRetryAt) {
-            const std::string c = code, s = secret;
-            const std::uint64_t gen = hostGen;
-            lk.unlock();
-            const WsOutcome outcome = host_socket(c, s, gen);
-            lk.lock();
-            if (hostGen != gen || stop) {
-                continue;
+        std::deque<Job> fresh;
+        {
+            std::unique_lock lk(mu);
+            const auto wake = [this] { return stop.load() || !jobs.empty(); };
+            if (inflight.empty() && !hosting && !ws.conn) {
+                cv.wait(lk, wake);
+            } else {
+                cv.wait_for(lk, kTick, wake);
             }
-            if (outcome == WsOutcome::Retry) {
-                wsBackoffS =
-                    wsBackoffS == 0 ? kWsBackoffFirstS : std::min(wsBackoffS * 2, kWsBackoffCapS);
-                wsRetryAt = Clock::now() + std::chrono::seconds(wsBackoffS);
-                Log.info("[mp-rdv] host socket for room {} reconnecting in {} s", c, wsBackoffS);
-            } else if (outcome == WsOutcome::RoomGone || outcome == WsOutcome::Replaced) {
-                hosting = false;
-                secret.clear();
-                createStatus = Status::ServerError;
+            if (stop) {
+                break;
             }
-            continue;
+            fresh.swap(jobs);
         }
-        if (hosting) {
-            cv.wait_until(lk, wsRetryAt);
-        } else {
-            cv.wait(lk);
+        for (Job& job : fresh) {
+            start_job(std::move(job));
         }
+        pump_requests();
+        drive_host_socket();
     }
+    shutdown();
+}
 
-    // Shutdown: delete the hosted room and any close still queued, within one 2 s budget.
-    std::vector<std::pair<std::string, std::string>> rooms;
+void Client::Shared::shutdown() {
+    if (ws.conn) {
+        ws.conn.close(1000);
+    }
+    ws = HostSocket{};
+
+    // Close the hosted room and any close still queued; closes already in flight keep running.
+    std::vector<Job> closes;
     {
         std::lock_guard lk(mu);
         if (hosting && !code.empty() && !secret.empty()) {
-            rooms.emplace_back(code, secret);
+            Job j{Job::Kind::Close};
+            j.code = code;
+            j.secret = secret;
+            closes.push_back(std::move(j));
         }
-        for (const Job& j : jobs) {
+        for (Job& j : jobs) {
             if (j.kind == Job::Kind::Close) {
-                rooms.emplace_back(j.code, j.secret);
+                closes.push_back(std::move(j));
             }
         }
         jobs.clear();
     }
-    const auto deadline = Clock::now() + std::chrono::milliseconds(kShutdownDeleteMs);
-    for (const auto& [c, s] : rooms) {
-        const auto left =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
-        if (left <= 0) {
-            break;
-        }
-        delete_room(c, s, static_cast<int>(left), nullptr);
+    inflight.remove_if([](const InFlight& f) { return f.job.kind == Job::Kind::Join; });
+    for (Job& j : closes) {
+        start_job(std::move(j));
     }
+
+    const auto deadline = Clock::now() + kShutdownBudget;
+    while (!inflight.empty() && Clock::now() < deadline) {
+        for (auto it = inflight.begin(); it != inflight.end();) {
+            if (!it->task.ready()) {
+                ++it;
+                continue;
+            }
+            const HttpResult r = take_result(it->task);
+            Job job = std::move(it->job);
+            it = inflight.erase(it);
+            if (job.kind == Job::Kind::Create) {
+                // A create that lands during shutdown must not leave a room alive.
+                Job close{Job::Kind::Close};
+                if (parse_create(r, &close.code, &close.secret) == Status::Ok) {
+                    Log.info(
+                        "[mp-rdv] room {} was created during shutdown; closing it", close.code);
+                    start_job(std::move(close));
+                }
+            } else {
+                finish_job(job, r);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!inflight.empty()) {
+        Log.warn("[mp-rdv] {} rendezvous request(s) still running at shutdown; abandoned",
+            inflight.size());
+    }
+    inflight.clear();  // dropping a Task cancels it
     {
         std::lock_guard lk(mu);
         done = true;
@@ -475,27 +634,75 @@ void Client::Shared::worker() {
     doneCv.notify_all();
 }
 
-void Client::Shared::run_job(const Job& job) {
+void Client::Shared::start_job(Job job) {
+    if (!borealis::http::available()) {
+        Log.error("[mp-rdv] no HTTPS backend on this platform; request not sent");
+    }
+    borealis::http::Request req;
+    req.method = borealis::http::Method::Post;
+    req.connectTimeout = kConnectTimeout;
+    req.idleTimeout = kRequestTimeout;
+    req.totalTimeout = kRequestTimeout;
+    req.maxBodyBytes = kMaxHttpBody;
     switch (job.kind) {
     case Job::Kind::Create: {
+        if (!borealis::ws::available()) {
+            // A room we could never hear guests on is worse than no room.
+            Log.error("[mp-rdv] cannot host: no WebSocket backend on this platform");
+            std::lock_guard lk(mu);
+            if (job.gen == hostGen) {
+                createStatus = Status::NetworkError;
+            }
+            return;
+        }
         const json body = {
             {"v", 1}, {"candidates", encode_candidates(job.cands)}, {"maxPlayers", job.maxPlayers}};
         Log.info("[mp-rdv] creating room ({} candidates, max {} players)", job.cands.size(),
             job.maxPlayers);
         log_candidates("our", job.cands);
-        const HttpResponse r =
-            https_request("POST", baseUrl + "/v1/rooms", dump(body), kRequestTimeoutMs, &stop);
-        Status st = map_http(r);
+        req.url = baseUrl + "/v1/rooms";
+        req.headers.push_back({"content-type", "application/json"});
+        req.body = dump(body);
+        break;
+    }
+    case Job::Kind::Join: {
+        const json body = {
+            {"v", 1}, {"name", job.name}, {"candidates", encode_candidates(job.cands)}};
+        Log.info("[mp-rdv] joining room {} ({} candidates)", job.code, job.cands.size());
+        log_candidates("our", job.cands);
+        req.url = room_url(job.code) + "/join";
+        req.headers.push_back({"content-type", "application/json"});
+        req.body = dump(body);
+        break;
+    }
+    case Job::Kind::Close:
+        // borealis has no DELETE; the Worker's POST .../close has the same semantics (204).
+        req.url = room_url(job.code) + "/close?secret=" + job.secret;
+        break;
+    }
+    InFlight f{std::move(job), borealis::http::start(std::move(req))};
+    inflight.push_back(std::move(f));
+}
+
+void Client::Shared::pump_requests() {
+    for (auto it = inflight.begin(); it != inflight.end();) {
+        if (!it->task.ready()) {
+            ++it;
+            continue;
+        }
+        const HttpResult r = take_result(it->task);
+        Job job = std::move(it->job);
+        it = inflight.erase(it);
+        finish_job(job, r);  // may append a close; std::list keeps @c it valid
+    }
+}
+
+void Client::Shared::finish_job(const Job& job, const HttpResult& r) {
+    switch (job.kind) {
+    case Job::Kind::Create: {
         std::string newCode, newSecret;
-        if (st == Status::Ok) {
-            const json j = json::parse(r.body, nullptr, false);
-            newCode = normalize_code(jstr(j, "code"));
-            newSecret = jstr(j, "hostSecret");
-            if (newCode.empty() || !is_hex(newSecret, 32)) {
-                Log.warn("[mp-rdv] create: malformed reply from server");
-                st = Status::ServerError;
-            }
-        } else {
+        const Status st = parse_create(r, &newCode, &newSecret);
+        if (map_http(r) != Status::Ok) {  // a malformed 2xx reply was logged by parse_create
             Log.warn("[mp-rdv] create failed: {} -> {}", describe(r), status_name(st));
         }
         bool stale = false;
@@ -516,8 +723,11 @@ void Client::Shared::run_job(const Job& job) {
         if (st == Status::Ok) {
             if (stale) {
                 // Closed or replaced while the create was in flight: don't leave it alive.
-                Log.info("[mp-rdv] room {} was cancelled before it was created; deleting", newCode);
-                delete_room(newCode, newSecret, kCloseTimeoutMs, &stop);
+                Log.info("[mp-rdv] room {} was cancelled before it was created; closing", newCode);
+                Job close{Job::Kind::Close};
+                close.code = newCode;
+                close.secret = newSecret;
+                start_job(std::move(close));
             } else {
                 Log.info("[mp-rdv] room {} created (secret {})", newCode, redact(newSecret));
             }
@@ -525,17 +735,11 @@ void Client::Shared::run_job(const Job& job) {
         break;
     }
     case Job::Kind::Join: {
-        const json body = {
-            {"v", 1}, {"name", job.name}, {"candidates", encode_candidates(job.cands)}};
-        Log.info("[mp-rdv] joining room {} ({} candidates)", job.code, job.cands.size());
-        log_candidates("our", job.cands);
-        const HttpResponse r = https_request(
-            "POST", room_url(job.code) + "/join", dump(body), kRequestTimeoutMs, &stop);
         Status st = map_http(r);
         std::vector<Candidate> hc;
         std::string tok;
         if (st == Status::Ok) {
-            const json j = json::parse(r.body, nullptr, false);
+            const json j = json::parse(r.response.body, nullptr, false);
             tok = jstr(j, "token");
             if (j.is_object() && j.contains("host") && j["host"].is_object() &&
                 j["host"].contains("candidates"))
@@ -563,9 +767,15 @@ void Client::Shared::run_job(const Job& job) {
         }
         break;
     }
-    case Job::Kind::Close:
-        delete_room(job.code, job.secret, kCloseTimeoutMs, &stop);
+    case Job::Kind::Close: {
+        const int s = r.response.statusCode;
+        if (r.error == borealis::http::Error::None && (s == 204 || s == 200 || s == 404)) {
+            Log.info("[mp-rdv] room {} closed", job.code);
+        } else {
+            Log.warn("[mp-rdv] closing room {} failed: {}", job.code, describe(r, job.secret));
+        }
         break;
+    }
     }
 }
 
@@ -605,317 +815,146 @@ void Client::Shared::accept_guests(const json& msg, std::uint64_t gen) {
     }
 }
 
-namespace {
-
-bool ws_send(TlsStream& ts, int opcode, std::string_view payload, std::string* error) {
-    std::string frame;
-    frame += static_cast<char>(0x80 | opcode);
-    const std::size_t len = payload.size();
-    if (len < 126) {
-        frame += static_cast<char>(0x80 | len);
-    } else if (len <= 0xFFFF) {
-        frame += static_cast<char>(0x80 | 126);
-        frame += static_cast<char>(len >> 8);
-        frame += static_cast<char>(len & 0xFF);
-    } else {
-        *error = "frame too large";
-        return false;
-    }
-    unsigned char mask[4];
-    if (!random_bytes(mask, sizeof(mask))) {
-        *error = "no randomness for the frame mask";
-        return false;
-    }
-    frame.append(reinterpret_cast<const char*>(mask), 4);
-    for (std::size_t i = 0; i < len; ++i) {
-        frame += static_cast<char>(payload[i] ^ mask[i & 3]);
-    }
-    return ts.write_all(frame.data(), frame.size(), 5000, nullptr, error);
-}
-
-struct WsFrame {
-    bool fin = false;
-    int opcode = 0;
-    std::string payload;
-};
-
-/// 1 = one frame parsed and removed from @p buf, 0 = need more bytes, -1 = protocol violation.
-int ws_parse(std::string& buf, WsFrame* f) {
-    if (buf.size() < 2) {
-        return 0;
-    }
-    const auto b = [&](std::size_t i) { return static_cast<unsigned char>(buf[i]); };
-    f->fin = (b(0) & 0x80) != 0;
-    f->opcode = b(0) & 0x0F;
-    const bool masked = (b(1) & 0x80) != 0;
-    std::uint64_t len = b(1) & 0x7F;
-    std::size_t pos = 2;
-    if (len == 126) {
-        if (buf.size() < 4) {
-            return 0;
-        }
-        len = (std::uint64_t{b(2)} << 8) | b(3);
-        pos = 4;
-    } else if (len == 127) {
-        if (buf.size() < 10) {
-            return 0;
-        }
-        len = 0;
-        for (std::size_t i = 2; i < 10; ++i) {
-            len = (len << 8) | b(i);
-        }
-        pos = 10;
-    }
-    if (len > kWsMaxMessage || (f->opcode >= 8 && (len > 125 || !f->fin))) {
-        return -1;
-    }
-    unsigned char mask[4] = {};
-    if (masked) {
-        if (buf.size() < pos + 4) {
-            return 0;
-        }
-        for (int i = 0; i < 4; ++i) {
-            mask[i] = b(pos + i);
-        }
-        pos += 4;
-    }
-    if (buf.size() < pos + len) {
-        return 0;
-    }
-    f->payload.assign(buf, pos, static_cast<std::size_t>(len));
-    if (masked) {
-        for (std::size_t i = 0; i < f->payload.size(); ++i) {
-            f->payload[i] = static_cast<char>(f->payload[i] ^ mask[i & 3]);
-        }
-    }
-    buf.erase(0, pos + static_cast<std::size_t>(len));
-    return 1;
-}
-
-std::string find_header(std::string_view head, std::string_view name) {
-    std::size_t pos = head.find("\r\n");
-    while (pos != std::string_view::npos && pos + 2 < head.size()) {
-        pos += 2;
-        std::size_t end = head.find("\r\n", pos);
-        const std::string_view line =
-            head.substr(pos, end == std::string_view::npos ? end : end - pos);
-        const std::size_t colon = line.find(':');
-        if (colon == name.size() && std::equal(name.begin(), name.end(), line.begin(),
-                                        [](char a, char b) {
-                                            return std::tolower(static_cast<unsigned char>(a)) ==
-                                                   std::tolower(static_cast<unsigned char>(b));
-                                        }))
-        {
-            std::string_view v = line.substr(colon + 1);
-            while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) {
-                v.remove_prefix(1);
-            }
-            while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) {
-                v.remove_suffix(1);
-            }
-            return std::string(v);
-        }
-        pos = end;
-    }
-    return {};
-}
-
-std::string base64(const unsigned char* data, std::size_t n) {
-    unsigned char out[64] = {};
-    std::size_t olen = 0;
-    if (mbedtls_base64_encode(out, sizeof(out), &olen, data, n) != 0) {
-        return {};
-    }
-    return std::string(reinterpret_cast<const char*>(out), olen);
-}
-
-}  // namespace
-
-WsOutcome Client::Shared::host_socket(
-    const std::string& c, const std::string& s, std::uint64_t gen) {
-    std::string host, port, target, err;
-    if (!parse_https_url(room_url(c) + "/ws?secret=" + s, &host, &port, &target, &err)) {
-        Log.error("[mp-rdv] host socket: {}", err);
-        return WsOutcome::Retry;
-    }
-    TlsStream ts;
-    if (!ts.connect(host, port, kRequestTimeoutMs, &stop, &err)) {
-        Log.warn("[mp-rdv] host socket for room {}: {}", c, err);
-        return WsOutcome::Retry;
-    }
-
-    unsigned char nonce[16];
-    if (!random_bytes(nonce, sizeof(nonce))) {
-        Log.error("[mp-rdv] host socket: no randomness");
-        return WsOutcome::Retry;
-    }
-    const std::string key = base64(nonce, sizeof(nonce));
-    std::string req = "GET " + target + " HTTP/1.1\r\n";
-    req += "Host: " + host + (port == "443" ? "" : ":" + port) + "\r\n";
-    req += "User-Agent: Dusklight-rdv/1\r\n";
-    req += "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n";
-    req += "Sec-WebSocket-Key: " + key + "\r\n\r\n";
-    if (!ts.write_all(req.data(), req.size(), kRequestTimeoutMs, &stop, &err)) {
-        Log.warn("[mp-rdv] host socket for room {}: {}", c, err);
-        return WsOutcome::Retry;
-    }
-
-    // Upgrade response.
-    std::string buf;
-    char chunk[4096];
-    const auto headDeadline = Clock::now() + std::chrono::milliseconds(kRequestTimeoutMs);
-    std::size_t headEnd;
-    while ((headEnd = buf.find("\r\n\r\n")) == std::string::npos) {
-        const int n = ts.read_some(chunk, sizeof(chunk), &err);
-        if (n > 0) {
-            buf.append(chunk, static_cast<std::size_t>(n));
-            if (buf.size() > 16 * 1024) {
-                Log.warn("[mp-rdv] host socket: oversized upgrade response");
-                return WsOutcome::Retry;
-            }
-            continue;
-        }
-        if (n == TlsStream::kReadEof || n == TlsStream::kReadError) {
-            Log.warn("[mp-rdv] host socket for room {}: {}", c,
-                n == TlsStream::kReadEof ? "closed" : err);
-            return WsOutcome::Retry;
-        }
-        if (stop) {
-            return WsOutcome::Interrupted;
-        }
-        if (Clock::now() >= headDeadline) {
-            Log.warn("[mp-rdv] host socket for room {}: no upgrade response", c);
-            return WsOutcome::Retry;
-        }
-    }
-    const std::string_view head = std::string_view(buf).substr(0, headEnd);
-    const int status = head.size() >= 12 && head.substr(0, 7) == "HTTP/1." ?
-                           std::atoi(std::string(head.substr(9, 3)).c_str()) :
-                           0;
-    if (status == 404) {
+WsOutcome Client::Shared::classify_close(const borealis::ws::Event& ev) const {
+    const std::string& c = ws.code;
+    if (ev.status == 404) {
         Log.warn("[mp-rdv] room {} is gone (404 on the host socket); hosting ended", c);
         return WsOutcome::RoomGone;
     }
-    if (status != 101) {
-        Log.warn("[mp-rdv] host socket for room {}: upgrade refused (HTTP {})", c, status);
-        return WsOutcome::Retry;
+    if (ev.code == 4000) {
+        Log.warn("[mp-rdv] room {}: another host socket replaced this one; hosting ended here", c);
+        return WsOutcome::Replaced;
     }
-    {
-        const std::string expectIn = key + "258EAFA5-E914-47DA-95CA-C5AB0DC11B85";
-        unsigned char digest[20];
-        if (mbedtls_sha1(reinterpret_cast<const unsigned char*>(expectIn.data()), expectIn.size(),
-                digest) != 0 ||
-            find_header(head, "Sec-WebSocket-Accept") != base64(digest, sizeof(digest)))
-        {
-            Log.warn("[mp-rdv] host socket for room {}: bad Sec-WebSocket-Accept", c);
-            return WsOutcome::Retry;
-        }
+    if (ev.code == 1000) {
+        Log.warn("[mp-rdv] room {} closed by the server; hosting ended", c);
+        return WsOutcome::RoomGone;
     }
-    buf.erase(0, headEnd + 4);
+    if (ev.status != 0 && ev.status != 101) {
+        Log.warn("[mp-rdv] host socket for room {}: upgrade refused (HTTP {})", c, ev.status);
+    } else {
+        Log.warn("[mp-rdv] host socket for room {} closed: {} (code {}){}{}", c,
+            ws_error_name(ev.error), ev.code, ev.message.empty() ? "" : ": ",
+            scrub(ev.message, ws.secret));
+    }
+    return WsOutcome::Retry;
+}
+
+void Client::Shared::end_socket(WsOutcome outcome, std::uint64_t gen, const std::string& c) {
+    std::lock_guard lk(mu);
+    if (hostGen != gen || stop) {
+        return;
+    }
+    if (outcome == WsOutcome::Retry) {
+        wsBackoffS = wsBackoffS == 0 ? kWsBackoffFirstS : std::min(wsBackoffS * 2, kWsBackoffCapS);
+        wsRetryAt = Clock::now() + std::chrono::seconds(wsBackoffS);
+        Log.info("[mp-rdv] host socket for room {} reconnecting in {} s", c, wsBackoffS);
+    } else {
+        hosting = false;
+        secret.clear();
+        createStatus = Status::ServerError;
+    }
+}
+
+void Client::Shared::drive_host_socket() {
+    std::string c, s;
+    std::uint64_t gen = 0;
+    bool want = false;
+    Clock::time_point retryAt;
     {
         std::lock_guard lk(mu);
-        wsBackoffS = 0;
+        want = hosting && !stop;
+        c = code;
+        s = secret;
+        gen = hostGen;
+        retryAt = wsRetryAt;
     }
-    Log.info("[mp-rdv] host socket open for room {}", c);
+    if (ws.conn && (!want || ws.gen != gen)) {
+        // Room closed or replaced: the close request tells the server; just drop the socket.
+        ws.conn.close(1000);
+        ws = HostSocket{};
+    }
+    if (!want) {
+        return;
+    }
 
-    auto lastRx = Clock::now();
-    auto lastPing = lastRx;
-    int msgOpcode = -1;
-    std::string msg;
-    for (;;) {
-        // Jobs (a guest-side join, a close) run here without dropping the socket.
-        Job job;
-        while (pop_job(&job)) {
-            run_job(job);
+    if (!ws.conn) {
+        if (Clock::now() < retryAt) {
+            return;
         }
-        if (!still_hosting(gen)) {
-            ws_send(ts, 0x8, std::string_view("\x03\xE8", 2), &err);  // 1000 normal closure
-            return WsOutcome::Interrupted;
+        borealis::ws::Options o;
+        o.url = wsBaseUrl + "/v1/rooms/" + c + "/ws?secret=" + s;
+        o.connectTimeout = kWsConnectTimeout;
+        o.keepaliveInterval = std::chrono::milliseconds(0);
+        o.maxMessageBytes = kWsMaxMessage;
+        o.allowPlaintext = plaintextLoopback;
+        ws.gen = gen;
+        ws.code = c;
+        ws.secret = s;
+        ws.open = false;
+        ws.conn = borealis::ws::connect(std::move(o));
+        if (!ws.conn) {
+            Log.warn("[mp-rdv] host socket for room {}: connect returned no connection", c);
+            ws = HostSocket{};
+            end_socket(WsOutcome::Retry, gen, c);
+            return;
         }
+        Log.debug("[mp-rdv] host socket for room {} connecting", c);
+    }
 
-        const int n = ts.read_some(chunk, sizeof(chunk), &err);
-        const auto now = Clock::now();
-        if (n == TlsStream::kReadEof || n == TlsStream::kReadError) {
-            Log.warn("[mp-rdv] host socket for room {} dropped: {}", c,
-                n == TlsStream::kReadEof ? "closed" : err);
-            return WsOutcome::Retry;
-        }
-        if (n > 0) {
-            lastRx = now;
-            buf.append(chunk, static_cast<std::size_t>(n));
-            WsFrame f;
-            int pr;
-            while ((pr = ws_parse(buf, &f)) == 1) {
-                if (f.opcode == 0x9) {
-                    ws_send(ts, 0xA, f.payload, &err);
-                    continue;
-                }
-                if (f.opcode == 0xA) {
-                    continue;
-                }
-                if (f.opcode == 0x8) {
-                    const int code = f.payload.size() >= 2 ?
-                                         (static_cast<unsigned char>(f.payload[0]) << 8) |
-                                             static_cast<unsigned char>(f.payload[1]) :
-                                         1005;
-                    ws_send(ts, 0x8, std::string_view(f.payload).substr(0, 2), &err);
-                    if (code == 4000) {
-                        Log.warn("[mp-rdv] room {}: another host socket replaced this one; hosting "
-                                 "ended here",
-                            c);
-                        return WsOutcome::Replaced;
-                    }
-                    if (code == 1000) {
-                        Log.warn("[mp-rdv] room {} closed by the server; hosting ended", c);
-                        return WsOutcome::RoomGone;
-                    }
-                    Log.warn(
-                        "[mp-rdv] host socket for room {} closed by server (code {})", c, code);
-                    return WsOutcome::Retry;
-                }
-                if (f.opcode == 0x1 || f.opcode == 0x2) {
-                    msgOpcode = f.opcode;
-                    msg = std::move(f.payload);
-                } else if (f.opcode == 0x0 && msgOpcode >= 0) {
-                    if (msg.size() + f.payload.size() > kWsMaxMessage) {
-                        Log.warn("[mp-rdv] host socket: message over 64 KiB");
-                        return WsOutcome::Retry;
-                    }
-                    msg += f.payload;
-                } else {
-                    Log.warn("[mp-rdv] host socket: unexpected opcode {}", f.opcode);
-                    return WsOutcome::Retry;
-                }
-                if (!f.fin) {
-                    continue;
-                }
-                const int op = msgOpcode;
-                msgOpcode = -1;
-                if (op != 0x1 || msg == "pong") {
-                    continue;  // binary is ignored; pong is the keepalive answer
-                }
-                const json j = json::parse(msg, nullptr, false);
-                if (jstr(j, "type") == "guests") {
-                    accept_guests(j, gen);
-                } else {
-                    Log.debug("[mp-rdv] host socket: ignoring message type '{}'", jstr(j, "type"));
-                }
+    borealis::ws::Event ev;
+    while (ws.conn.poll(ev)) {
+        switch (ev.kind) {
+        case borealis::ws::Event::Kind::Open: {
+            ws.open = true;
+            ws.lastRx = ws.lastPing = Clock::now();
+            {
+                std::lock_guard lk(mu);
+                wsBackoffS = 0;
             }
-            if (pr < 0) {
-                Log.warn("[mp-rdv] host socket for room {}: protocol error", c);
-                return WsOutcome::Retry;
-            }
+            Log.info("[mp-rdv] host socket open for room {}", c);
+            break;
         }
-        if (now - lastPing >= kWsPingInterval) {
-            lastPing = now;
-            if (!ws_send(ts, 0x1, "ping", &err)) {
-                Log.warn("[mp-rdv] host socket for room {}: ping failed: {}", c, err);
-                return WsOutcome::Retry;
+        case borealis::ws::Event::Kind::Message: {
+            ws.lastRx = Clock::now();
+            if (ev.messageKind != borealis::ws::MessageKind::Text || ev.data == "pong") {
+                break;  // binary is ignored; "pong" is the keepalive answer
             }
+            const json j = json::parse(ev.data, nullptr, false);
+            if (jstr(j, "type") == "guests") {
+                accept_guests(j, gen);
+            } else {
+                Log.debug("[mp-rdv] host socket: ignoring message type '{}'", jstr(j, "type"));
+            }
+            break;
         }
-        if (now - lastRx > kWsSilenceLimit) {
-            Log.warn("[mp-rdv] host socket for room {} silent for 35 s; reconnecting", c);
-            return WsOutcome::Retry;
+        case borealis::ws::Event::Kind::Closed: {
+            const WsOutcome outcome = classify_close(ev);
+            ws = HostSocket{};
+            end_socket(outcome, gen, c);
+            return;
+        }
+        }
+    }
+
+    if (!ws.open) {
+        return;  // still connecting; Options::connectTimeout bounds this
+    }
+    const auto now = Clock::now();
+    if (now - ws.lastRx > kWsSilenceLimit) {
+        Log.warn("[mp-rdv] host socket for room {} silent for 35 s; reconnecting", c);
+        ws.conn.close(1000);
+        ws = HostSocket{};
+        end_socket(WsOutcome::Retry, gen, c);
+        return;
+    }
+    if (now - ws.lastPing >= kWsPingInterval) {
+        ws.lastPing = now;
+        const borealis::ws::SendResult sr = ws.conn.send(borealis::ws::MessageKind::Text, "ping");
+        if (sr != borealis::ws::SendResult::Ok) {
+            Log.warn("[mp-rdv] host socket for room {}: ping not sent (result {})", c,
+                static_cast<int>(sr));
+            ws = HostSocket{};
+            end_socket(WsOutcome::Retry, gen, c);
         }
     }
 }
