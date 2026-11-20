@@ -107,7 +107,9 @@ MultiplayerWindow::MultiplayerWindow(LaunchCallback launch) : mLaunch(std::move(
                 pane.add_text("Start the game and wait for other players to join.");
                 pane.add_text(fmt::format(
                     "Other players connect to this computer's IP address on port {} (UDP). "
-                    "Players outside your local network need that port forwarded to you.",
+                    "To play over the internet without touching your router, both players can "
+                    "install Tailscale and join with this computer's Tailscale address "
+                    "(see docs/multiplayer-internet.md). Otherwise forward that port to you.",
                     configured_port()));
             });
 
