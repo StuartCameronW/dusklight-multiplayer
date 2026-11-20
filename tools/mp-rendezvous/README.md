@@ -17,29 +17,38 @@ It runs on the **Workers Free plan only**. See [Cost guard](#cost-guard).
 - `GET /v1/rooms/{code}/ws?secret=…` (WebSocket upgrade) is the **recommended host channel**. The server sends
   `{"type":"guests","guests":[{joinId,name,candidates,token}]}` text frames whenever joins arrive, including any that
   were pending when the socket connected. The host sends the text `ping` every 30 s and gets `pong` back. The
-  runtime answers that without waking the object, so it is free. Any other text (for example `sync`) re-sends what
-  is pending. While the socket is open the room does not expire; the 7200 s TTL counts from the disconnect. A new
-  socket replaces the old one (close code 4000). When the room is deleted or expires, the socket closes with code 1000.
+  runtime answers that without waking the object, so it is free. **Any other frame closes the socket with code
+  1008**; to get what is pending again, reconnect. While the socket is open the room does not expire; the 7200 s TTL
+  counts from the disconnect. A new socket replaces the old one (close code 4000), but a room takes at most one
+  upgrade per 5 s (`429 {error:"rate_limited"}` otherwise). When the room is deleted or expires, the socket closes
+  with code 1000.
 - `POST /v1/rooms/{code}/join` `{v:1, name, candidates:[…]}` → `200 {joinId, token, host:{candidates:[…]}}`.
   token = 32 hex, the SAME token is delivered to the host in its wait. Unknown and expired codes → identical `404
-  {error:"no_room"}`. Full room → `409 {error:"full"}`. Rate limits (per client IP, in the DO): join 10/min,
-  create 5/min → `429 {error:"rate_limited"}`.
+  {error:"no_room"}`. Full room → `409 {error:"full"}`. Two joins already waiting on the host (issued in the last
+  90 s and not released) → `429 {error:"busy"}`. Rate limits (per IPv4 address or IPv6 /64): join 10/min, create
+  5/min → `429 {error:"rate_limited"}`. Past the service-wide daily create cap → `503 {error:"daily_cap"}`.
 - `DELETE /v1/rooms/{code}?secret=…` → `204` (wrong secret / no room → `404 {error:"no_room"}`).
-- `POST /v1/rooms/{code}/close?secret=…` → `204`, the same as DELETE (the game uses this: its HTTP layer has no DELETE).
+- `POST /v1/rooms/{code}/close` `{secret}` → `204`, the same as DELETE (the game uses this: its HTTP layer has no
+  DELETE). `?secret=` in the query with no body also works; the body keeps the secret out of URLs.
+- `POST /v1/rooms/{code}/release` `{secret, joinId}` → `204`: the host gives back the slot of a guest it denied, or
+  whose Hello never came. An unknown `joinId` is a no-op `204`; wrong secret / no room → `404`; a `joinId` that isn't
+  16 hex → `400`. `?secret=` is accepted here too.
 - Server also records the requester's `CF-Connecting-IP` as an extra `{ip, port:0, lan:false, seen:true}` hint
   candidate (port unknown over HTTP, so the client still uses STUN's port; useful for diagnostics only). It is added
-  only when that address is IPv4.
+  only when that address is global-unicast IPv4.
 - No logging of candidates/IPs beyond the room's lifetime. No accounts. CORS not needed.
 
 Validation: a body larger than 8 KiB gets `413 {error:"too_large"}`. A malformed body or field gets
 `400 {error:"bad_request"}`: `v` must be `1`; candidates are ≤ 8 objects, each with `ip` (dotted IPv4), `port`
-(integer 0-65535) and an optional boolean `lan`; `name` is 1-32 characters with no control or format characters;
+(integer 0-65535) and an optional boolean `lan`; a candidate with `lan` false or absent must be global unicast (not
+in 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16, 198.18/15, 224/4 or 240/4);
+`name` is 1-32 characters with no control or format characters;
 `maxPlayers` is an integer 2-8 and includes the host. Codes in the path are matched case-insensitively.
 Other errors: `405 method_not_allowed`, `426 upgrade_required` (`/ws` without an Upgrade header),
-`410 longpoll_disabled`, `503 busy` (5 code collisions in a row) and `503 disabled`.
+`410 longpoll_disabled`, `503 busy` (5 code collisions in a row), `503 daily_cap` and `503 disabled`.
 
-v1 limitation: each issued token uses up a guest slot, and a slot is not given back if that guest never connects.
-A host that wants fresh slots closes the room and creates a new one.
+Each issued token uses up a guest slot until the host releases it. The game releases a slot when the host presses
+Deny or the guest's Hello doesn't arrive in time, so a guest who gives up doesn't hold a slot for good.
 
 ## Deploy
 
@@ -94,8 +103,10 @@ failing for the rest of the day (UTC), which is an outage for everyone. So the W
 `/wait` stays for development and for clients that cannot do WebSocket yet. Set `LONGPOLL = "0"` to turn it off.
 
 Other costs per action:
-- create: 1 Worker request + 1 rate-limit DO request + 1-5 room DO requests + 2 rows written;
+- create: 1 Worker request + 1 rate-limit DO request + 1 create-cap DO request + 1-5 room DO requests + 3 rows written;
 - join: 1 Worker request + 2 DO requests + 2 rows written;
+- release: 1 Worker request + 1 DO request + 1 row written;
+- a rejected request (malformed, bad code, pre-limited): 1 Worker request and no DO request;
 - expiry: 1 alarm plus the deletes.
 
 To keep rows written low, room state sits in one storage key, and the stored expiry is rewritten only when it has
@@ -103,13 +114,41 @@ moved by more than 10 minutes.
 
 ## Rate limiting
 
-Each client IP gets its own `RateLimiter` Durable Object (`idFromName("rl:" + ip)`), which keeps a sliding
-60-second window of timestamps **in memory only**. It writes no storage, so it costs one DO request per create/join
-and no rows. Per-isolate counters in the Worker were rejected: one IP's requests land on many isolates and
-locations, so an attacker could spread its requests to get past them. The runtime only evicts a limiter after it
-has been idle, i.e. after the caller stopped, so losing the window then does no harm. A malformed code in a join
-path still costs a join attempt, so it can't be used to probe without limits. Wrong secrets need no limit: they
-are 128-bit random values, and an unknown room, an expired room and a wrong secret all give the same 404.
+Each client gets its own `RateLimiter` Durable Object (`idFromName("rl:" + key)`), which keeps a sliding
+60-second window of timestamps **in memory only**. The key is the IPv4 address, or the **/64** of an IPv6 address
+(one subscriber usually holds a whole /64, so per-address keys could be rotated past). It writes no storage, so it
+costs one DO request per create/join and no rows. A per-isolate copy of the same limits runs in the Worker first:
+on its own it can't stop a client spread over many isolates and locations (the DO does that), but it turns away
+most of a flood without spending a DO request. The runtime only evicts a limiter after it has been idle, i.e.
+after the caller stopped, so losing the window then does no harm. A join to a code outside the public alphabet
+answers `404` at once: such a code can never name a room, so it tells a prober nothing. Wrong secrets need no
+limit: they are 128-bit random values, and an unknown room, an expired room and a wrong secret all give the same 404.
+
+## Security
+
+What stops each abuse (2026-11-20 review). None of it can make a bill; it keeps one abuser from using up the free
+daily quota, which would be an outage for everyone until 00:00 UTC.
+
+| Abuse | Protection |
+|---|---|
+| Flooding the host socket with frames (each wakes the DO) | any frame but the auto-answered `ping` closes the socket with 1008 and does no work |
+| A `/ws` reconnect loop (each costs a close + a touch) | at most one upgrade per room per 5 s (in memory, checked after the secret); disconnects don't force a storage write |
+| Requests that will be rejected anyway costing DO requests | every body, code and secret is validated before any DO is called; a per-isolate pre-limiter runs before the limiter DO |
+| Rotating IPv6 addresses past per-address limits | limits key on the IPv6 /64 |
+| Many clients creating rooms to spend rows written | a global cap on creates per UTC day (`CREATE_CAP_PER_DAY`, default 3000) in the singleton `CreateCap` DO |
+| Someone with the code filling a room for good | at most 2 unsettled joins per room (`429 busy`); the host releases denied / never-connected joins |
+| A guest making the host UDP-punch arbitrary addresses (its LAN, loopback, multicast, broadcast) | a `lan:false` candidate must be global unicast (`400` otherwise); the game also drops such candidates and punches at most 4 per guest |
+| Secrets in URLs | `/close` and `/release` take the secret in the JSON body |
+| Guessing secrets / codes | 128-bit secrets compared with `timingSafeEqual`; 2^30 codes; identical 404 for unknown, expired and wrong-secret |
+| Oversized or hostile bodies | 8 KiB cap, strict JSON object, typed and bounded fields, names without control characters |
+| Leaking addresses or secrets | nothing is logged; rooms delete everything when they expire |
+
+Accepted, by design: `409 full` tells a code-holder the room exists; clients with no `CF-Connecting-IP` share one
+bucket; a guest sees the host's address before the host approves it (the guest needs it to connect).
+
+Not done in code, needs the Cloudflare account: every request, even a `404`/`429`, still counts toward the Worker's
+100,000/day. The real fix is a custom domain on a Free zone with the free WAF rate-limiting rule in front of the
+Worker, and `workers_dev = false`.
 
 ## Cost guard
 

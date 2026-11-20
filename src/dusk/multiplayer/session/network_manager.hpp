@@ -61,6 +61,8 @@ struct PeerSession {
     /// Set from the UI (answer_join_request), acted on in the next pre_actor_tick: 0 undecided,
     /// 1 allow, 2 deny.
     std::uint8_t approvalDecision = 0;
+    /// The rendezvous joinId behind this guest's token, so a Deny can give the room slot back.
+    std::string rdvJoinId;
     std::uint8_t helloColorExplicit = 0;
     std::uint32_t helloPreferredColor = 0;
 };
@@ -313,6 +315,8 @@ private:
         std::uint16_t port = 0;
         /// Null when UPnP is off or not built for this platform.
         std::shared_ptr<UpnpJob> upnp;
+        /// The router forwards our port, so a guest reaches us without a hole punch.
+        bool upnpMapped = false;
         std::unique_ptr<rdv::Client> rdv;
         /// The six characters, no dash.
         std::string code;

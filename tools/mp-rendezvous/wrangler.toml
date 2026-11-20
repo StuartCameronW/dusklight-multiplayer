@@ -11,6 +11,8 @@ workers_dev = true
 DISABLED = "0"
 # "0" turns off the legacy host long-poll (GET /v1/rooms/{code}/wait). See README "Long-poll vs WebSocket".
 LONGPOLL = "0"  # the game hosts over /ws; long-poll holds the DO awake (costly), so it is off
+# Rooms the whole service may create per UTC day (the CreateCap DO). Past it, creates answer 503 {"error":"daily_cap"}.
+CREATE_CAP_PER_DAY = "3000"
 
 [[durable_objects.bindings]]
 name = "ROOMS"
@@ -20,7 +22,16 @@ class_name = "Room"
 name = "LIMITER"
 class_name = "RateLimiter"
 
+[[durable_objects.bindings]]
+name = "CREATE_CAP"
+class_name = "CreateCap"
+
 # SQLite-backed classes are the only Durable Objects available on the Workers Free plan.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room", "RateLimiter"]
+
+# Never edit an applied migration; add a new tag.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CreateCap"]

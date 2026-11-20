@@ -16,6 +16,9 @@
  *    session token to put in Hello.
  *  - close_room() / the destructor close the hosted room with POST /v1/rooms/{code}/close
  *    (borealis has no DELETE; same semantics). Destructor: best effort, 2 s.
+ *  - release_join() gives a guest's slot back (POST /v1/rooms/{code}/release) when the host denies
+ *    them or their Hello never comes. The secret goes in the JSON body, never in the URL.
+ *  - Public (lan=false) candidates that aren't global-unicast IPv4 are neither sent nor accepted.
  *
  * Transport: borealis::http (HTTPS) and borealis::ws (WebSocket), i.e. the platform's native
  * stack (WinHTTP, URLSession, libcurl, Android) verifying certificates against the OS store. No
@@ -83,6 +86,9 @@ public:
     Status join_status(std::vector<Candidate>* host, std::string* token) const;
 
     void close_room();
+    /// Host: frees the room slot of a join the host refused or that never connected. Fire and
+    /// forget; a no-op when no room is hosted.
+    void release_join(std::string joinId);
 
     struct Shared;
 
@@ -93,5 +99,10 @@ private:
 /// Upper-cases, strips '-' and spaces, maps O->0 and I/L->1; returns "" unless the result is
 /// exactly 6 characters of 0123456789ABCDEFGHJKMNPQRSTVWXYZ.
 std::string normalize_code(std::string typed);
+
+/// True for a dotted IPv4 address outside 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12,
+/// 192.0.0/24, 192.168/16, 198.18/15, 224/4 and 240/4: the only addresses a public candidate may
+/// have (the same list as the rendezvous Worker's).
+bool is_global_unicast_v4(const std::string& ip);
 
 }  // namespace dusk::mp::rdv
