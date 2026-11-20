@@ -61,4 +61,13 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId);
 
 void close();
 
+/* --- batch 8: enemies ---
+ * Enemy rows go to a SECOND file next to the trace, `<trace path>.enemies.csv`, because their
+ * columns are not a player's and the analyzers of the main file read it positionally. Opened on
+ * the first row, so a run with no synced enemy leaves no empty file. Every row is prefixed with
+ * `tick,ms,absMs,role,` (the same clocks as the main file); `header` is the rest of the header
+ * line, written once, and `row` the rest of one line, both without the trailing newline. Flushed
+ * with the main file in write_tick. No-op while tracing is off. */
+void enemy_row(std::uint64_t tick, const char* header, const std::string& row);
+
 }  // namespace dusk::mp::trace

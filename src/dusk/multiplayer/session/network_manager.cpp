@@ -19,6 +19,7 @@
 #include "../net/packet.hpp"
 #include "../net/serializer.hpp"
 #include "../policy/mp_policy.hpp"
+#include "../replication/enemy_sync.hpp"  // batch 8: enemies
 #include "../replication/item_claims.hpp"
 #include "../replication/object_channel.hpp"
 #include "../replication/object_drops.hpp"  // batch 7: drops
@@ -594,6 +595,9 @@ void NetworkManager::shutdown(DisconnectReason reason) {
     item_claims::reset();
     // v24: a guest ran the host's policy; its own comes back.
     policy_sync::reset();
+    /* --- batch 8: enemies --- */
+    // Every synced enemy back to local, every stand-in gone, slot 0 back on Link.
+    enemies::reset();
     mLastPresence.clear();
     mPeers.clear();
     mPendingHeartbeats.clear();
@@ -722,6 +726,13 @@ void NetworkManager::pre_actor_tick() {
     // Advancing the interpolation cursor here (once per sim tick, never per rendered frame) is
     // what keeps playback locked to the same clock the poses were captured on.
     replication_manager().drive_puppets();
+
+    /* --- batch 8: enemies --- */
+    // After drive_puppets: ghosts play on their authority's puppet timeline, and the target
+    // stand-ins are refilled from the poses just pushed.
+    if (session_live()) {
+        enemies::pre_tick();
+    }
 }
 
 void NetworkManager::post_actor_tick() {
@@ -745,6 +756,8 @@ void NetworkManager::post_actor_tick() {
         // v23: guest claim timeouts and host lease expiry (replication/item_claims.hpp).
         item_claims::tick();
         send_presence();
+        /* --- batch 8: enemies --- */
+        enemies::post_tick();
     }
 
     send_heartbeats();
@@ -887,6 +900,8 @@ void NetworkManager::handle_disconnect(PeerId peer, std::uint32_t reason) {
     objects::on_peer_left(session.playerId);
     // v23: a chest or item they held a claim on is free again at once, not after the lease lapses.
     item_claims::on_peer_left(session.playerId);
+    /* --- batch 8: enemies --- */
+    enemies::on_peer_left(session.playerId);
     broadcast_peer_left(session.playerId);
 
     if (session.refused) {
@@ -1164,6 +1179,16 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
         return;
     }
+    /* --- batch 8: enemies --- */
+    // EnemyAuthority is the host's table: client-bound, never relayed. EnemyUpdate and RoomsLoaded
+    // go either way and are policed in enemies::on_packet (a guest speaks only for itself, and only
+    // for rooms the host's table gives it).
+    if (id == PacketId::EnemyAuthority && mRole != Role::Client) {
+        if (warn_budget()) {
+            Log.warn("Ignoring packet {} from peer {}: wrong direction for this role", rawId, peer);
+        }
+        return;
+    }
     if (mRole == Role::Host && id != PacketId::Hello && id != PacketId::Heartbeat &&
         id != PacketId::HeartbeatAck &&
         (!sender->second.handshakeComplete || sender->second.refused))
@@ -1294,6 +1319,8 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         // v24: the session's policy, before the guest can ask for (and so receive) a WorldSync:
         // same ordered channel, so the world it installs is read under the host's policy.
         policy_sync::send_to(playerId);
+        /* --- batch 8: enemies --- */
+        enemies::on_peer_joined(playerId);
 
         replication_manager().add_player(playerId, nickname, assignedColor);
         Log.info("Peer {} admitted as player {} ('{}', #{:06X})", peer, playerId, nickname,
@@ -1614,6 +1641,8 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         replication_manager().remove_player(playerId);
         presence::on_peer_left(playerId);
         objects::on_peer_left(playerId);
+        /* --- batch 8: enemies --- */
+        enemies::on_peer_left(playerId);
         Log.info("Player {} left", playerId);
         if (known) {
             notify(fmt::format("{} left", name), "They are no longer in the session.", 4);
@@ -1690,6 +1719,23 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
     case PacketId::DropTaken:  // client-bound: the host granted a drop to someone
         objects::drops::on_packet(id, r, sender->second.playerId);
         break;
+    /* --- batch 8: enemies --- */
+    case PacketId::EnemyAuthority:  // client-bound (checked above): the host's authority table
+        enemies::on_packet(id, r, sender->second.playerId);
+        break;
+    case PacketId::EnemyUpdate: {  // a room's authority -> host -> others, unreliable
+        // Applied first, relayed only if on_packet vouched for it (the sender owns that room).
+        if (enemies::on_packet(id, r, sender->second.playerId) && mRole == Role::Host) {
+            relay_to_others(peer, data, size, kChannelState, false);
+        }
+        break;
+    }
+    case PacketId::RoomsLoaded: {  // peer -> host -> others, reliable
+        if (enemies::on_packet(id, r, sender->second.playerId) && mRole == Role::Host) {
+            relay_to_others(peer, data, size, kChannelObjects, true);
+        }
+        break;
+    }
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);
         break;

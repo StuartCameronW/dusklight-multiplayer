@@ -481,6 +481,17 @@ constexpr std::uint8_t kPlayerFormChain = 1 << 4;
 constexpr std::uint8_t kPlayerFormMidna = 1 << 5;
 constexpr std::uint8_t kPlayerFormKnownMask = 0x3F;
 
+/**
+ * Batch 8 (M6 phase 1) cut block (PlayerState::cutType / cutCount / cutFlags), appended after the
+ * form block, 3 bytes, always on the wire. The sender's daPy_py_c::mCutType (getCutType()),
+ * mComboCutCount (getCutCount()) and, in cutFlags bit 0, FLG0_CUT_AT_FLG (getCutAtFlg()). Read
+ * off the LINK_PTR slot, never slot 0. The receiver does not draw any of it: it feeds the enemy
+ * target stand-in (replication/enemy_target.cpp), so an enemy whose target is a remote player can
+ * answer getCutType / getCutCount (Bokoblin's dodge-the-spin, d_a_e_oc.cpp:414, :597-624).
+ */
+constexpr std::uint8_t kPlayerCutAt = 1 << 0;
+constexpr std::uint8_t kPlayerCutKnownMask = 0x01;
+
 struct PlayerState {
     float posX = 0.0f;
     float posY = 0.0f;
@@ -882,6 +893,13 @@ struct PlayerState {
     std::int8_t metaTint = 0;
     std::uint8_t furFrame = 0;
 
+    // batch 8 cut block (after the form block): 3 bytes, always. See kPlayerCutAt.
+    std::uint8_t cutType = 0;
+    std::uint8_t cutCount = 0;
+    std::uint8_t cutFlags = 0;
+
+    bool cut_at() const { return (cutFlags & kPlayerCutAt) != 0; }
+
     bool clawshot_out() const {
         return heldItem == kPlayerHeldClawshot || heldItem == kPlayerHeldDoubleClawshot;
     }
@@ -1033,6 +1051,10 @@ struct PlayerState {
             w.write_u8(static_cast<std::uint8_t>(metaTint));
             w.write_u8(furFrame);
         }
+        // batch 8 cut block: always, after the form block
+        w.write_u8(cutType);
+        w.write_u8(cutCount);
+        w.write_u8(cutFlags);
     }
 
     bool read(Reader& r) {
@@ -1162,6 +1184,11 @@ struct PlayerState {
             metaTint = 0;
             furFrame = 0;
         }
+        // batch 8 cut block
+        if (!(r.read_u8(cutType) && r.read_u8(cutCount) && r.read_u8(cutFlags))) {
+            return false;
+        }
+        cutFlags &= kPlayerCutKnownMask;
         roomNo = static_cast<std::int8_t>(room);
         actYawOff = joint_aim_from_wire(yawOff);
         actPitch = act_decode_turn(pitch);
@@ -1472,6 +1499,10 @@ inline PlayerState lerp_state(const PlayerState& a, const PlayerState& b, float 
     out.form = b.form;
     out.metaTint = b.metaTint;
     out.furFrame = b.furFrame;
+    // batch 8 cut block: discrete (an enum, a count and a bit), take b.
+    out.cutType = b.cutType;
+    out.cutCount = b.cutCount;
+    out.cutFlags = b.cutFlags;
     return out;
 }
 

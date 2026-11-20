@@ -13,6 +13,9 @@ namespace {
 constexpr borealis::Log Log{"dusk::mp"};
 
 std::ofstream sFile;
+/* --- batch 8: enemies --- */
+std::ofstream sEnemyFile;
+std::string sPath;
 std::string sRole;
 std::chrono::steady_clock::time_point sStart;
 bool sEnabled = false;
@@ -91,6 +94,7 @@ void open(const std::string& path, const char* role) {
     }
 
     sRole = role;
+    sPath = path;
     sStart = std::chrono::steady_clock::now();
     sEnabled = true;
     // `moveRate` was called `speed` until protocol 6, and it is genuinely a different quantity now
@@ -177,6 +181,9 @@ void write_tick(std::uint64_t tick, std::uint32_t localPlayerId) {
     // Flushed every tick on purpose: these runs are usually ended by killing the process, and a
     // buffered tail would lose exactly the part worth reading.
     sFile.flush();
+    if (sEnemyFile.is_open()) {
+        sEnemyFile.flush();
+    }
 }
 
 void close() {
@@ -185,6 +192,28 @@ void close() {
         sFile.close();
         sEnabled = false;
     }
+    if (sEnemyFile.is_open()) {
+        sEnemyFile.flush();
+        sEnemyFile.close();
+    }
+}
+
+void enemy_row(std::uint64_t tick, const char* header, const std::string& row) {
+    if (!sEnabled) {
+        return;
+    }
+    if (!sEnemyFile.is_open()) {
+        const std::string path = sPath + ".enemies.csv";
+        sEnemyFile.open(path, std::ios::out | std::ios::trunc);
+        if (!sEnemyFile) {
+            Log.error("Could not open enemy trace file '{}'", path);
+            return;
+        }
+        sEnemyFile << "tick,ms,absMs,role," << header << '\n';
+        Log.info("Tracing enemies to '{}'", path);
+    }
+    sEnemyFile << tick << ',' << elapsed_ms() << ',' << abs_ms() << ',' << sRole << ',' << row
+               << '\n';
 }
 
 }  // namespace dusk::mp::trace
