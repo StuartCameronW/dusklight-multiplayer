@@ -224,7 +224,7 @@ uint32_t item_revision(u8 itemNo) noexcept {
         revision = revision * 131u + (dComIfGs_getOil() == 0 ? 0u : 1u);
     }
     if (itemNo == dItemNo_COPY_ROD_e) {
-        auto* player = daPy_getPlayerActorClass();
+        auto* player = daPy_getLinkPlayerActorClass();
         revision = revision * 131u + (player != nullptr && player->checkCopyRodTopUse() ? 1u : 0u);
     }
     return revision;

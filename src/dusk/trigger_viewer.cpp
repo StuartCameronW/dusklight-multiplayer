@@ -127,7 +127,7 @@ static void drawEventArea(fopAc_ac_c* actor) {
         GXColor inner_color = {0x00, 0xFF, 0x00, s_opacity};
         cXyz pos = actor->current.pos;
 
-        daAlink_c* player = (daAlink_c*)dComIfGp_getPlayer(0);
+        daAlink_c* player = daAlink_getAlinkActorClass();
         if (player != NULL && pos.y < player->mLinkAcch.GetGroundH()) {
             pos.y = player->mLinkAcch.GetGroundH() + 100.0f;
         }
@@ -213,7 +213,7 @@ static void drawStagePaths() {
 }
 
 static void drawCurrentRoomPaths() {
-    fopAc_ac_c* player = dComIfGp_getPlayer(0);
+    fopAc_ac_c* player = dComIfGp_getLinkPlayer();
     if (player == nullptr) {
         return;
     }
@@ -249,7 +249,7 @@ static void drawCheckpointTag(fopAc_ac_c* actor) {
 
     mDoMtx_multVecArray(mDoMtx_stack_c::get(), points, points, 8);
 
-    fopAc_ac_c* player = dComIfGp_getPlayer(0);
+    fopAc_ac_c* player = dComIfGp_getLinkPlayer();
     if (player != nullptr) {
         for (int i = 0; i < 8; i++) {
             points[i].y = player->current.pos.y;
@@ -337,7 +337,7 @@ static void drawLeeverData(fopAc_ac_c* actor) {
     GXColor color2 = {0x00, 0x00, 0xFF, s_opacity};
 
     cXyz pos = actor->current.pos;
-    daAlink_c* player = (daAlink_c*)dComIfGp_getPlayer(0);
+    daAlink_c* player = daAlink_getAlinkActorClass();
     if (player != nullptr && pos.y < player->mLinkAcch.GetGroundH()) {
         pos.y = player->mLinkAcch.GetGroundH() + 100.0f;
     }

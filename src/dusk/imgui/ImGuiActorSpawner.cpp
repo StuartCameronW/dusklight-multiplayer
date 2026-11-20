@@ -43,7 +43,7 @@ void ImGuiMenuTools::ShowActorSpawner() {
         return;
     }
 
-    daAlink_c* player = (daAlink_c*)dComIfGp_getPlayer(0);
+    daAlink_c* player = daAlink_getAlinkActorClass();
 
     ImGui::SeparatorText("Actor");
     ImGui::InputInt("Actor ID", &s_state.actorId);

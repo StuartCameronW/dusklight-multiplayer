@@ -977,7 +977,7 @@ void populate_select_clothes_picker(Pane& pane) {
             .on_pressed([id] {
                 mDoAud_seStartMenu(kSoundItemChange);
                 dMeter2Info_setCloth(id, false);
-                daPy_getPlayerActorClass()->setClothesChange(0);
+                daPy_getLinkPlayerActorClass()->setClothesChange(0);
             });
     };
     addOption(dItemNo_WEAR_CASUAL_e);

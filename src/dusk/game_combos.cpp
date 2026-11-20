@@ -15,7 +15,7 @@ s16 s_savedTeleportAngle = 0;
 bool s_hasTeleportPos = false;
 
 static daAlink_c* getPlayer() {
-    return (daAlink_c*)dComIfGp_getPlayer(0);
+    return daAlink_getAlinkActorClass();
 }
 
 static void consumeButtons(u16 mask) {

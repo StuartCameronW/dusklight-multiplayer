@@ -91,7 +91,7 @@ static base_process_class* ParseProcArg(
         }
         id = foundProcId;
     } else if (inner == "link") {
-        auto* player = dComIfGp_getPlayer(0);
+        auto* player = dComIfGp_getLinkPlayer();
         if (player == nullptr) {
             output("Error: player not available");
             return nullptr;
@@ -286,7 +286,7 @@ void runCommand(std::string_view cmdLine, CommandState& state, const CommandOutp
     const auto& cmd = args[0];
 
     auto requirePlayer = [&]() -> daAlink_c* {
-        auto* p = (daAlink_c*)dComIfGp_getPlayer(0);
+        auto* p = daAlink_getAlinkActorClass();
         if (p == nullptr) {
             output("Error: player not available");
         }
