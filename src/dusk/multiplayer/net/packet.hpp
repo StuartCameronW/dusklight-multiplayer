@@ -172,7 +172,14 @@ namespace dusk::mp {
  * channel gains ObjKind::Drop (0x09). DisconnectReason::SaveReset (6) ends a session whose save
  * memory was reset. Co-op death offers only Retry.
  */
-inline constexpr std::uint32_t kProtocolVersion = 24;
+/*
+ * 25: Batch 8 (M6 phase 1). PlayerState grew a 3-byte cut block after the form block (u8 cutType,
+ * u8 cutCount, u8 cutFlags bit 0 = cut AT): a v24 peer's read() would stop three bytes short and drop
+ * every pose. New packets 28 EnemyAuthority (host -> all), 29 EnemyUpdate (authority -> host -> others,
+ * unreliable) and 30 RoomsLoaded (peer -> host -> others); a v24 peer would drop them as unknown and run
+ * every enemy locally. Layouts: replication/enemy_sync.hpp.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 25;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
