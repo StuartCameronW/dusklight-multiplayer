@@ -10,7 +10,7 @@ workers_dev = true
 # Manual off-switch: "1" makes every route answer 503 {"error":"disabled"} without touching a Durable Object.
 DISABLED = "0"
 # "0" turns off the legacy host long-poll (GET /v1/rooms/{code}/wait). See README "Long-poll vs WebSocket".
-LONGPOLL = "1"
+LONGPOLL = "0"  # the game hosts over /ws; long-poll holds the DO awake (costly), so it is off
 
 [[durable_objects.bindings]]
 name = "ROOMS"
