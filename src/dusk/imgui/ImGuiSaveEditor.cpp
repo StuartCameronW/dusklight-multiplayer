@@ -582,19 +582,19 @@ namespace dusk {
         if (ImGui::BeginCombo("Clothes", itemMap.find(statusA.mSelectEquip[0])->second.m_name.c_str())) {
             if (ImGui::Selectable("Ordon Clothes")) {
                 dMeter2Info_setCloth(dItemNo_WEAR_CASUAL_e, false);
-                daPy_getPlayerActorClass()->setClothesChange(0);
+                daPy_getLinkPlayerActorClass()->setClothesChange(0);
             }
             if (ImGui::Selectable("Hero's Clothes")) {
                 dMeter2Info_setCloth(dItemNo_WEAR_KOKIRI_e, false);
-                daPy_getPlayerActorClass()->setClothesChange(0);
+                daPy_getLinkPlayerActorClass()->setClothesChange(0);
             }
             if (ImGui::Selectable("Zora Armor")) {
                 dMeter2Info_setCloth(dItemNo_WEAR_ZORA_e, false);
-                daPy_getPlayerActorClass()->setClothesChange(0);
+                daPy_getLinkPlayerActorClass()->setClothesChange(0);
             }
             if (ImGui::Selectable("Magic Armor")) {
                 dMeter2Info_setCloth(dItemNo_ARMOR_e, false);
-                daPy_getPlayerActorClass()->setClothesChange(0);
+                daPy_getLinkPlayerActorClass()->setClothesChange(0);
             }
             ImGui::EndCombo();
         }

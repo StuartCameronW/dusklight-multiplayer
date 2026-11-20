@@ -153,7 +153,7 @@ s8 stick_value(float value) noexcept {
 }
 
 bool player_attention_locked() noexcept {
-    const auto* player = daPy_getPlayerActorClass();
+    const auto* player = daPy_getLinkPlayerActorClass();
     return player != nullptr && (player->checkAttentionLock() || player->checkEnemyAttentionLock());
 }
 

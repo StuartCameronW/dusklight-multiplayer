@@ -449,7 +449,7 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
 #if TARGET_PC
             if (fopAcM_GetGroup(i_enemy) == fopAc_ENEMY_e) {
                 dusk::AchievementSystem::get().signal("enemy_killed");
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link != nullptr && link->mProcID == daAlink_c::PROC_CUT_FINISH && link->mIsRollstab) {
                     dusk::AchievementSystem::get().signal("rollstab_kill");
                 }

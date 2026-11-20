@@ -64,7 +64,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link != nullptr && link->mProcID == daAlink_c::PROC_GANON_FINISH) {
                     a.progress = 1;
                 }
@@ -80,7 +80,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
@@ -99,7 +99,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
@@ -342,7 +342,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 true, 4, 0, false
             },
             [](Achievement& a, json&) {
-                if (daPy_getPlayerActorClass() == nullptr) {
+                if (dComIfGp_getLinkPlayer() == nullptr) {
                     return;
                 }
                 int count = 0;
@@ -432,7 +432,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
@@ -452,7 +452,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
@@ -487,7 +487,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
@@ -541,7 +541,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
             },
             [](Achievement& a, json&) {
                 static int rollstabKills = 0;
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 const bool inRollstab = link != nullptr && link->mProcID == daAlink_c::PROC_CUT_FINISH && link->mIsRollstab;
                 if (!inRollstab) {
                     rollstabKills = 0;
@@ -668,7 +668,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr) {
                     return;
                 }
@@ -740,7 +740,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 static bool inJump = false;
                 static float startX = 0.0f, startZ = 0.0f;
 
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr) {
                     inJump = false;
                     return;
@@ -796,11 +796,11 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
-                if (daPy_getPlayerActorClass()->checkEquipHeavyBoots()) {
+                if (link->checkEquipHeavyBoots()) {
                     a.progress = 1;
                 }
             },
@@ -861,7 +861,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
             },
             [](Achievement& a, json&) {
                 auto& sys = AchievementSystem::get();
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
 
                 static int autospinCount = 0;
                 static int pendingHits = 0;
@@ -924,7 +924,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 if (fopAcM_SearchByName(fpcNm_TITLE_e) == nullptr) {
                     return;
                 }
-                const auto* player = static_cast<const daPy_py_c*>(daPy_getPlayerActorClass());
+                const auto* player = daPy_getLinkPlayerActorClass();
 
                 if (player != nullptr && player->mDemo.getDemoMode() == 1) {
                         a.progress = 1;
@@ -971,7 +971,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                const auto* link = static_cast<const daAlink_c*>(daPy_getPlayerActorClass());
+                const auto* link = daAlink_getAlinkActorClass();
                 if (link == nullptr || link->mProcID != daAlink_c::PROC_GANON_FINISH) {
                     return;
                 }
@@ -1027,7 +1027,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                if (daPy_getPlayerActorClass() == nullptr) {
+                if (dComIfGp_getLinkPlayer() == nullptr) {
                     return;
                 }
                 for (int i = 0; i < 24; ++i) {
@@ -1112,7 +1112,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 if (!dComIfGs_isEventBit(dSv_event_flag_c::M_022)) {
                     return;
                 }
-                if (daPy_getPlayerActorClass() == nullptr) {
+                if (dComIfGp_getLinkPlayer() == nullptr) {
                     return;
                 }
                 for (int i = 0; i < 24; ++i) {
@@ -1133,7 +1133,7 @@ std::vector<AchievementSystem::Entry> AchievementSystem::makeEntries() {
                 false, 0, 0, false
             },
             [](Achievement& a, json&) {
-                if (daPy_getPlayerActorClass() == nullptr) {
+                if (dComIfGp_getLinkPlayer() == nullptr) {
                     return;
                 }
                 bool hasDoubleClawshot = false;

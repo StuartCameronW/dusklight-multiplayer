@@ -223,7 +223,7 @@ namespace dusk {
         ImGui::SetNextWindowBgAlpha(0.65f);
 
         if (ImGui::Begin("Player Info", nullptr, windowFlags)) {
-            daAlink_c* player = (daAlink_c*)dComIfGp_getPlayer(0);
+            daAlink_c* player = daAlink_getAlinkActorClass();
             daHorse_c* horse = dComIfGp_getHorseActor();
 
             double speedXzy = 0.0;

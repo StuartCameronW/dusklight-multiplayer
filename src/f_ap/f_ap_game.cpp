@@ -771,8 +771,8 @@ static void duskExecute() {
     }
 
     if (dusk::getSettings().game.fastSpinner && mDoCPd_c::getHoldR(PAD_1)) {
-        if (const auto link = g_dComIfG_gameInfo.play.getPlayer(0)) {
-            auto spinnerActor = (fopAc_ac_c*)dynamic_cast<daAlink_c*>(link)->getSpinnerActor();
+        if (daAlink_c* const link = daAlink_getAlinkActorClass()) {
+            auto spinnerActor = (fopAc_ac_c*)link->getSpinnerActor();
             if (spinnerActor) {
                 if (spinnerActor->speedF < 60.f)
                     spinnerActor->speedF += 2.f;
