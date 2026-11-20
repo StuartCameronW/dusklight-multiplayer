@@ -98,4 +98,34 @@ private:
     bool mActive;
 };
 
+/* --- batch 9: enemy hits (M6 phase 2, mp-m6-enemies.md §5.1, §5.6.5 items 3 and 7) --- */
+
+/// True while enemy sync is live (session live and multiplayer.enemySync on). The d_cc_uty.cpp
+/// hooks then read the attacker from the LinkPlayer slot instead of player slot 0, which may hold
+/// a target stand-in inside a swapped enemy execute (§5.6.5 item 3). False: vanilla.
+bool enemy_sync_live();
+
+/// What an injected remote hit carries in place of the local player's state. Filled on the
+/// authority from an EnemyHit event; the proxy AT collider it belongs to lives until the next tick.
+struct EnemyHitOverride {
+    /// at_power_check's results as the ATTACKER's machine computed them (dCcU_AtInfo fields).
+    unsigned char hitType;
+    unsigned int hitBit;
+    signed char hitStatus;
+    /// The attacker's own Link at the time of the hit (cc_at_check's sword modifiers etc.).
+    bool masterSword;
+    bool woodSword;
+    bool wolf;
+    bool swordUp;
+    bool headJump;
+    bool cutJumpCancelTurn;
+    bool horseRide;
+    short shapeAngleY;
+};
+
+/// Non-null when `atObj` is the proxy AT collider of an injected remote hit: at_power_check and
+/// cc_at_check take the hit type, bits and sword modifiers from it, and cc_at_check does not start
+/// the global hit-stop (the remote attacker's machine runs its own). Null for every real collider.
+const EnemyHitOverride* enemy_hit_override(const cCcD_Obj* atObj);
+
 }  // namespace dusk::mp

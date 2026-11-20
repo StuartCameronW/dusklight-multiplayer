@@ -54,6 +54,21 @@
  *       Room -1 (stage-level actors) is listed whenever the sender is in a stage. The m keys are
  *       enemies the sender degraded to local-only since its last RoomsLoaded; the receiver
  *       degrades its own copy too ("on both ends").
+ *   --- batch 9 (phase 2): hits. Both go attacker -> the room's authority, reliable
+ *   kChannelObjects: direct when the host is one end, else guest -> host -> the other guests (only
+ *   the addressed authority acts; the host relays only a guest speaking for itself). ---
+ *   EnemyHit 31:
+ *       [u8 attacker][u8 authority][u32 key][u16 epoch][u8 tgIndex]
+ *       [u32 atType][u8 atp][u8 atSpl][u8 atMtrl][u8 atSe][u8 atHitMark]
+ *       [f32 x][f32 y][f32 z]                   the cross (hit) position
+ *       [u8 hitType][u32 hitBit][s8 hitStatus]  at_power_check on the attacker's machine
+ *       [u8 attackerFlags][u8 cutType][s16 shapeAngleY][s16 attackerLife]
+ *       attackerFlags: 1 master sword, 2 wood sword, 4 wolf, 8 sword-up, 0x10 head jump,
+ *                      0x20 cut-jump-cancel turn, 0x40 riding
+ *       The authority validates (epoch, TG set, alive, distance), then injects it before its next
+ *       actor pass as a proxy AT collider owned by the attacker's puppet (§5.1).
+ *   EnemyFlagHit 32:
+ *       [u8 attacker][u8 authority][u32 key][u16 epoch][u16 bit]   bit: CutDownHit or WolfBite
  *
  * ---- Playback ----
  * A ghost plays the authority's samples on the authority's own pose timeline: the tick its puppet
@@ -124,6 +139,11 @@ struct EnemyView {
     std::uint32_t swapTicks = 0;
     std::uint32_t absorbedWrites = 0;
     std::uint32_t realLinkWrites = 0;
+    /* batch 9: enemy hits. Ghost: sent. Authority: received / injected / rejected. */
+    std::uint32_t hitsSent = 0;
+    std::uint32_t hitsRecv = 0;
+    std::uint32_t hitsInjected = 0;
+    std::uint32_t hitsRejected = 0;
 };
 
 /// Every registered (adapted, placed) enemy, created and alive.

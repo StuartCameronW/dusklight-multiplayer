@@ -181,7 +181,14 @@ namespace dusk::mp {
  * Also batch 8 (pause): PlayerState gear bit 7 = kPlayerGearInMenu (the player is in a menu); the
  * world freezes only while every player has it set. A v24 peer ignores the bit and never freezes.
  */
-inline constexpr std::uint32_t kProtocolVersion = 25;
+/*
+ * 26: Batch 9 (M6 phase 2, enemy hits). New packets 31 EnemyHit and 32 EnemyFlagHit (a non-authority
+ * -> the room's authority, via the host; reliable kChannelObjects): a player's hit on a ghost enemy,
+ * and an enemy flag bit (CutDownHit, wolf bite) his Link set on one, applied by the authority. A v25
+ * peer would drop them as unknown and every hit on its ghosts would be lost. Layouts:
+ * replication/enemy_sync.hpp.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 26;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -306,7 +313,13 @@ enum class PacketId : std::uint8_t {
     /// the host sends its own to every guest. Which rooms the sender has loaded, plus enemy keys it
     /// degraded to local-only (cross-check mismatch).
     RoomsLoaded = 30,
-    /* 31 EnemyHit and 32 EnemyFlagHit: reserved for M6 phase 2. */
+    /* --- batch 9: enemy hits (M6 phase 2). Layouts: replication/enemy_sync.hpp. --- */
+    /// A player who hit a ghost enemy -> the room's authority (via the host; the host relays a
+    /// guest's to the others, and only the authority acts on it), reliable on kChannelObjects.
+    EnemyHit = 31,
+    /// Same route: an enemy flag bit (CutDownHit, WolfBiteDamage) the sender's Link set on a ghost.
+    EnemyFlagHit = 32,
+    /* 33: reserved. */
 };
 
 /**

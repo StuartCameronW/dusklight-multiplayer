@@ -80,6 +80,21 @@ struct Rec {
     std::uint32_t absorbedWrites = 0;
     std::uint32_t realLinkWrites = 0;
     std::uint32_t targetSwitches = 0;
+
+    /* ---- batch 9: enemy hits (phase 2) ---- */
+    /// Ghost: the mFlags value the ghost tick last wrote, to spot bits the local Link set since.
+    std::uint16_t ghostFlagsWritten = 0;
+    bool ghostFlagsValid = false;
+    /// Authority: an injected hit this tick, and the HP before it (post_tick logs the result).
+    bool injectedThisTick = false;
+    std::int16_t hpBeforeInject = 0;
+    /// Ghost: EnemyHit / EnemyFlagHit sent. Authority: received, injected, rejected (any reason).
+    std::uint32_t hitsSent = 0;
+    std::uint32_t hitsRecv = 0;
+    std::uint32_t hitsInjected = 0;
+    std::uint32_t hitsRejected = 0;
+    std::uint32_t flagHitsSent = 0;
+    std::uint32_t flagHitsApplied = 0;
 };
 
 /// Sync is live this tick: session live and multiplayer.enemySync on (latched by pre_tick, cleared

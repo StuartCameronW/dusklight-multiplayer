@@ -17,6 +17,7 @@
 #include "dusk/achievements.h"
 #include "dusk/settings.h"
 #include "d/actor/d_a_alink.h"
+#include "dusk/mp_enemy.hpp"
 #endif
 
 static int plCutLRC[58] = {
@@ -89,7 +90,15 @@ int pl_cut_LRC(int index) {
 }
 
 u16 cc_pl_cut_bit_get() {
+#if TARGET_PC
+    // MP enemy sync: slot 0 may be a target stand-in inside a swapped enemy execute; the attacker
+    // is the local Link (mp-m6-enemies.md §5.6.5 item 3). Vanilla otherwise.
+    daPy_py_c* player_p = dusk::mp::enemy_sync_live() && dComIfGp_getLinkPlayer() != NULL ?
+                              dComIfGp_getLinkPlayer() :
+                              (daPy_py_c*)dComIfGp_getPlayer(0);
+#else
     daPy_py_c* player_p = (daPy_py_c*)dComIfGp_getPlayer(0);
+#endif
 
     u16 bit = 0;
     if (player_p->getCutType() == daPy_py_c::CUT_TYPE_NM_VERTICAL) {
@@ -366,11 +375,31 @@ fopAc_ac_c* at_power_check(dCcU_AtInfo* i_AtInfo) {
         }
     }
 
+#if TARGET_PC
+    // MP enemy sync (§5.1 item 6): an injected remote hit's proxy AT is owned by the attacker's
+    // puppet, which is not fpcNm_ALINK_e. Its hit type, bits and status are the ones the attacker's
+    // own machine classified it as (from the event), never the local player's cut.
+    if (const dusk::mp::EnemyHitOverride* mpHit = dusk::mp::enemy_hit_override(i_AtInfo->mpCollider)) {
+        i_AtInfo->mHitType = mpHit->hitType;
+        i_AtInfo->mHitBit = mpHit->hitBit;
+        i_AtInfo->mHitStatus = mpHit->hitStatus;
+    }
+#endif
+
     return i_AtInfo->mpActor;
 }
 
 fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
+#if TARGET_PC
+    // MP enemy sync (§5.6.5 item 3): the attacker is the local Link (not slot 0, which may be a
+    // target stand-in here), or, for an injected remote hit, the event in mpHit. Vanilla otherwise.
+    daPy_py_c* player_p = dusk::mp::enemy_sync_live() && dComIfGp_getLinkPlayer() != NULL ?
+                              dComIfGp_getLinkPlayer() :
+                              (daPy_py_c*)dComIfGp_getPlayer(0);
+    const dusk::mp::EnemyHitOverride* mpHit = dusk::mp::enemy_hit_override(i_AtInfo->mpCollider);
+#else
     daPy_py_c* player_p = (daPy_py_c*)dComIfGp_getPlayer(0);
+#endif
     i_AtInfo->mpActor = at_power_check(i_AtInfo);
 
     f32 x_diff;
@@ -394,6 +423,13 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
             }
         }
 
+#if TARGET_PC
+        if (mpHit != NULL) {
+            if (i_AtInfo->mHitType == HIT_TYPE_LINK_NORMAL_ATTACK && mpHit->headJump) {
+                i_AtInfo->mHitDirection.y = mpHit->shapeAngleY;
+            }
+        } else
+#endif
         if (i_AtInfo->mHitType == HIT_TYPE_LINK_NORMAL_ATTACK &&
             player_p->getCutType() == daPy_py_c::CUT_TYPE_HEAD_JUMP)
         {
@@ -414,6 +450,27 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
             }
         }
 
+#if TARGET_PC
+        if (mpHit != NULL) {
+            // The remote attacker's sword, from the event (same rule as below).
+            if (i_AtInfo->mHitType == HIT_TYPE_LINK_NORMAL_ATTACK) {
+                if (!mpHit->wolf) {
+                    if (mpHit->masterSword) {
+                        i_AtInfo->mAttackPower *= 2;
+                    }
+
+                    if (mpHit->woodSword) {
+                        i_AtInfo->mAttackPower /= 2;
+                    }
+                }
+
+                if (mpHit->swordUp) {
+                    i_AtInfo->mAttackPower *= 2;
+                    i_AtInfo->mHitStatus = 1;
+                }
+            }
+        } else
+#endif
         if (i_AtInfo->mHitType == HIT_TYPE_LINK_NORMAL_ATTACK) {
             if (!daPy_py_c::checkNowWolf()) {
                 if (player_p->checkMasterSwordEquip()) {
@@ -447,7 +504,8 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
             i_AtInfo->mHitStatus = 2;
             i_enemy->health = 0;
 #if TARGET_PC
-            if (fopAcM_GetGroup(i_enemy) == fopAc_ENEMY_e) {
+            // Not for an injected remote hit: the kill was the remote player's, not this end's.
+            if (fopAcM_GetGroup(i_enemy) == fopAc_ENEMY_e && mpHit == NULL) {
                 dusk::AchievementSystem::get().signal("enemy_killed");
                 const auto* link = daAlink_getAlinkActorClass();
                 if (link != nullptr && link->mProcID == daAlink_c::PROC_CUT_FINISH && link->mIsRollstab) {
@@ -484,8 +542,13 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
             }
         }
 
+#if TARGET_PC
+        if (i_AtInfo->mpCollider->ChkAtType(AT_TYPE_MIDNA_LOCK) ||
+            (mpHit != NULL ? mpHit->horseRide : player_p->checkHorseRide()))
+#else
         if (i_AtInfo->mpCollider->ChkAtType(AT_TYPE_MIDNA_LOCK) ||
             ((daPy_py_c*)dComIfGp_getPlayer(0))->checkHorseRide())
+#endif
         {
             // actor is Bulblin or Horseback Ganon
             if ((fopAcM_GetName(i_enemy) == fpcNm_E_RD_e && ((s8*)i_enemy)[0x129a] != 0) ||
@@ -513,7 +576,15 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
             if (i_AtInfo->mpCollider->ChkAtType(AT_TYPE_THROW_OBJ)) {
                 pause_time = 4;
             }
+#if TARGET_PC
+            // §5.6.5 item 7: the hit-stop is global; a remote player's hit must not freeze this
+            // world. His own machine paused his (enemy_sync.cpp, the ghost side).
+            if (mpHit == NULL) {
+                dScnPly_c::setPauseTimer(pause_time);
+            }
+#else
             dScnPly_c::setPauseTimer(pause_time);
+#endif
         }
     }
 

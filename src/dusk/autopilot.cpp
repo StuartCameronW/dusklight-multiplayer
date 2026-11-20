@@ -166,6 +166,10 @@ enum class Op {
     GotoEnemy,
     SavePos,
     RestorePos,
+    /* --- batch 9: enemy hits --- */
+    // attacknear is run by tick(); expecthits by run_enemy_command.
+    AttackNear,
+    ExpectHits,
     /* --- batch 8: pause --- */
     // The Dying Light pause model (multiplayer/session/pause.hpp): see run_pause_command and the
     // OpenMenu / CloseMenu cases in tick().
@@ -1650,6 +1654,43 @@ constexpr int kTargetNone = 2;
 bool sHaveSavedPos = false;
 cXyz sSavedPos;
 
+/* --- batch 9: enemy hits ---
+ *   attacknear <profile|*> <frames>      steer toward the nearest synced enemy, re-aimed every tick
+ *                                        (as stickto), lock on (hold L) inside 400 units and tap B
+ *                                        inside 150; logs the B taps when it ends
+ *   expecthits <sent|recv|injected|rejected> <min> [profile]   PASS iff the nearest synced enemy's
+ *                                        hit counter on this end is >= min (sent: ghost side;
+ *                                        recv/injected/rejected: authority side)
+ */
+constexpr double kAttackTapRange = 150.0;
+constexpr double kAttackLockRange = 400.0;
+/// B is pressed for the first kAttackTapHold ticks of every kAttackTapPeriod (a clean edge).
+constexpr int kAttackTapPeriod = 12;
+constexpr int kAttackTapHold = 3;
+int sAttackTaps = 0;
+double sAttackNearest = -1.0;
+
+int parse_hit_counter(const std::string& token) {
+    const std::string word = to_upper(token);
+    return word == "SENT"     ? 0 :
+           word == "RECV"     ? 1 :
+           word == "INJECTED" ? 2 :
+           word == "REJECTED" ? 3 :
+                                -1;
+}
+
+const char* hit_counter_name(int which) {
+    return which == 0 ? "sent" : which == 1 ? "recv" : which == 2 ? "injected" : "rejected";
+}
+
+std::uint32_t hit_counter_of(const mp::enemies::EnemyView& v, int which) {
+    return which == 0 ? v.hitsSent :
+           which == 1 ? v.hitsRecv :
+           which == 2 ? v.hitsInjected :
+                        v.hitsRejected;
+}
+/* --- end batch 9 --- */
+
 bool parse_enemy_profile(const std::string& token, int& out) {
     if (token.empty() || token == "*") {
         out = -1;
@@ -1835,6 +1876,18 @@ void run_enemy_command(const Command& command) {
         link->setPlayerPosAndAngle(&pos, link->shape_angle.y, TRUE);
         Log.info("[autopilot] gotoenemy {:.0f}: setpos ({:.0f}, {:.0f}, {:.0f}) for {} tick={}",
             command.targetX, pos.x, pos.y, pos.z, desc, sTicks);
+        break;
+    }
+    /* --- batch 9: enemy hits --- */
+    case Op::ExpectHits: {
+        en::EnemyView v;
+        std::string desc;
+        const bool found = nearest_enemy(command, v, desc);
+        const std::uint32_t have = found ? hit_counter_of(v, command.layer) : 0;
+        log_expect(found && have >= static_cast<std::uint32_t>(command.room), "expecthits",
+            fmt::format("want {}>={} have={} (sent={} recv={} injected={} rejected={}) {}",
+                hit_counter_name(command.layer), command.room, have, v.hitsSent, v.hitsRecv,
+                v.hitsInjected, v.hitsRejected, desc));
         break;
     }
     case Op::SavePos:
@@ -2278,6 +2331,7 @@ bool settle_program_counter() {
         case Op::GotoEnemy:
         case Op::SavePos:
         case Op::RestorePos:
+        case Op::ExpectHits:  // batch 9: enemy hits
             if (!in_world()) {
                 Log.error("[{}] line {}: needs the world; skipped", sTicks, command.line);
             } else {
@@ -2800,6 +2854,20 @@ void load_script(const std::filesystem::path& path) {
             command.radius = kEnemyRadius;
             ok = parse_double(a, command.targetX) && command.targetX >= 0.0 &&
                  parse_enemy_profile(b, command.point);
+            /* --- batch 9: enemy hits --- */
+        } else if (verb == "ATTACKNEAR") {
+            // "attacknear 0x1FE 300": walk at the nearest synced Bokoblin and swing for 300 ticks.
+            command.op = Op::AttackNear;
+            command.radius = kEnemyRadius;
+            ok = parse_enemy_profile(a, command.point) && parse_int(b, command.frames) &&
+                 command.frames > 0;
+        } else if (verb == "EXPECTHITS") {
+            // "expecthits injected 1 [0x1FE]": the nearest synced enemy's hit counter here.
+            command.op = Op::ExpectHits;
+            command.radius = kEnemyRadius;
+            command.layer = parse_hit_counter(a);
+            ok = command.layer >= 0 && parse_int(b, command.room) && command.room >= 0 &&
+                 parse_enemy_profile(c, command.point);
         } else if (verb == "SAVEPOS") {
             command.op = Op::SavePos;
         } else if (verb == "RESTOREPOS") {
@@ -3382,6 +3450,52 @@ void tick() {
         if (sElapsed + 1 >= command.frames) {
             Log.warn("[autopilot] {} result=timeout after {} ticks: {} tick={}", verb,
                 command.frames, describe_drop(item), sTicks);
+        }
+        break;
+    }
+
+    /* --- batch 9: enemy hits --- */
+    case Op::AttackNear: {
+        if (sElapsed == 0) {
+            sAttackTaps = 0;
+            sAttackNearest = -1.0;
+        }
+        mp::enemies::EnemyView v;
+        std::string desc;
+        if (in_world() && nearest_enemy(command, v, desc)) {
+            fopAc_ac_c* link = dComIfGp_getPlayer(0);
+            double distance = -1.0;
+            if (link != nullptr) {
+                const double dx = v.pos[0] - link->current.pos.x;
+                const double dz = v.pos[2] - link->current.pos.z;
+                distance = std::sqrt(dx * dx + dz * dz);
+            }
+            if (distance >= 0.0 && (sAttackNearest < 0.0 || distance < sAttackNearest)) {
+                sAttackNearest = distance;
+            }
+            // Walk in until well inside the swing range, then stand and swing (pushing into
+            // its collider only shoves him around).
+            if (distance > kAttackTapRange * 0.6) {
+                steer_toward(status, v.pos[0], v.pos[2], 1.0);
+            }
+            if (distance >= 0.0 && distance < kAttackLockRange) {
+                status.button |= PAD_TRIGGER_L;
+            }
+            if (distance >= 0.0 && distance < kAttackTapRange) {
+                const int phase = sElapsed % kAttackTapPeriod;
+                if (phase < kAttackTapHold) {
+                    status.button |= PAD_BUTTON_B;
+                    if (phase == 0) {
+                        sAttackTaps++;
+                    }
+                }
+            }
+        }
+        if (sElapsed + 1 >= command.frames) {
+            Log.info("[autopilot] attacknear done: taps={} frames={} nearest={:.0f} last: {} "
+                     "tick={}",
+                sAttackTaps, command.frames, sAttackNearest, desc.empty() ? "no enemy" : desc,
+                sTicks);
         }
         break;
     }

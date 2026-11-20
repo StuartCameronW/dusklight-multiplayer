@@ -164,6 +164,11 @@ bool read_puppet_root(std::uint32_t playerId, float& x, float& y, float& z);
 bool read_local_loc_phase(float& out);
 /// The same off a puppet's own animation object. -1 (and false) outside blended locomotion.
 bool read_puppet_loc_phase(std::uint32_t playerId, float& out);
+/* --- batch 9: enemy hits --- */
+/// The puppet actor of `playerId` (a daRemotePlayer_c, as fopAc_ac_c*), or null when it is not
+/// alive. void* keeps this header engine-free. Never cache it: a room unload can delete it.
+void* puppet_actor_ptr(std::uint32_t playerId);
+
 /// Despawn one puppet (peer disconnected).
 void destroy_puppet(std::uint32_t playerId);
 
