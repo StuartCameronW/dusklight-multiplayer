@@ -371,6 +371,8 @@ struct UserSettings {
         /// Debug/test knob for M6: how many ticks a guest keeps a room after the host walks in
         /// (rule 1's minimum hold; above 300 it also raises the cap; max 3600). Default 15, the design.
         ConfigVar<int> enemyHostHoldTicks;
+        /// Debug/test knob for M6: false keeps ghost enemies' attack colliders off (default true).
+        ConfigVar<bool> enemyGhostAttacks;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports

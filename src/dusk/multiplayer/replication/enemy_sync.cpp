@@ -2414,6 +2414,10 @@ bool enemy_sync_live() {
     return enemies::detail::s_enabled;
 }
 
+bool enemy_ghost_attacks() {
+    return dusk::getSettings().multiplayer.enemyGhostAttacks.getValue();
+}
+
 const EnemyHitOverride* enemy_hit_override(const cCcD_Obj* atObj) {
     // Called for every hit any enemy takes: bail before the proxy scan when sync is off.
     if (!enemies::detail::s_enabled) {

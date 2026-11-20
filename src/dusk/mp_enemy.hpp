@@ -122,6 +122,10 @@ private:
 /// a target stand-in inside a swapped enemy execute (§5.6.5 item 3). False: vanilla.
 bool enemy_sync_live();
 
+/// False only when a test switches ghost attacks off (cvar multiplayer.enemyGhostAttacks, default
+/// true): adapters then keep a ghost's AT colliders cleared, so it cannot hit the local player.
+bool enemy_ghost_attacks();
+
 /// What an injected remote hit carries in place of the local player's state. Filled on the
 /// authority from an EnemyHit event; the proxy AT collider it belongs to lives until the next tick.
 struct EnemyHitOverride {

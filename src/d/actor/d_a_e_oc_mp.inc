@@ -229,12 +229,12 @@ static void daE_OC_mp_applyExtra(fopAc_ac_c* actor, const dusk::mp::EnemyExtra& 
     } else {
         oc->mSphs_cc[1].OffCoSetBit();
     }
-    if (kE_OC_GhostAtLive && (bits & 0x40)) {
+    if (kE_OC_GhostAtLive && dusk::mp::enemy_ghost_attacks() && (bits & 0x40)) {
         oc->mSphs_at[0].OnAtSetBit();
     } else {
         oc->mSphs_at[0].OffAtSetBit();
     }
-    if (kE_OC_GhostAtLive && (bits & 0x80)) {
+    if (kE_OC_GhostAtLive && dusk::mp::enemy_ghost_attacks() && (bits & 0x80)) {
         oc->mSphs_at[1].OnAtSetBit();
     } else {
         oc->mSphs_at[1].OffAtSetBit();
