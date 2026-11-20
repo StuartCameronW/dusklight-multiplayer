@@ -1631,7 +1631,8 @@ void run_drop_command(const Command& command) {
  * `*`; "nearest" is nearest to the real local Link, within kEnemyRadius unless given.
  *   enemynear [profile] [radius]         log every synced enemy near Link: key, mode, authority,
  *                                        epoch, target, pos, hp, anm, counters
- *   expectenemy <ghost|authority|local> [profile]   PASS iff the nearest one is in that mode here
+ *   expectenemy <ghost|authority|local|gone> [profile]   PASS iff the nearest one is in that mode
+ *                                        here ("gone": no synced enemy of that profile in range)
  *   expecttarget <self|partner|none> [profile]      PASS iff the nearest one's target (the
  *                                        authority's choice; on a ghost the targetPeer it was sent)
  *                                        is this end's Link / a remote player / nobody
@@ -1699,12 +1700,21 @@ bool parse_enemy_profile(const std::string& token, int& out) {
     return parse_int(token, out) && out >= 0 && out <= 0x7FFF;
 }
 
+/* --- batch 10B: death and drops --- "gone": no synced enemy of that profile within range. */
+constexpr int kEnemyGone = 3;
+
 int parse_enemy_mode(const std::string& token) {
     const std::string word = to_upper(token);
     return word == "LOCAL"     ? static_cast<int>(mp::enemies::Mode::Local) :
            word == "AUTHORITY" ? static_cast<int>(mp::enemies::Mode::Authority) :
            word == "GHOST"     ? static_cast<int>(mp::enemies::Mode::Ghost) :
+           word == "GONE"      ? kEnemyGone :
                                  -1;
+}
+
+const char* enemy_mode_word(int mode) {
+    return mode == kEnemyGone ? "gone" :
+                                mp::enemies::mode_name(static_cast<mp::enemies::Mode>(mode));
 }
 
 int parse_target_word(const std::string& token) {
@@ -1783,7 +1793,11 @@ bool nearest_enemy(const Command& command, mp::enemies::EnemyView& out, std::str
 
 bool enemy_mode_matches(const Command& command, std::string& desc) {
     mp::enemies::EnemyView v;
-    return nearest_enemy(command, v, desc) && static_cast<int>(v.mode) == command.layer;
+    const bool found = nearest_enemy(command, v, desc);
+    if (command.layer == kEnemyGone) {
+        return !found;  // batch 10B: dead and deleted (or never here)
+    }
+    return found && static_cast<int>(v.mode) == command.layer;
 }
 
 bool enemy_target_matches(const Command& command, std::string& desc) {
@@ -1817,8 +1831,8 @@ void run_enemy_command(const Command& command) {
     case Op::ExpectEnemy: {
         std::string desc;
         const bool pass = enemy_mode_matches(command, desc);
-        log_expect(pass, "expectenemy",
-            fmt::format("want={} {}", en::mode_name(static_cast<en::Mode>(command.layer)), desc));
+        log_expect(
+            pass, "expectenemy", fmt::format("want={} {}", enemy_mode_word(command.layer), desc));
         break;
     }
     case Op::ExpectTarget: {
@@ -3506,8 +3520,7 @@ void tick() {
         const bool modeVerb = command.op == Op::WaitEnemy;
         const char* verb = modeVerb ? "waitenemy" : "waittarget";
         const char* want =
-            modeVerb ? mp::enemies::mode_name(static_cast<mp::enemies::Mode>(command.layer)) :
-                       target_word_name(command.layer);
+            modeVerb ? enemy_mode_word(command.layer) : target_word_name(command.layer);
         std::string desc;
         const bool met = in_world() && (modeVerb ? enemy_mode_matches(command, desc) :
                                                    enemy_target_matches(command, desc));

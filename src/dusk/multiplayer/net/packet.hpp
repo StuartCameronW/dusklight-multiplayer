@@ -188,7 +188,15 @@ namespace dusk::mp {
  * peer would drop them as unknown and every hit on its ghosts would be lost. Layouts:
  * replication/enemy_sync.hpp.
  */
-inline constexpr std::uint32_t kProtocolVersion = 26;
+/*
+ * 27: Batch 10 (M6 phase 3). Batch 10B (death and drops): new packet 34 EnemyDespawn (a room's
+ * authority -> host -> others, reliable kChannelObjects): a synced enemy died on its authority, with
+ * its createDisappear args and the killer; the ghost plays the smoke with no drop roll and deletes
+ * itself, and the killer's end credits the kill. EnemyHit grew a u16 maxLife after life and a
+ * rollstab bit (0x80) in its flags byte, so the authority rolls the kill drop on the killer's
+ * hearts. A v26 peer would misread EnemyHit. Layouts: replication/enemy_sync.hpp.
+ */
+inline constexpr std::uint32_t kProtocolVersion = 27;
 
 /// Default UDP port. Chosen to sit clear of common web-dev ports.
 inline constexpr std::uint16_t kDefaultPort = 7777;
@@ -320,6 +328,10 @@ enum class PacketId : std::uint8_t {
     /// Same route: an enemy flag bit (CutDownHit, WolfBiteDamage) the sender's Link set on a ghost.
     EnemyFlagHit = 32,
     /* 33: reserved. */
+    /* --- batch 10B: enemy death and drops (M6 phase 3). Layout: replication/enemy_sync.hpp. --- */
+    /// A room's authority -> host -> others, reliable on kChannelObjects: a synced enemy died there.
+    /// The host relays a guest's only if the guest owns the room.
+    EnemyDespawn = 34,
 };
 
 /**

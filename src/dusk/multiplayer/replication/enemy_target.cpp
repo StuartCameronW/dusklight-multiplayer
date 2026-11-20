@@ -513,7 +513,8 @@ bool player_position(std::uint32_t playerId, float out[3]) {
 
 namespace dusk::mp {
 
-EnemyTargetScope::EnemyTargetScope(fopAc_ac_c* actor) : mSavedPlayer(nullptr), mActive(false) {
+EnemyTargetScope::EnemyTargetScope(fopAc_ac_c* actor)
+    : mSavedPlayer(nullptr), mActive(false), mPrevExecProc(kNoProc), mExecSet(false) {
     using namespace enemies::detail;
     // ★ Runs for every actor that passes the execute gate, every tick: bail before any map lookup.
     if (!enabled() || actor == nullptr) {
@@ -535,6 +536,11 @@ EnemyTargetScope::EnemyTargetScope(fopAc_ac_c* actor) : mSavedPlayer(nullptr), m
     if (rec->mode != enemies::Mode::Authority) {
         return;
     }
+    /* --- batch 10B: death and drops --- whatever this execute drops is this enemy's (§5.4 item 4:
+     * fopAcM_createDisappear fast-creates daDisappear, whose create rolls the drop, in here). */
+    mPrevExecProc = exec_proc();
+    set_exec_proc(rec->proc);
+    mExecSet = true;
     choose_target(*rec, actor, adapter);
     const std::uint32_t me = network_manager().local_player_id();
     if (rec->target == enemies::kNoPlayer || rec->target == me) {
@@ -575,6 +581,10 @@ EnemyTargetScope::EnemyTargetScope(fopAc_ac_c* actor) : mSavedPlayer(nullptr), m
 
 EnemyTargetScope::~EnemyTargetScope() {
     using namespace enemies::detail;
+    /* --- batch 10B: death and drops --- */
+    if (mExecSet) {
+        set_exec_proc(mPrevExecProc);
+    }
     if (!mActive) {
         return;
     }

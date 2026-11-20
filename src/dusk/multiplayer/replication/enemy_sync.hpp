@@ -62,13 +62,24 @@
  *       [u32 atType][u8 atp][u8 atSpl][u8 atMtrl][u8 atSe][u8 atHitMark]
  *       [f32 x][f32 y][f32 z]                   the cross (hit) position
  *       [u8 hitType][u32 hitBit][s8 hitStatus]  at_power_check on the attacker's machine
- *       [u8 attackerFlags][u8 cutType][s16 shapeAngleY][s16 attackerLife]
+ *       [u8 attackerFlags][u8 cutType][s16 shapeAngleY][s16 attackerLife][u16 attackerMaxLife]
  *       attackerFlags: 1 master sword, 2 wood sword, 4 wolf, 8 sword-up, 0x10 head jump,
- *                      0x20 cut-jump-cancel turn, 0x40 riding
+ *                      0x20 cut-jump-cancel turn, 0x40 riding, 0x80 rollstab (v27)
+ *       attackerMaxLife (v27): the kill drop's table roll uses the killer's hearts (§5.4 item 4).
  *       The authority validates (epoch, TG set, alive, distance), then injects it before its next
  *       actor pass as a proxy AT collider owned by the attacker's puppet (§5.1).
  *   EnemyFlagHit 32:
  *       [u8 attacker][u8 authority][u32 key][u16 epoch][u16 bit]   bit: CutDownHit or WolfBite
+ *   --- batch 10B (phase 3): death and drops ---
+ *   EnemyDespawn 34 (the room's authority -> host -> others, reliable kChannelObjects):
+ *       [u8 authority][u32 stageHash][u8 layer][u8 room][u32 key][u16 epoch]
+ *       [u8 reason][u8 killerPeer][u8 dflags][u8 disappearSize][u8 disappearType]
+ *       [u8 disappearEnemyId][f32 x][f32 y][f32 z]
+ *       reason: 1 killed. killerPeer: who dealt the killing blow (0xFF unknown). dflags: 1 the
+ *       disappear args are valid (the enemy left through fopAcM_createDisappear), 2 the kill was a
+ *       rollstab. The ghost replays the disappear with enemy id 0xFF (smoke, NO drop roll) and
+ *       deletes itself; the killer's end signals the kill achievement. The kill drop itself is the
+ *       authority's, shared as a batch 7 ObjKind::Drop (one drop, first come).
  *
  * ---- Playback ----
  * A ghost plays the authority's samples on the authority's own pose timeline: the tick its puppet
