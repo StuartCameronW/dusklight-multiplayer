@@ -537,7 +537,7 @@ EnemyTargetScope::EnemyTargetScope(fopAc_ac_c* actor) : mSavedPlayer(nullptr), m
     }
     choose_target(*rec, actor, adapter);
     const std::uint32_t me = network_manager().local_player_id();
-    if (rec->target == kNoPlayer || rec->target == me) {
+    if (rec->target == enemies::kNoPlayer || rec->target == me) {
         return;
     }
     ActiveScope& scope = active_scope();
