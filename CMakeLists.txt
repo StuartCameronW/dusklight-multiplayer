@@ -199,8 +199,26 @@ FetchContent_Declare(enet
     URL_HASH SHA256=28603c895f9ed24a846478180ee72c7376b39b4bb1287b73877e5eae7d96b0dd
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
+# miniupnpc (agent T)
+# HTTPS for the internet-play rendezvous client (src/dusk/multiplayer/rendezvous). mbedTLS 3.6 LTS,
+# from the release tarball: GitHub's auto-generated source archive lacks the framework/ submodule
+# and does not build. SHA256 matches the release's own mbedtls-3.6.7-sha256sum.txt.
+message(STATUS "dusklight: Fetching mbedTLS")
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(USE_STATIC_MBEDTLS_LIBRARY ON CACHE BOOL "" FORCE)
+set(USE_SHARED_MBEDTLS_LIBRARY OFF CACHE BOOL "" FORCE)
+set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
+FetchContent_Declare(mbedtls
+    URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2
+    URL_HASH SHA256=a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    EXCLUDE_FROM_ALL
+)
 
 set(_fetch_content_deps miniz picosha2 enet)
+list(APPEND _fetch_content_deps mbedtls)
 
 if (DUSK_ENABLE_OPUS)
     message(STATUS "dusklight: Fetching opusfile")
@@ -295,7 +313,8 @@ find_package(Threads REQUIRED)
 set(GAME_COMPILE_DEFS DUSK_BUILDING_GAME=1)
 set(GAME_LIBS aurora::core aurora::gx aurora::gd aurora::si aurora::vi aurora::pad aurora::mtx aurora::os aurora::dvd aurora::thp
     aurora::card borealis::http borealis::cli borealis::crash borealis::data borealis::disc borealis::discord borealis::file_select borealis::io borealis::log borealis::net borealis::presentation borealis::sentry borealis::update borealis::ws freeverb cxxopts::cxxopts absl::flat_hash_map nlohmann_json::nlohmann_json TracyClient fmt::fmt
-    Threads::Threads zstd::libzstd dusklight_game_headers picosha2 PNG::PNG enet)
+    Threads::Threads zstd::libzstd dusklight_game_headers picosha2 PNG::PNG enet
+    mbedtls mbedx509 mbedcrypto)
 if (DUSK_HAS_FUNCHOOK)
     list(APPEND GAME_LIBS funchook-static)
 endif ()

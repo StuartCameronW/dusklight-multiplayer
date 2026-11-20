@@ -1702,6 +1702,13 @@ set(DUSK_FILES
         src/dusk/multiplayer/net/transport.hpp
         src/dusk/multiplayer/net/enet_transport.cpp
         src/dusk/multiplayer/net/enet_transport.hpp
+        # stun/upnp (agent T)
+        src/dusk/multiplayer/rendezvous/ca_roots.cpp
+        src/dusk/multiplayer/rendezvous/ca_roots.hpp
+        src/dusk/multiplayer/rendezvous/https_client.cpp
+        src/dusk/multiplayer/rendezvous/https_client.hpp
+        src/dusk/multiplayer/rendezvous/rendezvous_client.cpp
+        src/dusk/multiplayer/rendezvous/rendezvous_client.hpp
         src/dusk/multiplayer/replication/player_state.hpp
         src/dusk/multiplayer/replication/state_buffer.cpp
         src/dusk/multiplayer/replication/state_buffer.hpp
