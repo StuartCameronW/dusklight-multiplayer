@@ -95,6 +95,10 @@ struct Rec {
     std::uint32_t hitsRejected = 0;
     std::uint32_t flagHitsSent = 0;
     std::uint32_t flagHitsApplied = 0;
+    /* --- batch 10A: ghost AT --- Ghost: its AT colliders hit the local Link / of those, shield. */
+    std::uint32_t atHitsLocal = 0;
+    std::uint32_t atShieldedLocal = 0;
+    /* --- end batch 10A --- */
 };
 
 /// Sync is live this tick: session live and multiplayer.enemySync on (latched by pre_tick, cleared
