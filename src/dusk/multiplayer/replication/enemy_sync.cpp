@@ -1565,7 +1565,8 @@ void write_trace_rows() {
     static const char* kHeader =
         "key,prof,proc,mode,degraded,authority,epoch,target,x,y,z,shapeY,hp,anm,frame,mflags,"
         "engaged,tx,ty,tz,tdist,samples,ghostTicks,realExecWhileGhost,swapTicks,absorbed,"
-        "realLinkWrites,targetSwitches,hitsSent,hitsRecv,hitsInjected,hitsRejected";
+        "realLinkWrites,targetSwitches,hitsSent,hitsRecv,hitsInjected,hitsRejected"
+        /* --- batch 10A: ghost AT --- */ ",atHitsLocal,atShieldedLocal";
     const std::uint64_t tick = network_manager().sim_tick();
     for (auto& [proc, rec] : S().recs) {
         if (rec.mode == Mode::Local && !rec.degraded) {
@@ -1603,7 +1604,8 @@ void write_trace_rows() {
             rec.gateAsGhost > rec.ghostTicks ? rec.gateAsGhost - rec.ghostTicks : 0;
         trace::enemy_row(tick, kHeader,
             fmt::format("{:08X},0x{:03X},{},{},{},{},{},{},{:.2f},{:.2f},{:.2f},{},{},{},{:.2f},{},"
-                        "{},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{},{},{},{},{},{},{},{},{}",
+                        "{},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{},{},{},{},{},{},{},{},{}"
+                        /* --- batch 10A: ghost AT --- */ ",{},{}",
                 rec.key, static_cast<unsigned>(static_cast<std::uint16_t>(rec.prof)), rec.proc,
                 mode_name(rec.mode), rec.degraded ? 1 : 0, pid_str(rec.authority), rec.epoch,
                 pid_str(target), actor->current.pos.x, actor->current.pos.y, actor->current.pos.z,
@@ -1611,7 +1613,8 @@ void write_trace_rows() {
                 static_cast<fopEn_enemy_c*>(actor)->mFlags, engaged ? 1 : 0, tp[0], tp[1], tp[2],
                 tdist, rec.samples.size(), rec.ghostTicks, realExec, rec.swapTicks,
                 rec.absorbedWrites, rec.realLinkWrites, rec.targetSwitches, rec.hitsSent,
-                rec.hitsRecv, rec.hitsInjected, rec.hitsRejected));
+                rec.hitsRecv, rec.hitsInjected, rec.hitsRejected,
+                /* --- batch 10A: ghost AT --- */ rec.atHitsLocal, rec.atShieldedLocal));
     }
 }
 
@@ -1637,12 +1640,13 @@ void log_stats() {
             "[mp-enemy] stats key={:08X} mode={} owner={} epoch={} target={} hp={} pos=({:.0f}, "
             "{:.0f}, {:.0f}) ghostTicks={} realExecWhileGhost={} swaps={} absorbed={} "
             "realLinkWrites={} switches={} hitsSent={} hitsRecv={} hitsInjected={} "
-            "hitsRejected={} tick={}",
+            "hitsRejected={} tick={} atHitsLocal={} atShieldedLocal={}",
             rec.key, mode_name(rec.mode), pid_str(rec.authority), rec.epoch, pid_str(target),
             actor->health, actor->current.pos.x, actor->current.pos.y, actor->current.pos.z,
             rec.ghostTicks, realExec, rec.swapTicks, rec.absorbedWrites, rec.realLinkWrites,
             rec.targetSwitches, rec.hitsSent, rec.hitsRecv, rec.hitsInjected, rec.hitsRejected,
-            network_manager().sim_tick());
+            network_manager().sim_tick(),
+            /* --- batch 10A: ghost AT --- */ rec.atHitsLocal, rec.atShieldedLocal);
     }
 }
 
@@ -1868,6 +1872,10 @@ std::vector<EnemyView> views() {
         v.hitsRecv = rec.hitsRecv;
         v.hitsInjected = rec.hitsInjected;
         v.hitsRejected = rec.hitsRejected;
+        /* --- batch 10A: ghost AT --- */
+        v.atHitsLocal = rec.atHitsLocal;
+        v.atShieldedLocal = rec.atShieldedLocal;
+        /* --- end batch 10A --- */
         out.push_back(v);
     }
     return out;
@@ -2030,6 +2038,23 @@ bool enemy_ghost_execute(fopAc_ac_c* actor) {
             ghost_send_flag_hit(*rec, added);
         }
     }
+
+    /* --- batch 10A: ghost AT --- spec 5.3: the ghost's AT spheres (set from the authority's bits
+     * by applyExtra below, placed by present) hit this end's Link in the collision pass. Read the
+     * last pass's result before applyExtra/cc_set re-arm them; ChkAtTg clears it every pass. */
+    if (adapter->ghostAtHitsLocal != nullptr) {
+        int shielded = 0;
+        const int hits = adapter->ghostAtHitsLocal(actor, &shielded);
+        if (hits > 0) {
+            rec->atHitsLocal += static_cast<std::uint32_t>(hits);
+            rec->atShieldedLocal += static_cast<std::uint32_t>(shielded > 0 ? shielded : 0);
+            Log.info("[mp-enemy] ghost-at key={:08X} owner={} hit local Link colliders={} "
+                     "shielded={} life={} total={} tick={}",
+                rec->key, pid_str(rec->authority), hits, shielded, dComIfGs_getLife(),
+                rec->atHitsLocal, network_manager().sim_tick());
+        }
+    }
+    /* --- end batch 10A --- */
 
     const Sample& s = rec->played;
     // §2.2 one ghost tick. 1: pose.

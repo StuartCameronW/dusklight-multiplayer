@@ -41,10 +41,17 @@
 
 #include "dusk/mp_enemy.hpp"
 
-/// Phase 1 is "no combat": the ghost's AT spheres stay off even when the authority's are on. The
-/// AT bits are already captured and on the wire (byte [2], 0x40/0x80); Phase 3 ("a ghost hits the
-/// local player", spec 5.3) flips this to true and needs no layout change.
-static const bool kE_OC_GhostAtLive = false;
+/* --- batch 10A: ghost AT --- */
+/// Phase 3, spec 5.3 (victim-decided): the ghost's AT spheres follow the authority's set bits
+/// (byte [2], 0x40/0x80). present() -> cc_set() positions and registers them off the ghost's own
+/// joints, so in this machine's collision pass they hit THIS machine's Link, who then takes damage,
+/// guards and knockback through his own TG path. at_sph_src is AT_SPRM 0xD (set | vs player |
+/// vs other): it can only meet a TG flagged IS_PLAYER or IS_OTHER, and the remote-player puppet
+/// registers no TG at all (only its friendly-fire AT capsules), so a ghost never hits a puppet and
+/// the authority's real swing never hits one either. Only the local Link can take the blow.
+/// Set false to go back to the phase 1 "no combat" ghost.
+static const bool kE_OC_GhostAtLive = true;
+/* --- end batch 10A --- */
 
 static const unsigned char kE_OC_ExtraLen = 18;
 
@@ -423,6 +430,36 @@ static void daE_OC_mp_onBecomeAuthority(fopAc_ac_c* actor) {
     }
 }
 
+/* --- batch 10A: ghost AT --- */
+/// The ghost-side half of executeAttack's own hit test (d_a_e_oc.cpp, the ChkAtHit block after
+/// the 14..22 swing window): which AT spheres met this machine's Link in the last collision pass.
+/// Read-only: the enemy-side reaction (the guard recoil to mOcState 3) stays on the authority
+/// (spec 5.3 "Gap"). Both spheres hitting in one pass count twice, as two colliders hit.
+static int daE_OC_mp_ghostAtHitsLocal(fopAc_ac_c* actor, int* shielded) {
+    daE_OC_c* oc = static_cast<daE_OC_c*>(actor);
+    int hits = 0;
+    int guarded = 0;
+    for (int i = 0; i < 2; i++) {
+        dCcD_Sph& at = oc->mSphs_at[i];
+        if (!at.ChkAtHit() || at.GetAtHitObj() == NULL) {
+            continue;
+        }
+        fopAc_ac_c* hit_actor = dCc_GetAc(at.GetAtHitObj()->GetAc());
+        if (hit_actor == NULL || fopAcM_GetName(hit_actor) != fpcNm_ALINK_e) {
+            continue;
+        }
+        hits++;
+        if (at.ChkAtShieldHit()) {
+            guarded++;
+        }
+    }
+    if (shielded != NULL) {
+        *shielded = guarded;
+    }
+    return hits;
+}
+/* --- end batch 10A --- */
+
 static const dusk::mp::EnemyNetAdapter l_daE_OC_netAdapter = {
     "E_ocb",                      // arc: every setBck/checkBck resolves anms in E_ocb
     daE_OC_mp_morf,               // morf
@@ -435,6 +472,7 @@ static const dusk::mp::EnemyNetAdapter l_daE_OC_netAdapter = {
     daE_OC_mp_tgByIndex,          // tgByIndex (phase 2)
     daE_OC_mp_onBecomeAuthority,  // onBecomeAuthority
     NULL,                         // onGhostDeath (phase 3)
+    daE_OC_mp_ghostAtHitsLocal,   // ghostAtHitsLocal (batch 10A)
 };
 
 /// Registered at static-init time: the header promises the adapter table is plain storage, and

@@ -59,6 +59,12 @@ struct EnemyNetAdapter {
     cCcD_Obj* (*tgByIndex)(fopAc_ac_c* actor, int index);
     void (*onBecomeAuthority)(fopAc_ac_c* actor);
     void (*onGhostDeath)(fopAc_ac_c* actor, const EnemyDespawn& why);
+    /* --- batch 10A: ghost AT --- */
+    /// Ghost only, read before applyExtra: how many of the ghost's AT colliders hit THIS machine's
+    /// Link in the last collision pass, and (out) how many of those he blocked with his shield.
+    /// Counting only; the damage itself is Link's own TG path (spec 5.3).
+    int (*ghostAtHitsLocal)(fopAc_ac_c* actor, int* shielded);
+    /* --- end batch 10A --- */
 };
 
 /// Register an adapter for an fpcNm_* profile. Call from the adapter .inc (a file-scope static

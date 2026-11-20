@@ -139,6 +139,10 @@ enum class Op {
     /* --- batch 7: death --- */
     Life,
     ExpectLife,
+    /* --- batch 10A: ghost AT --- */
+    MarkLife,
+    ExpectLifeBelow,
+    /* --- end batch 10A --- */
     DeathMenu,
     MenuAnswer,
     Reset,
@@ -1419,6 +1423,15 @@ std::string describe_death_menu() {
         menu->getEndStatus(), menu->getSaveStatus(), dComIfGs_getLife());
 }
 
+/* --- batch 10A: ghost AT --- the life "marklife" recorded; -1 = none yet. A want of -1 in an
+ * expectlife / expectlifebelow command means "the marked life". */
+int sMarkedLife = -1;
+
+int resolve_life_want(int want) {
+    return want < 0 ? sMarkedLife : want;
+}
+/* --- end batch 10A --- */
+
 void run_death_command(const Command& command) {
     switch (command.op) {
     case Op::Life: {
@@ -1435,11 +1448,28 @@ void run_death_command(const Command& command) {
     }
     case Op::ExpectLife: {
         const int life = dComIfGs_getLife();
+        // batch 10A: "expectlife mark" compares with the marked life.
+        const int want = resolve_life_want(command.room);
         Log.info("[autopilot] expectlife {} {} life={} want={} tick={}",
             command.text.empty() ? std::string("-") : command.text,
-            life == command.room ? "PASS" : "FAIL", life, command.room, sTicks);
+            want >= 0 && life == want ? "PASS" : "FAIL", life, want, sTicks);
         break;
     }
+    /* --- batch 10A: ghost AT --- */
+    case Op::MarkLife:
+        sMarkedLife = dComIfGs_getLife();
+        Log.info("[autopilot] marklife {} life={} tick={}",
+            command.text.empty() ? std::string("-") : command.text, sMarkedLife, sTicks);
+        break;
+    case Op::ExpectLifeBelow: {
+        const int life = dComIfGs_getLife();
+        const int want = resolve_life_want(command.room);
+        log_expect(want >= 0 && life < want, "expectlifebelow",
+            fmt::format("{} life={} want<{}", command.text.empty() ? std::string("-") : command.text,
+                life, want));
+        break;
+    }
+    /* --- end batch 10A --- */
     case Op::DeathMenu:
         Log.info("[autopilot] deathmenu {} {} session={} tick={}",
             command.text.empty() ? std::string("-") : command.text, describe_death_menu(),
@@ -1676,18 +1706,28 @@ int parse_hit_counter(const std::string& token) {
            word == "RECV"     ? 1 :
            word == "INJECTED" ? 2 :
            word == "REJECTED" ? 3 :
-                                -1;
+           /* batch 10A: a ghost's AT hits on this end's Link, and how many he shielded */
+           word == "ATHIT"   ? 4 :
+           word == "ATGUARD" ? 5 :
+                               -1;
 }
 
 const char* hit_counter_name(int which) {
-    return which == 0 ? "sent" : which == 1 ? "recv" : which == 2 ? "injected" : "rejected";
+    return which == 0 ? "sent" :
+           which == 1 ? "recv" :
+           which == 2 ? "injected" :
+           which == 3 ? "rejected" :
+           which == 4 ? "athit" :
+                        "atguard";
 }
 
 std::uint32_t hit_counter_of(const mp::enemies::EnemyView& v, int which) {
     return which == 0 ? v.hitsSent :
            which == 1 ? v.hitsRecv :
            which == 2 ? v.hitsInjected :
-                        v.hitsRejected;
+           which == 3 ? v.hitsRejected :
+           which == 4 ? v.atHitsLocal :
+                        v.atShieldedLocal;
 }
 /* --- end batch 9 --- */
 
@@ -2295,6 +2335,8 @@ bool settle_program_counter() {
         // menuanswer takes ticks; it is run by tick().
         case Op::Life:
         case Op::ExpectLife:
+        case Op::MarkLife:         // batch 10A
+        case Op::ExpectLifeBelow:  // batch 10A
         case Op::DeathMenu:
         case Op::Reset:
             run_death_command(command);
@@ -2754,8 +2796,31 @@ void load_script(const std::filesystem::path& path) {
         } else if (verb == "EXPECTLIFE") {
             // "expectlife 12 retried": PASS/FAIL on the current life (Retry respawns at 12).
             command.op = Op::ExpectLife;
-            ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+            // batch 10A: "expectlife mark [label]" compares with the life marklife recorded.
+            if (to_upper(a) == "MARK") {
+                command.room = -1;
+                ok = true;
+            } else {
+                ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+            }
             command.text = b;
+            /* --- batch 10A: ghost AT --- */
+        } else if (verb == "MARKLIFE") {
+            // "marklife [label]": remember the current life for "expectlife mark" and
+            // "expectlifebelow mark".
+            command.op = Op::MarkLife;
+            command.text = a;
+        } else if (verb == "EXPECTLIFEBELOW") {
+            // "expectlifebelow mark took-a-hit": PASS when the life is under n (or the mark).
+            command.op = Op::ExpectLifeBelow;
+            if (to_upper(a) == "MARK") {
+                command.room = -1;
+                ok = true;
+            } else {
+                ok = parse_int(a, command.room) && command.room >= 0 && command.room <= 0xFFFF;
+            }
+            command.text = b;
+            /* --- end batch 10A --- */
         } else if (verb == "DEATHMENU") {
             // "deathmenu after-no": log the game-over menu's state.
             command.op = Op::DeathMenu;

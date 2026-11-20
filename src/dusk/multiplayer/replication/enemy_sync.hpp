@@ -144,6 +144,10 @@ struct EnemyView {
     std::uint32_t hitsRecv = 0;
     std::uint32_t hitsInjected = 0;
     std::uint32_t hitsRejected = 0;
+    /* --- batch 10A: ghost AT --- Ghost: AT hits on this end's Link / of those, shielded. */
+    std::uint32_t atHitsLocal = 0;
+    std::uint32_t atShieldedLocal = 0;
+    /* --- end batch 10A --- */
 };
 
 /// Every registered (adapted, placed) enemy, created and alive.
