@@ -1690,6 +1690,7 @@ set(DUSK_FILES
         src/dusk/ui/window.hpp
         src/dusk/version.cpp
         src/dusk/multiplayer.hpp
+        src/dusk/mp_enemy.hpp
         src/dusk/player_atn.hpp
         src/dusk/player_equip.hpp
         src/dusk/player_held.hpp
