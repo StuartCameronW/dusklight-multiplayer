@@ -55,16 +55,20 @@ Deny or the guest's Hello doesn't arrive in time, so a guest who gives up doesn'
 ```sh
 cd tools/mp-rendezvous
 npx wrangler login     # opens a browser to authorise wrangler for the Cloudflare account
-npx wrangler deploy    # prints https://dusk-mp-rendezvous.<subdomain>.workers.dev
+npx wrangler deploy    # prints mp.kong.bike (custom domain)
 ```
 
-No routes and no custom domain are configured, so it is served only on `workers.dev`. Observability/Workers Logs
+It is served on the custom domain `mp.kong.bike` (a Free zone on the same account), which is what every build
+uses by default (`kDefaultRendezvousUrl` in `src/dusk/settings.h`). The zone's one free WAF rate-limiting rule
+sits in front of it: `http.host eq "mp.kong.bike"`, 40 requests per 10 s per IP, then Block for 10 s. That rule
+lives in the dashboard (Security → Security rules), not in this repo. `workers_dev` and `preview_urls` are off so the WAF cannot be
+bypassed. Observability/Workers Logs
 are deliberately not enabled in `wrangler.toml`, because host URLs carry `?secret=`. Leave them off.
 
 ## Test with curl
 
 ```sh
-BASE=https://dusk-mp-rendezvous.<subdomain>.workers.dev
+BASE=https://mp.kong.bike
 
 # host: create a room
 curl -s -X POST $BASE/v1/rooms -H 'content-type: application/json' \
@@ -80,7 +84,7 @@ curl -s -X POST $BASE/v1/rooms/7KQ2MX/join -H 'content-type: application/json' \
 # -> {"joinId":"…","token":"<32 hex>","host":{"candidates":[…]}}   and the held wait returns 200 with the same token
 
 # host over WebSocket instead (any WS client, e.g. `npx wscat`):
-npx wscat -c "wss://dusk-mp-rendezvous.<subdomain>.workers.dev/v1/rooms/7KQ2MX/ws?secret=<hostSecret>"
+npx wscat -c "wss://mp.kong.bike/v1/rooms/7KQ2MX/ws?secret=<hostSecret>"
 #   type: ping   -> pong
 
 # host: close the room
@@ -146,9 +150,9 @@ daily quota, which would be an outage for everyone until 00:00 UTC.
 Accepted, by design: `409 full` tells a code-holder the room exists; clients with no `CF-Connecting-IP` share one
 bucket; a guest sees the host's address before the host approves it (the guest needs it to connect).
 
-Not done in code, needs the Cloudflare account: every request, even a `404`/`429`, still counts toward the Worker's
-100,000/day. The real fix is a custom domain on a Free zone with the free WAF rate-limiting rule in front of the
-Worker, and `workers_dev = false`.
+Done on the account, not in code: every request that reaches the Worker, even a `404`/`429`, counts toward the
+Worker's 100,000/day. So it runs on a custom domain (`mp.kong.bike`, Free zone) whose free WAF rate-limiting rule
+blocks a flooding IP before the Worker runs, and `workers_dev = false` closes the bypass.
 
 ## Cost guard
 
@@ -185,7 +189,7 @@ Free-plan limits as of 2026-11-20:
 **Manual off-switch:** set `DISABLED = "1"` (dashboard: Worker → *Settings → Variables*, or edit `wrangler.toml`
 and run `npx wrangler deploy`). Every route then answers `503 {"error":"disabled"}` without touching a Durable
 Object. Worker requests still count toward the free daily limit. To stop even those, use the Worker's
-*Settings → Domains & Routes* to disable the `workers.dev` route, or run `npx wrangler delete`.
+*Settings → Domains & Routes* to remove the `mp.kong.bike` custom domain, or run `npx wrangler delete`.
 
 Abuse can't create a bill. The worst it can do is use up the free daily quota, after which the service stops
 answering until 00:00 UTC.

@@ -13,7 +13,7 @@ using config::ActionBindConfigVar;
 /// The join-code rendezvous every build uses unless multiplayer.rendezvousUrl says otherwise.
 /// The one place to change it (internet play plan §6).
 inline constexpr const char* kDefaultRendezvousUrl =
-    "https://dusk-mp-rendezvous.mp-rendezvous.workers.dev";
+    "https://mp.kong.bike";
 
 enum class BloomMode : int {
     Off = 0,

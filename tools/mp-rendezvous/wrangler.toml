@@ -3,8 +3,11 @@ name = "dusk-mp-rendezvous"
 main = "src/index.js"
 compatibility_date = "2026-10-01"
 
-# Served only on <name>.<account>.workers.dev. No routes, no custom domain.
-workers_dev = true
+# Served on mp.kong.bike (Stuart's Free zone), where the free WAF rate-limit rule applies.
+# workers.dev is off: it would bypass the WAF rule.
+workers_dev = false
+preview_urls = false
+routes = [{ pattern = "mp.kong.bike", custom_domain = true }]
 
 [vars]
 # Manual off-switch: "1" makes every route answer 503 {"error":"disabled"} without touching a Durable Object.
