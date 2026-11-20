@@ -43,6 +43,21 @@ struct TransportEvent {
     std::uint32_t reason = 0;
 };
 
+/// An IPv4 address and port, as seen by whoever reported it (STUN, a LAN interface, the
+/// rendezvous).
+struct Endpoint {
+    std::string ip;  ///< dotted IPv4, e.g. "203.0.113.7"
+    std::uint16_t port = 0;
+};
+
+/// Progress of a begin_stun() request.
+enum class StunState {
+    Idle,     ///< begin_stun() never called
+    Pending,  ///< request sent, still retrying
+    Done,     ///< public endpoint known
+    Failed,   ///< no answer before the timeout, or no server could be resolved
+};
+
 class ITransport {
 public:
     virtual ~ITransport() = default;
@@ -83,6 +98,32 @@ public:
     /// Hang up on everyone and close, blocking briefly so the far ends hear it rather than having
     /// to time out. No Disconnected events are produced: the caller is the one leaving.
     virtual void disconnect_all(std::uint32_t reason) = 0;
+
+    // --- NAT traversal (internet play, mp-internet-play.md §6.2) ---
+
+    /// Client role, before connect(): create the socket now (ephemeral port) so STUN and connect
+    /// share one NAT mapping. connect() then reuses it. Calling connect() without this still works.
+    virtual bool open_client() = 0;
+
+    /// Send a STUN Binding Request (RFC 5389) from THE transport's own socket; the reply is
+    /// consumed before the transport's protocol sees it. Async: retries every 250 ms up to
+    /// @p timeoutMs, falling back to a second public server after half of it. Works in host role
+    /// (after listen) and client role (after open_client). ★ Resolves the server names
+    /// synchronously, so the call itself may block briefly on DNS.
+    virtual void begin_stun(const std::string& server, std::uint16_t port, int timeoutMs) = 0;
+
+    /// Where begin_stun() has got to; fills @p outPublic (if non-null) once Done. Progressed by
+    /// poll().
+    virtual StunState stun_state(Endpoint* outPublic) const = 0;
+
+    /// Host role: send small "DUSKPUNCH" datagrams to @p to every 100 ms for @p durationMs (from
+    /// the transport's own socket), so the host's NAT opens toward the guest. Progressed by
+    /// poll(). Received DUSKPUNCH datagrams are dropped silently.
+    virtual void punch(const Endpoint& to, int durationMs) = 0;
+
+    /// Local IPv4 addresses of this machine (non-loopback, up, not link-local), paired with the
+    /// bound port. Empty if the socket is not open or not yet bound to a port.
+    virtual std::vector<Endpoint> lan_endpoints() const = 0;
 };
 
 }  // namespace dusk::mp

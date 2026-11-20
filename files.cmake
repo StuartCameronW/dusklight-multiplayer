@@ -1701,6 +1701,10 @@ set(DUSK_FILES
         src/dusk/multiplayer/net/serializer.hpp
         src/dusk/multiplayer/net/transport.hpp
         src/dusk/multiplayer/net/enet_transport.cpp
+        src/dusk/multiplayer/net/stun.cpp
+        src/dusk/multiplayer/net/stun.hpp
+        src/dusk/multiplayer/net/upnp.cpp
+        src/dusk/multiplayer/net/upnp.hpp
         src/dusk/multiplayer/net/enet_transport.hpp
         src/dusk/multiplayer/replication/player_state.hpp
         src/dusk/multiplayer/replication/state_buffer.cpp
