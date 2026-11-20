@@ -25,6 +25,7 @@
 #if TARGET_PC
 #include "dusk/logging.h"
 #include "dusk/multiplayer.hpp"
+#include "dusk/mp_enemy.hpp"
 #include "dusk/mods/svc/actor.hpp"
 #include "dusk/mods/svc/stage.hpp"
 #include "helpers/string.hpp"
@@ -2056,6 +2057,17 @@ static int dStage_sclsInfoInit(dStage_dt_c* i_stage, void* i_data, int entryNum,
     return 1;
 }
 
+#if TARGET_PC
+/* Dusk (multiplayer M6, mp-m6-enemies.md 3): the tag of the chunk an actor iterator was handed
+ * ("ACTR", "TGOB", "TRES", "SCOB", "TGSC", "TGDR", "Door", or a layer variant such as "ACT1",
+ * "SCO1", "TRE1", "Doo1") as the multi-char value 'ACTR', byte order independent. i_data is the
+ * chunk's dStage_nodeHeader (dStage_dt_c_decode passes node1), and m_tag holds the raw file bytes. */
+static u32 dStage_mpChunkTag(void* i_data) {
+    const u8* tag = (const u8*)&((dStage_nodeHeader*)i_data)->m_tag;
+    return ((u32)tag[0] << 24) | ((u32)tag[1] << 16) | ((u32)tag[2] << 8) | (u32)tag[3];
+}
+#endif
+
 static int dStage_actorCommonLayerInit(dStage_dt_c* i_stage, void* i_data, int entryNum,
                                        void* param_3) {
     UNUSED(entryNum);
@@ -2071,6 +2083,10 @@ static int dStage_actorCommonLayerInit(dStage_dt_c* i_stage, void* i_data, int e
                 if (appen != NULL) {
                     appen->base = actor_data->base;
                     appen->room_no = (int)i_stage->getRoomNo();
+#if TARGET_PC
+                    appen->mMpPlacementKey = dusk::mp::enemy_placement_key(
+                        i_stage->getRoomNo(), dStage_mpChunkTag(i_data), i);
+#endif
                     dStage_actorCreate(actor_data, appen);
                 }
             }
@@ -2098,6 +2114,8 @@ static int dStage_tgscCommonLayerInit(dStage_dt_c* i_stage, void* i_data, int en
                 appen->room_no = (int)i_stage->getRoomNo();
                 appen->scale = tgsc_data->scale;
 #if TARGET_PC
+                appen->mMpPlacementKey = dusk::mp::enemy_placement_key(
+                    i_stage->getRoomNo(), dStage_mpChunkTag(i_data), i);
                 dStage_actorCreate(actor_data, appen,
                     sizeof(stage_actor_data_class) + sizeof(fopAcM_prmScale_class));
 #else
@@ -2125,6 +2143,10 @@ static int dStage_actorInit(dStage_dt_c* i_stage, void* i_data, int entryNum, vo
                 if (appen != NULL) {
                     appen->base = actor_data->base;
                     appen->room_no = (int)i_stage->getRoomNo();
+#if TARGET_PC
+                    appen->mMpPlacementKey = dusk::mp::enemy_placement_key(
+                        i_stage->getRoomNo(), dStage_mpChunkTag(i_data), i);
+#endif
                     dStage_actorCreate(actor_data, appen);
                 }
             }
@@ -2149,6 +2171,10 @@ static int dStage_actorInit_always(dStage_dt_c* i_stage, void* i_data, int entry
             if (appen != NULL) {
                 appen->base = actor_data->base;
                 appen->room_no = (int)i_stage->getRoomNo();
+#if TARGET_PC
+                appen->mMpPlacementKey = dusk::mp::enemy_placement_key(
+                    i_stage->getRoomNo(), dStage_mpChunkTag(i_data), i);
+#endif
                 dStage_actorCreate(actor_data, appen);
             }
         }
@@ -2174,6 +2200,8 @@ static int dStage_tgscInfoInit(dStage_dt_c* i_stage, void* i_data, int entryNum,
                 appen->room_no = (int)i_stage->getRoomNo();
                 appen->scale = tgsc_data->scale;
 #if TARGET_PC
+                appen->mMpPlacementKey = dusk::mp::enemy_placement_key(
+                    i_stage->getRoomNo(), dStage_mpChunkTag(i_data), i);
                 dStage_actorCreate(actor_data, appen,
                     sizeof(stage_actor_data_class) + sizeof(fopAcM_prmScale_class));
 #else
@@ -2201,6 +2229,10 @@ static int dStage_doorInfoInit(dStage_dt_c* i_stage, void* i_data, int entryNum,
             appen->base = actor_data->base;
             appen->room_no = (int)i_stage->getRoomNo();
             appen->scale = tgsc_data->scale;
+#if TARGET_PC
+            appen->mMpPlacementKey = dusk::mp::enemy_placement_key(
+                i_stage->getRoomNo(), dStage_mpChunkTag(i_data), i);
+#endif
             dStage_actorCreate(actor_data, appen IF_DUSK_ARG(
                 sizeof(stage_actor_data_class) + sizeof(fopAcM_prmScale_class)));
         }

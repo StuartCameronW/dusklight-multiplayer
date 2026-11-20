@@ -365,6 +365,9 @@ struct UserSettings {
         /// per player. Read when hosting starts and sent to every guest (policy_sync.hpp); a
         /// guest's own value is never used in a session.
         ConfigVar<bool> sharedWallet;
+        /// Debug switch for M6 enemy sync (ghost enemies, nearest-player aggro). Off by default
+        /// until M6 phase 3; while off every dusk::mp::enemy_* hook answers "vanilla".
+        ConfigVar<bool> enemySync;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports

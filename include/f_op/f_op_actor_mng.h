@@ -80,6 +80,10 @@ struct fopAcM_prm_class {
 #if TARGET_PC
     u32 mItemGiveTag;
     u8 mItemGiveOriginalNo;
+    /// Dusk (multiplayer M6): placement key of an actor created from stage data
+    /// (dusk::mp::enemy_placement_key, set by the d_stage.cpp iterators); 0 for every other
+    /// spawn, which fopAcM_CreateAppend's memset guarantees. Copied out in fopAc_Create.
+    u32 mMpPlacementKey;
 #endif
 };
 

@@ -21,6 +21,7 @@
 
 #if TARGET_PC
 #include "dusk/interp/samples.h"
+#include "dusk/mp_enemy.hpp"
 #endif
 
 #if DEBUG
@@ -339,7 +340,21 @@ static int fopAc_Execute(void* i_this) {
             print_error_check_c error_check(actor, print_error_check_c::sEXECUTE);
             #endif
 
+#if TARGET_PC
+            {
+            /* Dusk (multiplayer M6, mp-m6-enemies.md 2.2 / 5.6.3): the scope points player slot 0
+             * at a remote player's stand-in for exactly this one subclass execute when this
+             * machine owns the enemy and its target is remote (a no-op otherwise); a synced enemy
+             * that is a ghost here is driven from the network instead of running its AI. When the
+             * ghost path skips the execute, ret keeps its initial 1, the same value the function
+             * returns when the gate above does not run the execute at all. */
+            dusk::mp::EnemyTargetScope target_scope(actor);
+            if (!dusk::mp::enemy_ghost_execute(actor))
+#endif
             ret = fpcMtd_Execute((process_method_class DUSK_CONST*)actor->sub_method, actor);
+#if TARGET_PC
+            }
+#endif
 
             #if DEBUG
             }
@@ -417,6 +432,8 @@ static int fopAc_Delete(void* i_this) {
     #endif
 
     if (ret == TRUE) {
+        // Dusk (multiplayer M6): forget the actor in the enemy registry (no-op if never noted).
+        IF_DUSK(dusk::mp::enemy_note_deleted(actor));
         IF_DUSK(dusk::interp::erase_owned_samples(actor));
         fopAcTg_ActorQTo(&actor->actor_tag);
         fopDwTg_DrawQTo(&actor->draw_tag);
@@ -475,6 +492,11 @@ static int fopAc_Create(void* i_this) {
             actor->setID = append->base.setID;
             actor->home.roomNo = append->room_no;
         }
+#if TARGET_PC
+        // Dusk (multiplayer M6, mp-m6-enemies.md 3): the append is freed once create completes,
+        // so the placement key is handed to the enemy registry now (0 = not from stage data).
+        dusk::mp::enemy_note_created(actor, append != NULL ? append->mMpPlacementKey : 0);
+#endif
 
         actor->old = actor->home;
         actor->current = actor->home;
