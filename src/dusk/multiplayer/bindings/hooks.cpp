@@ -3,6 +3,7 @@
 #include <string>
 
 #include "../session/network_manager.hpp"
+#include "../session/pause.hpp"  // batch 8: pause
 #include "dusk/logging.h"
 
 /**
@@ -91,6 +92,8 @@ void pre_actor_tick() {
         return;
     }
     network_manager().pre_actor_tick();
+    // batch 8: pause. After the drain, so every partner's menu bit is the newest one received.
+    pause::pre_actor_tick();
 }
 
 void post_actor_tick() {

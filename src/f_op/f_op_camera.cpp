@@ -10,6 +10,10 @@
 #include "d/d_s_play.h"
 #include "f_op/f_op_draw_tag.h"
 
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"  // batch 8: pause
+#endif
+
 static s32 fopCam_Draw(camera_class* i_this) {
     s32 ret = 1;
     #if DEBUG
@@ -37,11 +41,15 @@ static int fopCam_Execute(camera_class* i_this) {
     #endif
 
     #if TARGET_PC
+    /* batch 8 pause (G2, mp-pause.md 2.2): the camera keeps following a Link the world is still
+     * moving behind a menu, and sees a zeroed pad while the menu has it (2.3). Vanilla outside a
+     * live session. */
+    dusk::mp::PauseWorldExecScope pauseWorldScope;
     if (dusk::getSettings().game.debugFlyCam && dusk::getSettings().game.debugFlyCamLockEvents) {
         dScnPly_c::setPauseTimer(1);
         ret = fpcMtd_Execute((process_method_class*)i_this->submethod, i_this);
     } else {
-        if (!dComIfGp_isPauseFlag() && !dScnPly_c::isPause()) {
+        if (!dusk::mp::world_frozen() && !dScnPly_c::isPause()) {
             ret = fpcMtd_Execute((process_method_class*)i_this->submethod, i_this);
         }
     }

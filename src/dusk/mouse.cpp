@@ -2,6 +2,7 @@
 #include "d/actor/d_a_alink.h"
 #include "d/d_com_inf_game.h"
 #include "dusk/menu_pointer.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/settings.h"
 #include "dusk/ui/ui.hpp"
 
@@ -180,6 +181,12 @@ void read() {
 }
 
 void get_aim_deltas(float& out_yaw, float& out_pitch) {
+    // batch 8: pause. A world execute behind a menu sees no input; the menu has it.
+    if (mp::pause_world_input_blocked()) {
+        out_yaw = 0.0f;
+        out_pitch = 0.0f;
+        return;
+    }
     out_yaw = s_aim_yaw_rad;
     out_pitch = s_aim_pitch_rad;
 }
@@ -188,7 +195,7 @@ void get_camera_deltas(float& out_yaw, float& out_pitch) {
     out_yaw = 0.0f;
     out_pitch = 0.0f;
 
-    if (!getSettings().game.enableMouseCamera) {
+    if (!getSettings().game.enableMouseCamera || mp::pause_world_input_blocked()) {
         return;
     }
 

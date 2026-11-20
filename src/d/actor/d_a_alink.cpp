@@ -55,6 +55,7 @@
 #include "dusk/action_bindings.h"
 #include "dusk/interp/frame_interpolation.h"
 #include "dusk/interp/sight.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/settings.h"
 #include "res/Object/Alink.h"
 #include <cstring>
@@ -17814,6 +17815,17 @@ int daAlink_c::procGoronRideWait() {
 int daAlink_c::execute() {
     loadModelDVD();
 
+#if TARGET_PC
+    /* batch 8 pause (P1): a shield chosen on a doll-less co-op Collect screen reloads after the
+     * menu closes. Vanilla pumps that reload only while the doll freezes him; in the world it nulls
+     * mShieldModel under his own execute (setCollision dereferences it), so he holds, as a paused
+     * actor would, until it lands (a few ticks). Never true outside a live session. */
+    if (mShieldChangeWaitTimer != 0 && dusk::mp::pause_equip_hold()) {
+        loadShieldModelDVD();
+        return 1;
+    }
+#endif
+
     if (checkEndResetFlg0(ERFLG0_BOSS_ROOM_WAIT) && getMidnaActor() != NULL) {
         getMidnaActor()->onNoServiceWait();
     }
@@ -18250,7 +18262,16 @@ int daAlink_c::execute() {
             }
         }
 
+#if TARGET_PC
+        /* batch 8 pause (P3): with the world running behind the field map in co-op, a warp chosen
+         * on it starts once the map has closed, as it does when the map freezes him. Vanilla
+         * outside a live session. */
+        if (!dusk::mp::pause_defer_warp_start()) {
+            checkWarpStart();
+        }
+#else
         checkWarpStart();
+#endif
 
         if (!checkSpecialDemoMode() && mClothesChangeWaitTimer == 0) {
             if (!checkDemoAction() && !checkDeadAction(0) && !checkNoResetFlg0(FLG0_UNK_100000) &&

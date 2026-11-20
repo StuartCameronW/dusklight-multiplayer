@@ -1,4 +1,5 @@
 #include "dusk/gyro.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/ui/ui.hpp"
 #include "d/actor/d_a_alink.h"
 
@@ -171,6 +172,12 @@ void read(float dt) {
 }
 
 void getAimDeltas(float& out_yaw, float& out_pitch) {
+    // batch 8: pause. A world execute behind a menu sees no input; the menu has it.
+    if (mp::pause_world_input_blocked()) {
+        out_yaw = 0.0f;
+        out_pitch = 0.0f;
+        return;
+    }
     out_yaw = s_yaw_rad;
     out_pitch = s_pitch_rad;
 }

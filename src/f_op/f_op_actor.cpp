@@ -23,6 +23,10 @@
 #include "dusk/interp/samples.h"
 #endif
 
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"  // batch 8: pause (world_frozen, PauseWorldExecScope)
+#endif
+
 #if DEBUG
 class print_error_check_c {
 public:
@@ -320,7 +324,16 @@ static int fopAc_Execute(void* i_this) {
     JUT_ASSERT(685, -1.0e32f < actor->current.pos.x && actor->current.pos.x < 1.0e32f && -1.0e32f < actor->current.pos.y && actor->current.pos.y < 1.0e32f && -1.0e32f < actor->current.pos.z && actor->current.pos.z < 1.0e32f);
     #endif
 
+#if TARGET_PC
+    /* batch 8 pause (G1, mp-pause.md 2.2): in a live session the menu flag freezes the actors
+     * only when every player is in a menu. One player's menu leaves his world running behind it,
+     * and the scope gives the menu the pad: this execute sees a zeroed one (2.3). Vanilla outside
+     * a session: world_frozen() is the flag and the scope does nothing. */
+    dusk::mp::PauseWorldExecScope pauseWorldScope;
+    if (!dusk::mp::world_frozen() && !dScnPly_c::isPause() && !dComIfA_PauseCheck()) {
+#else
     if (!dComIfGp_isPauseFlag() && !dScnPly_c::isPause() && !dComIfA_PauseCheck()) {
+#endif
         daSus_c::check(actor);
         actor->eventInfo.beforeProc();
         s32 move = dComIfGp_event_moveApproval(actor);
