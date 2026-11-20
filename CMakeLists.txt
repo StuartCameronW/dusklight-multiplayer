@@ -202,6 +202,28 @@ FetchContent_Declare(enet
 
 set(_fetch_content_deps miniz picosha2 enet)
 
+# miniupnpc (agent T): UPnP-IGD auto port-forward for the multiplayer host (BSD-3). Phones and
+# TVs only ever join, so it is left out there and net/upnp.cpp compiles to a stub.
+if (NOT ANDROID AND NOT IOS AND NOT TVOS)
+    set(DUSK_MP_HAS_UPNP ON)
+    message(STATUS "dusklight: Fetching miniupnpc")
+    set(UPNPC_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
+    set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(miniupnpc
+        URL https://github.com/miniupnp/miniupnp/archive/refs/tags/miniupnpc_2_2_8.tar.gz
+        URL_HASH SHA256=3d0d49f761f09c1321ceb663d1b008825361d7bd242640c60ae467e82642502a
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        SOURCE_SUBDIR miniupnpc
+        EXCLUDE_FROM_ALL
+    )
+    list(APPEND _fetch_content_deps miniupnpc)
+else ()
+    set(DUSK_MP_HAS_UPNP OFF)
+endif ()
+
 if (DUSK_ENABLE_OPUS)
     message(STATUS "dusklight: Fetching opusfile")
 
@@ -258,7 +280,8 @@ target_include_directories(enet PUBLIC ${enet_SOURCE_DIR}/include)
 if (WIN32)
     # win32.c uses timeGetTime/timeBeginPeriod/timeEndPeriod but ENet doesn't declare the
     # dependency, so consumers fail to link without these.
-    target_link_libraries(enet PUBLIC winmm ws2_32)
+    # iphlpapi: GetAdaptersAddresses, which EnetTransport::lan_endpoints() uses.
+    target_link_libraries(enet PUBLIC winmm ws2_32 iphlpapi)
 endif ()
 
 if (DUSK_HAS_FUNCHOOK AND APPLE)
@@ -296,6 +319,10 @@ set(GAME_COMPILE_DEFS DUSK_BUILDING_GAME=1)
 set(GAME_LIBS aurora::core aurora::gx aurora::gd aurora::si aurora::vi aurora::pad aurora::mtx aurora::os aurora::dvd aurora::thp
     aurora::card borealis::http borealis::cli borealis::crash borealis::data borealis::disc borealis::discord borealis::file_select borealis::io borealis::log borealis::net borealis::presentation borealis::sentry borealis::update borealis::ws freeverb cxxopts::cxxopts absl::flat_hash_map nlohmann_json::nlohmann_json TracyClient fmt::fmt
     Threads::Threads zstd::libzstd dusklight_game_headers picosha2 PNG::PNG enet)
+if (DUSK_MP_HAS_UPNP)
+    list(APPEND GAME_LIBS libminiupnpc-static)
+    list(APPEND GAME_COMPILE_DEFS DUSK_MP_HAS_UPNP=1)
+endif ()
 if (DUSK_HAS_FUNCHOOK)
     list(APPEND GAME_LIBS funchook-static)
 endif ()
