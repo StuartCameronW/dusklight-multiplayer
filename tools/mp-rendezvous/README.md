@@ -25,6 +25,7 @@ It runs on the **Workers Free plan only**. See [Cost guard](#cost-guard).
   {error:"no_room"}`. Full room → `409 {error:"full"}`. Rate limits (per client IP, in the DO): join 10/min,
   create 5/min → `429 {error:"rate_limited"}`.
 - `DELETE /v1/rooms/{code}?secret=…` → `204` (wrong secret / no room → `404 {error:"no_room"}`).
+- `POST /v1/rooms/{code}/close?secret=…` → `204`, the same as DELETE (the game uses this: its HTTP layer has no DELETE).
 - Server also records the requester's `CF-Connecting-IP` as an extra `{ip, port:0, lan:false, seen:true}` hint
   candidate (port unknown over HTTP, so the client still uses STUN's port; useful for diagnostics only). It is added
   only when that address is IPv4.

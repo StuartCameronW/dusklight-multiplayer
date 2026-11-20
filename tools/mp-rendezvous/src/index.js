@@ -215,6 +215,12 @@ async function route(request, env) {
         if (!authOk) return noRoom();
         return postJson(roomStub(env, code), "/delete", { secret });
     }
+    // Same as DELETE, for clients whose HTTP layer has no DELETE (the game's borealis::http: GET/POST/HEAD).
+    if (action === "close") {
+        if (method !== "POST") return json(405, { error: "method_not_allowed" });
+        if (!authOk) return noRoom();
+        return postJson(roomStub(env, code), "/delete", { secret });
+    }
     if (action === "wait") {
         if (method !== "GET") return json(405, { error: "method_not_allowed" });
         if (env.LONGPOLL === "0") return json(410, { error: "longpoll_disabled" });
