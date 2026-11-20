@@ -1706,6 +1706,8 @@ set(DUSK_FILES
         src/dusk/multiplayer/net/upnp.cpp
         src/dusk/multiplayer/net/upnp.hpp
         src/dusk/multiplayer/net/enet_transport.hpp
+        src/dusk/multiplayer/rendezvous/rendezvous_client.cpp
+        src/dusk/multiplayer/rendezvous/rendezvous_client.hpp
         src/dusk/multiplayer/replication/player_state.hpp
         src/dusk/multiplayer/replication/state_buffer.cpp
         src/dusk/multiplayer/replication/state_buffer.hpp
