@@ -18,8 +18,10 @@
 
 namespace dusk::mp {
 
-/// True when the game is in real, playable gameplay — not a menu, a load, a cutscene, or the
-/// title screen's attract demo. Exported rather than kept private because the autopilot needs the
+/// True when the game is in real, playable gameplay — not a load, a cutscene, or the title
+/// screen's attract demo. A pause menu does NOT clear it, and must not: under the Dying Light pause
+/// model (batch 8) a player in a menu is still in the world, which keeps running behind the menu.
+/// Exported rather than kept private because the autopilot needs the
 /// identical test: when the two definitions drifted apart, scripts believed they were in the world
 /// several hundred ticks before replication agreed, and the resulting traces were nonsense.
 bool world_is_playable();

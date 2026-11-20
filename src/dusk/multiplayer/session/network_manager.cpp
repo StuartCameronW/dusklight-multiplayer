@@ -35,6 +35,7 @@
 #include "fmt/format.h"
 #include "m_Do/m_Do_MemCard.h"
 #include "mod_check.hpp"
+#include "pause.hpp"  // batch 8: pause
 #include "policy_sync.hpp"
 #include "presence.hpp"
 #include "save_guard.hpp"
@@ -1920,6 +1921,7 @@ PlayerState NetworkManager::wire_local_state() {
         }
         s_standInOn = false;
         s_staleOn = false;
+        pause::fill_wire_bit(state);  // batch 8: pause (gear bit 7, the menu as it is now)
         return state;
     }
     if (!mHaveLastLocal) {
@@ -1992,6 +1994,9 @@ PlayerState NetworkManager::wire_local_state() {
     if (leaving || !sameLink) {
         held.flags &= ~kPlayerStateInWorld;
     }
+    /* batch 8: pause. The held copy's gear byte is from the last live tick; the menu bit must be
+     * the current one (a menu can be open during an event, which is this path). */
+    pause::fill_wire_bit(held);
     return held;
 }
 

@@ -21,18 +21,23 @@
 #include "d/d_camera.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_gameover.h"
+#include "d/d_menu_collect.h"  // batch 8: pause
+#include "d/d_menu_ring.h"     // batch 8: pause
 #include "d/d_menu_save.h"
+#include "d/d_menu_window.h"  // batch 8: pause
 #include "d/d_meter2_info.h"
 #include "d/d_msg_scrn_explain.h"
 #include "dusk/logging.h"
 #include "dusk/mods/item.hpp"
 #include "dusk/multiplayer/replication/enemy_sync.hpp"  // batch 8: enemies
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/multiplayer/replication/item_claims.hpp"
 #include "dusk/multiplayer/replication/object_channel.hpp"
 #include "dusk/multiplayer/replication/object_drops.hpp"  // batch 7: drops
 #include "dusk/multiplayer/replication/player_bridge.hpp"
 #include "dusk/multiplayer/replication/world_bridge.hpp"
 #include "dusk/multiplayer/session/network_manager.hpp"
+#include "dusk/multiplayer/session/pause.hpp"  // batch 8: pause
 #include "dusk/multiplayer/session/policy_sync.hpp"
 #include "dusk/multiplayer/session/presence.hpp"
 #include "dusk/multiplayer/session/world_sync.hpp"
@@ -161,6 +166,21 @@ enum class Op {
     GotoEnemy,
     SavePos,
     RestorePos,
+    /* --- batch 8: pause --- */
+    // The Dying Light pause model (multiplayer/session/pause.hpp): see run_pause_command and the
+    // OpenMenu / CloseMenu cases in tick().
+    OpenMenu,
+    CloseMenu,
+    PauseMark,
+    PauseLog,
+    ExpectFrozen,
+    ExpectMenu,
+    ExpectStill,
+    ExpectCursor,
+    ExpectPartnerMoved,
+    Hurt,
+    ExpectFlash,
+    ExpectForceClose,
 };
 
 struct Command {
@@ -1844,6 +1864,216 @@ void run_enemy_command(const Command& command) {
     }
 }
 
+/* --- batch 8: pause ---
+ *
+ * The Dying Light pause model's verbs (multiplayer/session/pause.hpp, mp-pause.md §6). Menus are
+ * opened and closed through the virtual pad, as a player does; everything else is instant.
+ *  - `openmenu collect|ring [timeout]` (tick()): START (collect) or d-pad DOWN (ring) on a 4-on /
+ *    8-off cadence until that menu is fully open (its *_MOVE proc). Default timeout 300.
+ *  - `closemenu [timeout]` (tick()): B on the same cadence until no menu is open.
+ *  - `pausemark [tag]`: remember Link's position and the menu cursor, and zero the pause counters
+ *    (hearts flashes, force-closes) for the expect* verbs below.
+ *  - `pauselog [tag]`: one "[autopilot] pauselog" line with the whole pause state.
+ *  - `expectfrozen 0|1 [tag]`: PASS/FAIL on dusk::mp::world_frozen().
+ *  - `expectmenu open|closed [tag]`: PASS/FAIL on whether a menu is open (window status / flag).
+ *  - `expectstill [tag]`: PASS if Link moved under kPauseStillUnits since the pausemark.
+ *  - `expectcursor moved|same [tag]`: the menu cursor against the pausemark's.
+ *  - `expectpartnermoved 0|1 [tag]`: the partner's puppet (an actor, so it moves behind a menu
+ *    only while the world runs) moved >= kPausePartnerMovedUnits (1) / < kPauseStillUnits (0)
+ *    since the pausemark.
+ *  - `hurt <n>`: n quarter hearts of damage through Link's own setDamagePoint (his damage
+ *    multiplier and armour rules apply), so the meter's moveLife applies it as a hit's would.
+ *  - `expectflash 0|1 [tag]`: whether a hearts flash started since the pausemark.
+ *  - `expectforceclose none|death|event|scene-change|player-demo [tag]`: the last force-close
+ *    since the pausemark.
+ */
+constexpr double kPauseStillUnits = 10.0;
+/// expectpartnermoved 1: the partner's puppet covered at least this much since the pausemark.
+constexpr double kPausePartnerMovedUnits = 50.0;
+
+bool sPauseMarkValid = false;
+double sPauseMarkX = 0.0;
+double sPauseMarkY = 0.0;
+double sPauseMarkZ = 0.0;
+int sPauseMarkCursor = -1;
+bool sPauseMarkPartnerValid = false;
+double sPauseMarkPartnerX = 0.0;
+double sPauseMarkPartnerZ = 0.0;
+
+/// The first remote player's puppet in this scene, or null. Two-instance tests have one.
+fopAc_ac_c* pause_partner_puppet() {
+    return fopAcM_Search(
+        [](void* i_actor, void*) -> void* {
+            fopAc_ac_c* actor = static_cast<fopAc_ac_c*>(i_actor);
+            return fopAcM_GetName(actor) == fpcNm_REMOTE_PLAYER_e ? i_actor : nullptr;
+        },
+        nullptr);
+}
+
+/// The open menu's cursor as one number: 0x1XXYY for the Collect screen (x, y), 0x200SS for the
+/// item ring (its current slot), -1 when neither is up.
+int pause_menu_cursor() {
+    dMw_c* menu = dMeter2Info_getMenuWindowClass();
+    if (menu == nullptr) {
+        return -1;
+    }
+    if (menu->mpMenuCollect != nullptr && menu->mpMenuCollect->mpCollect2D != nullptr) {
+        dMenu_Collect2D_c* collect = menu->mpMenuCollect->mpCollect2D;
+        return 0x10000 | (static_cast<int>(collect->getCursorX()) << 8) |
+               static_cast<int>(collect->getCursorY());
+    }
+    if (menu->mpMenuRing != nullptr) {
+        return 0x20000 | static_cast<int>(menu->mpMenuRing->mCurrentSlot);
+    }
+    return -1;
+}
+
+std::string describe_pause() {
+    const mp::pause::Stats s = mp::pause::stats();
+    dMw_c* menu = dMeter2Info_getMenuWindowClass();
+    fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    fopAc_ac_c* partner = pause_partner_puppet();
+    const std::string partnerPos = partner != nullptr ?
+        fmt::format("({:.1f}, {:.1f}, {:.1f})", partner->current.pos.x, partner->current.pos.y,
+            partner->current.pos.z) :
+        std::string("none");
+    return fmt::format(
+        "session={} frozen={} menu={} status={} proc={} cursor={:#x} partners={}/{} "
+        "isolatedExecs={} flashes={} flashing={} forceCloses={} lastForce={} dollHidden={} "
+        "life={} partnerPuppet={} pos=({:.1f}, {:.1f}, {:.1f})",
+        s.sessionLive ? "live" : "none", s.frozen ? 1 : 0, s.localInMenu ? 1 : 0, s.windowStatus,
+        menu != nullptr ? static_cast<int>(menu->mMenuProc) : -1,
+        pause_menu_cursor(), s.pausedPeers, s.countedPeers,
+        s.isolatedExecsLastTick, s.heartsFlashes, s.heartsFlashing ? 1 : 0, s.forceCloses,
+        mp::pause::force_close_reason_name(s.lastForceCloseReason), s.collectDollHidden ? 1 : 0,
+        static_cast<int>(dComIfGs_getLife()), partnerPos,
+        link != nullptr ? link->current.pos.x : 0.0f,
+        link != nullptr ? link->current.pos.y : 0.0f, link != nullptr ? link->current.pos.z : 0.0f);
+}
+
+std::string pause_tag(const Command& command) {
+    return command.text.empty() ? std::string("-") : command.text;
+}
+
+void run_pause_command(const Command& command) {
+    switch (command.op) {
+    case Op::PauseMark: {
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        sPauseMarkValid = link != nullptr;
+        if (link != nullptr) {
+            sPauseMarkX = link->current.pos.x;
+            sPauseMarkY = link->current.pos.y;
+            sPauseMarkZ = link->current.pos.z;
+        }
+        sPauseMarkCursor = pause_menu_cursor();
+        fopAc_ac_c* partner = pause_partner_puppet();
+        sPauseMarkPartnerValid = partner != nullptr;
+        if (partner != nullptr) {
+            sPauseMarkPartnerX = partner->current.pos.x;
+            sPauseMarkPartnerZ = partner->current.pos.z;
+        }
+        mp::pause::reset_counters();
+        Log.info("[autopilot] pausemark {} {} tick={}", pause_tag(command), describe_pause(), sTicks);
+        break;
+    }
+    case Op::PauseLog:
+        Log.info("[autopilot] pauselog {} {} tick={}", pause_tag(command), describe_pause(), sTicks);
+        break;
+    case Op::ExpectFrozen: {
+        const bool frozen = mp::world_frozen();
+        log_expect(frozen == (command.point != 0), "expectfrozen",
+            fmt::format("{} want={} got={} ({})", pause_tag(command), command.point, frozen ? 1 : 0,
+                describe_pause()));
+        break;
+    }
+    case Op::ExpectMenu: {
+        const bool open = mp::pause::local_in_menu();
+        log_expect(open == (command.point != 0), "expectmenu",
+            fmt::format("{} want={} got={} ({})", pause_tag(command),
+                command.point != 0 ? "open" : "closed", open ? "open" : "closed", describe_pause()));
+        break;
+    }
+    case Op::ExpectStill: {
+        fopAc_ac_c* link = dComIfGp_getPlayer(0);
+        if (!sPauseMarkValid || link == nullptr) {
+            log_expect(false, "expectstill",
+                fmt::format("{} no pausemark or no Link ({})", pause_tag(command), describe_pause()));
+            break;
+        }
+        const double dx = link->current.pos.x - sPauseMarkX;
+        const double dy = link->current.pos.y - sPauseMarkY;
+        const double dz = link->current.pos.z - sPauseMarkZ;
+        const double moved = std::sqrt(dx * dx + dy * dy + dz * dz);
+        log_expect(moved < kPauseStillUnits, "expectstill",
+            fmt::format("{} moved={:.1f} limit={:.0f} ({})", pause_tag(command), moved,
+                kPauseStillUnits, describe_pause()));
+        break;
+    }
+    case Op::ExpectPartnerMoved: {
+        // The partner's puppet is an actor: it moves behind a menu only if the world runs (G1).
+        fopAc_ac_c* partner = pause_partner_puppet();
+        if (!sPauseMarkPartnerValid || partner == nullptr) {
+            log_expect(false, "expectpartnermoved",
+                fmt::format("{} no partner puppet at the pausemark or now ({})", pause_tag(command),
+                    describe_pause()));
+            break;
+        }
+        const double dx = partner->current.pos.x - sPauseMarkPartnerX;
+        const double dz = partner->current.pos.z - sPauseMarkPartnerZ;
+        const double moved = std::sqrt(dx * dx + dz * dz);
+        const bool wantMoved = command.point != 0;
+        log_expect(wantMoved ? moved >= kPausePartnerMovedUnits : moved < kPauseStillUnits,
+            "expectpartnermoved",
+            fmt::format("{} want={} moved={:.1f} ({})", pause_tag(command), wantMoved ? 1 : 0,
+                moved, describe_pause()));
+        break;
+    }
+    case Op::ExpectCursor: {
+        const int cursor = pause_menu_cursor();
+        const bool moved = cursor != sPauseMarkCursor;
+        const bool wantMoved = command.point != 0;
+        log_expect(cursor >= 0 && sPauseMarkCursor >= 0 && moved == wantMoved, "expectcursor",
+            fmt::format("{} want={} mark={:#x} now={:#x}", pause_tag(command),
+                wantMoved ? "moved" : "same", sPauseMarkCursor, cursor));
+        break;
+    }
+    case Op::Hurt: {
+        daAlink_c* alink = daAlink_getAlinkActorClass();
+        if (!in_world() || alink == nullptr) {
+            Log.error("[{}] line {}: hurt needs the world; skipped", sTicks, command.line);
+            break;
+        }
+        const int before = dComIfGs_getLife();
+        alink->setDamagePoint(command.room, FALSE, TRUE, 0);
+        Log.info("[autopilot] hurt {} quarter heart(s) via setDamagePoint: life {} now, applied by "
+                 "the meter next tick ({}) tick={}",
+            command.room, before, describe_pause(), sTicks);
+        break;
+    }
+    case Op::ExpectFlash: {
+        const mp::pause::Stats s = mp::pause::stats();
+        const bool flashed = s.heartsFlashes > 0;
+        log_expect(flashed == (command.point != 0), "expectflash",
+            fmt::format("{} want={} flashes={} ({})", pause_tag(command), command.point,
+                s.heartsFlashes, describe_pause()));
+        break;
+    }
+    case Op::ExpectForceClose: {
+        // command.point: the wanted mp::PauseForceClose (kPauseForceCloseNone = none since mark).
+        const mp::pause::Stats s = mp::pause::stats();
+        const int got =
+            s.forceCloses > 0 ? s.lastForceCloseReason : static_cast<int>(mp::kPauseForceCloseNone);
+        log_expect(got == command.point, "expectforceclose",
+            fmt::format("{} want={} got={} count={} ({})", pause_tag(command),
+                mp::pause::force_close_reason_name(command.point),
+                mp::pause::force_close_reason_name(got), s.forceCloses, describe_pause()));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 bool settle_program_counter() {
     for (int guard = 0; guard < kInstantCommandLimit; guard++) {
         if (sPc >= sProgram.size()) {
@@ -2053,6 +2283,22 @@ bool settle_program_counter() {
             } else {
                 run_enemy_command(command);
             }
+            sPc++;
+            continue;
+
+        /* --- batch 8: pause --- */
+        // openmenu and closemenu take ticks; they are run by tick().
+        case Op::PauseMark:
+        case Op::PauseLog:
+        case Op::ExpectFrozen:
+        case Op::ExpectMenu:
+        case Op::ExpectStill:
+        case Op::ExpectCursor:
+        case Op::ExpectPartnerMoved:
+        case Op::Hurt:
+        case Op::ExpectFlash:
+        case Op::ExpectForceClose:
+            run_pause_command(command);
             sPc++;
             continue;
 
@@ -2558,6 +2804,73 @@ void load_script(const std::filesystem::path& path) {
             command.op = Op::SavePos;
         } else if (verb == "RESTOREPOS") {
             command.op = Op::RestorePos;
+            /* --- batch 8: pause --- */
+        } else if (verb == "OPENMENU") {
+            // "openmenu collect|ring [timeout]": open it through the pad (point = its window status).
+            command.op = Op::OpenMenu;
+            const std::string which = to_upper(a);
+            command.point = which == "COLLECT" ? 3 : (which == "RING" ? 2 : -1);
+            command.frames = 300;
+            ok = command.point >= 0 && (b.empty() || parse_int(b, command.frames)) &&
+                 command.frames > 0;
+        } else if (verb == "CLOSEMENU") {
+            // "closemenu [timeout]": B until no menu is open.
+            command.op = Op::CloseMenu;
+            command.frames = 300;
+            ok = (a.empty() || parse_int(a, command.frames)) && command.frames > 0;
+        } else if (verb == "PAUSEMARK" || verb == "PAUSELOG") {
+            // "pausemark [tag]" / "pauselog [tag]": see run_pause_command.
+            command.op = verb == "PAUSEMARK" ? Op::PauseMark : Op::PauseLog;
+            command.text = a;
+        } else if (verb == "EXPECTFROZEN" || verb == "EXPECTFLASH" ||
+                   verb == "EXPECTPARTNERMOVED") {
+            // "expectfrozen 0|1 [tag]" / "expectflash 0|1 [tag]" / "expectpartnermoved 0|1 [tag]".
+            command.op = verb == "EXPECTFROZEN" ? Op::ExpectFrozen :
+                         verb == "EXPECTFLASH"  ? Op::ExpectFlash :
+                                                  Op::ExpectPartnerMoved;
+            ok = a == "0" || a == "1";
+            command.point = a == "1" ? 1 : 0;
+            command.text = b;
+        } else if (verb == "EXPECTMENU") {
+            // "expectmenu open|closed [tag]".
+            command.op = Op::ExpectMenu;
+            const std::string want = to_upper(a);
+            command.point = want == "OPEN" ? 1 : (want == "CLOSED" ? 0 : -1);
+            ok = command.point >= 0;
+            command.text = b;
+        } else if (verb == "EXPECTSTILL") {
+            // "expectstill [tag]": Link has not moved since the pausemark.
+            command.op = Op::ExpectStill;
+            command.text = a;
+        } else if (verb == "EXPECTCURSOR") {
+            // "expectcursor moved|same [tag]": the menu cursor against the pausemark's.
+            command.op = Op::ExpectCursor;
+            const std::string want = to_upper(a);
+            command.point = want == "MOVED" ? 1 : (want == "SAME" ? 0 : -1);
+            ok = command.point >= 0;
+            command.text = b;
+        } else if (verb == "HURT") {
+            // "hurt 4": that many quarter hearts of damage, as a hit deals it.
+            command.op = Op::Hurt;
+            ok = parse_int(a, command.room) && command.room > 0 && command.room <= 80;
+        } else if (verb == "EXPECTFORCECLOSE") {
+            // "expectforceclose death [tag]": the last force-close since the pausemark.
+            command.op = Op::ExpectForceClose;
+            const std::string want = to_upper(a);
+            command.point = -1;
+            if (want == "NONE") {
+                command.point = static_cast<int>(mp::kPauseForceCloseNone);
+            } else if (want == "DEATH") {
+                command.point = static_cast<int>(mp::kPauseForceCloseDeath);
+            } else if (want == "EVENT") {
+                command.point = static_cast<int>(mp::kPauseForceCloseEvent);
+            } else if (want == "SCENE-CHANGE") {
+                command.point = static_cast<int>(mp::kPauseForceCloseScene);
+            } else if (want == "PLAYER-DEMO") {
+                command.point = static_cast<int>(mp::kPauseForceCloseDemo);
+            }
+            ok = command.point >= 0;
+            command.text = b;
         } else {
             Log.error("Line {}: unknown command '{}'", lineNumber, verb);
             ok = false;
@@ -3092,6 +3405,53 @@ void tick() {
         } else if (sElapsed + 1 >= command.frames) {
             log_expect(false, verb,
                 fmt::format("want={} not reached in {} ticks: {}", want, command.frames, desc));
+        }
+        break;
+    }
+
+    /* --- batch 8: pause --- */
+    case Op::OpenMenu: {
+        /* START opens the Collect screen and d-pad DOWN the item ring (dMw_c::key_wait_proc). Done
+         * once that menu reaches its *_MOVE proc, i.e. it is fully open and taking input. 4 ticks
+         * on, 8 off: every press is a clean edge, and none lands once the menu is up. */
+        const bool ring = command.point == 2;
+        const u8 moveProc = ring ? static_cast<u8>(dMw_c::RING_MOVE) : static_cast<u8>(dMw_c::COLLECT_MOVE);
+        dMw_c* menu = dMeter2Info_getMenuWindowClass();
+        const int windowStatus = static_cast<int>(dMeter2Info_getWindowStatus());
+        if (menu != nullptr && windowStatus == command.point && menu->mMenuProc == moveProc) {
+            Log.info("[autopilot] openmenu {} result=open after {} tick(s): {} tick={}",
+                ring ? "ring" : "collect", sElapsed, describe_pause(), sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        if (windowStatus == 0 && sElapsed % 12 < 4) {
+            status.button = static_cast<u16>(ring ? PAD_BUTTON_DOWN : PAD_BUTTON_START);
+        }
+        if (sElapsed + 1 >= command.frames) {
+            Log.error("[autopilot] openmenu {} result=timeout after {} ticks: {} tick={}",
+                ring ? "ring" : "collect", command.frames, describe_pause(), sTicks);
+        }
+        break;
+    }
+
+    case Op::CloseMenu: {
+        // B closes the Collect screen (dMw_isPush_S_Button) and the ring (isMoveEnd), and backs
+        // out of a sub-window first. Done once no menu is open at all.
+        dMw_c* menu = dMeter2Info_getMenuWindowClass();
+        const bool open = mp::pause::local_in_menu() ||
+                          (menu != nullptr && menu->mMenuProc != dMw_c::NO_MENU);
+        if (!open) {
+            Log.info("[autopilot] closemenu result=closed after {} tick(s): {} tick={}", sElapsed,
+                describe_pause(), sTicks);
+            duration = sElapsed + 1;
+            break;
+        }
+        if (sElapsed % 12 < 4) {
+            status.button = PAD_BUTTON_B;
+        }
+        if (sElapsed + 1 >= command.frames) {
+            Log.error("[autopilot] closemenu result=timeout after {} ticks: {} tick={}",
+                command.frames, describe_pause(), sTicks);
         }
         break;
     }

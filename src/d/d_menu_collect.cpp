@@ -41,7 +41,28 @@
 #include "dusk/game_clock.h"
 #include "dusk/interp/user_interface.h"
 #include "dusk/menu_pointer.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/utilities.hpp"
+#endif
+
+#if TARGET_PC
+/* batch 8 pause (P1, Q-P2): with the doll hidden (co-op), Link's shield and outfit reloads wait
+ * for the menu to close. The save's selection is still written at once, so the screen shows it. */
+static void dMc_dusk_shieldChange() {
+    if (dusk::mp::pause_collect_doll_hidden()) {
+        dusk::mp::pause_defer_shield_change();
+    } else {
+        daAlink_getAlinkActorClass()->setShieldChange();
+    }
+}
+
+static void dMc_dusk_clothesChange() {
+    if (dusk::mp::pause_collect_doll_hidden()) {
+        dusk::mp::pause_defer_clothes_change();
+    } else {
+        daPy_getPlayerActorClass()->setClothesChange(0);
+    }
+}
 #endif
 
 typedef void (dMenu_Collect2D_c::*initFunc)();
@@ -1380,7 +1401,11 @@ void dMenu_Collect2D_c::changeShield() {
             if (dComIfGs_getSelectEquipShield() != dItemNo_SHIELD_e) {
                 dMeter2Info_setShield(dItemNo_SHIELD_e, false);
                 setEquipItemFrameColorShield(0);
+#if TARGET_PC
+                dMc_dusk_shieldChange();
+#else
                 daAlink_getAlinkActorClass()->setShieldChange();
+#endif
                 Z2GetAudioMgr()->seStart(Z2SE_SY_ITEM_SET_X, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f,
                                          0);
                 dMeter2Info_set2DVibration();
@@ -1389,7 +1414,11 @@ void dMenu_Collect2D_c::changeShield() {
             if (dComIfGs_getSelectEquipShield() != dItemNo_WOOD_SHIELD_e) {
                 dMeter2Info_setShield(dItemNo_WOOD_SHIELD_e, false);
                 setEquipItemFrameColorShield(0);
+#if TARGET_PC
+                dMc_dusk_shieldChange();
+#else
                 daAlink_getAlinkActorClass()->setShieldChange();
+#endif
                 Z2GetAudioMgr()->seStart(Z2SE_SY_ITEM_SET_X, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f,
                                          0);
                 dMeter2Info_set2DVibration();
@@ -1400,7 +1429,11 @@ void dMenu_Collect2D_c::changeShield() {
         if (dComIfGs_getSelectEquipShield() != dItemNo_HYLIA_SHIELD_e) {
             dMeter2Info_setShield(dItemNo_HYLIA_SHIELD_e, false);
             setEquipItemFrameColorShield(1);
+#if TARGET_PC
+            dMc_dusk_shieldChange();
+#else
             daAlink_getAlinkActorClass()->setShieldChange();
+#endif
             Z2GetAudioMgr()->seStart(Z2SE_SY_ITEM_SET_X, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f, 0);
             dMeter2Info_set2DVibration();
         }
@@ -1414,7 +1447,11 @@ void dMenu_Collect2D_c::changeClothe() {
         if (dComIfGs_getSelectEquipClothes() != dItemNo_WEAR_KOKIRI_e) {
             dMeter2Info_setCloth(dItemNo_WEAR_KOKIRI_e, false);
             setEquipItemFrameColorClothes(0);
+#if TARGET_PC
+            dMc_dusk_clothesChange();
+#else
             daPy_getPlayerActorClass()->setClothesChange(0);
+#endif
             Z2GetAudioMgr()->seStart(Z2SE_SY_ITEM_SET_X, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f, 0);
             dMeter2Info_set2DVibration();
         }
@@ -1423,7 +1460,11 @@ void dMenu_Collect2D_c::changeClothe() {
         if (dComIfGs_getSelectEquipClothes() != dItemNo_WEAR_ZORA_e) {
             dMeter2Info_setCloth(dItemNo_WEAR_ZORA_e, false);
             setEquipItemFrameColorClothes(1);
+#if TARGET_PC
+            dMc_dusk_clothesChange();
+#else
             daPy_getPlayerActorClass()->setClothesChange(0);
+#endif
             Z2GetAudioMgr()->seStart(Z2SE_SY_ITEM_SET_X, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f, 0);
             dMeter2Info_set2DVibration();
         }
@@ -1432,7 +1473,11 @@ void dMenu_Collect2D_c::changeClothe() {
         if (dComIfGs_getSelectEquipClothes() != dItemNo_ARMOR_e) {
             dMeter2Info_setCloth(dItemNo_ARMOR_e, false);
             setEquipItemFrameColorClothes(2);
+#if TARGET_PC
+            dMc_dusk_clothesChange();
+#else
             daPy_getPlayerActorClass()->setClothesChange(0);
+#endif
             Z2GetAudioMgr()->seStart(Z2SE_SY_ITEM_SET_X, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f, 0);
             dMeter2Info_set2DVibration();
         }
@@ -2736,7 +2781,16 @@ void dMenu_Collect3D_c::_create() {
     JKRHEAP_NAME(mpSolidHeap, "dMenu_Collect3D_c::mpSolidHeap");
     mDoExt_setCurrentHeap((JKRHeap*)mpSolidHeap);
     daAlink_c* linkActor = daAlink_getAlinkActorClass();
+#if TARGET_PC
+    /* batch 8 pause (P1, Q-P2): in a live session Link's own execute keeps running behind the
+     * menu, and the doll swaps his real model data and poses his real model
+     * (d_a_alink_swindow.inc:247-389). So the doll is not built at all; equipment changes made
+     * here apply when the menu closes. Latched for this screen's whole life. */
+    const bool dollHidden = dusk::mp::pause_collect_doll_begin();
+    if (linkActor != NULL && !dollHidden) {
+#else
     if (linkActor != NULL) {
+#endif
         linkActor->initStatusWindow();
     }
     u8 maskMdl = getMaskMdlVisible();
@@ -2759,9 +2813,17 @@ void dMenu_Collect3D_c::_create() {
 }
 
 void dMenu_Collect3D_c::_delete() {
+#if TARGET_PC
+    // batch 8 pause (P1): no doll was built, so there is nothing to give back.
+    if (daAlink_getAlinkActorClass() && !dusk::mp::pause_collect_doll_hidden()) {
+        daAlink_getAlinkActorClass()->resetStatusWindow();
+    }
+    dusk::mp::pause_collect_doll_end();
+#else
     if (daAlink_getAlinkActorClass()) {
         daAlink_getAlinkActorClass()->resetStatusWindow();
     }
+#endif
 }
 
 void dMenu_Collect3D_c::_move(u8 param_0, u8 param_1) {
@@ -2791,9 +2853,18 @@ void dMenu_Collect3D_c::_move(u8 param_0, u8 param_1) {
         s16 target = mIsWolf != 0 ? (s16)-0x510C : (s16)-0x5B1C;
         cLib_addCalcAngleS(&mLinkAngle, target, 4, 0x800, 0x80);
     }
+#if TARGET_PC
+    if (dusk::mp::pause_collect_doll_hidden()) {
+        // batch 8 pause (P1): the doll's sword-wait countdown alone, without its model work.
+        dusk::mp::pause_collect_doll_execute();
+    } else if (daAlink_getAlinkActorClass() != NULL) {
+        daAlink_getAlinkActorClass()->statusWindowExecute(&itemPos, mLinkAngle);
+    }
+#else
     if (daAlink_getAlinkActorClass() != NULL) {
         daAlink_getAlinkActorClass()->statusWindowExecute(&itemPos, mLinkAngle);
     }
+#endif
     if (mpModel != NULL) {
         cXyz modelPos;
         Vec maskPos = mpCollect2D->getpMask()->getGlobalVtxCenter(false, 0);
@@ -2838,7 +2909,12 @@ void dMenu_Collect3D_c::_move(u8 param_0, u8 param_1) {
 
 void dMenu_Collect3D_c::draw() {
     dComIfGd_setListItem3D();
+#if TARGET_PC
+    // batch 8 pause (P1): hidden in co-op.
+    if (daAlink_getAlinkActorClass() && !dusk::mp::pause_collect_doll_hidden()) {
+#else
     if (daAlink_getAlinkActorClass()) {
+#endif
         daAlink_getAlinkActorClass()->statusWindowDraw();
     }
     if (mpModel) {

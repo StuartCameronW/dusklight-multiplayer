@@ -26,6 +26,7 @@
 
 #if TARGET_PC
 #include "dusk/memory.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/settings.h"
 
 namespace {
@@ -319,7 +320,13 @@ int dMeter2_c::_execute() {
     moveSubContents();
     move2DContents();
 
+#if TARGET_PC
+    // batch 8 pause (Q-P4: timers keep counting behind a menu): the hot-spring water timer stops
+    // only when the whole world is paused. Vanilla outside a live session.
+    if (!dusk::mp::world_frozen() && !dComIfGp_event_runCheck()) {
+#else
     if (!dComIfGp_isPauseFlag() && !dComIfGp_event_runCheck()) {
+#endif
         dMeter2Info_decHotSpringTimer();
     }
 
@@ -2826,6 +2833,16 @@ void dMeter2_c::movePachinkoNum() {
 }
 
 void dMeter2_c::alphaAnimeLife() {
+#if TARGET_PC
+    /* batch 8 pause (Stuart, 2026-11-20): hurt behind a menu while the world runs, the life gauge
+     * is shown over the opaque menu, flashing, for a moment after each hit. The meter draws on the
+     * 2-D top list, above the menu's capture. Only in a live session. */
+    if (dusk::mp::pause_hearts_flash_on()) {
+        mpMeterDraw->setAlphaLifeAnimeMax();
+        mpMeterDraw->setAlphaLifeChange(false);
+        return;
+    }
+#endif
     if ((mStatus & 0x4000) ||
         ((mStatus & 0x40) && dComIfGp_event_checkHind(0x10) &&
          !dComIfGp_checkPlayerStatus1(0, 0x2000)) ||

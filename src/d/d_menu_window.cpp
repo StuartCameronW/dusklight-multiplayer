@@ -28,6 +28,7 @@
 
 #if TARGET_PC
 #include "dusk/interp/frame_interpolation.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #endif
 
 class dDlst_MENU_CAPTURE_c : public dDlst_base_c {
@@ -1603,8 +1604,107 @@ int dMw_c::_create() {
     return cPhs_COMPLEATE_e;
 }
 
+#if TARGET_PC
+/* batch 8 pause (mp-pause.md 3): something that started behind the menu while the world ran
+ * (death, an event, a scene change, an enemy grab) cannot wait for the player to close it. Nothing
+ * in the original ever closed a menu from outside, so this is the same teardown key_wait_init and
+ * _delete do, applied from any menu state. Latched once begun: the deletes run in the order
+ * _delete uses, and a sub-menu still loading (isSync) is retried next tick with the menu's own
+ * procs held off, since they would read the menus already deleted. */
+static bool l_duskForceClosing = false;
+static int l_duskForceCloseReason = dusk::mp::kPauseForceCloseNone;
+
+/// The procs whose menu faded the screen to black (collect_open_init, the sub-windows, Agitha's
+/// insect menu); the ring and the two maps never touch the fader.
+static bool dMw_dusk_isFadingProc(u8 i_proc) {
+    return (i_proc >= dMw_c::COLLECT_OPEN && i_proc <= dMw_c::COLLECT_CLOSE) ||
+           (i_proc >= dMw_c::SAVE_OPEN && i_proc <= dMw_c::INSECT_AGITHA_CLOSE);
+}
+
+/// True: the menu is (being) force-closed and _execute must do nothing else this tick.
+static bool dMw_dusk_forceClose(dMw_c* i_this) {
+    if (l_duskForceClosing && i_this->mMenuProc == dMw_c::NO_MENU) {
+        // A latch left over from a menu window deleted mid-close (a scene change): this one is new.
+        l_duskForceClosing = false;
+        l_duskForceCloseReason = dusk::mp::kPauseForceCloseNone;
+    }
+    if (!l_duskForceClosing) {
+        if (i_this->mMenuProc == dMw_c::NO_MENU) {
+            return false;
+        }
+        const int reason = dusk::mp::pause_menu_force_close_reason();
+        if (reason == dusk::mp::kPauseForceCloseNone) {
+            return false;
+        }
+        // A save in progress owns the memory card (mp-pause.md P6): its own state machine must
+        // finish, so the menu runs normally until the player leaves the save screen.
+        if (i_this->mpMenuSave != NULL) {
+            dusk::mp::pause_note_force_close(reason, i_this->mMenuProc, "the save screen");
+            return false;
+        }
+        // A fade in flight lands first, so the screen is left either clear or black, never half.
+        const s32 fader = mDoGph_gInf_c::getFader()->getStatus();
+        if (fader == JUTFader::FadeIn || fader == JUTFader::FadeOut) {
+            dusk::mp::pause_note_force_close(reason, i_this->mMenuProc, "a fade");
+            return false;
+        }
+        l_duskForceClosing = true;
+        l_duskForceCloseReason = reason;
+    }
+
+    JKRHeap* prev_heap = mDoExt_setCurrentHeap(i_this->mpHeap);
+    const u8 proc = i_this->mMenuProc;
+
+    // What ring_close_proc's isClose() would have committed (an item still flying to its button).
+    if (i_this->mpMenuRing != NULL) {
+        for (int i = 0; i < 4; i++) {
+            i_this->mpMenuRing->setSelectItemForce(i);
+        }
+    }
+
+    if (!i_this->dMw_collect_delete(true) || !i_this->dMw_dmap_delete(true) ||
+        !i_this->dMw_fmap_delete(true) || !i_this->dMw_option_delete() ||
+        !i_this->dMw_letter_delete() || !i_this->dMw_fishing_delete() ||
+        !i_this->dMw_skill_delete() || !i_this->dMw_insect_delete() || !i_this->dMw_ring_delete())
+    {
+        dusk::mp::pause_note_force_close(l_duskForceCloseReason, proc, "a sub-menu to finish loading");
+        mDoExt_setCurrentHeap(prev_heap);
+        return true;
+    }
+
+    // key_wait_init's half: the capture and the pause flag, the window status, the heap.
+    i_this->dMw_capture_delete();
+    if (i_this->mpCapture != NULL) {
+        // A capture not drawn yet (no pause flag to clear) is not freed by dMw_capture_delete.
+        JKR_DELETE(i_this->mpCapture);
+        i_this->mpCapture = NULL;
+    }
+    dMeter2Info_setWindowStatus(0);
+    dMeter2Info_offMenuInForce(2);
+    i_this->mpHeap->freeAll();
+    dComIfGp_offHeapLockFlag(0);
+
+    if (dMw_dusk_isFadingProc(proc) && mDoGph_gInf_c::getFader()->getStatus() == JUTFader::None) {
+        dMw_c::dMw_fade_in();
+    }
+    // The close sound, and it is what lifts the menu's audio duck (Z2SeMgr.cpp:220-223).
+    Z2GetAudioMgr()->seStart(Z2SE_SY_MENU_OUT, NULL, 0, 0, 1.0f, 1.0f, -1.0f, -1.0f, 0);
+
+    i_this->mMenuProc = dMw_c::NO_MENU;
+    mDoExt_setCurrentHeap(prev_heap);
+
+    dusk::mp::pause_note_force_close(l_duskForceCloseReason, proc, NULL);
+    l_duskForceClosing = false;
+    l_duskForceCloseReason = dusk::mp::kPauseForceCloseNone;
+    return true;
+}
+#endif
+
 int dMw_c::_execute() {
 #if TARGET_PC
+    if (dMw_dusk_forceClose(this)) {
+        return 1;
+    }
     if (mpMenuRing != NULL) {
         mpMenuRing->advanceSelectItem();
     }

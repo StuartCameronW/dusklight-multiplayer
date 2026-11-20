@@ -10,6 +10,10 @@
 #include "f_op/f_op_draw_tag.h"
 #include "f_op/f_op_kankyo_mng.h"
 
+#if TARGET_PC
+#include "dusk/multiplayer.hpp"  // batch 8: pause
+#endif
+
 static int fopKy_KANKYO_TYPE;
 
 BOOL fopKy_IsKankyo(void* i_this) {
@@ -48,7 +52,14 @@ static int fopKy_Execute(void* i_this) {
     fapGm_HIO_c::startCpuTimer();
 #endif
 
+#if TARGET_PC
+    /* batch 8 pause (G3, mp-pause.md 2.2): the clock (dKy_Execute -> setDaytime) keeps running
+     * behind one player's menu; a paused host must not stall the shared clock. Vanilla outside a
+     * live session. */
+    if (!dScnPly_c::isPause() && (!dusk::mp::world_frozen() || fpcM_GetName(a_this) == fpcNm_ENVSE_e)) {
+#else
     if (!dScnPly_c::isPause() && (!dComIfGp_isPauseFlag() || fpcM_GetName(a_this) == fpcNm_ENVSE_e)) {
+#endif
         ret = fpcMtd_Execute(&((kankyo_class*)i_this)->sub_method->base, i_this);
     }
 

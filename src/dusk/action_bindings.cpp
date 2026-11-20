@@ -1,5 +1,6 @@
 #include "dusk/action_bindings.h"
 
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/settings.h"
 #include "dusk/ui/ui.hpp"
 
@@ -129,11 +130,19 @@ void clearAllVirtualActionBinds() {
 }
 
 bool getActionBindTrig(ActionBinds action, u32 port) {
+    // batch 8: pause. A world execute behind a menu sees no input; the menu has it.
+    if (mp::pause_world_input_blocked()) {
+        return false;
+    }
     return actionPressData[port][static_cast<int>(action)].pressedCurFrame &&
           !actionPressData[port][static_cast<int>(action)].pressedPrevFrame;
 }
 
 bool getActionBindHold(ActionBinds action, u32 port) {
+    // batch 8: pause. See getActionBindTrig.
+    if (mp::pause_world_input_blocked()) {
+        return false;
+    }
     return actionPressData[port][static_cast<int>(action)].pressedCurFrame &&
            actionPressData[port][static_cast<int>(action)].pressedPrevFrame;
 }

@@ -231,6 +231,18 @@ enum PlayerGearFlags : std::uint8_t {
      * d_a_remote_player_gear.inc.
      */
     kPlayerGearShieldBurning = 1 << 6,
+    /**
+     * Batch 8 (pause): the sender has a menu open — `dMeter2Info_getWindowStatus() != 0` or the
+     * menu pause flag (multiplayer/session/pause.cpp). Not equipment; it lives here because `flags`
+     * is full and this byte had the bit spare. Under the Dying Light model the world freezes only
+     * when every in-world player sets it.
+     *
+     * Set from the CURRENT state on both of wire_local_state's paths, so a held pose (an event, a
+     * reload) still carries a live bit. Rides the unreliable per-tick stream: a lost edge heals on
+     * the next tick, because senders never go quiet. A sender built before it leaves it clear, which
+     * reads as "playing" and keeps the world running: the safe side.
+     */
+    kPlayerGearInMenu = 1 << 7,
 };
 
 /**

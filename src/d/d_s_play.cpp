@@ -42,6 +42,7 @@
 #if TARGET_PC
 #include "dusk/autosave.h"
 #include "dusk/memory.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/mods/item.hpp"
 #include "dusk/trigger_viewer.h"
 #include "dusk/ui/ui.hpp"
@@ -598,7 +599,14 @@ static int dScnPly_Draw(dScnPly_c* i_this) {
 
     dMdl_mng_c::reset();
 
+#if TARGET_PC
+    /* batch 8 pause (G4, mp-pause.md 2.2): goes with G1. Its else-branch sets dPa_control_c status
+     * 1, which defers every process delete (f_pc_manager.cpp), so with the actors running behind a
+     * menu killed enemies and picked-up drops would pile up undeleted. Vanilla outside a session. */
+    if (!dusk::mp::world_frozen() && !dScnPly_c::isPause()
+#else
     if (!dComIfGp_isPauseFlag() && !dScnPly_c::isPause()
+#endif
         #if DEBUG
         && !fapGm_HIO_c::isCaptureScreen()
         #endif
@@ -797,7 +805,14 @@ static int dScnPly_Execute(dScnPly_c* i_this) {
     }
     #endif
 
+#if TARGET_PC
+    /* batch 8 pause (G5, mp-pause.md 2.2): events, demos and attention advance behind one player's
+     * menu; one that starts there closes the menu (dMw_c::_execute force-close). Vanilla outside a
+     * live session. */
+    if (!dusk::mp::world_frozen()) {
+#else
     if (!dComIfGp_isPauseFlag()) {
+#endif
         #if DEBUG
         dJprev_c::get()->update();
         #endif

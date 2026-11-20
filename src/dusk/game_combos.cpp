@@ -4,6 +4,7 @@
 #include "SSystem/SComponent/c_xyz.h"
 #include "d/actor/d_a_alink.h"
 #include "d/d_com_inf_game.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/settings.h"
 #include "m_Do/m_Do_controller_pad.h"
 
@@ -105,6 +106,12 @@ static const GameCombo kCombos[] = {
 void processGameCombos() {
     if (!getSettings().game.enableMoveLinkCombo) {
         getTransientSettings().moveLinkActive = false;
+    }
+
+    // batch 8: pause. Every combo acts on Link (transform, howl, teleport, moon jump); with the
+    // world running behind a co-op menu the pad belongs to the menu.
+    if (mp::pause_isolates_world()) {
+        return;
     }
 
     const u16 held = mDoCPd_c::getHold(PAD_1) & 0xFFFF;

@@ -191,4 +191,88 @@ bool drops_execute(daItem_c* item);
 /// item that is not a shared drop.
 int drops_claim_pickup(daItem_c* item);
 
+/* --- batch 8: pause ---
+ * The Dying Light pause model (.claude/future-plans/mp-pause.md; Stuart's calls in
+ * .claude/plan/17-decisions-2026-11-20.md): the world pauses only when EVERY player is in a menu.
+ * One player alone in a menu keeps his world running behind it, and he can be hit there.
+ * Called from decomp code inside #if TARGET_PC; implemented in multiplayer/session/pause.cpp.
+ * Outside a live session every one of them answers "vanilla": world_frozen() is the menu pause
+ * flag, nothing is isolated, deferred, hidden or force-closed. */
+
+/// Replaces dComIfGp_isPauseFlag() at the world's execute gates (actors, camera, kankyo, the two
+/// d_s_play blocks) and the timers. No live session: exactly the flag. Live: the flag AND every
+/// in-world partner reports being in a menu. The flag itself is never touched: the menus' own
+/// drawing needs it.
+bool world_frozen();
+
+/// The local player has a menu open, a session is live and the world runs behind the menu: the
+/// menu owns the pad, and the world must see none of it.
+bool pause_isolates_world();
+
+/// True inside a PauseWorldExecScope that is isolating: Dusk's own input feeds (action binds,
+/// mouse and gyro aim) must answer "nothing" to the world while the menu has the pad.
+bool pause_world_input_blocked();
+
+/**
+ * Around one actor or camera execute (f_op_actor.cpp / f_op_camera.cpp). While
+ * pause_isolates_world(), the outermost scope zeroes mDoCPd_c::m_cpadInfo[PAD_1] and restores it
+ * after, and shows the world the X/Y assignment it had when the menu opened (the menu's changes
+ * apply on close). Otherwise it does nothing at all.
+ */
+class PauseWorldExecScope {
+public:
+    PauseWorldExecScope();
+    ~PauseWorldExecScope();
+
+private:
+    bool mActive;
+    PauseWorldExecScope(const PauseWorldExecScope&);
+    PauseWorldExecScope& operator=(const PauseWorldExecScope&);
+};
+
+/// Why an open menu must close now (pause_menu_force_close_reason). Something that started behind
+/// the menu while the world ran: it cannot wait for the player to close it.
+enum PauseForceClose {
+    kPauseForceCloseNone = 0,
+    kPauseForceCloseDeath = 1,  ///< life 0: the gameover waits for the menu (d_gameover.cpp:133)
+    kPauseForceCloseEvent = 2,  ///< an event started behind the menu
+    kPauseForceCloseScene = 3,  ///< a scene change (void-out, exit, warp) was queued
+    kPauseForceCloseDemo = 4,   ///< Link went into a demo (an enemy grab) behind the menu
+};
+
+/// dMw_c::_execute: a PauseForceClose, kPauseForceCloseNone unless a live session's world runs
+/// behind the open menu and one of the reasons started after it opened.
+int pause_menu_force_close_reason();
+
+/// Logging for the force-close: `waitingFor` non-null while it is held back (a save in progress,
+/// a fade landing, a sub-menu still loading), null once the menu is closed.
+void pause_note_force_close(int reason, int menuProc, const char* waitingFor);
+
+/// dMenu_Collect3D_c::_create: true if this Collect screen runs without its 3-D Link doll (any
+/// live session, latched for the screen's life). The doll drives Link's real model, and Link's own
+/// execute keeps running behind the menu in co-op.
+bool pause_collect_doll_begin();
+/// The latched answer, for the Collect screen's _move / draw / _delete.
+bool pause_collect_doll_hidden();
+/// dMenu_Collect3D_c::_move with the doll hidden: the doll's sword-wait countdown alone, so the
+/// screen can still close (dMw_isPush_S_Button waits for it).
+void pause_collect_doll_execute();
+/// dMenu_Collect3D_c::_delete.
+void pause_collect_doll_end();
+/// The Collect screen's outfit / shield change with the doll hidden: applied when the menu closes.
+void pause_defer_clothes_change();
+void pause_defer_shield_change();
+
+/// daAlink_c::execute: a deferred shield reload is landing in the world. His execute must not run
+/// while mShieldModel is null (setCollision dereferences it), so it holds until the reload is done.
+bool pause_equip_hold();
+
+/// daAlink_c::execute: hold checkWarpStart while a menu is open in a live session, so a warp chosen
+/// on the field map starts when the map has closed, as it does when the map freezes him.
+bool pause_defer_warp_start();
+
+/// dMeter2_c::alphaAnimeLife: true on the "shown" half of the hearts flash, which runs for a while
+/// after the player was hurt behind a menu.
+bool pause_hearts_flash_on();
+
 }  // namespace dusk::mp

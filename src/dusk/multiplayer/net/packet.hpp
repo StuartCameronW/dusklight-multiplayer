@@ -178,6 +178,8 @@ namespace dusk::mp {
  * every pose. New packets 28 EnemyAuthority (host -> all), 29 EnemyUpdate (authority -> host -> others,
  * unreliable) and 30 RoomsLoaded (peer -> host -> others); a v24 peer would drop them as unknown and run
  * every enemy locally. Layouts: replication/enemy_sync.hpp.
+ * Also batch 8 (pause): PlayerState gear bit 7 = kPlayerGearInMenu (the player is in a menu); the
+ * world freezes only while every player has it set. A v24 peer ignores the bit and never freezes.
  */
 inline constexpr std::uint32_t kProtocolVersion = 25;
 

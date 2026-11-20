@@ -25,6 +25,7 @@
 
 #if TARGET_PC
 #include "dusk/interp/user_interface.h"
+#include "dusk/multiplayer.hpp"  // batch 8: pause
 #include "dusk/version.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -185,7 +186,13 @@ int dTimer_c::_execute() {
     }
 
     if (field_0x16A != 1) {
+#if TARGET_PC
+        // batch 8 pause (Q-P4): timers keep counting behind one player's menu; they stop only when
+        // the whole world is paused. Vanilla outside a live session.
+        if (dusk::mp::world_frozen() || dMsgObject_isTalkNowCheck()) {
+#else
         if (dComIfGp_isPauseFlag() || dMsgObject_isTalkNowCheck()) {
+#endif
             stop(2);
         }
 
@@ -249,7 +256,12 @@ int dTimer_c::_execute() {
             m_time = field_0x120;
         }
     } else {
+#if TARGET_PC
+        // batch 8 pause (Q-P4): the restart side of the stop above.
+        if (field_0x16B == 2 && !dusk::mp::world_frozen() && !dMsgObject_isTalkNowCheck()) {
+#else
         if (field_0x16B == 2 && !dComIfGp_isPauseFlag() && !dMsgObject_isTalkNowCheck()) {
+#endif
             restart(2);
         }
 
