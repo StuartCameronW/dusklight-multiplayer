@@ -373,6 +373,9 @@ struct UserSettings {
         ConfigVar<int> enemyHostHoldTicks;
         /// Debug/test knob for M6: false keeps ghost enemies' attack colliders off (default true).
         ConfigVar<bool> enemyGhostAttacks;
+        /// Debug/test knob for M6: an item number (0-254) a synced authority enemy's kill drop
+        /// always rolls, e.g. 1 = green rupee, so a test can count the ONE shared drop. -1 = off.
+        ConfigVar<int> enemyForceDropItem;
     } multiplayer;
 
     // Arrays of size 4 for 4 ports

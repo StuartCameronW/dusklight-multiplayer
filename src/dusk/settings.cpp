@@ -198,6 +198,7 @@ UserSettings g_userSettings = {
         .enemySync {"multiplayer.enemySync", false},
         .enemyHostHoldTicks {"multiplayer.enemyHostHoldTicks", 15},
         .enemyGhostAttacks {"multiplayer.enemyGhostAttacks", true},
+        .enemyForceDropItem {"multiplayer.enemyForceDropItem", -1},
     },
 
     // Not sure if there's a better way to declare this
@@ -429,6 +430,7 @@ void registerSettings() {
     Register(g_userSettings.multiplayer.enemySync);
     Register(g_userSettings.multiplayer.enemyHostHoldTicks);
     Register(g_userSettings.multiplayer.enemyGhostAttacks);
+    Register(g_userSettings.multiplayer.enemyForceDropItem);
 
     Register(g_userSettings.actionBindings.firstPersonCamera[0]);
     Register(g_userSettings.actionBindings.firstPersonCamera[1]);

@@ -179,4 +179,9 @@ void enemy_roll_life(int tableNo, int& life, int& maxLife);
 /// authority of the executing synced enemy (Test 3's low-life check). A no-op otherwise.
 void enemy_note_roll_table(int tableIn, int tableOut);
 
+/// fopAcM_getItemNoFromTableNo, after the table picked the item: logs it on the authority of the
+/// executing synced enemy, and swaps it for multiplayer.enemyForceDropItem when that test knob is
+/// set (the random roll still runs, so the RNG stream is unchanged). A no-op otherwise.
+void enemy_note_roll_item(int& itemNo);
+
 }  // namespace dusk::mp

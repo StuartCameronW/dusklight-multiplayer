@@ -1488,6 +1488,12 @@ u8 fopAcM_getItemNoFromTableNo(u8 i_tableNo) {
     dusk::mp::enemy_note_roll_table(duskTableIn, i_tableNo);
 #endif
     i_tableNo = tableList->mTables[i_tableNo][(int)cM_rndF(15.9999f)];
+#if TARGET_PC
+    // Dusk (multiplayer M6): logs a synced enemy's rolled item; a test knob may force it.
+    int duskItemNo = i_tableNo;
+    dusk::mp::enemy_note_roll_item(duskItemNo);
+    i_tableNo = duskItemNo;
+#endif
     return i_tableNo;
 }
 

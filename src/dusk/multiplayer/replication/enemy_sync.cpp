@@ -2511,4 +2511,21 @@ void enemy_note_roll_table(int tableIn, int tableOut) {
         tableOut != tableIn ? " (low-life variant)" : "", network_manager().sim_tick());
 }
 
+void enemy_note_roll_item(int& itemNo) {
+    using namespace enemies::detail;
+    Rec* rec = exec_authority_rec();
+    if (rec == nullptr) {
+        return;
+    }
+    const int rolled = itemNo;
+    const int forced = dusk::getSettings().multiplayer.enemyForceDropItem.getValue();
+    if (forced >= 0 && forced < 0xFF) {
+        itemNo = forced;
+    }
+    Log.info("[mp-enemy] drop item key={:08X} rolled={}{} -> {}{} tick={}", rec->key, rolled,
+        rolled == 0xFF ? " (none)" : "", itemNo,
+        itemNo != rolled ? " (forced by multiplayer.enemyForceDropItem)" : "",
+        network_manager().sim_tick());
+}
+
 }  // namespace dusk::mp
