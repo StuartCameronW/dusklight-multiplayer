@@ -13,6 +13,9 @@
 #include "d/actor/d_a_player.h"
 #include "f_pc/f_pc_name.h"
 #include "f_op/f_op_actor_enemy.h"
+#if TARGET_PC
+#include "dusk/mp_enemy.hpp"
+#endif
 
 class daE_BA_HIO_c {
 public:
@@ -819,7 +822,16 @@ static void action(e_ba_class* i_this) {
                 fopAcM_delete(a_this);
                 if (i_this->mHomeType == e_ba_class::HOME_APPEAR) {
                     // should be dItemNo_HEART_e : dItemNo_ARROW_10_e but that gives incorrect code
+#if TARGET_PC
+                    // Dusk (multiplayer M6, batch 10B): a synced Keese a remote player killed
+                    // drops on the killer's hearts (a no-op until Keese has an adapter).
+                    int duskLife = dComIfGs_getLife();
+                    int duskMaxLife = dComIfGs_getMaxLife();
+                    dusk::mp::enemy_roll_life(-1, duskLife, duskMaxLife);
+                    int item_no = duskLife <= 4 ? 0 : 0xE;
+#else
                     int item_no = dComIfGs_getLife() <= 4 ? 0 : 0xE;
+#endif
                     fopAcM_createItem(&a_this->current.pos, item_no, -1, -1, NULL, NULL, 0);
                     fopAcM_createDisappear(a_this, &a_this->current.pos, 6, 0, 0xff);
                 } else {

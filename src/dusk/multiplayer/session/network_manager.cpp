@@ -1747,6 +1747,14 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
         break;
     }
+    /* --- batch 10B: enemy death and drops --- */
+    case PacketId::EnemyDespawn: {  // a room's authority -> host -> others, reliable
+        // Applied first, relayed only if on_packet vouched for it (the sender owns that room).
+        if (enemies::on_packet(id, r, sender->second.playerId) && mRole == Role::Host) {
+            relay_to_others(peer, data, size, kChannelObjects, true);
+        }
+        break;
+    }
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);
         break;

@@ -30,6 +30,7 @@
 #include <cstring>
 #if TARGET_PC
 #include "dusk/multiplayer.hpp"
+#include "dusk/mp_enemy.hpp"
 #endif
 
 #define MAKE_ITEM_PARAMS(itemNo, itemBitNo, param_2, param_3)                                      \
@@ -1449,8 +1450,19 @@ u8 fopAcM_getItemNoFromTableNo(u8 i_tableNo) {
     }
 #endif
 
+#if TARGET_PC
+    // Dusk (multiplayer M6, batch 10B): an enemy a remote player killed rolls on the KILLER's
+    // hearts, not this player's (mp-m6-enemies.md §5.4 item 4). Local hearts otherwise.
+    int duskLife = dComIfGs_getLife();
+    int duskMaxLife = dComIfGs_getMaxLife();
+    dusk::mp::enemy_roll_life(i_tableNo, duskLife, duskMaxLife);
+    const u8 duskTableIn = i_tableNo;
+    hp_max = duskMaxLife / 5 * 4;
+    hp_percent = (duskLife * 100) / hp_max;
+#else
     hp_max = dComIfGs_getMaxLife() / 5 * 4;
     hp_percent = (dComIfGs_getLife() * 100) / hp_max;
+#endif
 
     switch (i_tableNo) {
     case 150:
@@ -1472,6 +1484,9 @@ u8 fopAcM_getItemNoFromTableNo(u8 i_tableNo) {
         break;
     }
 
+#if TARGET_PC
+    dusk::mp::enemy_note_roll_table(duskTableIn, i_tableNo);
+#endif
     i_tableNo = tableList->mTables[i_tableNo][(int)cM_rndF(15.9999f)];
     return i_tableNo;
 }
@@ -1530,11 +1545,18 @@ fpc_ProcID fopAcM_createItemFromEnemyID(u8 i_enemyID, cXyz const* i_pos, int i_i
 #if TARGET_PC
     // Dusk (multiplayer batch 7): an enemy's kill drop stays this player's own until the enemies
     // themselves are shared (M6), or it would pop out of an enemy still alive on the partner's end.
-    dusk::mp::drops_enemy_scope(true);
+    // Batch 10B: a synced enemy this end is the authority for IS shared, so its drop is too: ONE
+    // drop, first come (the ghost's end replays the disappear with enemy id 0xFF and rolls none).
+    const bool duskShared = dusk::mp::enemy_drop_shared();
+    if (!duskShared) {
+        dusk::mp::drops_enemy_scope(true);
+    }
     const fpc_ProcID duskItemId = fopAcM_createItemFromTable(i_pos, tableNo, i_itemBitNo, i_roomNo,
                                                              i_angle, 0, i_scale, i_speedF, i_speedY,
                                                              false);
-    dusk::mp::drops_enemy_scope(false);
+    if (!duskShared) {
+        dusk::mp::drops_enemy_scope(false);
+    }
     return duskItemId;
 #else
     return fopAcM_createItemFromTable(i_pos, tableNo, i_itemBitNo, i_roomNo, i_angle, 0, i_scale,
@@ -2060,6 +2082,14 @@ void fopAcM_DrawCullingBox(const fopAc_ac_c* i_actor, const GXColor& i_color) {
 
 fpc_ProcID fopAcM_createDisappear(const fopAc_ac_c* i_actor, const cXyz* i_pos, u8 i_size,
                                   u8 i_type, u8 i_enemyID) {
+#if TARGET_PC
+    // Dusk (multiplayer M6, batch 10B): a synced authority enemy's disappear args ride on its
+    // EnemyDespawn, so the ghost on the other end plays the same smoke.
+    if (i_pos != NULL) {
+        dusk::mp::enemy_note_disappear(i_actor, i_pos->x, i_pos->y, i_pos->z, i_size, i_type,
+                                       i_enemyID);
+    }
+#endif
     u32 param = (i_enemyID << 0x10) | (i_size << 0x8) | i_type;
     fopAc_ac_c* actor = fopAcM_fastCreate(
         fpcNm_DISAPPEAR_e, param, i_pos, fopAcM_GetRoomNo(i_actor), &i_actor->current.angle, NULL, 0xFF,

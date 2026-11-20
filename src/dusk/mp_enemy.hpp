@@ -33,6 +33,14 @@ struct EnemyExtra {
 struct EnemyDespawn {
     unsigned char reason = 0;
     unsigned char killerPeer = 0xFF;
+    /* --- batch 10B: death and drops --- the authority's fopAcM_createDisappear args (valid when
+     * haveDisappear). The ghost replays them with enemy id 0xFF: the smoke, and no drop roll. */
+    bool haveDisappear = false;
+    bool rollstab = false;
+    unsigned char disappearSize = 0;
+    unsigned char disappearType = 0;
+    unsigned char disappearEnemyId = 0xFF;
+    float pos[3] = {0.0f, 0.0f, 0.0f};
 };
 
 /**
@@ -102,6 +110,9 @@ private:
     EnemyTargetScope& operator=(const EnemyTargetScope&);
     void* mSavedPlayer;
     bool mActive;
+    /* --- batch 10B: death and drops --- the executing authority enemy (enemy_drop_shared). */
+    unsigned int mPrevExecProc;
+    bool mExecSet;
 };
 
 /* --- batch 9: enemy hits (M6 phase 2, mp-m6-enemies.md §5.1, §5.6.5 items 3 and 7) --- */
@@ -127,11 +138,41 @@ struct EnemyHitOverride {
     bool cutJumpCancelTurn;
     bool horseRide;
     short shapeAngleY;
+    /* --- batch 10B: death and drops --- who hit, and his hearts then (the kill drop's roll). */
+    unsigned int attacker;
+    short life;
+    short maxLife;
+    bool rollstab;
 };
 
 /// Non-null when `atObj` is the proxy AT collider of an injected remote hit: at_power_check and
 /// cc_at_check take the hit type, bits and sword modifiers from it, and cc_at_check does not start
 /// the global hit-stop (the remote attacker's machine runs its own). Null for every real collider.
 const EnemyHitOverride* enemy_hit_override(const cCcD_Obj* atObj);
+
+/* --- batch 10B: death and drops (M6 phase 3, mp-m6-enemies.md §5.4) --- */
+
+/// fopAcM_createDisappear: `actor` leaves through the disappear smoke with these args. Kept, on the
+/// authority of a synced enemy, for the EnemyDespawn its deletion sends. A no-op otherwise.
+void enemy_note_disappear(const fopAc_ac_c* actor, float x, float y, float z, unsigned char size,
+    unsigned char type, unsigned char enemyId);
+
+/// cc_at_check, on the hit that takes an enemy's HP to 0: who killed it (`mpHit` non-null: that
+/// injected hit's remote attacker; null: this end's own Link). A no-op for an unsynced enemy.
+void enemy_note_killing_blow(const fopAc_ac_c* enemy, const EnemyHitOverride* mpHit);
+
+/// fopAcM_createItemFromEnemyID: true while a synced enemy this end is the authority for executes.
+/// Its kill drop is then shared (batch 7's ObjKind::Drop, one drop, first come) instead of staying
+/// this player's own. False otherwise (vanilla / batch 7 rule).
+bool enemy_drop_shared();
+
+/// The drop rolls that read the local hearts (fopAcM_getItemNoFromTableNo; tableNo -1 for a direct
+/// drop): inside a synced authority enemy's execute whose killer is a remote player, replaces
+/// `life` and `maxLife` with the killer's (§5.4 item 4) and logs the roll. Untouched otherwise.
+void enemy_roll_life(int tableNo, int& life, int& maxLife);
+
+/// fopAcM_getItemNoFromTableNo, after the hearts picked the table variant: logs it on the
+/// authority of the executing synced enemy (Test 3's low-life check). A no-op otherwise.
+void enemy_note_roll_table(int tableIn, int tableOut);
 
 }  // namespace dusk::mp

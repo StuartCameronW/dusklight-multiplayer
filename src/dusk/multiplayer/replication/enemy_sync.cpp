@@ -17,6 +17,7 @@
 #include "../net/serializer.hpp"
 #include "../session/network_manager.hpp"
 #include "../session/trace.hpp"
+#include "dusk/achievements.h"
 #include "dusk/logging.h"
 #include "dusk/settings.h"
 #include "enemy_internal.hpp"
@@ -29,6 +30,7 @@
 #include "d/d_cc_uty.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_s_play.h"
+#include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_player.h"
 #include "d/d_resorce.h"
 #include "f_op/f_op_actor.h"
@@ -59,6 +61,17 @@ static int s_adapterCount;
 
 /// Latched by pre_tick, cleared by reset(). A plain bool, read for every actor every tick.
 static bool s_enabled;
+/* --- batch 10B: death and drops --- set by EnemyTargetScope around an authority enemy's
+ * execute. */
+static std::uint32_t s_execProc = kNoProc;
+
+std::uint32_t exec_proc() {
+    return s_execProc;
+}
+
+void set_exec_proc(std::uint32_t proc) {
+    s_execProc = proc;
+}
 
 const EnemyNetAdapter* find_adapter(short prof) {
     for (int i = 0; i < s_adapterCount; i++) {
@@ -1031,6 +1044,9 @@ constexpr std::uint8_t kHitSwordUp = 0x08;
 constexpr std::uint8_t kHitHeadJump = 0x10;
 constexpr std::uint8_t kHitCutJumpCancel = 0x20;
 constexpr std::uint8_t kHitHorse = 0x40;
+/* --- batch 10B: death and drops --- the attacker's Link was in a rollstab finish (the
+ * rollstab_kill achievement is the killer's). */
+constexpr std::uint8_t kHitRollstab = 0x80;
 
 struct PendingHit {
     std::uint32_t attacker = kNoPlayer;
@@ -1051,6 +1067,8 @@ struct PendingHit {
     std::uint8_t cutType = 0;
     std::int16_t angleY = 0;
     std::int16_t life = 0;
+    /* --- batch 10B --- */
+    std::int16_t maxLife = 0;
 };
 
 struct PendingFlag {
@@ -1113,7 +1131,9 @@ void send_to_authority(Writer& w, std::uint32_t authority) {
 /// by this end's own Link (or his bomb, arrow, boomerang) to the authority, and give the attacker
 /// the hit-stop his own hit would have caused (§5.6.5 item 7; the authority suppresses its own).
 void ghost_scan_hits(Rec& rec, fopAc_ac_c* actor) {
-    if (rec.adapter == nullptr || rec.adapter->tgByIndex == nullptr || rec.authority == kNoPlayer) {
+    if (rec.adapter == nullptr || rec.adapter->tgByIndex == nullptr || rec.authority == kNoPlayer ||
+        rec.despawnPending)
+    {
         return;
     }
     daPy_py_c* link = dComIfGp_getLinkPlayer();
@@ -1183,6 +1203,12 @@ void ghost_scan_hits(Rec& rec, fopAc_ac_c* actor) {
         if (link->checkHorseRide()) {
             flags |= kHitHorse;
         }
+        /* --- batch 10B: death and drops --- */
+        if (const daAlink_c* alink = daAlink_getAlinkActorClass();
+            alink != nullptr && alink->mProcID == daAlink_c::PROC_CUT_FINISH && alink->mIsRollstab)
+        {
+            flags |= kHitRollstab;
+        }
         cXyz hitPos = *tgInf->GetTgHitPosP();
 
         Writer w;
@@ -1209,6 +1235,8 @@ void ghost_scan_hits(Rec& rec, fopAc_ac_c* actor) {
         w.write_u16(static_cast<std::uint16_t>(link->shape_angle.y));
         // Link's hearts live in the save data, not in fopAc_ac_c::health (always 0 for him).
         w.write_u16(dComIfGs_getLife());
+        /* --- batch 10B: death and drops --- the kill drop rolls on the killer's hearts. */
+        w.write_u16(dComIfGs_getMaxLife());
         send_to_authority(w, rec.authority);
         rec.hitsSent++;
         Log.info("[mp-enemy] hit sent key={:08X} n={} tg={} atType=0x{:X} atp={} spl={} "
@@ -1321,11 +1349,13 @@ bool on_hit(Reader& r, std::uint32_t fromPlayerId) {
     std::uint8_t status = 0;
     std::uint16_t angle = 0;
     std::uint16_t life = 0;
+    std::uint16_t maxLife = 0;
     if (!(r.read_u8(h.tgIndex) && r.read_u32(h.atType) && r.read_u8(h.atp) && r.read_u8(h.atSpl) &&
             r.read_u8(h.atMtrl) && r.read_u8(h.atSe) && r.read_u8(h.atHitMark) &&
             r.read_f32(h.pos[0]) && r.read_f32(h.pos[1]) && r.read_f32(h.pos[2]) &&
             r.read_u8(h.hitType) && r.read_u32(h.hitBit) && r.read_u8(status) &&
-            r.read_u8(h.flags) && r.read_u8(h.cutType) && r.read_u16(angle) && r.read_u16(life)))
+            r.read_u8(h.flags) && r.read_u8(h.cutType) && r.read_u16(angle) && r.read_u16(life) &&
+            r.read_u16(maxLife)))
     {
         Log.warn("[mp-enemy] malformed EnemyHit from player {}", fromPlayerId);
         return false;
@@ -1337,6 +1367,7 @@ bool on_hit(Reader& r, std::uint32_t fromPlayerId) {
     h.hitStatus = static_cast<std::int8_t>(status);
     h.angleY = static_cast<std::int16_t>(angle);
     h.life = static_cast<std::int16_t>(life);
+    h.maxLife = static_cast<std::int16_t>(maxLife);
     s_pendingHits.push_back(h);
     return relay;
 }
@@ -1503,6 +1534,11 @@ void authority_apply_hits() {
         px.ov.cutJumpCancelTurn = (h.flags & kHitCutJumpCancel) != 0;
         px.ov.horseRide = (h.flags & kHitHorse) != 0;
         px.ov.shapeAngleY = h.angleY;
+        /* --- batch 10B: death and drops --- */
+        px.ov.attacker = h.attacker;
+        px.ov.life = h.life;
+        px.ov.maxLife = h.maxLife;
+        px.ov.rollstab = (h.flags & kHitRollstab) != 0;
         s_proxyLive[used] = true;
         used++;
 
@@ -1515,6 +1551,10 @@ void authority_apply_hits() {
             continue;
         }
         rec->hitsInjected++;
+        /* --- batch 10B: death and drops --- the killer, if this enemy dies some other way. */
+        rec->lastAttacker = h.attacker;
+        rec->lastAttackerLife = h.life;
+        rec->lastAttackerMaxLife = h.maxLife;
         if (!rec->injectedThisTick) {
             rec->injectedThisTick = true;
             rec->hpBeforeInject = actor->health;
@@ -1558,6 +1598,245 @@ void hits_reset() {
 }
 
 /* --- end batch 9 --- */
+
+/* =============================================================================================
+ * --- batch 10B: death and drops (M6 phase 3, mp-m6-enemies.md §5.4) ---
+ * The authority's enemy dies through its own code: death action -> fopAcM_createDisappear ->
+ * fopAcM_delete. The disappear actor is fast-created inside that execute (EnemyTargetScope is
+ * live), so its drop roll runs there too: on the KILLER's hearts (enemy_roll_life), and the item it
+ * makes is shared as ONE batch 7 drop (enemy_drop_shared; first come through ClaimKind::Drop). The
+ * deletion sends EnemyDespawn with the disappear args; the ghost replays the disappear with enemy
+ * id 0xFF (the smoke, no roll, d_a_disappear.cpp) inside its own gate tick and deletes itself. The
+ * killer's end signals the kill achievement (the authority does not for an injected hit).
+ * =========================================================================================== */
+
+constexpr std::uint8_t kDespawnKilled = 1;
+constexpr std::uint8_t kDespawnHaveDisappear = 0x01;
+constexpr std::uint8_t kDespawnRollstab = 0x02;
+/// A despawned ghost no gate tick has removed after this long is deleted from pre_tick, without
+/// the smoke (outside its own execute there is no process layer of its own to create it in).
+constexpr std::uint64_t kDespawnFallbackTicks = 30;
+
+std::uint32_t s_despawnsSent = 0;
+std::uint32_t s_despawnsRecv = 0;
+
+/// Who killed an authority enemy: the killing blow's dealer, else the last remote attacker whose
+/// hit was injected (a death that did not come through cc_at_check), else this end's own Link.
+/// `known` (with `life`/`maxLife`) only for a remote killer whose hearts came in his EnemyHit.
+std::uint32_t resolved_killer(
+    const Rec& rec, std::int16_t& life, std::int16_t& maxLife, bool& known) {
+    const std::uint32_t me = network_manager().local_player_id();
+    known = false;
+    if (rec.killer != kNoPlayer) {
+        if (rec.killer != me) {
+            life = rec.killerLife;
+            maxLife = rec.killerMaxLife;
+            known = true;
+        }
+        return rec.killer;
+    }
+    if (rec.lastAttacker != kNoPlayer && rec.lastAttacker != me) {
+        life = rec.lastAttackerLife;
+        maxLife = rec.lastAttackerMaxLife;
+        known = true;
+        return rec.lastAttacker;
+    }
+    return me;
+}
+
+/// The record of the synced enemy whose execute is running now, if this end is its authority.
+Rec* exec_authority_rec() {
+    if (!s_enabled || s_execProc == kNoProc) {
+        return nullptr;
+    }
+    Rec* rec = find_rec(s_execProc);
+    return rec != nullptr && rec->mode == Mode::Authority ? rec : nullptr;
+}
+
+/// post_tick on the authority: remember a death while the actor can still be read (fopAc_Delete
+/// runs after the subclass delete, so enemy_note_deleted must not read it).
+void authority_note_dead() {
+    for (auto& [proc, rec] : S().recs) {
+        if (rec.mode != Mode::Authority || rec.deadSeen) {
+            continue;
+        }
+        fopAc_ac_c* actor = actor_of(rec);
+        if (actor == nullptr) {
+            continue;
+        }
+        const bool deadFlag =
+            (static_cast<fopEn_enemy_c*>(actor)->mFlags & fopEn_enemy_c::fopEn_flag_Dead) != 0;
+        if (actor->health > 0 && !deadFlag) {
+            rec.aliveSeen = true;
+            continue;
+        }
+        // HP 0 counts only after it was ever above 0 here: an enemy that never uses HP is not dead.
+        if (deadFlag || rec.aliveSeen) {
+            rec.deadSeen = true;
+            std::int16_t life = 0;
+            std::int16_t maxLife = 0;
+            bool known = false;
+            Log.info("[mp-enemy] dead here key={:08X} hp={} deadFlag={} killer={} tick={}", rec.key,
+                actor->health, deadFlag ? 1 : 0,
+                pid_str(resolved_killer(rec, life, maxLife, known)), network_manager().sim_tick());
+        }
+    }
+}
+
+/// The authority, as its dead enemy is deleted: tell everyone else.
+void send_despawn(const Rec& rec) {
+    NetworkManager& net = network_manager();
+    std::int16_t life = 0;
+    std::int16_t maxLife = 0;
+    bool known = false;
+    const std::uint32_t killer = resolved_killer(rec, life, maxLife, known);
+    std::uint8_t dflags = 0;
+    if (rec.haveDisappear) {
+        dflags |= kDespawnHaveDisappear;
+    }
+    if (rec.killer != kNoPlayer && rec.killerRollstab) {
+        dflags |= kDespawnRollstab;
+    }
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::EnemyDespawn));
+    w.write_u8(pid_to_wire(net.local_player_id()));
+    w.write_u32(rec.stageHash);
+    w.write_u8(static_cast<std::uint8_t>(rec.layer));
+    w.write_u8(static_cast<std::uint8_t>(rec.room));
+    w.write_u32(rec.key);
+    w.write_u16(rec.epoch);
+    w.write_u8(kDespawnKilled);
+    w.write_u8(pid_to_wire(killer));
+    w.write_u8(dflags);
+    w.write_u8(rec.disappearSize);
+    w.write_u8(rec.disappearType);
+    w.write_u8(rec.disappearEnemyId);
+    w.write_f32(rec.disappearPos[0]);
+    w.write_f32(rec.disappearPos[1]);
+    w.write_f32(rec.disappearPos[2]);
+    if (net.role() == Role::Host) {
+        net.send_to_session(w, kChannelObjects, true);
+    } else {
+        net.send_to_player(kHostPlayerId, w, kChannelObjects, true);
+    }
+    s_despawnsSent++;
+    Log.info("[mp-enemy] despawn sent key={:08X} n={} killer={} rollstab={} disappear={} size={} "
+             "type={} enemyId=0x{:02X} epoch={} tick={}",
+        rec.key, s_despawnsSent, pid_str(killer), (dflags & kDespawnRollstab) ? 1 : 0,
+        rec.haveDisappear ? 1 : 0, rec.disappearSize, rec.disappearType, rec.disappearEnemyId,
+        rec.epoch, net.sim_tick());
+}
+
+bool on_despawn(Reader& r, std::uint32_t fromPlayerId) {
+    State& s = S();
+    NetworkManager& net = network_manager();
+    std::uint8_t authorityWire = 0;
+    std::uint32_t stageHash = 0;
+    std::uint8_t layer = 0;
+    std::uint8_t room = 0;
+    std::uint32_t key = 0;
+    std::uint16_t epoch = 0;
+    std::uint8_t reason = 0;
+    std::uint8_t killerWire = 0;
+    std::uint8_t dflags = 0;
+    EnemyDespawn d;
+    if (!(r.read_u8(authorityWire) && r.read_u32(stageHash) && r.read_u8(layer) &&
+            r.read_u8(room) && r.read_u32(key) && r.read_u16(epoch) && r.read_u8(reason) &&
+            r.read_u8(killerWire) && r.read_u8(dflags) && r.read_u8(d.disappearSize) &&
+            r.read_u8(d.disappearType) && r.read_u8(d.disappearEnemyId) && r.read_f32(d.pos[0]) &&
+            r.read_f32(d.pos[1]) && r.read_f32(d.pos[2])))
+    {
+        Log.warn("[mp-enemy] malformed EnemyDespawn from player {}", fromPlayerId);
+        return false;
+    }
+    const std::uint32_t authority = pid_from_wire(authorityWire);
+    const std::uint32_t killer = pid_from_wire(killerWire);
+    const std::uint64_t k =
+        room_key(stageHash, static_cast<std::int8_t>(layer), static_cast<std::int8_t>(room));
+    const auto t = s.table.find(k);
+    const bool ownerMatches = t != s.table.end() && t->second.owner == authority;
+    if (net.role() == Role::Host && (authority != fromPlayerId || !ownerMatches)) {
+        // As EnemyUpdate: a guest speaks only for rooms the host's table gives it.
+        Log.warn("[mp-enemy] dropping EnemyDespawn key={:08X} from player {}: authority {} room {} "
+                 "owner {}",
+            key, fromPlayerId, pid_str(authority), static_cast<int>(static_cast<std::int8_t>(room)),
+            t != s.table.end() ? pid_str(t->second.owner) : std::string("none"));
+        return false;
+    }
+    s_despawnsRecv++;
+    d.reason = reason;
+    d.killerPeer = killerWire;
+    d.haveDisappear = (dflags & kDespawnHaveDisappear) != 0;
+    d.rollstab = (dflags & kDespawnRollstab) != 0;
+    const std::uint32_t me = net.local_player_id();
+    Log.info("[mp-enemy] despawn recv key={:08X} n={} from={} killer={}{} disappear={} size={} "
+             "type={} epoch={} tick={}",
+        key, s_despawnsRecv, pid_str(authority), pid_str(killer), killer == me ? " (me)" : "",
+        d.haveDisappear ? 1 : 0, d.disappearSize, d.disappearType, epoch, net.sim_tick());
+
+    // §5.4 item 7: the kill is the killer's. The authority did not signal it (cc_at_check skips an
+    // injected hit), so the killer's own end does, here.
+    if (killer == me && authority != me) {
+        dusk::AchievementSystem::get().signal("enemy_killed");
+        if (d.rollstab) {
+            dusk::AchievementSystem::get().signal("rollstab_kill");
+        }
+        Log.info("[mp-enemy] kill credited here key={:08X} rollstab={} tick={}", key,
+            d.rollstab ? 1 : 0, net.sim_tick());
+    }
+
+    Rec* rec = find_rec_by_key(key);
+    if (rec == nullptr) {
+        Log.info("[mp-enemy] despawn key={:08X}: no copy here (room not loaded)", key);
+    } else if (rec->mode != Mode::Ghost) {
+        Log.warn("[mp-enemy] despawn key={:08X} ignored: this end runs it as {} (epoch {} vs {})",
+            key, mode_name(rec->mode), rec->epoch, epoch);
+    } else if (!rec->despawnPending && !rec->despawnApplied) {
+        rec->despawnPending = true;
+        rec->despawnAt = s.tick;
+        rec->despawn = d;
+    }
+    return net.role() == Role::Host;
+}
+
+/// The ghost's end: play the authority's disappear (with enemy id 0xFF: the smoke, and no drop
+/// roll) and delete the ghost. `withSmoke` false outside the ghost's own gate tick.
+void apply_despawn(Rec& rec, fopAc_ac_c* actor, bool withSmoke) {
+    rec.despawnPending = false;
+    rec.despawnApplied = true;
+    if (rec.adapter != nullptr && rec.adapter->onGhostDeath != nullptr) {
+        rec.adapter->onGhostDeath(actor, rec.despawn);
+    }
+    const bool smoke = withSmoke && rec.despawn.haveDisappear;
+    if (smoke) {
+        cXyz pos(rec.despawn.pos[0], rec.despawn.pos[1], rec.despawn.pos[2]);
+        fopAcM_createDisappear(
+            actor, &pos, rec.despawn.disappearSize, rec.despawn.disappearType, 0xFF);
+    }
+    fopAcM_delete(actor);
+    Log.info("[mp-enemy] despawn applied key={:08X} smoke={} after {} tick(s) tick={}", rec.key,
+        smoke ? 1 : 0, S().tick - rec.despawnAt, network_manager().sim_tick());
+}
+
+/// pre_tick: a despawn no gate tick has applied in time (the ghost is not executing).
+void despawn_fallback() {
+    State& s = S();
+    for (auto& [proc, rec] : s.recs) {
+        if (!rec.despawnPending || s.tick - rec.despawnAt <= kDespawnFallbackTicks) {
+            continue;
+        }
+        fopAc_ac_c* actor = actor_of(rec);
+        if (actor == nullptr) {
+            continue;
+        }
+        Log.warn("[mp-enemy] despawn key={:08X}: no ghost tick in {} ticks, deleting it from "
+                 "pre_tick",
+            rec.key, kDespawnFallbackTicks);
+        apply_despawn(rec, actor, false);
+    }
+}
+
+/* --- end batch 10B --- */
 
 void write_trace_rows() {
     if (!trace::enabled()) {
@@ -1668,6 +1947,11 @@ void reset_session_state() {
         rec.challengerTicks = 0;
         rec.ghostFlagsValid = false;
         rec.injectedThisTick = false;
+        /* --- batch 10B: death and drops --- */
+        rec.haveDisappear = false;
+        rec.killer = kNoPlayer;
+        rec.lastAttacker = kNoPlayer;
+        rec.despawnPending = false;
     }
     hits_reset();
     s.lastSentRooms = RoomSet{};
@@ -1780,6 +2064,8 @@ void pre_tick() {
     standins_refresh();
     /* --- batch 9: enemy hits --- before this tick's actor pass, so before its damage_check. */
     authority_apply_hits();
+    /* --- batch 10B: death and drops --- */
+    despawn_fallback();
 }
 
 void post_tick() {
@@ -1789,6 +2075,8 @@ void post_tick() {
     check_slot0("post_tick");
     /* --- batch 9: enemy hits --- */
     authority_log_hit_results();
+    /* --- batch 10B: death and drops --- */
+    authority_note_dead();
     send_updates();
     write_trace_rows();
     log_stats();
@@ -1812,6 +2100,9 @@ bool on_packet(PacketId id, Reader& r, std::uint32_t fromPlayerId) {
         return on_hit(r, fromPlayerId);
     case PacketId::EnemyFlagHit:
         return on_flag_hit(r, fromPlayerId);
+    /* --- batch 10B: death and drops --- */
+    case PacketId::EnemyDespawn:
+        return on_despawn(r, fromPlayerId);
     default:
         return false;
     }
@@ -1994,6 +2285,11 @@ void enemy_note_deleted(fopAc_ac_c* actor) {
     if (s_enabled) {
         Log.info("[mp-enemy] deleted key={:08X} proc={} mode={} ghostTicks={} swaps={}", rec.key,
             rec.proc, enemies::mode_name(rec.mode), rec.ghostTicks, rec.swapTicks);
+        /* --- batch 10B: death and drops --- a dead authority enemy's deletion is its despawn. A
+         * live one going (room unload, stage change) is not: the others keep their own copy. */
+        if (rec.mode == enemies::Mode::Authority && (rec.haveDisappear || rec.deadSeen)) {
+            send_despawn(rec);
+        }
     }
     const auto k = s.byKey.find(rec.key);
     if (k != s.byKey.end() && k->second == rec.proc) {
@@ -2015,6 +2311,17 @@ bool enemy_ghost_execute(fopAc_ac_c* actor) {
     Rec* rec = find_rec(fopAcM_GetID(actor));
     if (rec == nullptr || rec->mode != enemies::Mode::Ghost) {
         return false;
+    }
+
+    /* --- batch 10B: death and drops --- inside its own gate tick, so the smoke is created where
+     * the authority's was (this actor's room and process layer). */
+    if (rec->despawnApplied) {
+        return true;
+    }
+    if (rec->despawnPending) {
+        apply_despawn(*rec, actor, true);
+        rec->ghostTicks++;
+        return true;
     }
 
     if (!rec->havePlayed) {
@@ -2113,6 +2420,91 @@ const EnemyHitOverride* enemy_hit_override(const cCcD_Obj* atObj) {
         return nullptr;
     }
     return enemies::detail::hit_override(atObj);
+}
+
+/* --- batch 10B: death and drops --- */
+void enemy_note_disappear(const fopAc_ac_c* actor, float x, float y, float z, unsigned char size,
+    unsigned char type, unsigned char enemyId) {
+    using namespace enemies::detail;
+    // Called by every disappear in the game (51 enemy files): bail before the map lookup.
+    if (!s_enabled || actor == nullptr) {
+        return;
+    }
+    Rec* rec = find_rec(fopAcM_GetID(const_cast<fopAc_ac_c*>(actor)));
+    if (rec == nullptr || rec->mode != enemies::Mode::Authority) {
+        return;
+    }
+    rec->haveDisappear = true;
+    rec->disappearSize = size;
+    rec->disappearType = type;
+    rec->disappearEnemyId = enemyId;
+    rec->disappearPos[0] = x;
+    rec->disappearPos[1] = y;
+    rec->disappearPos[2] = z;
+    Log.info("[mp-enemy] disappear key={:08X} size={} type={} enemyId=0x{:02X} at ({:.0f}, {:.0f}, "
+             "{:.0f}) tick={}",
+        rec->key, size, type, enemyId, x, y, z, network_manager().sim_tick());
+}
+
+void enemy_note_killing_blow(const fopAc_ac_c* enemy, const EnemyHitOverride* mpHit) {
+    using namespace enemies::detail;
+    if (!s_enabled || enemy == nullptr) {
+        return;
+    }
+    Rec* rec = find_rec(fopAcM_GetID(const_cast<fopAc_ac_c*>(enemy)));
+    if (rec == nullptr || rec->mode != enemies::Mode::Authority || rec->killer != kNoPlayer) {
+        return;
+    }
+    if (mpHit != nullptr) {
+        rec->killer = mpHit->attacker;
+        rec->killerLife = mpHit->life;
+        rec->killerMaxLife = mpHit->maxLife;
+        rec->killerRollstab = mpHit->rollstab;
+    } else {
+        rec->killer = network_manager().local_player_id();
+        rec->killerRollstab = false;
+    }
+    Log.info("[mp-enemy] killing blow key={:08X} by={} ({}) life={}/{} rollstab={} tick={}",
+        rec->key, pid_str(rec->killer), mpHit != nullptr ? "remote, injected" : "this end's Link",
+        mpHit != nullptr ? mpHit->life : static_cast<short>(dComIfGs_getLife()),
+        mpHit != nullptr ? mpHit->maxLife : static_cast<short>(dComIfGs_getMaxLife()),
+        rec->killerRollstab ? 1 : 0, network_manager().sim_tick());
+}
+
+bool enemy_drop_shared() {
+    return enemies::detail::exec_authority_rec() != nullptr;
+}
+
+void enemy_roll_life(int tableNo, int& life, int& maxLife) {
+    using namespace enemies::detail;
+    Rec* rec = exec_authority_rec();
+    if (rec == nullptr) {
+        return;
+    }
+    std::int16_t killerLife = 0;
+    std::int16_t killerMaxLife = 0;
+    bool known = false;
+    const std::uint32_t killer = resolved_killer(*rec, killerLife, killerMaxLife, known);
+    // maxLife below 5 would make the roll's hp_max 0 (a divide by zero): keep the local hearts.
+    const bool use = known && killerMaxLife >= 5;
+    if (use) {
+        life = killerLife;
+        maxLife = killerMaxLife;
+    }
+    Log.info("[mp-enemy] drop roll key={:08X} table={} killer={} life={}/{} ({}) tick={}", rec->key,
+        tableNo, pid_str(killer), life, maxLife,
+        use ? "the killer's" : (known ? "mine: the killer's max is unknown" : "mine"),
+        network_manager().sim_tick());
+}
+
+void enemy_note_roll_table(int tableIn, int tableOut) {
+    using namespace enemies::detail;
+    Rec* rec = exec_authority_rec();
+    if (rec == nullptr) {
+        return;
+    }
+    Log.info("[mp-enemy] drop table key={:08X} {} -> {}{} tick={}", rec->key, tableIn, tableOut,
+        tableOut != tableIn ? " (low-life variant)" : "", network_manager().sim_tick());
 }
 
 }  // namespace dusk::mp

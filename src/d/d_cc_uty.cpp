@@ -504,6 +504,8 @@ fopAc_ac_c* cc_at_check(fopAc_ac_c* i_enemy, dCcU_AtInfo* i_AtInfo) {
             i_AtInfo->mHitStatus = 2;
             i_enemy->health = 0;
 #if TARGET_PC
+            // Batch 10B: remember who killed a synced enemy (its EnemyDespawn credits the killer).
+            dusk::mp::enemy_note_killing_blow(i_enemy, mpHit);
             // Not for an injected remote hit: the kill was the remote player's, not this end's.
             if (fopAcM_GetGroup(i_enemy) == fopAc_ENEMY_e && mpHit == NULL) {
                 dusk::AchievementSystem::get().signal("enemy_killed");

@@ -99,6 +99,35 @@ struct Rec {
     std::uint32_t atHitsLocal = 0;
     std::uint32_t atShieldedLocal = 0;
     /* --- end batch 10A --- */
+
+    /* ---- batch 10B: death and drops (phase 3) ---- */
+    /// Authority: the fopAcM_createDisappear args it left with (sent in its EnemyDespawn).
+    bool haveDisappear = false;
+    std::uint8_t disappearSize = 0;
+    std::uint8_t disappearType = 0;
+    std::uint8_t disappearEnemyId = 0xFF;
+    float disappearPos[3] = {0.0f, 0.0f, 0.0f};
+    /// Authority: HP was <= 0 (or the Dead flag set) at some post_tick. Kept here because the actor
+    /// must not be read in fopAc_Delete (its subclass delete has already run).
+    bool deadSeen = false;
+    /// Authority: HP was above 0 at some post_tick (HP 0 is a death only after that).
+    bool aliveSeen = false;
+    /// Authority: who dealt the killing blow (kNoPlayer: not dead, or not through cc_at_check), and
+    /// the killer's hearts then (remote killer only: from his EnemyHit).
+    std::uint32_t killer = kNoPlayer;
+    bool killerRollstab = false;
+    std::int16_t killerLife = 0;
+    std::int16_t killerMaxLife = 0;
+    /// Authority: the last remote attacker whose hit was injected, and his hearts then (the killer
+    /// when the death did not come through cc_at_check).
+    std::uint32_t lastAttacker = kNoPlayer;
+    std::int16_t lastAttackerLife = 0;
+    std::int16_t lastAttackerMaxLife = 0;
+    /// Ghost: an EnemyDespawn arrived; the next ghost tick plays the smoke and deletes it.
+    bool despawnPending = false;
+    bool despawnApplied = false;
+    std::uint64_t despawnAt = 0;
+    EnemyDespawn despawn;
 };
 
 /// Sync is live this tick: session live and multiplayer.enemySync on (latched by pre_tick, cleared
@@ -110,6 +139,14 @@ Rec* find_rec(std::uint32_t procId);
 std::uint64_t local_tick();
 /// Room `room` is loaded on this machine (-1: in a stage at all).
 bool local_room_loaded(int room);
+
+/* ---- batch 10B: death and drops ---- */
+
+/// The proc of the synced enemy this end is the authority for whose execute is running now
+/// (EnemyTargetScope sets and restores it), else kNoProc.
+constexpr std::uint32_t kNoProc = 0xFFFFFFFFu;
+std::uint32_t exec_proc();
+void set_exec_proc(std::uint32_t proc);
 
 /* ---- enemy_target.cpp ---- */
 
