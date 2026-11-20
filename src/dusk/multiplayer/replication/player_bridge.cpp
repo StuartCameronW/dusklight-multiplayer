@@ -3239,6 +3239,11 @@ bool reconcile_puppet_outfit(std::uint32_t playerId, std::uint8_t outfit, bool w
     return true;
 }
 
+/* --- batch 9: enemy hits --- */
+void* puppet_actor_ptr(std::uint32_t playerId) {
+    return static_cast<fopAc_ac_c*>(resolve_puppet(playerId));
+}
+
 void destroy_all_puppets() {
     for (const auto& entry : s_puppets) {
         if (entry.second.id != fpcM_ERROR_PROCESS_ID_e) {

@@ -1737,6 +1737,16 @@ void NetworkManager::handle_packet(PeerId peer, const std::uint8_t* data, std::s
         }
         break;
     }
+    /* --- batch 9: enemy hits --- */
+    case PacketId::EnemyHit:        // attacker -> host -> the room's authority, reliable
+    case PacketId::EnemyFlagHit: {  // same route
+        // True only on the host, for a guest's event addressed to another guest's room: relayed
+        // to the others, and only the addressed authority acts on it.
+        if (enemies::on_packet(id, r, sender->second.playerId) && mRole == Role::Host) {
+            relay_to_others(peer, data, size, kChannelObjects, true);
+        }
+        break;
+    }
     default:
         Log.warn("Unknown packet id {} from peer {}", rawId, peer);
         break;

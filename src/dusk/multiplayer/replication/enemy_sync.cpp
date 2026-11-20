@@ -24,7 +24,12 @@
 #include "player_state.hpp"
 #include "replication_manager.hpp"
 
+#include "d/d_cc_d.h"
+#include "d/d_cc_s.h"
+#include "d/d_cc_uty.h"
 #include "d/d_com_inf_game.h"
+#include "d/d_s_play.h"
+#include "d/actor/d_a_player.h"
 #include "d/d_resorce.h"
 #include "f_op/f_op_actor.h"
 #include "f_op/f_op_actor_mng.h"
@@ -514,6 +519,7 @@ void transition(Rec& rec, Mode want, std::uint32_t owner, std::uint16_t epoch) {
             rec.ghostSince = s.tick;
             rec.ghostAnm = 0xFFFF;
             rec.everEngaged = false;
+            rec.ghostFlagsValid = false;  // batch 9: no mFlags written by this ghost yet
         }
         // A different owner or epoch is a different stream: its samples start over. The last
         // played sample is kept, so the ghost holds still instead of snapping home meanwhile.
@@ -990,6 +996,563 @@ bool on_rooms(Reader& r, std::uint32_t fromPlayerId) {
     return false;
 }
 
+/* =============================================================================================
+ * --- batch 9: enemy hits (M6 phase 2, mp-m6-enemies.md §5.1, §5.2, §5.6.5 items 3 and 7) ---
+ * A player hits a GHOST in his own collision pass; the ghost tick reads that hit off the ghost's
+ * TG and sends it (EnemyHit) to the enemy's authority, which validates it and injects it before its
+ * next actor pass as a proxy AT collider owned by the attacker's puppet. The enemy's own
+ * damage_check then runs on it: its own reaction, invulnerability timer and HP loss. The ghost
+ * never changes its own HP. Flag bits the attacker's Link sets directly (CutDownHit, wolf bite)
+ * travel as EnemyFlagHit.
+ * =========================================================================================== */
+
+/// mFlags bits only the PLAYER sets on an enemy (§5.1 item 8); a ghost forwards these.
+constexpr std::uint16_t kForwardFlagBits =
+    fopEn_enemy_c::fopEn_flag_CutDownHit | fopEn_enemy_c::fopEn_flag_WolfBiteDamage;
+/// Injected hits per tick (the rest wait a tick). Each needs its own proxy collider, which must
+/// outlive the tick: the enemy's TG keeps pointing at it until the next collision pass.
+constexpr int kMaxProxies = 4;
+/// Highest TG index a ghost looks for (tgByIndex answers null past its last one).
+constexpr int kMaxTgIndex = 16;
+/// Validation: attacker-to-enemy distance. Melee (sword, a Link hit type) vs everything else
+/// (arrows, bombs, boomerang). Generous: the puppet pose the authority sees lags the attacker.
+constexpr float kMaxMeleeHitDist = 1200.0f;
+constexpr float kMaxRangedHitDist = 6000.0f;
+
+constexpr std::uint8_t kHitMaster = 0x01;
+constexpr std::uint8_t kHitWood = 0x02;
+constexpr std::uint8_t kHitWolf = 0x04;
+constexpr std::uint8_t kHitSwordUp = 0x08;
+constexpr std::uint8_t kHitHeadJump = 0x10;
+constexpr std::uint8_t kHitCutJumpCancel = 0x20;
+constexpr std::uint8_t kHitHorse = 0x40;
+
+struct PendingHit {
+    std::uint32_t attacker = kNoPlayer;
+    std::uint32_t key = 0;
+    std::uint16_t epoch = 0;
+    std::uint8_t tgIndex = 0;
+    std::uint32_t atType = 0;
+    std::uint8_t atp = 0;
+    std::uint8_t atSpl = 0;
+    std::uint8_t atMtrl = 0;
+    std::uint8_t atSe = 0;
+    std::uint8_t atHitMark = 0;
+    float pos[3] = {0.0f, 0.0f, 0.0f};
+    std::uint8_t hitType = 0;
+    std::uint32_t hitBit = 0;
+    std::int8_t hitStatus = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t cutType = 0;
+    std::int16_t angleY = 0;
+    std::int16_t life = 0;
+};
+
+struct PendingFlag {
+    std::uint32_t attacker = kNoPlayer;
+    std::uint32_t key = 0;
+    std::uint16_t epoch = 0;
+    std::uint16_t bit = 0;
+};
+
+struct Proxy {
+    dCcD_Stts stts;
+    dCcD_Sph sph;
+    EnemyHitOverride ov;
+};
+
+/// Constructed on first use (not at static-init time: dCcD objects have real constructors).
+Proxy* proxies() {
+    static Proxy p[kMaxProxies];
+    return p;
+}
+/// Which proxies carry an override. Plain storage, read by enemy_hit_override for every hit.
+bool s_proxyLive[kMaxProxies];
+
+std::vector<PendingHit> s_pendingHits;
+std::vector<PendingFlag> s_pendingFlags;
+std::uint32_t s_hitsUnknownKey = 0;
+
+const EnemyHitOverride* hit_override(const cCcD_Obj* atObj) {
+    if (atObj == nullptr) {
+        return nullptr;
+    }
+    for (int i = 0; i < kMaxProxies; i++) {
+        if (s_proxyLive[i] && static_cast<const cCcD_Obj*>(&proxies()[i].sph) == atObj) {
+            return &proxies()[i].ov;
+        }
+    }
+    return nullptr;
+}
+
+Rec* find_rec_by_key(std::uint32_t key) {
+    State& s = S();
+    const auto k = s.byKey.find(key);
+    if (k == s.byKey.end()) {
+        return nullptr;
+    }
+    return find_rec(k->second);
+}
+
+void send_to_authority(Writer& w, std::uint32_t authority) {
+    NetworkManager& net = network_manager();
+    if (net.role() == Role::Host) {
+        net.send_to_player(authority, w, kChannelObjects, true);
+    } else {
+        // A guest only talks to the host; the host relays it when the authority is another guest.
+        net.send_to_player(kHostPlayerId, w, kChannelObjects, true);
+    }
+}
+
+/// The attacker's machine: this ghost's TGs were hit in the last collision pass. Send each hit made
+/// by this end's own Link (or his bomb, arrow, boomerang) to the authority, and give the attacker
+/// the hit-stop his own hit would have caused (§5.6.5 item 7; the authority suppresses its own).
+void ghost_scan_hits(Rec& rec, fopAc_ac_c* actor) {
+    if (rec.adapter == nullptr || rec.adapter->tgByIndex == nullptr || rec.authority == kNoPlayer) {
+        return;
+    }
+    daPy_py_c* link = dComIfGp_getLinkPlayer();
+    if (link == nullptr) {
+        return;
+    }
+    NetworkManager& net = network_manager();
+    for (int i = 0; i < kMaxTgIndex; i++) {
+        cCcD_Obj* tg = rec.adapter->tgByIndex(actor, i);
+        if (tg == nullptr) {
+            break;
+        }
+        dCcD_GObjInf* tgInf = dCcD_GetGObjInf(tg);
+        if (tgInf == nullptr || !tgInf->ChkTgHit()) {
+            continue;
+        }
+        cCcD_Obj* atObj = tgInf->GetTgHitObj();
+        dCcD_GObjInf* atInf = tgInf->GetTgHitGObj();
+        if (atObj == nullptr || atInf == nullptr) {
+            continue;
+        }
+        fopAc_ac_c* owner = atObj->GetAc();
+        if (owner == nullptr) {
+            continue;
+        }
+        const s16 ownerName = fopAcM_GetName(owner);
+        const bool byLink = owner == static_cast<fopAc_ac_c*>(link);
+        if (!byLink && ownerName != fpcNm_NBOMB_e && ownerName != fpcNm_BOOMERANG_e &&
+            ownerName != fpcNm_ARROW_e)
+        {
+            continue;  // not this player's: another enemy, a puppet, the world
+        }
+
+        // Classify it exactly as this end's own damage code would (cut bits from the local Link).
+        dCcU_AtInfo info;
+        info.mpCollider = atObj;
+        info.mpActor = nullptr;
+        info.mpSound = nullptr;
+        info.mHitDirection.set(0, 0, 0);
+        info.mHitBit = 0;
+        info.field_0x18 = 0;
+        info.mAttackPower = 0;
+        info.mPowerType = 0;
+        info.mHitStatus = 0;
+        info.mHitType = 0;
+        at_power_check(&info);
+
+        std::uint8_t flags = 0;
+        if (daPy_py_c::checkMasterSwordEquip()) {
+            flags |= kHitMaster;
+        }
+        if (daPy_py_c::checkWoodSwordEquip()) {
+            flags |= kHitWood;
+        }
+        if (daPy_py_c::checkNowWolf()) {
+            flags |= kHitWolf;
+        }
+        if (link->getSwordAtUpTime() != 0) {
+            flags |= kHitSwordUp;
+        }
+        if (link->getCutType() == daPy_py_c::CUT_TYPE_HEAD_JUMP) {
+            flags |= kHitHeadJump;
+        }
+        if (link->checkCutJumpCancelTurn()) {
+            flags |= kHitCutJumpCancel;
+        }
+        if (link->checkHorseRide()) {
+            flags |= kHitHorse;
+        }
+        cXyz hitPos = *tgInf->GetTgHitPosP();
+
+        Writer w;
+        w.write_u8(static_cast<std::uint8_t>(PacketId::EnemyHit));
+        w.write_u8(pid_to_wire(net.local_player_id()));
+        w.write_u8(pid_to_wire(rec.authority));
+        w.write_u32(rec.key);
+        w.write_u16(rec.epoch);
+        w.write_u8(static_cast<std::uint8_t>(i));
+        w.write_u32(atObj->GetAtType());
+        w.write_u8(atObj->GetAtAtp());
+        w.write_u8(static_cast<std::uint8_t>(atInf->GetAtSpl()));
+        w.write_u8(atInf->GetAtMtrl());
+        w.write_u8(atInf->GetAtSe());
+        w.write_u8(static_cast<std::uint8_t>(atInf->GetAtHitMark()));
+        w.write_f32(hitPos.x);
+        w.write_f32(hitPos.y);
+        w.write_f32(hitPos.z);
+        w.write_u8(info.mHitType);
+        w.write_u32(info.mHitBit);
+        w.write_u8(static_cast<std::uint8_t>(info.mHitStatus));
+        w.write_u8(flags);
+        w.write_u8(link->getCutType());
+        w.write_u16(static_cast<std::uint16_t>(link->shape_angle.y));
+        w.write_u16(static_cast<std::uint16_t>(link->health));
+        send_to_authority(w, rec.authority);
+        rec.hitsSent++;
+        Log.info("[mp-enemy] hit sent key={:08X} n={} tg={} atType=0x{:X} atp={} spl={} "
+                 "hitType={} bit=0x{:X} status={} flags=0x{:02X} cut={} by={} to={} tick={}",
+            rec.key, rec.hitsSent, i, atObj->GetAtType(), atObj->GetAtAtp(),
+            static_cast<int>(atInf->GetAtSpl()), info.mHitType, info.mHitBit,
+            static_cast<int>(info.mHitStatus), flags, link->getCutType(),
+            byLink ? "link" : "projectile", pid_str(rec.authority), net.sim_tick());
+
+        // The attacker's hit-stop (cc_at_check's rule, d_cc_uty.cpp; the ghost skips
+        // damage_check, so nothing else gives it). HP and death are the authority's: the death
+        // pause uses this end's (streamed) HP as an estimate.
+        int power = info.mAttackPower;
+        std::int8_t status = info.mHitStatus;
+        if (info.mHitType == HIT_TYPE_LINK_NORMAL_ATTACK) {
+            if (!(flags & kHitWolf)) {
+                if (flags & kHitMaster) {
+                    power *= 2;
+                }
+                if (flags & kHitWood) {
+                    power /= 2;
+                }
+            }
+            if (flags & kHitSwordUp) {
+                power *= 2;
+                status = 1;
+            }
+        }
+        if (power != 0 && actor->health - power <= 0) {
+            status = 2;
+        }
+        s8 pause = status != 0 ? 5 : (power > 1 ? 2 : 0);
+        if (atObj->ChkAtType(AT_TYPE_MIDNA_LOCK) || (flags & kHitHorse)) {
+            pause = 0;
+        }
+        if ((info.mHitType == HIT_TYPE_LINK_NORMAL_ATTACK || atObj->ChkAtType(AT_TYPE_THROW_OBJ)) &&
+            !(flags & kHitCutJumpCancel))
+        {
+            if (atObj->ChkAtType(AT_TYPE_THROW_OBJ)) {
+                pause = 4;
+            }
+            dScnPly_c::setPauseTimer(pause);
+        }
+    }
+}
+
+/// The attacker's machine: bits in kForwardFlagBits that appeared on this ghost since its last
+/// tick were set by this end's Link (the ghost writes mFlags from the stream every tick).
+void ghost_send_flag_hit(Rec& rec, std::uint16_t added) {
+    if (rec.authority == kNoPlayer) {
+        return;
+    }
+    NetworkManager& net = network_manager();
+    Writer w;
+    w.write_u8(static_cast<std::uint8_t>(PacketId::EnemyFlagHit));
+    w.write_u8(pid_to_wire(net.local_player_id()));
+    w.write_u8(pid_to_wire(rec.authority));
+    w.write_u32(rec.key);
+    w.write_u16(rec.epoch);
+    w.write_u16(added);
+    send_to_authority(w, rec.authority);
+    rec.flagHitsSent++;
+    Log.info("[mp-enemy] flag hit sent key={:08X} bit=0x{:04X} n={} to={} tick={}", rec.key, added,
+        rec.flagHitsSent, pid_str(rec.authority), net.sim_tick());
+}
+
+/// Common header of EnemyHit / EnemyFlagHit. Returns false on a malformed packet. `relay` is set
+/// on the host for a guest's event addressed to another guest (the caller returns it).
+bool read_hit_header(Reader& r, std::uint32_t fromPlayerId, const char* what,
+    std::uint32_t& attacker, std::uint32_t& authority, std::uint32_t& key, std::uint16_t& epoch,
+    bool& forMe, bool& relay) {
+    NetworkManager& net = network_manager();
+    std::uint8_t attackerWire = 0;
+    std::uint8_t authorityWire = 0;
+    if (!(r.read_u8(attackerWire) && r.read_u8(authorityWire) && r.read_u32(key) &&
+            r.read_u16(epoch)))
+    {
+        Log.warn("[mp-enemy] malformed {} from player {}", what, fromPlayerId);
+        return false;
+    }
+    attacker = pid_from_wire(attackerWire);
+    authority = pid_from_wire(authorityWire);
+    forMe = false;
+    relay = false;
+    if (net.role() == Role::Host && fromPlayerId != attacker) {
+        // A guest speaks only for itself.
+        Log.warn("[mp-enemy] {} key={:08X} from player {} claims attacker {}: dropped", what, key,
+            fromPlayerId, pid_str(attacker));
+        return true;
+    }
+    if (authority == net.local_player_id()) {
+        forMe = true;
+    } else if (net.role() == Role::Host) {
+        relay = true;
+    }
+    return true;
+}
+
+bool on_hit(Reader& r, std::uint32_t fromPlayerId) {
+    std::uint32_t attacker = kNoPlayer;
+    std::uint32_t authority = kNoPlayer;
+    PendingHit h;
+    bool forMe = false;
+    bool relay = false;
+    if (!read_hit_header(r, fromPlayerId, "EnemyHit", attacker, authority, h.key, h.epoch, forMe,
+            relay))
+    {
+        return false;
+    }
+    std::uint8_t status = 0;
+    std::uint16_t angle = 0;
+    std::uint16_t life = 0;
+    if (!(r.read_u8(h.tgIndex) && r.read_u32(h.atType) && r.read_u8(h.atp) && r.read_u8(h.atSpl) &&
+            r.read_u8(h.atMtrl) && r.read_u8(h.atSe) && r.read_u8(h.atHitMark) &&
+            r.read_f32(h.pos[0]) && r.read_f32(h.pos[1]) && r.read_f32(h.pos[2]) &&
+            r.read_u8(h.hitType) && r.read_u32(h.hitBit) && r.read_u8(status) &&
+            r.read_u8(h.flags) && r.read_u8(h.cutType) && r.read_u16(angle) && r.read_u16(life)))
+    {
+        Log.warn("[mp-enemy] malformed EnemyHit from player {}", fromPlayerId);
+        return false;
+    }
+    if (!forMe) {
+        return relay;
+    }
+    h.attacker = attacker;
+    h.hitStatus = static_cast<std::int8_t>(status);
+    h.angleY = static_cast<std::int16_t>(angle);
+    h.life = static_cast<std::int16_t>(life);
+    s_pendingHits.push_back(h);
+    return relay;
+}
+
+bool on_flag_hit(Reader& r, std::uint32_t fromPlayerId) {
+    std::uint32_t attacker = kNoPlayer;
+    std::uint32_t authority = kNoPlayer;
+    PendingFlag f;
+    bool forMe = false;
+    bool relay = false;
+    if (!read_hit_header(r, fromPlayerId, "EnemyFlagHit", attacker, authority, f.key, f.epoch,
+            forMe, relay))
+    {
+        return false;
+    }
+    if (!r.read_u16(f.bit)) {
+        Log.warn("[mp-enemy] malformed EnemyFlagHit from player {}", fromPlayerId);
+        return false;
+    }
+    if (forMe) {
+        f.attacker = attacker;
+        s_pendingFlags.push_back(f);
+    }
+    return relay;
+}
+
+/// Why this end may not apply a hit on `rec` now (null: it may). `actor` is its live actor.
+const char* hit_reject_reason(const Rec* rec, fopAc_ac_c* actor, std::uint16_t epoch) {
+    if (rec == nullptr || actor == nullptr) {
+        return "unknown key";
+    }
+    if (rec->mode != Mode::Authority) {
+        return "not authority";
+    }
+    if (rec->epoch != epoch) {
+        return "stale epoch";
+    }
+    if (actor->health <= 0 ||
+        (static_cast<fopEn_enemy_c*>(actor)->mFlags & fopEn_enemy_c::fopEn_flag_Dead))
+    {
+        return "dead";
+    }
+    return nullptr;
+}
+
+/// pre_tick on the authority, before this tick's actor pass (so before this tick's damage_check,
+/// §1.4): apply the queued flag bits and inject the queued hits.
+void authority_apply_hits() {
+    NetworkManager& net = network_manager();
+    for (const PendingFlag& f : s_pendingFlags) {
+        Rec* rec = find_rec_by_key(f.key);
+        fopAc_ac_c* actor = rec != nullptr ? actor_of(*rec) : nullptr;
+        const char* why = hit_reject_reason(rec, actor, f.epoch);
+        const std::uint16_t bit = f.bit & kForwardFlagBits;
+        if (why == nullptr && bit == 0) {
+            why = "bit not forwardable";
+        }
+        if (why != nullptr) {
+            Log.info("[mp-enemy] flag hit recv key={:08X} bit=0x{:04X} from={} rejected({})", f.key,
+                f.bit, pid_str(f.attacker), why);
+            continue;
+        }
+        static_cast<fopEn_enemy_c*>(actor)->mFlags |= bit;
+        rec->flagHitsApplied++;
+        Log.info("[mp-enemy] flag hit recv key={:08X} bit=0x{:04X} from={} applied n={} tick={}",
+            f.key, bit, pid_str(f.attacker), rec->flagHitsApplied, net.sim_tick());
+    }
+    s_pendingFlags.clear();
+
+    int used = 0;
+    std::size_t consumed = 0;
+    for (; consumed < s_pendingHits.size(); consumed++) {
+        if (used >= kMaxProxies) {
+            break;  // the rest next tick
+        }
+        const PendingHit& h = s_pendingHits[consumed];
+        Rec* rec = find_rec_by_key(h.key);
+        fopAc_ac_c* actor = rec != nullptr ? actor_of(*rec) : nullptr;
+        if (rec != nullptr) {
+            rec->hitsRecv++;
+        } else {
+            s_hitsUnknownKey++;
+        }
+        std::string reason;
+        const char* why = hit_reject_reason(rec, actor, h.epoch);
+        cCcD_Obj* tg = nullptr;
+        fopAc_ac_c* puppet = nullptr;
+        if (why == nullptr) {
+            tg = rec->adapter != nullptr && rec->adapter->tgByIndex != nullptr ?
+                     rec->adapter->tgByIndex(actor, h.tgIndex) :
+                     nullptr;
+            if (tg == nullptr) {
+                why = "no such TG";
+            } else if (!tg->ChkTgSet()) {
+                why = "TG not set (invulnerable here)";
+            }
+        }
+        if (why == nullptr) {
+            puppet = static_cast<fopAc_ac_c*>(puppet_actor_ptr(h.attacker));
+            if (puppet == nullptr) {
+                why = "no puppet for attacker";
+            }
+        }
+        if (why == nullptr) {
+            float ap[3];
+            if (!player_position(h.attacker, ap)) {
+                why = "attacker position unknown";
+            } else {
+                const float dx = ap[0] - actor->current.pos.x;
+                const float dy = ap[1] - actor->current.pos.y;
+                const float dz = ap[2] - actor->current.pos.z;
+                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const bool melee = h.hitType == HIT_TYPE_LINK_NORMAL_ATTACK ||
+                                   h.hitType == HIT_TYPE_LINK_HEAVY_ATTACK;
+                if (d > (melee ? kMaxMeleeHitDist : kMaxRangedHitDist)) {
+                    reason = fmt::format("too far: {:.0f}", d);
+                    why = reason.c_str();
+                }
+            }
+        }
+        if (why != nullptr) {
+            if (rec != nullptr) {
+                rec->hitsRejected++;
+            }
+            Log.info("[mp-enemy] hit recv key={:08X} from={} tg={} rejected({}) tick={}", h.key,
+                pid_str(h.attacker), h.tgIndex, why, net.sim_tick());
+            continue;
+        }
+
+        Proxy& px = proxies()[used];
+        s_proxyLive[used] = false;
+        px.stts.Init(0xFF, 0xFF, puppet);
+        static const dCcD_SrcSph kProxySrc = {
+            {
+                {0, {{0, 0, 0x1}, {0, 0}, 0}},
+                {dCcD_SE_NONE, 0, 0, 0, {0}},
+                {dCcD_SE_NONE, 0, 0, 0, {0}},
+                {0},
+            },
+            {{
+                {0.0f, 0.0f, 0.0f},
+                10.0f,
+            }},
+        };
+        px.sph.Set(kProxySrc);
+        px.sph.SetStts(&px.stts);
+        px.sph.SetAtType(h.atType);
+        px.sph.SetAtAtp(h.atp);
+        px.sph.SetAtSpl(static_cast<dCcG_At_Spl>(h.atSpl));
+        px.sph.SetAtMtrl(h.atMtrl);
+        px.sph.SetAtSe(h.atSe);
+        px.sph.SetAtHitMark(h.atHitMark);
+        cXyz hitPos(h.pos[0], h.pos[1], h.pos[2]);
+        px.sph.SetC(hitPos);
+        px.sph.SetR(10.0f);
+        px.ov.hitType = h.hitType;
+        px.ov.hitBit = h.hitBit;
+        px.ov.hitStatus = h.hitStatus;
+        px.ov.masterSword = (h.flags & kHitMaster) != 0;
+        px.ov.woodSword = (h.flags & kHitWood) != 0;
+        px.ov.wolf = (h.flags & kHitWolf) != 0;
+        px.ov.swordUp = (h.flags & kHitSwordUp) != 0;
+        px.ov.headJump = (h.flags & kHitHeadJump) != 0;
+        px.ov.cutJumpCancelTurn = (h.flags & kHitCutJumpCancel) != 0;
+        px.ov.horseRide = (h.flags & kHitHorse) != 0;
+        px.ov.shapeAngleY = h.angleY;
+        s_proxyLive[used] = true;
+        used++;
+
+        dComIfG_Ccsp()->SetAtTgCommonHitInf(&px.sph, tg, &hitPos);
+        if (!dCcD_GetGObjInf(tg)->ChkTgHit()) {
+            rec->hitsRejected++;
+            Log.info("[mp-enemy] hit recv key={:08X} from={} tg={} rejected(collision refused it: "
+                     "no-con-hit / shield) tick={}",
+                h.key, pid_str(h.attacker), h.tgIndex, net.sim_tick());
+            continue;
+        }
+        rec->hitsInjected++;
+        if (!rec->injectedThisTick) {
+            rec->injectedThisTick = true;
+            rec->hpBeforeInject = actor->health;
+        }
+        Log.info("[mp-enemy] hit recv key={:08X} from={} tg={} injected n={} atType=0x{:X} atp={} "
+                 "hitType={} bit=0x{:X} flags=0x{:02X} life={} hp={} tick={}",
+            h.key, pid_str(h.attacker), h.tgIndex, rec->hitsInjected, h.atType, h.atp, h.hitType,
+            h.hitBit, h.flags, h.life, actor->health, net.sim_tick());
+    }
+    s_pendingHits.erase(s_pendingHits.begin(), s_pendingHits.begin() + consumed);
+}
+
+/// post_tick on the authority: what the enemy's own damage_check made of this tick's injections.
+void authority_log_hit_results() {
+    for (auto& [proc, rec] : S().recs) {
+        if (!rec.injectedThisTick) {
+            continue;
+        }
+        rec.injectedThisTick = false;
+        fopAc_ac_c* actor = actor_of(rec);
+        if (actor == nullptr) {
+            continue;
+        }
+        if (actor->health != rec.hpBeforeInject) {
+            Log.info("[mp-enemy] hit applied key={:08X} hp {} -> {} tick={}", rec.key,
+                rec.hpBeforeInject, actor->health, network_manager().sim_tick());
+        } else {
+            Log.info("[mp-enemy] hit applied key={:08X} hp {} unchanged (its damage_check ignored "
+                     "it: invulnerable, guarding or not reading damage now) tick={}",
+                rec.key, rec.hpBeforeInject, network_manager().sim_tick());
+        }
+    }
+}
+
+void hits_reset() {
+    s_pendingHits.clear();
+    s_pendingFlags.clear();
+    for (int i = 0; i < kMaxProxies; i++) {
+        s_proxyLive[i] = false;
+    }
+}
+
+/* --- end batch 9 --- */
+
 void write_trace_rows() {
     if (!trace::enabled()) {
         return;
@@ -997,7 +1560,7 @@ void write_trace_rows() {
     static const char* kHeader =
         "key,prof,proc,mode,degraded,authority,epoch,target,x,y,z,shapeY,hp,anm,frame,mflags,"
         "engaged,tx,ty,tz,tdist,samples,ghostTicks,realExecWhileGhost,swapTicks,absorbed,"
-        "realLinkWrites,targetSwitches";
+        "realLinkWrites,targetSwitches,hitsSent,hitsRecv,hitsInjected,hitsRejected";
     const std::uint64_t tick = network_manager().sim_tick();
     for (auto& [proc, rec] : S().recs) {
         if (rec.mode == Mode::Local && !rec.degraded) {
@@ -1035,14 +1598,15 @@ void write_trace_rows() {
             rec.gateAsGhost > rec.ghostTicks ? rec.gateAsGhost - rec.ghostTicks : 0;
         trace::enemy_row(tick, kHeader,
             fmt::format("{:08X},0x{:03X},{},{},{},{},{},{},{:.2f},{:.2f},{:.2f},{},{},{},{:.2f},{},"
-                        "{},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{},{},{},{},{}",
+                        "{},{:.2f},{:.2f},{:.2f},{:.2f},{},{},{},{},{},{},{},{},{},{},{}",
                 rec.key, static_cast<unsigned>(static_cast<std::uint16_t>(rec.prof)), rec.proc,
                 mode_name(rec.mode), rec.degraded ? 1 : 0, pid_str(rec.authority), rec.epoch,
                 pid_str(target), actor->current.pos.x, actor->current.pos.y, actor->current.pos.z,
                 actor->shape_angle.y, actor->health, anm, frame,
                 static_cast<fopEn_enemy_c*>(actor)->mFlags, engaged ? 1 : 0, tp[0], tp[1], tp[2],
                 tdist, rec.samples.size(), rec.ghostTicks, realExec, rec.swapTicks,
-                rec.absorbedWrites, rec.realLinkWrites, rec.targetSwitches));
+                rec.absorbedWrites, rec.realLinkWrites, rec.targetSwitches, rec.hitsSent,
+                rec.hitsRecv, rec.hitsInjected, rec.hitsRejected));
     }
 }
 
@@ -1067,11 +1631,13 @@ void log_stats() {
         Log.info(
             "[mp-enemy] stats key={:08X} mode={} owner={} epoch={} target={} hp={} pos=({:.0f}, "
             "{:.0f}, {:.0f}) ghostTicks={} realExecWhileGhost={} swaps={} absorbed={} "
-            "realLinkWrites={} switches={} tick={}",
+            "realLinkWrites={} switches={} hitsSent={} hitsRecv={} hitsInjected={} "
+            "hitsRejected={} tick={}",
             rec.key, mode_name(rec.mode), pid_str(rec.authority), rec.epoch, pid_str(target),
             actor->health, actor->current.pos.x, actor->current.pos.y, actor->current.pos.z,
             rec.ghostTicks, realExec, rec.swapTicks, rec.absorbedWrites, rec.realLinkWrites,
-            rec.targetSwitches, network_manager().sim_tick());
+            rec.targetSwitches, rec.hitsSent, rec.hitsRecv, rec.hitsInjected, rec.hitsRejected,
+            network_manager().sim_tick());
     }
 }
 
@@ -1090,7 +1656,10 @@ void reset_session_state() {
         rec.target = kNoPlayer;
         rec.challenger = kNoPlayer;
         rec.challengerTicks = 0;
+        rec.ghostFlagsValid = false;
+        rec.injectedThisTick = false;
     }
+    hits_reset();
     s.lastSentRooms = RoomSet{};
     s.haveSentRooms = false;
     s.forceRooms = false;
@@ -1199,6 +1768,8 @@ void pre_tick() {
         play_ghost(rec);
     }
     standins_refresh();
+    /* --- batch 9: enemy hits --- before this tick's actor pass, so before its damage_check. */
+    authority_apply_hits();
 }
 
 void post_tick() {
@@ -1206,6 +1777,8 @@ void post_tick() {
         return;
     }
     check_slot0("post_tick");
+    /* --- batch 9: enemy hits --- */
+    authority_log_hit_results();
     send_updates();
     write_trace_rows();
     log_stats();
@@ -1224,6 +1797,11 @@ bool on_packet(PacketId id, Reader& r, std::uint32_t fromPlayerId) {
         return on_update(r, fromPlayerId);
     case PacketId::RoomsLoaded:
         return on_rooms(r, fromPlayerId);
+    /* --- batch 9: enemy hits --- */
+    case PacketId::EnemyHit:
+        return on_hit(r, fromPlayerId);
+    case PacketId::EnemyFlagHit:
+        return on_flag_hit(r, fromPlayerId);
     default:
         return false;
     }
@@ -1281,6 +1859,10 @@ std::vector<EnemyView> views() {
         v.swapTicks = rec.swapTicks;
         v.absorbedWrites = rec.absorbedWrites;
         v.realLinkWrites = rec.realLinkWrites;
+        v.hitsSent = rec.hitsSent;
+        v.hitsRecv = rec.hitsRecv;
+        v.hitsInjected = rec.hitsInjected;
+        v.hitsRejected = rec.hitsRejected;
         out.push_back(v);
     }
     return out;
@@ -1431,6 +2013,19 @@ bool enemy_ghost_execute(fopAc_ac_c* actor) {
         return true;
     }
 
+    /* --- batch 9: enemy hits --- what this end's Link did to the ghost since its last tick: the
+     * TG hits of the last collision pass, and flag bits set directly (the ghost rewrites mFlags
+     * from the stream below, so a new bit there is the local player's). */
+    ghost_scan_hits(*rec, actor);
+    if (rec->ghostFlagsValid) {
+        const std::uint16_t added = static_cast<fopEn_enemy_c*>(actor)->mFlags &
+                                    static_cast<std::uint16_t>(~rec->ghostFlagsWritten) &
+                                    kForwardFlagBits;
+        if (added != 0) {
+            ghost_send_flag_hit(*rec, added);
+        }
+    }
+
     const Sample& s = rec->played;
     // §2.2 one ghost tick. 1: pose.
     actor->current.pos.set(s.pos[0], s.pos[1], s.pos[2]);
@@ -1442,6 +2037,8 @@ bool enemy_ghost_execute(fopAc_ac_c* actor) {
     actor->health = s.health;
     static_cast<fopEn_enemy_c*>(actor)->mFlags =
         static_cast<u16>(s.flags | fopEn_enemy_c::fopEn_flag_WolfNoLock);
+    rec->ghostFlagsWritten = static_cast<fopEn_enemy_c*>(actor)->mFlags;
+    rec->ghostFlagsValid = true;
     // 3-5: the animation. Set on a change (the authority's own morph), played here at the sent
     // rate so its BAS sounds play locally, then corrected to the authority's frame when off by
     // more than one frame (the puppet lesson: frames are set, not lerped).
@@ -1472,6 +2069,19 @@ bool enemy_ghost_execute(fopAc_ac_c* actor) {
     }
     rec->ghostTicks++;
     return true;
+}
+
+/* --- batch 9: enemy hits --- */
+bool enemy_sync_live() {
+    return enemies::detail::s_enabled;
+}
+
+const EnemyHitOverride* enemy_hit_override(const cCcD_Obj* atObj) {
+    // Called for every hit any enemy takes: bail before the proxy scan when sync is off.
+    if (!enemies::detail::s_enabled) {
+        return nullptr;
+    }
+    return enemies::detail::hit_override(atObj);
 }
 
 }  // namespace dusk::mp
