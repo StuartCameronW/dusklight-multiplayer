@@ -369,7 +369,7 @@ struct UserSettings {
         /// until M6 phase 3; while off every dusk::mp::enemy_* hook answers "vanilla".
         ConfigVar<bool> enemySync;
         /// Debug/test knob for M6: how many ticks a guest keeps a room after the host walks in
-        /// (rule 1's minimum hold, clamped to the 300-tick cap). Default 15, the designed value.
+        /// (rule 1's minimum hold; above 300 it also raises the cap; max 3600). Default 15, the design.
         ConfigVar<int> enemyHostHoldTicks;
     } multiplayer;
 

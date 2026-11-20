@@ -459,18 +459,19 @@ void host_recompute_table() {
             // Rule 1: the host arrived in a room a guest is simulating. Defer.
             const auto arrived = s.hostArrivedAt.try_emplace(k, s.tick).first->second;
             const std::uint64_t held = s.tick - arrived;
-            // The minimum hold is the cvar (default 15 = kHostArrivalMinHoldTicks; tests widen it).
+            // The minimum hold is the cvar (default 15 = kHostArrivalMinHoldTicks). A test may widen
+            // it past the 300-tick cap, which then moves with it (capped at 3600 ticks).
             const int holdCvar = dusk::getSettings().multiplayer.enemyHostHoldTicks.getValue();
             const std::uint64_t minHold =
-                holdCvar < 0 ? kHostArrivalMinHoldTicks : std::min<std::uint64_t>(holdCvar, kHostArrivalMaxHoldTicks);
-            const bool hold = held < minHold ||
-                              (held < kHostArrivalMaxHoldTicks && host_hold_room(k));
+                holdCvar < 0 ? kHostArrivalMinHoldTicks : std::min<std::uint64_t>(holdCvar, 3600);
+            const std::uint64_t maxHold = std::max(kHostArrivalMaxHoldTicks, minHold);
+            const bool hold = held < minHold || (held < maxHold && host_hold_room(k));
             owner = hold ? prev->second.owner : kHostPlayerId;
             if (!hold) {
                 Log.info("[mp-enemy] host takes over stage={:08X} room={} from player {} after {} "
                          "tick(s){}",
                     key_stage(k), key_room(k), prev->second.owner, held,
-                    held >= kHostArrivalMaxHoldTicks ? " (hold cap reached)" : "");
+                    held >= maxHold ? " (hold cap reached)" : "");
             }
         } else if (hostHas) {
             owner = kHostPlayerId;
