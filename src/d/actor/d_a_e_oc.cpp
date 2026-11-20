@@ -2863,3 +2863,7 @@ DUSK_PROFILE actor_process_profile_definition DUSK_CONST g_profile_E_OC = {
 };
 
 AUDIO_INSTANCES;
+
+#if TARGET_PC
+#include "d/actor/d_a_e_oc_mp.inc"
+#endif
